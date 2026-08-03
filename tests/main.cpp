@@ -37,6 +37,7 @@ int main() {
                 " (driver is not instrumented)\n");
 #endif
     runPngTests();
+    runRollDampingTests();
     runSchedulerTests();
     runSerialiseTests();
     runWorldIoTests();
