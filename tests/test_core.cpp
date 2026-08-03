@@ -178,6 +178,114 @@ void testClippedCompartmentStaysInsideHull() {
     expectTrue("carved compartment stays within the hull envelope", inside);
 }
 
+// --- Buoyancy under a wavy free surface --------------------------------------
+
+// Flat water is the degenerate case of a height field, so the general routine
+// must reproduce the plane routine exactly. If it does not, one of them is wrong
+// and every wave result would inherit the error invisibly.
+void testWavySurfaceReducesToThePlaneCase() {
+    const TriMesh hull = testHull();
+    for (double level : {-1.0, 0.0, 2.5, 4.0, 6.5, 9.0}) {
+        const VolumeIntegral plane = integrateBelowPlane(hull, {0, 0, 1}, level);
+        const VolumeIntegral surface =
+            integrateBelowSurface(hull, [level](double, double) { return level; });
+        expectNear("flat height field matches the plane volume at " + std::to_string(level),
+                   surface.volume, plane.volume, std::max(1e-9, 1e-9 * plane.volume));
+        if (plane.volume > 1.0) {
+            expectNear("flat height field matches the plane centroid z", surface.centroid.z,
+                       plane.centroid.z, 1e-7);
+            expectNear("flat height field matches the plane centroid x", surface.centroid.x,
+                       plane.centroid.x, 1e-6);
+        }
+    }
+}
+
+// A box under a sinusoidal surface has an analytic submerged volume, which is
+// what makes this a real check rather than a comparison of two approximations.
+//
+// For a box spanning x in [x0, x1] with its bottom below the trough and its top
+// above the crest, the submerged volume is W * integral of (h(x) - zBottom) dx,
+// and for h = A cos(k x) that integral is closed form.
+//
+// **cos, not sin.** The first version of this test used a sine over a symmetric
+// range, where the wave's contribution integrates to exactly zero -- so the
+// analytic answer did not depend on the wave at all, the routine returned it to
+// machine precision at every resolution, and the convergence assertion was
+// comparing zero against zero. A cosine over the same range does not cancel.
+void testSinusoidalSurfaceAgainstAnalyticVolume() {
+    const double x0 = -10.0, x1 = 10.0, y1 = 3.0;
+    const double bottom = -5.0, top = 5.0;
+    const double amplitude = 2.0;
+    const double wavelength = 40.0;
+    const double k = 2.0 * kPi / wavelength;
+
+    auto wave = [&](double x, double) { return amplitude * std::cos(k * x); };
+
+    const double width = 2.0 * y1;
+    const double integral = (amplitude / k * std::sin(k * x1) - bottom * x1) -
+                            (amplitude / k * std::sin(k * x0) - bottom * x0);
+    const double analytic = width * integral;
+
+    // Guard against the vacuity that caught the first version: the wave must
+    // actually move the answer away from the still-water volume.
+    const double stillWater = width * (-bottom) * (x1 - x0);
+    expectTrue("the analytic answer genuinely depends on the wave",
+               std::abs(analytic - stillWater) > 0.1 * stillWater);
+
+    double previousError = 1e30;
+    double ratio = 0;
+    for (int divisions : {8, 16, 32, 64}) {
+        std::vector<Station> stations;
+        const std::vector<double> waterlines{bottom, top};
+        for (int i = 0; i <= divisions; ++i) {
+            Station station;
+            station.x = x0 + (x1 - x0) * i / divisions;
+            station.halfBeam = {y1, y1};
+            stations.push_back(station);
+        }
+        const TriMesh box = makeHullFromStations(stations, waterlines);
+
+        const VolumeIntegral got = integrateBelowSurface(box, wave);
+        const double error = std::abs(got.volume - analytic) / analytic;
+        expectTrue("sinusoidal volume converges, divisions=" + std::to_string(divisions),
+                   error < previousError);
+        if (previousError < 1e29) ratio = previousError / error;
+        previousError = error;
+    }
+    expectTrue("the finest sinusoidal mesh is within 1e-8 of the analytic volume",
+               previousError < 1e-8);
+    // Measured fourth order: the edge-midpoint rule is exact for quadratics and
+    // its leading error term is O(h^4) for a smooth surface. Asserting the *rate*
+    // catches a scheme that converges to the right answer for the wrong reason.
+    expectTrue("convergence is fourth order, as the quadrature rule implies",
+               ratio > 10.0 && ratio < 24.0);
+}
+
+// A wave must actually change the answer, or the routine is silently ignoring
+// its height field and every check above would still pass.
+void testWavySurfaceIsNotSecretlyFlat() {
+    const TriMesh hull = testHull();
+    const VolumeIntegral flat =
+        integrateBelowSurface(hull, [](double, double) { return 5.0; });
+    const VolumeIntegral crest =
+        integrateBelowSurface(hull, [](double x, double) { return 5.0 + 2.0 * std::cos(x * 0.1); });
+
+    expectTrue("a wave changes the displaced volume", std::abs(crest.volume - flat.volume) > 1.0);
+    // A wave crest amidships and troughs at the ends shifts buoyancy toward the
+    // middle, but the total is bounded by the flat-water volumes at crest and
+    // trough level.
+    const double atCrest = integrateBelowPlane(hull, {0, 0, 1}, 7.0).volume;
+    const double atTrough = integrateBelowPlane(hull, {0, 0, 1}, 3.0).volume;
+    expectTrue("wave displacement lies between the trough and crest still-water values",
+               crest.volume > atTrough && crest.volume < atCrest);
+
+    // And a wave whose crest is entirely above the hull must submerge it wholly.
+    const VolumeIntegral drowned =
+        integrateBelowSurface(hull, [](double, double) { return 100.0; });
+    expectNear("a surface above the whole hull submerges all of it", drowned.volume,
+               integrate(hull).volume, 1e-6 * integrate(hull).volume);
+}
+
 // --- Hydrostatics -----------------------------------------------------------
 
 // A homogeneous box floats at a draft of (rho_body / rho_water) * height.
@@ -378,6 +486,9 @@ void runCoreTests() {
     testClipMatchesIntegral();
     testSubdivisionTiles();
     testClippedCompartmentStaysInsideHull();
+    testWavySurfaceReducesToThePlaneCase();
+    testSinusoidalSurfaceAgainstAnalyticVolume();
+    testWavySurfaceIsNotSecretlyFlat();
     testArchimedes();
     testFreeSurfaceEffect();
     testTrappedAirArrestsFlooding();
