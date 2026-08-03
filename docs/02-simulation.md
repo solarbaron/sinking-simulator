@@ -250,17 +250,19 @@ than waited for.
 
 ### Radiation and diffraction
 
-The honest way to do wave loads on a large ship is potential flow. Plan:
+The honest way to do wave loads on a large ship is potential flow.
 
-- **Offline:** solve the boundary-element (panel) problem over the hull for a grid
-  of frequencies and headings, producing added mass A(ω), radiation damping B(ω),
-  and diffraction/Froude–Krylov exciting forces. Use NEMOH or Capytaine as the
-  reference solver; ship the coefficient tables as ship assets.
-- **Runtime:** Cummins impulse-response formulation. The radiation force has
-  memory — it depends on the history of motion — so the convolution integral is
-  approximated by a fitted state-space model (4–8 states per DOF, identified
-  offline). This is the standard marine-simulation approach and it is cheap at
-  runtime.
+- **Radiation — implemented by strip theory**, `engine/sim/radiation.{hpp,cpp}`.
+  See the next section for what it is, what it measures, and where it stops.
+- **Diffraction — still to build.** The exciting force from the incident wave
+  scattering off a stationary hull. Strip theory can supply it by the same
+  sectional route (Haskind relations tie it to the radiation potential already
+  computed, which is the cheap way in), and nothing of it exists yet.
+- **The offline BEM is still the plan for the real thing:** solve the
+  boundary-element problem over the whole hull for a grid of frequencies and
+  headings with NEMOH or Capytaine, and ship the coefficient tables as ship
+  assets. `RadiationTable` is deliberately the *only* thing the Cummins machinery
+  consumes, so that swap changes how the table is filled in and nothing else.
 - **Nonlinear Froude–Krylov and restoring** — **implemented**. `Sea` carries an
   optional `WaveField`; when present, `Ship` transforms the hull into world
   coordinates and integrates buoyancy against the actual surface with
@@ -348,6 +350,232 @@ only sets the frequency the response is fitted at — it does not propel the hul
 Zero-speed RAOs are the validated case. Comparison against published RAOs for a
 real hull waits on the radiation coefficients below, since without added mass the
 heave natural frequency is too high.
+### Radiation hydrodynamics — **implemented** (strip theory)
+
+`engine/sim/radiation.{hpp,cpp}`. A ship carries water with it and radiates waves
+away, and the force from that depends on the *history* of the motion. Cummins
+(1962):
+
+```
+(M + A_inf) x'' + integral_0^t K(t - tau) x'(tau) dtau + C x = F_ext
+```
+
+Three pieces are implemented: sectional coefficients per station, the
+Cummins/Ogilvie machinery that turns `A(ω)` and `B(ω)` into the memory kernel
+`K(t)`, and a state-space approximation of the convolution so the memory costs a
+matrix-vector product per tick instead of an integral over the past.
+
+**No boundary-element solver was used and none is pretended.** NEMOH and
+Capytaine are not available here. What replaces them is strip theory with a real
+two-dimensional solve per station — not a chart lookup and not a regression.
+
+#### The 2D section problem
+
+Section shape is a **Lewis form**: the image of the unit circle under
+`z = M(ζ + a₁/ζ + a₃/ζ³)`, determined exactly by beam, draft and sectional area
+coefficient, which is what a hull table gives you. The area coefficient reduces
+to a quadratic in `1 + a₃`; **only the larger root is the section you asked for**
+— the smaller one lands on `a₃ = −1/2` at the circle and produces a
+plausible-looking shape that is not it. `validateLewisSection()` reports both
+ways the family can fail: an area coefficient outside it, and a mapping that
+folds over itself (a folded contour still panels and still solves, and the answer
+is meaningless).
+
+The radiation problem on that contour is solved by a **close-fit source
+distribution** in the manner of Frank (1967), with the deep-water free-surface
+Green's function
+
+```
+G = ln r − ln r' − 2 Re{J} + 2πi e^{ν(y+η)} cos(ν(x−ξ)),
+J = PV ∫₀^∞ e^{k(y+η)} e^{ik(x−ξ)}/(k−ν) dk = e^{Z}[E₁(Z) + iπ sgn(x−ξ)]
+```
+
+with `Z = ν((y+η) + i(x−ξ))`. Writing `J` closed-form through the complex
+exponential integral is what makes this affordable — the alternative is a
+principal-value quadrature per panel pair per frequency. `E₁` is evaluated as the
+product `e^z E₁(z)`, which stays of order `1/z` where `E₁` alone overflows.
+
+**Im{J} does not satisfy the free-surface condition; only Re{J} does.** The
+outgoing behaviour has to come from the regular standing wave. Getting that wrong
+produces a purely *real* source distribution and therefore identically zero
+damping everywhere — a failure that looks like a plausible added-mass calculation
+with the damping switched off, and which the near-field/far-field energy check
+below catches immediately.
+
+Port/starboard symmetry is exploited exactly: heave is solved with symmetric
+source pairs and sway/roll with antisymmetric ones, so a symmetric section cannot
+produce an asymmetric answer through rounding, and the cross-plane couplings are
+exactly zero rather than small.
+
+**The infinite-frequency added mass is solved separately and exactly.** As
+`ω → ∞` the free-surface condition degenerates to `φ = 0`, the wave terms vanish
+identically, and `G = ln r − ln r'`. That matters twice: the panel method would
+resolve a very high frequency badly, and it gives `A_inf` by a route that shares
+no code with the Ogilvie relation that also produces it.
+
+#### What was measured
+
+| Quantity | Measured |
+|---|---|
+| Heaving semicircle, `A₃₃(ω→∞)` | 1.0022 × ρπa²/2, against the exact 1 |
+| Heaving semicircle, added-mass minimum | **0.5983** at `ω√(a/g) = 0.894`, against Ursell's published ≈0.60 near 0.9 |
+| Near-field vs far-field damping | 4.5 × 10⁻³ at 40 panels, 2.2 × 10⁻³ at 80 |
+| Reciprocity `A₂₄` vs `A₄₂` | 3.9 × 10⁻⁴ at 80 panels, first order in panel size |
+| Ogilvie round trip `B → K → B` | worst 6.3 × 10⁻³ of peak `B₃₃` |
+| `A_inf`: rigid-lid solve vs Ogilvie | 0.57% apart; the Ogilvie value varies 2.3% across `ω` |
+| Closed-form transforms | 2.8 × 10⁻⁷ (B), 4.4 × 10⁻⁶ (A) |
+| Memory decay | `K₃₃` falls to 1% of peak at **20.3 s**, 0.1% at 56.6 s |
+| State space, 6 states | 7.6% relative RMS, **2.8% of K(0)** peak error |
+| Prony on a planted 4-pole signal | 3.0 × 10⁻⁹ relative RMS |
+| Geometric scaling by 2.5 | added mass exact to 7.5 × 10⁻¹⁵, damping to 1.9 × 10⁻¹² |
+| Runtime cost | 0.53 µs per tick for 13 state-space models |
+
+The **published comparison is Ursell (1949)**, the heaving semi-immersed circular
+cylinder, whose added-mass coefficient dips to about 0.60 of `ρπa²/2` near
+`ω√(a/g) ≈ 0.9` and returns to 1.0 at high frequency. Both the depth of the
+minimum and its location are asserted, and the high-frequency limit is asserted
+against the exact 1.0 — which follows from an image argument with no
+hydrodynamics in it at all: with `φ = 0` on the free surface the section and its
+negative image are a full circle translating in unbounded fluid.
+
+The 2D solver was cross-checked during development against an **independent
+Ursell-type multipole expansion** written for the purpose: Richardson-extrapolated
+they agree to four figures (0.98745 vs 0.98749 at `νa = 0.2`). That multipole
+method is not in the tree — it diverges for box-like sections, because its
+Laurent series in `1/z` only converges outside a circle that a full midship
+section does not fit inside. That is the reason the close-fit method is the one
+that shipped.
+
+#### Irregular frequencies — the defect that had to be found, not waited for
+
+A source distribution over a closed contour solves the exterior problem correctly
+**except at the eigenfrequencies of the interior Dirichlet problem**, where the
+system is near-singular. On the 25 × 6.5 m midship section these sit at
+ω = 1.33, 1.94, 2.48, 2.94 rad/s — squarely inside the seakeeping band — and they
+match the closed form `ν_m = (mπ/B) coth(mπT/B)` for odd `m`. They produce
+**negative damping**, a ship extracting energy from still water, and they do
+**not** refine away: doubling the panels narrows the spike and leaves it there,
+because they are a property of the geometry rather than of the discretisation.
+
+They were found by the near-field/far-field energy check, not by any functional
+test — every coefficient looked like a coefficient. That check compares damping
+from integrating pressure over the hull against damping from the amplitude of the
+wave radiated to infinity: the same number by conservation of energy, computed
+along completely different paths. It reads under 0.01 in the clean band and runs
+to 60 on a spike, so the signal is unambiguous.
+
+**What is implemented is detection and repair**, not removal: solves whose energy
+residual exceeds 0.2, or whose diagonal damping is negative, are rejected and
+interpolated over from the neighbours that passed, and `RadiationTable` reports
+`repairedSolves` out of `totalSolves` so a hull whose entire grid is being
+patched cannot pass for a clean one. On the reference ferry that is **13 of 180**
+section solves. The proper cure is an extended integral equation with unknowns on
+an interior lid; it was attempted and abandoned — imposing `φ = 0` on a lid
+without giving the lid its own unknowns over-constrains the exterior solution
+too, because a source-only formulation's interior field is not zero, and the
+variants with lid unknowns did not converge in the time available. It remains the
+right fix.
+
+#### Cummins and Ogilvie
+
+The Ogilvie relations are exact identities, which makes them the strongest check
+available on everything upstream:
+
+```
+K(t)     = (2/π) ∫₀^∞ B(ω) cos(ωt) dω
+B(ω)     =       ∫₀^∞ K(t) cos(ωt) dt
+A(ω)     = A_inf − (1/ω) ∫₀^∞ K(t) sin(ωt) dt
+```
+
+Both legs treat their input as **piecewise linear between samples and integrate
+each interval against cos or sin exactly**. That is not a refinement: the
+integrands oscillate arbitrarily fast at large `t`, so any rule that samples them
+would need a mesh refined without limit, while the closed form is as accurate at
+`t = 100 s` as at `t = 0`.
+
+Because `A(ω)` and `B(ω)` are a Kramers–Kronig pair, `A_inf` recovered from
+`A(ω)` and `K(t)` must not depend on `ω` — and must agree with the rigid-lid
+panel solve, which shares no code with the transform. It does, to 0.57%, with a
+2.3% spread across the band. A frequency table that was internally inconsistent
+could not do that.
+
+#### The state-space approximation
+
+`μ(t) = ∫₀^t K(t−τ) v(τ) dτ` is replaced by `ẋ = Ax + Bv, μ = Cx` with
+`C e^{At} B` fitted to `K`. `A` is block diagonal — one 2×2 block per complex pole
+pair, one 1×1 per real pole — so the model is an explicit set of damped modes.
+Poles come from a **least-squares linear-prediction (Prony) fit**; unstable roots
+are reflected inside the unit circle, because an unstable radiation model does not
+merely lose accuracy, it diverges.
+
+Prony is exact for a signal that really is a sum of damped sinusoids, and the
+tests plant one and require it back to 3 × 10⁻⁹ before the method is turned loose
+on a hull. On the real `K₃₃`, six states give 7.6% relative RMS and 2.8% of `K(0)`
+peak error — honest but not impressive; the published figures for this technique
+are better, and the gap is the long low-frequency tail that a truncated `B(ω)`
+grid leaves behind. Fitting on a coarser sampling of `K` helps (2.9% relative RMS
+at `dt = 0.2 s`), which is a clue that the residual is high-frequency structure
+rather than shape.
+
+The runtime update is the **exact zero-order-hold discretisation** of each block,
+in closed form. It is unconditionally stable and does not care whether the tick
+matches the interval `K` was fitted at — an explicit integrator would go unstable
+on exactly the stiff fast-decaying modes the fit produces. Measured at 0.53 µs
+per tick for 13 models.
+
+`RadiationForce::memoryForce()` returns `μ`; `A_inf` is **not** applied there, it
+belongs on the left-hand side added to the rigid-body mass matrix, and is exposed
+for that.
+
+#### Validity limits — where this stops being trustworthy
+
+1. **Strip theory.** The flow at a station is taken as two-dimensional, which
+   needs the section small against both the length and the wavelength. A beamy
+   ship cannot satisfy both comfortably; `validateRadiationHull()` flags a band
+   whose shortest wavelength is under a beam, and a hull whose beam exceeds a
+   quarter of its length.
+2. **No forward-speed correction.** Everything here is zero-speed. The
+   speed-dependent terms in strip theory (the `U/ω` corrections to the coupled
+   heave–pitch and sway–yaw–roll coefficients, and the transom terms) are not
+   implemented. At Froude numbers above about 0.2 this matters.
+3. **Surge is identically zero.** A strip has no longitudinal radiation problem
+   at all; surge added mass is entirely a three-dimensional end effect. The
+   matrix reports zero rather than inventing a number.
+4. **Lewis forms are a three-parameter family.** Bulbous bows, transom sterns,
+   hard chines and any section with a real bulb are outside it. The mapping will
+   return the closest attainable form and `validateLewisSection()` will say so.
+5. **Irregular frequencies are repaired, not removed** — see above.
+6. **First-order convergence in panel count.** Flat constant-strength panels with
+   midpoint collocation. Halving the panel size halves the error; there is no
+   cheaper accuracy to be had without higher-order panels.
+7. **Deep water, no current, no viscosity.** Roll radiation damping from potential
+   flow is real but small; the viscous part is the next section and is where roll
+   damping actually comes from.
+8. **The frequency grid is truncated.** `B(ω)` is taken to zero above the last
+   grid point, and that truncation is what limits the Ogilvie round trip to
+   6 × 10⁻³ rather than machine precision.
+
+#### Cost
+
+One section solve is O(n²) influence coefficients and O(n³) factorisation, the
+former dominating. Measured on the 25 × 6.5 m midship section at ω = 0.8: **1.8–2.0
+ms at 24 panels per half section and 4.7–5.8 ms at 40** — the spread is the
+machine, not the method. A full table for the reference ferry — 9 stations × 20
+frequencies × 24 panels — is **420–490 ms**, one-off at ship load. Runtime is
+**0.53 µs per tick** for 13 state-space models, which is what the whole
+state-space apparatus is for.
+
+The cost is not uniform across sections: the inner loop is the complex
+exponential integral, and its power series takes more terms for a deep section
+than a shallow one, so a fine end station is cheaper than midships by more than
+its panel count suggests. The quadrature over each panel drops from 8 points to 4
+when the panel is well separated and the radiated waves are long, worth a factor
+of two overall.
+
+A hull whose stations are geometrically similar could share solves outright — the
+2D problem depends only on `ν` times a length — and nothing exploits that yet.
+That is the obvious next factor if table construction ever becomes the
+bottleneck.
 
 ### Viscous roll damping — **implemented**
 

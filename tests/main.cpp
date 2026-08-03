@@ -39,6 +39,7 @@ int main() {
 #endif
     runPngTests();
     runPropulsionTests();
+    runRadiationTests();
     runRollDampingTests();
     runSchedulerTests();
     runSerialiseTests();

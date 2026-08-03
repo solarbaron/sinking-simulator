@@ -84,6 +84,7 @@ most useful thing to know about this codebase:
 | `World::load` leaving a half-built world | every truncation of a valid save |
 | Under-tessellated hull inventing ±6% displacement | a short-wave test that should have cancelled |
 | Sea surface queried 6× more than necessary | timing the real tick instead of extrapolating |
+| Radiation solver returning **negative** damping at four frequencies in the seakeeping band | a near-field/far-field **energy balance**, not any coefficient test |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct.

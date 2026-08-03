@@ -37,6 +37,7 @@ void runOffscreenTests();
 void runOceanTests();
 void runPngTests();
 void runPropulsionTests();
+void runRadiationTests();
 void runRollDampingTests();
 void runSchedulerTests();
 void runSerialiseTests();
