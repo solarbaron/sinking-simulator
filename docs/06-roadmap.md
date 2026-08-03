@@ -141,7 +141,16 @@ worth trusting.
   emergent (`02-simulation.md` §2). This is the instrument the milestone is
   defined against, so it had to exist before the thing it measures.
 - BEM offline pipeline + Cummins state-space radiation at runtime
-- Ocean rendering, hull rendering, basic materials
+- ~~**Ocean rendering**~~ **done** — a displaced grid driven by `sim::WaveField`
+  itself, asserted against `elevation()` through the whole render path
+  (`03-renderer-audio.md`)
+- ~~**Hull rendering and basic materials**~~ **done** — `engine/gpu/hull.{hpp,cpp}`
+  and `engine/gpu/material.{hpp,cpp}`. A lit solid on one pipeline with the sea, so
+  the ship shares its depth buffer rather than being composited beside it; an
+  analytic metallic-roughness BRDF; and a material set that is a **text file**, so a
+  mod adds a surface without recompiling (`03-renderer-audio.md`,
+  `05-data-modding-validation.md` §4). 0.26 ms of GPU time at 1080p for a whole ship
+  and sea on the target card
 - **Milestone:** drive a ship in a real seaway. Validated against published RAOs.
 
 **Performance, now measured rather than projected.** The wave-field query is

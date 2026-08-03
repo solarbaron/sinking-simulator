@@ -162,7 +162,21 @@ struct Mat4 {
 // Right-handed view matrix: the camera sits at `eye` looking toward `target`.
 inline Mat4 lookAt(const Vec3& eye, const Vec3& target, const Vec3& up) {
     const Vec3 forward = normalize(target - eye);
-    const Vec3 right = normalize(cross(forward, up));
+
+    // Looking straight along `up` leaves no way to say which way is up on
+    // screen, and cross() is zero there. Without this, normalize() hands back a
+    // zero vector and the entire view matrix collapses to a point -- every
+    // vertex projects to the same place and the frame comes out blank. That
+    // reads as "nothing in view" rather than as "invalid camera", so it emptied
+    // two rendering tests without failing either of them. Fall back to an axis
+    // the view is not parallel to; the roll about the view direction is then
+    // arbitrary, which it always was.
+    Vec3 side = cross(forward, up);
+    if (length(side) < 1e-9 * length(up)) {
+        const Vec3 fallback = std::abs(forward.z) < 0.9 ? Vec3{0, 0, 1} : Vec3{0, 1, 0};
+        side = cross(forward, fallback);
+    }
+    const Vec3 right = normalize(side);
     const Vec3 trueUp = cross(right, forward);
 
     Mat4 view;

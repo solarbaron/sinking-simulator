@@ -33,6 +33,9 @@ add_library(shipsim_engine
   engine/core/png.cpp
   engine/core/scheduler.cpp
   engine/core/serialise.cpp
+  # Pure data and a text parser -- no Vulkan -- so the material library builds and
+  # is checkable on a machine that has no GPU at all.
+  engine/gpu/material.cpp
   engine/sim/ship.cpp
   engine/sim/propulsion.cpp
   engine/sim/rao.cpp
@@ -93,7 +96,8 @@ if(Vulkan_FOUND AND GLSLC)
   set(SHADER_OUT ${CMAKE_BINARY_DIR}/shaders)
   file(MAKE_DIRECTORY ${SHADER_OUT})
   set(SPV_FILES)
-  foreach(SHADER tet_forces.comp node_integrate.comp mesh.vert mesh.frag ocean.vert ocean.frag)
+  foreach(SHADER tet_forces.comp node_integrate.comp mesh.vert mesh.frag ocean.vert ocean.frag
+                 hull.vert hull.frag)
     add_custom_command(
       OUTPUT ${SHADER_OUT}/${SHADER}.spv
       COMMAND ${GLSLC} -O
@@ -106,18 +110,23 @@ if(Vulkan_FOUND AND GLSLC)
   add_custom_target(shipsim_shaders DEPENDS ${SPV_FILES})
 
   target_sources(shipsim_engine PRIVATE engine/gpu/device.cpp engine/gpu/offscreen.cpp
-                                        engine/gpu/ocean.cpp)
+                                        engine/gpu/ocean.cpp engine/gpu/hull.cpp)
   # The `{VK_STRUCTURE_TYPE_X}` idiom value-initialises the remaining fields,
   # which is exactly what Vulkan wants. Scoped to this file so the rest of the
   # library keeps the warning.
   set_source_files_properties(engine/gpu/device.cpp engine/gpu/offscreen.cpp
-                              engine/gpu/ocean.cpp PROPERTIES
+                              engine/gpu/ocean.cpp engine/gpu/hull.cpp PROPERTIES
     COMPILE_OPTIONS "-Wno-missing-field-initializers")
   target_link_libraries(shipsim_engine PUBLIC Vulkan::Vulkan)
   target_compile_definitions(shipsim_engine PUBLIC SHIPSIM_HAS_VULKAN=1)
   target_sources(shipsim_tests PRIVATE tests/test_device.cpp tests/test_offscreen.cpp
-                                       tests/test_ocean.cpp)
+                                       tests/test_ocean.cpp tests/test_hull_render.cpp)
   target_compile_definitions(shipsim_tests PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}")
+  # The shipped material set is data, read at runtime rather than compiled in, so
+  # the tests need to be told where it lives. Source directory, not build: it is
+  # an input like the shaders' GLSL, not an artefact.
+  target_compile_definitions(shipsim_tests PRIVATE
+    SHIPSIM_MATERIAL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/engine/gpu/materials")
   add_dependencies(shipsim_tests shipsim_shaders)
 
   add_executable(ferry_view tools/ferry_view/main.cpp game/prototype/ferry.cpp)

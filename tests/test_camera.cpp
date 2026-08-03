@@ -142,6 +142,46 @@ void testWorldPointLandsOnKnownPixel() {
     expectTrue("a point behind the eye is rejected", !sim::clipToPixel(clip, width, height, x, y));
 }
 
+
+// A view straight down the `up` axis has no defined screen-roll, and the naive
+// construction silently collapses the whole matrix to a point rather than
+// picking one. The frame then comes out blank, which reads as an empty scene
+// rather than as a broken camera -- it emptied two rendering tests in the hull
+// renderer without failing either. This is the same shape as the bow-on camera
+// in CLAUDE.md's list: a camera that produces nothing while looking like it
+// worked.
+void testLookAtSurvivesAViewAlongUp() {
+    constexpr double width = 256, height = 256;
+    const Mat4 projection = sim::perspective(90.0 * sim::kDegToRad, 1.0, 1.0, 500.0);
+    // Straight down, with up parallel to the view direction.
+    const Mat4 viewProjection = projection * sim::lookAt({0, 0, 100}, {0, 0, 0}, {0, 0, 1});
+
+    double clip[4], cx = 0, cy = 0;
+    viewProjection.transform({0, 0, 0}, clip);
+    expectTrue("the target still projects", sim::clipToPixel(clip, width, height, cx, cy));
+
+    // The load-bearing part. A collapsed matrix sends *every* point to the same
+    // pixel, so two points 40 m apart landing apart is the direct statement that
+    // it did not collapse -- and it is exactly what a blank-frame check misses.
+    double ax = 0, ay = 0, bx = 0, by = 0;
+    viewProjection.transform({40, 0, 0}, clip);
+    expectTrue("an offset point projects", sim::clipToPixel(clip, width, height, ax, ay));
+    viewProjection.transform({0, 40, 0}, clip);
+    expectTrue("a perpendicular offset projects", sim::clipToPixel(clip, width, height, bx, by));
+
+    expectTrue("two separated points do not land on the same pixel",
+               std::hypot(ax - bx, ay - by) > 10.0);
+    expectTrue("and neither sits on top of the target",
+               std::hypot(ax - cx, ay - cy) > 5.0 && std::hypot(bx - cx, by - cy) > 5.0);
+    expectNear("the target is still dead centre", cx, width * 0.5, 1e-6);
+
+    // With a 90 degree field of view at 100 m, the frustum edge is 100 m out, so
+    // 40 m lands at 40% of the half-width from centre. The guard must produce a
+    // real camera, not merely a non-degenerate one.
+    expectNear("the offset lands where the field of view says it should",
+               std::hypot(ax - cx, ay - cy), 0.40 * width * 0.5, 1e-6);
+}
+
 }  // namespace
 
 void runCameraTests() {
@@ -151,4 +191,5 @@ void runCameraTests() {
     testPerspectiveFlipsYForVulkan();
     testLookAtPlacesTheCamera();
     testWorldPointLandsOnKnownPixel();
+    testLookAtSurvivesAViewAlongUp();
 }
