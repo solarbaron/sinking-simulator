@@ -108,6 +108,17 @@ Transcendental functions are the residual risk (`libm` differs across platforms
 and versions). The sim uses an in-tree implementation of `sin`, `cos`, `exp`,
 `log`, `pow`, `atan2` and `sqrt`-adjacent helpers for anything on the state path.
 
+**The boundary of this guarantee, measured rather than assumed.** Determinism
+covers the CPU simulation path. It does **not** extend to GPU field solvers. The
+FEM spike (`07-fem-spike-findings.md` §2) shows the GPU and CPU kernels agreeing
+to 2 × 10⁻⁵ on a single step — the kernel is correct — and then diverging to
+5 × 10⁻³ over a thousand steps, because the GPU contracts multiply-add pairs
+differently and an explicit scheme at the CFL limit amplifies that in its
+highest-frequency modes. This is a property of explicit dynamics, not a bug to be
+fixed. Anything requiring reproducibility must therefore consume *events* from
+the field solvers (a tear, its geometry, the resulting orifice area) rather than
+their raw state.
+
 ## 5. Memory
 
 - Arena allocators per frame and per subsystem; the global allocator is off-limits

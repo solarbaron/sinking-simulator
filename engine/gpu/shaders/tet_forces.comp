@@ -1,0 +1,77 @@
+#version 450
+// One invocation per tetrahedron: co-rotational linear elasticity, producing the
+// four nodal force vectors this element contributes. Deliberately mirrors
+// sim::fem::tetForces() term for term so the two can be diffed.
+//
+// Forces are written to a per-element slot rather than scattered into nodes. The
+// companion node kernel gathers them, which needs no float atomics and -- more
+// importantly -- fixes the summation order, so the result is reproducible.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer Positions { float position[]; };
+layout(std430, binding = 4) readonly  buffer Indices   { uint  index[]; };
+layout(std430, binding = 5) readonly  buffer RestInv   { float restInv[]; };
+layout(std430, binding = 6) readonly  buffer RestVol   { float restVolume[]; };
+layout(std430, binding = 7) writeonly buffer TetForce  { float tetForce[]; };
+
+layout(push_constant) uniform Params {
+    float dt;
+    float lambda;
+    float mu;
+    float gravity;
+    float damping;
+    uint  nodeCount;
+    uint  tetCount;
+} params;
+
+// Rotation part of F by Higham's Newton iteration. Convergence is quadratic, so
+// four iterations is already at float precision for any non-inverted element.
+// The count must match the CPU reference exactly or the two solvers diverge.
+mat3 polarRotation(mat3 f) {
+    mat3 r = f;
+    for (int i = 0; i < 4; ++i) r = 0.5 * (r + transpose(inverse(r)));
+    return r;
+}
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= params.tetCount) return;
+
+    uvec4 idx = uvec4(index[t * 4 + 0], index[t * 4 + 1], index[t * 4 + 2], index[t * 4 + 3]);
+    vec3 x0 = vec3(position[idx.x * 3], position[idx.x * 3 + 1], position[idx.x * 3 + 2]);
+    vec3 x1 = vec3(position[idx.y * 3], position[idx.y * 3 + 1], position[idx.y * 3 + 2]);
+    vec3 x2 = vec3(position[idx.z * 3], position[idx.z * 3 + 1], position[idx.z * 3 + 2]);
+    vec3 x3 = vec3(position[idx.w * 3], position[idx.w * 3 + 1], position[idx.w * 3 + 2]);
+
+    // Column-major, same convention as the CPU side.
+    mat3 ds = mat3(x1 - x0, x2 - x0, x3 - x0);
+    mat3 dmInv = mat3(restInv[t * 9 + 0], restInv[t * 9 + 1], restInv[t * 9 + 2],
+                      restInv[t * 9 + 3], restInv[t * 9 + 4], restInv[t * 9 + 5],
+                      restInv[t * 9 + 6], restInv[t * 9 + 7], restInv[t * 9 + 8]);
+
+    mat3 f = ds * dmInv;
+    mat3 r = polarRotation(f);
+
+    // Unrotate, take the linear strain tensor, and apply Hooke's law. The
+    // co-rotational step is what keeps a linear material honest under the large
+    // rotations a deforming hull actually undergoes.
+    mat3 s = transpose(r) * f;
+    mat3 strain = 0.5 * (s + transpose(s)) - mat3(1.0);
+    float tr = strain[0][0] + strain[1][1] + strain[2][2];
+    mat3 stress = 2.0 * params.mu * strain + params.lambda * tr * mat3(1.0);
+
+    mat3 h = (r * stress) * transpose(dmInv);
+    float scale = -restVolume[t];
+
+    vec3 f1 = scale * h[0];
+    vec3 f2 = scale * h[1];
+    vec3 f3 = scale * h[2];
+    vec3 f0 = -(f1 + f2 + f3);
+
+    uint o = t * 12;
+    tetForce[o +  0] = f0.x; tetForce[o +  1] = f0.y; tetForce[o +  2] = f0.z;
+    tetForce[o +  3] = f1.x; tetForce[o +  4] = f1.y; tetForce[o +  5] = f1.z;
+    tetForce[o +  6] = f2.x; tetForce[o +  7] = f2.y; tetForce[o +  8] = f2.z;
+    tetForce[o +  9] = f3.x; tetForce[o + 10] = f3.y; tetForce[o + 11] = f3.z;
+}

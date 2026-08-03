@@ -27,7 +27,11 @@ ninja -C build
 ./build/shipsim --scenario=doors            # close the watertight door
 ./build/shipsim --scenario=full             # full damage control response
 ./build/shipsim --scenario=full --csv=run.csv
+./build/fem_spike                           # explicit tet FEM: validation + GPU benchmark
 ```
+
+`fem_spike` needs Vulkan and `glslc`; without them CMake skips that target and
+everything else still builds.
 
 ## What slice 1 already does
 
@@ -121,6 +125,40 @@ answers that depend on where you put the reference point. The hull was overstati
 displacement by 40%. There is now an `isClosedManifold` check and `Ship::validate()`
 runs it at load, because this class of error is invisible until you go looking.
 
+## The FEM spike
+
+Phase 3 — deformation, tearing, structural failure — is the largest and riskiest
+part of the plan, so it got probed before anything was built on it. There is now
+an explicit co-rotational tetrahedral FEM with a CPU reference and a Vulkan
+compute back-end, and it has been measured on the target GPU.
+
+- **The formulation validates.** A cantilever under its own weight converges to
+  Euler-Bernoulli theory under uniform refinement: 63.6% error at 2 elements
+  through the thickness, 32.2% at 4, 10.8% at 8.
+- **The GPU kernel is correct.** One step from identical deformed state agrees
+  with the CPU to 2 × 10⁻⁵ relative.
+- **It is not reproducible over long runs.** That agreement decays to 5 × 10⁻³
+  over a thousand steps, because the GPU contracts multiply-add pairs differently
+  and an explicit scheme at the CFL limit amplifies it. Not a bug — a property of
+  explicit dynamics, and it confirms the decision to replicate damage *events*
+  rather than field state across the network.
+- **Throughput: 450–670 M element-updates/s** on a GTX 1070 Ti. About 100× one
+  CPU core, or 4× the whole 24-thread CPU.
+
+And the finding that changed the plan: **uniform linear tetrahedra are the wrong
+element for ship plating.** They lock in bending, so they need many elements
+through the thickness — and the explicit stability limit is set by the smallest
+element dimension, so those same elements collapse the timestep. Cost scales as
+h⁻⁴ and the two constraints close on each other. A realistic 20 m collision zone
+at plate-resolving tet resolution is 10³–10⁴× slower than real time.
+
+The fix is solid-shell elements for plating, with tets kept for genuinely
+three-dimensional regions. Full numbers and reasoning in
+[docs/07 — FEM spike findings](docs/07-fem-spike-findings.md).
+
+The spike cost a day and moved an 18-engineer-month bet from assumed to measured,
+identifying one architectural change before any of that phase existed to rewrite.
+
 ## Where this is going
 
 `docs/` contains the full plan. In short:
@@ -136,13 +174,17 @@ runs it at load, because this class of error is invisible until you go looking.
 - **[05 — Data & validation](docs/05-data-modding-validation.md)** — ship format,
   editor, and how each subsystem gets checked against real data.
 - **[06 — Roadmap](docs/06-roadmap.md)** — phases, dependencies, honest costs.
+- **[07 — FEM spike findings](docs/07-fem-spike-findings.md)** — what the
+  measurements said and what changed because of them.
 
 ## Repository layout
 
 ```
-engine/core/     math, closed-mesh volume integration
-engine/sim/      compartments, orifice network, 6-DOF rigid body
+engine/core/     math, closed-mesh volume integration, mesh booleans
+engine/sim/      compartments, orifice network, 6-DOF rigid body, tet FEM
+engine/gpu/      Vulkan compute back-end and shaders for the FEM
 game/prototype/  the ferry definition and the headless scenario driver
+tools/fem_spike/ FEM validation and GPU benchmark
 tests/           closed-form validation of the numerical core
 docs/            the plan
 ```

@@ -158,17 +158,42 @@ model is local.
   own (lower) strength. Structures fail at connections far more often than in the
   middle of a plate.
 
+### Element technology — revised after measurement
+
+The original plan was uniform linear tetrahedra throughout Tier 2. **The spike in
+`07-fem-spike-findings.md` ruled that out**, and the reason is worth stating
+because it is not the obvious one.
+
+Linear tets lock in bending: measured error against beam theory is 63% at two
+elements through the thickness, 32% at four, 11% at eight. Ship plating is thin,
+so avoiding that error needs many elements through 20 mm of steel — and the
+explicit stability limit is set by the *smallest* element dimension, so those
+same elements collapse the timestep. Cost scales as h⁻⁴. The two constraints
+close on each other and leave no workable resolution.
+
+So Tier 2 is mixed:
+
+- **Solid-shell / assumed-strain (EAS, ANS) elements for plating.** One element
+  through the thickness, no locking, and the timestep is governed by in-plane
+  size instead of plate thickness — worth 5–10× on the step alone, on top of the
+  element count reduction.
+- **Tetrahedra where the geometry really is three-dimensional**: castings, engine
+  seats, thick brackets, and the crush zone once plating has folded and shell
+  kinematics no longer apply.
+- **Promotion from shell to tet** as an element crumples past that point.
+
 ### Solver
 
 Explicit central-difference time integration inside Tier 2 (standard for
-impact/fracture, no global stiffness matrix, trivially parallel, CFL-limited to
-~1.5 µs at 10 mm in steel). Tier 1 is implicit and cheap. Lumped mass matrix.
+impact/fracture, no global stiffness matrix, trivially parallel). Tier 1 is
+implicit and cheap. Lumped mass matrix.
 
-GPU: the element loop is a perfect compute-shader workload — gather nodal state,
-compute deformation gradient, stress, internal force, scatter. On Pascal-class
-hardware expect ~2–4 M element-updates/ms. A 300 k element zone at 2 kHz is
-~0.6 GB/s of state traffic and comfortably real-time; at 20 kHz it needs time
-dilation, which the engine already provides.
+GPU: the element loop is a good compute-shader workload — gather nodal state,
+compute deformation gradient, stress, internal force, write per-element forces,
+then gather into nodes through a CSR adjacency. **Measured on a GTX 1070 Ti:
+450–670 M element-updates/s**, roughly 100× a single CPU core and 4× the whole
+24-thread CPU. Nodal forces are gathered rather than scattered, which avoids
+float atomics entirely and fixes the accumulation order.
 
 ### Slow damage
 

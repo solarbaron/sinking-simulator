@@ -1,0 +1,55 @@
+#version 450
+// One invocation per node: gather the element forces incident on it, add body
+// force, and advance velocity and position by symplectic Euler.
+//
+// The gather runs over a CSR adjacency built once on the CPU. Summation order is
+// therefore fixed by the mesh, not by which warp happened to finish first, which
+// is what the determinism requirement in docs/01-architecture.md needs.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0)          buffer Positions { float position[]; };
+layout(std430, binding = 1)          buffer Velocities { float velocity[]; };
+layout(std430, binding = 2) readonly buffer Masses    { float mass[]; };
+layout(std430, binding = 3) readonly buffer Fixed     { uint  fixedNode[]; };
+layout(std430, binding = 7) readonly buffer TetForce  { float tetForce[]; };
+layout(std430, binding = 8) readonly buffer AdjOffset { uint  adjacencyOffset[]; };
+layout(std430, binding = 9) readonly buffer AdjEntry  { uint  adjacencyEntry[]; };
+
+layout(push_constant) uniform Params {
+    float dt;
+    float lambda;
+    float mu;
+    float gravity;
+    float damping;
+    uint  nodeCount;
+    uint  tetCount;
+} params;
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= params.nodeCount) return;
+
+    if (fixedNode[n] != 0u) {
+        velocity[n * 3] = 0.0;
+        velocity[n * 3 + 1] = 0.0;
+        velocity[n * 3 + 2] = 0.0;
+        return;
+    }
+
+    vec3 force = vec3(0.0, 0.0, -params.gravity * mass[n]);
+    uint begin = adjacencyOffset[n];
+    uint end = adjacencyOffset[n + 1];
+    for (uint e = begin; e < end; ++e) {
+        uint entry = adjacencyEntry[e];
+        uint o = (entry >> 2) * 12u + (entry & 3u) * 3u;
+        force += vec3(tetForce[o], tetForce[o + 1], tetForce[o + 2]);
+    }
+
+    vec3 v = vec3(velocity[n * 3], velocity[n * 3 + 1], velocity[n * 3 + 2]);
+    v = (v + force * (params.dt / mass[n])) * params.damping;
+    vec3 p = vec3(position[n * 3], position[n * 3 + 1], position[n * 3 + 2]) + v * params.dt;
+
+    velocity[n * 3] = v.x; velocity[n * 3 + 1] = v.y; velocity[n * 3 + 2] = v.z;
+    position[n * 3] = p.x; position[n * 3 + 1] = p.y; position[n * 3 + 2] = p.z;
+}

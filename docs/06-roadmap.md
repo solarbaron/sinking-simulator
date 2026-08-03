@@ -31,8 +31,11 @@ Numerical core, flooding, air, damaged stability, validation harness.
 - Watertightness checking and load-time ship definition validation
 - 116 closed-form validation checks
 - A 120 m ferry that lolls over, capsizes, or survives depending on what you do
+- Explicit co-rotational tet FEM, CPU reference plus a Vulkan compute back-end,
+  validated against beam theory and benchmarked on the target GPU
 
-**Deliverable:** `./build/shipsim`. Runs today.
+**Deliverables:** `./build/shipsim`, `./build/shipsim_tests`, `./build/fem_spike`.
+All run today.
 
 ---
 
@@ -69,7 +72,9 @@ The longest and highest-risk phase.
 
 - Structural mesh generation from scantlings
 - Craig–Bampton offline reduction; Tier-0 beam and Tier-1 reduced models
-- Explicit tet FEM with co-rotational elasticity and J2 plasticity
+- Solid-shell elements for plating; explicit tet FEM for genuinely 3D regions
+  (see `07-fem-spike-findings.md` §4 for why this split is not optional)
+- Co-rotational elasticity and J2 plasticity
 - Adaptive zone promotion/demotion and interface coupling
 - Ductile damage and mesh-splitting fracture
 - GPU element solver
@@ -145,11 +150,14 @@ Phase 0 ✅ ──▶ Phase 1 ──┬──▶ Phase 2 ──┬──▶ Phas
 
 **Highest risks, in order:**
 
-1. **Phase 3 performance.** Adaptive tet FEM at interactive rates is the central
-   technical bet. Mitigation: the tier structure means a failure here degrades to
-   Tier-1-only (elastic deformation, scripted-threshold tearing) rather than
-   killing the project. Prototype the GPU element solver early — in Phase 1, on
-   a single plate — rather than discovering the cost in Phase 3.
+1. **Phase 3 performance.** Adaptive FEM at interactive rates is the central
+   technical bet. **Now measured** (`07-fem-spike-findings.md`): the GPU is fast
+   enough, but only with the right element — uniform linear tets at
+   plate-resolving resolution would have been 10³–10⁴× slower than real time.
+   Residual risk moves to solid-shell element implementation, which is
+   better-understood work than an open performance question. The tier structure
+   still means a failure here degrades to Tier-1-only (elastic deformation,
+   scripted-threshold tearing) rather than killing the project.
 2. **Coupling stability.** Partitioned multiphysics can go unstable in ways
    neither solver does alone. Mitigation: every coupling gets an energy-balance
    check in CI; the flooding↔rigid-body predictor-corrector already in the code
@@ -164,16 +172,23 @@ Phase 0 ✅ ──▶ Phase 1 ──┬──▶ Phase 2 ──┬──▶ Phas
 
 ## What to do next
 
-**Done since this document was written:** compartment CSG, which found and fixed a
-hull winding bug that had been overstating displacement by 40%. See `README.md`.
+**Both pre-Phase-1 items are done.**
 
-The remaining pre-Phase-1 item:
+1. ~~Compartment CSG~~ — done, and it found a hull winding bug that had been
+   overstating displacement by 40%. See `README.md`.
+2. ~~GPU tet-FEM spike~~ — done. Full results in
+   **[07 — FEM spike findings](07-fem-spike-findings.md)**. Headline: the GPU
+   delivers 450–670 M element-updates/s, the formulation validates against beam
+   theory, and **uniform linear tetrahedra are ruled out for plating** — Tier 2
+   needs solid-shell elements where the structure is thin. That change is now
+   folded into `02-simulation.md` §3 and into the Phase 3 line item above.
 
-1. **A GPU tet-FEM spike** — one steel plate, explicit solver, compute shader,
-   measured throughput on the 1070 Ti. A weekend, and it tells you whether Phase 3
-   is a plan or a wish before you spend 18 engineer-months finding out.
+So Phase 1 is next, with two lessons carried forward from Phase 0:
 
-Then Phase 1, with one lesson carried forward from Phase 0: **every geometric
-representation gets a validity check that runs at load.** The winding bug cost
-nothing to fix and would have cost a great deal to find later, because the
-simulation kept producing believable numbers the whole time it was wrong.
+- **Every geometric representation gets a validity check that runs at load.** The
+  winding bug cost nothing to fix and would have cost a great deal to find later,
+  because the simulation kept producing believable numbers the whole time it was
+  wrong.
+- **Measure the expensive bet before building on it.** The spike cost a day and
+  changed an architectural decision inside an 18-engineer-month phase, before any
+  of that phase existed to be rewritten.
