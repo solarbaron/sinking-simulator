@@ -46,19 +46,142 @@ floodwater free to re-level.
 
 ## 2. Seakeeping and hydrodynamics
 
-The ship currently floats in still water. This adds the sea.
+The ship currently floats in still water. This adds the sea. The wave field is
+built; the loads it drives are not.
 
-### Wave field
+### Wave field — **implemented**
 
-Directional spectrum (JONSWAP for fetch-limited, Pierson–Moskowitz for fully
-developed, plus swell trains superposed), sampled as several hundred components
-and evaluated by FFT on a tiled grid for rendering. For physics, the analytic
-sum is evaluated directly at the points that matter — hull panels, openings, the
-free surface at each breach — because interpolating a rendering grid loses exactly
-the detail that decides whether a hatch immerses.
+`engine/sim/waves.{hpp,cpp}`. A directional spectrum discretised into components
+and evaluated analytically:
 
-Nonlinear extensions: second-order Stokes correction for steep seas, and a
-breaking criterion driving spray/foam emission.
+```
+eta(x, y, t) = sum_i a_i cos(k_i . x - omega_i t + phi_i)
+```
+
+`SeaState` asks for the sea in the terms a forecast gives it — Hs, Tp, mean
+direction, spreading exponent, peak enhancement — and a seed. `WaveField` turns
+that into N × M components; `elevation()` and `kinematics()` evaluate them
+directly at whatever point is asked for. A `WaveField` can be built from several
+superposed `SeaState`s, which is how a swell train sits under a wind sea; the
+variances add and each system draws from its own phase stream.
+
+**JONSWAP normalised by quadrature, not by the usual approximation.** The shape
+is scaled so that its zeroth moment is exactly Hs²/16 whatever γ is. The
+customary DNV shortcut for that factor, `1 − 0.287 ln γ`, is a fit and is wrong by
+a few parts in a thousand (worst observed 7.9 × 10⁻³ at γ = 7); integrating the
+shape costs one quadrature at construction and is exact. γ = 1 recovers
+Pierson–Moskowitz, and the normalisation then comes out as 1.0 to 8 × 10⁻¹⁶,
+which is a useful check that the quadrature is not lying.
+
+**Frequencies are spaced by equal energy, not uniformly.** The spectrum is cut
+into N intervals each carrying exactly m0/N of the variance, and each interval is
+represented by its own energy *centroid* frequency. The outermost intervals are
+open — the first runs down to zero and the last up to infinity — so there is no
+band truncation anywhere. What follows:
+
+- **No energy is lost, in the tail or anywhere else.** Measured Hs round trip
+  (`4·sqrt(m0)` against the Hs asked for) is exact to 5 × 10⁻¹⁵ relative at
+  N = 1, 8, 48, 128 and 512 — floating-point summation error and nothing else.
+  Uniform spacing over a truncated band loses the tail quietly, and a sea missing
+  its short waves is too smooth at exactly the scale of the openings that flood a
+  ship.
+- **Components sit where the energy is.** At Hs = 3 m, Tp = 9 s, γ = 3.3 and
+  N = 64, the interval containing the peak is 0.0035 rad/s wide while the
+  open-topped one starts at 2.7ω_p and runs to infinity; a uniform grid would
+  spend most of its components resolving a tail that carries 1.5% of the
+  variance.
+- **The first moment is preserved exactly**, because a centroid is what makes
+  `Σ ω̄_i E_i = ∫ ω S dω` an identity rather than an approximation. The mean
+  period comes out at the textbook Pierson–Moskowitz ratio T1 = 0.77177 Tp to
+  2 × 10⁻¹² relative.
+- **The second moment is not**, and this is the price. One frequency cannot
+  represent the spread of frequencies inside its own interval, so m2 is biased
+  low and the zero-crossing period comes out long: +1.9% at N = 12, +0.93% at
+  N = 48, +0.33% at N = 384, halving as N doubles. It is a discretisation bias,
+  not an error, and the tests assert its sign as well as its size.
+
+Pierson–Moskowitz has an exact cumulative energy distribution,
+`exp(−1.25 (ω_p/ω)⁴)`, so the equal-energy interval edges have a closed form to
+check the whole quantile machinery against; the numerically tabulated path that
+JONSWAP needs reproduces it to 6 × 10⁻¹⁵ relative.
+
+**Directions are discretised the same way** — M intervals of equal directional
+energy, each at its centroid — over a `cos^(2s)((θ−θ₀)/2)` Longuet-Higgins
+spreading function, normalised through Γ functions so it integrates to exactly 1
+over the circle. That form covers the whole circle; the `cos^(2s)(θ−θ₀)`
+alternative has to be truncated at ±90° and renormalised, and a spreading
+function that does not normalise makes the sea the wrong height in a way that
+only shows up in directional seas, which is all of them. The interval edges and
+centroids are explicitly antisymmetrised about the mean direction rather than
+left to cancel numerically, so a single-direction sea is exactly long-crested
+instead of long-crested to 10⁻¹⁷. Spreading is currently constant with frequency;
+real seas spread more at high frequency, which is a refinement, not a bug.
+
+**Kinematics** are deep-water linear theory: ω² = gk, orbital velocity
+`(a ω e^{kz} cos ψ, a ω e^{kz} sin ψ)` and the local (Eulerian) acceleration that
+goes with it, which is what Froude–Krylov and Morison want. **z is clamped to ≤ 0
+before the exponential.** A nonlinear Froude–Krylov integration over the
+*instantaneous* wetted surface will ask for kinematics above the still-water
+plane, inside a crest, and `exp(kz)` there grows without bound — this is the
+standard way that integration explodes in a steep sea. Wheeler stretching is the
+refinement when the nonlinear loads arrive.
+
+**Determinism.** Phases come from Threefry-2x64-20 keyed on (seed, sea-state
+index) and *indexed by component*, never advanced as a stream — so components can
+be generated in any order or on any thread and the sea is bit-identical. The
+residual risk is the one §4 of `01-architecture.md` already names: `cos`, `exp`
+and `pow` here are still libm's, and move to the in-tree implementations when
+those land.
+
+**Cost, measured (one core, `-O2`, glibc `libm`).** Construction is ~2 ms per sea state,
+one-off. Evaluation is ~11 ns per component for elevation and ~20 ns for full
+kinematics, so a 576-component sea costs 6.3 µs per elevation query and 11.4 µs
+per kinematics query. That is affordable for hundreds of query points per tick
+and **not** for thousands: a 2000-panel hull wanting kinematics at 100 Hz is
+23 ms/tick on one core, against a 10 ms budget. The naive `std::cos` loop is the
+whole of it, so the work is a vectorised sincos over the component array, and a
+per-tick phase recurrence where the query point is not moving. Worth doing before
+the Froude–Krylov integration, not after.
+
+**Still to build here:** the FFT-on-a-tiled-grid path for rendering (physics
+keeps the analytic sum — interpolating a rendering grid loses exactly the detail
+that decides whether a hatch immerses); second-order Stokes correction for steep
+seas; and a breaking criterion driving spray/foam emission.
+
+### Wave field — what the tests are pointed at
+
+`tests/test_waves.cpp`. Any sum of cosines looks like the sea, so nothing is
+eyeballed: every assertion is a closed form fixed before the code ran — the
+analytic integral of S, the dispersion relation, the Pierson–Moskowitz period
+ratios from Γ functions, the exact Airy wave, `e^{-π}` at half a wavelength down,
+`E[cos Δ] = s/(s+1)` for the spreading.
+
+Two of them earned their place by catching something:
+
+- **The variance-convergence test was wrong before the code was.** It sampled
+  elevation on a regular grid stepping 101 m through a sea whose dominant
+  wavelength was 126 m, so the dominant components were aliased rather than
+  averaged and the sampled variance came out 1% high — systematically, every run.
+  The fix was pseudorandom sample points, not a looser tolerance. It now takes
+  300 000 samples for a relative standard error of `sqrt(2/M)` = 0.26%, measured
+  at 0.22% RMS over 30 field and sampling seeds, and asserts 1%.
+- **A one-component sea must be the exact Airy wave**, `a cos(kx − ωt + φ)`, with
+  the kinematics that go with it. A spectrum averages sign and convention errors
+  into something that still looks like a sea; a single component cannot.
+
+The suite was checked by mutation: seventeen plausible-but-wrong implementations
+— g inverted in the dispersion relation, the spreading left unnormalised, the
+depth decay with the wrong sign, `+ωt` instead of `−ωt`, the missing factor of
+two in the amplitude, one round of RNG mixing instead of twenty, the band
+truncated at 3ω_p — and each must fail at least one check. Two survived the first
+pass and both were real gaps: placing components at interval *midpoints* instead
+of energy centroids was invisible until the mean-period tolerance was tightened
+from 0.1% to 10⁻⁸ (which is what the construction actually guarantees), and
+swapping JONSWAP's σ = 0.07/0.09 branches changed nothing measurable at all until
+a test was added that divides S by the bare Pierson–Moskowitz shape and demands
+the peak enhancement back. Both of those are shape errors that leave Hs, Tp and
+the total energy correct, which is precisely why they needed to be hunted rather
+than waited for.
 
 ### Radiation and diffraction
 

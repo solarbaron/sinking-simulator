@@ -31,3 +31,4 @@ void runRollDampingTests();
 void runSchedulerTests();
 void runSerialiseTests();
 void runWorldIoTests();
+void runWaveTests();

@@ -36,6 +36,7 @@ add_library(shipsim_engine
   engine/sim/ship.cpp
   engine/sim/fem.cpp
   engine/sim/roll_damping.cpp
+  engine/sim/waves.cpp
 )
 target_include_directories(shipsim_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 find_package(Threads REQUIRED)
@@ -69,6 +70,7 @@ add_executable(shipsim_tests
   tests/test_serialise.cpp
   tests/test_worldio.cpp
   tests/test_jobs.cpp
+  tests/test_waves.cpp
 )
 target_include_directories(shipsim_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(shipsim_tests PRIVATE shipsim_engine)
