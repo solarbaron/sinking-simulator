@@ -107,6 +107,12 @@ if(Vulkan_FOUND AND GLSLC)
   target_compile_definitions(shipsim_tests PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}")
   add_dependencies(shipsim_tests shipsim_shaders)
 
+  add_executable(ferry_view tools/ferry_view/main.cpp game/prototype/ferry.cpp)
+  add_dependencies(ferry_view shipsim_shaders)
+  target_link_libraries(ferry_view PRIVATE shipsim_engine)
+  target_compile_definitions(ferry_view PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}")
+  target_compile_options(ferry_view PRIVATE -Wall -Wextra)
+
   add_executable(fem_spike tools/fem_spike/main.cpp engine/gpu/fem_gpu.cpp)
   add_dependencies(fem_spike shipsim_shaders)
   target_link_libraries(fem_spike PRIVATE shipsim_engine Vulkan::Vulkan)

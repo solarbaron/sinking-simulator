@@ -39,7 +39,7 @@ All run today.
 
 ---
 
-## Phase 1 — Engine skeleton — *~8 em*
+## Phase 1 — Engine skeleton ✅ *complete*
 
 Everything in `01-architecture.md` that the current single-threaded prototype does
 without.
@@ -85,11 +85,42 @@ without.
   (`01-architecture.md` §4)
 - Render graph and bindless setup — deferred past the Phase 1 milestone, which
   the push-constant path already satisfies
-- **Milestone:** watch the current ferry scenario in 3D, in real time, with a
-  free camera and a wireframe of the flooding compartments.
+- ✅ **Milestone met:** `tools/ferry_view` renders the ferry casualty in 3D with
+  an orbiting camera and the compartments tinted by fill fraction, driven by the
+  same `sim::Ship` and `core::Scheduler` the headless scenarios use. A cutaway
+  rather than a wireframe — `fillModeNonSolid` is a device feature this build
+  does not request, and clipping the starboard half away with the existing
+  `sim::clipByPlane` shows the interior better anyway.
 
 This is the least glamorous phase and skipping it is how projects like this die at
 month 30.
+
+### What Phase 1 actually taught
+
+Every subsystem shipped green on its functional tests while still containing a
+real defect. In each case a *different instrument* found it:
+
+| Defect | Found by |
+|---|---|
+| Job records recycled while still queued | zero-worker configuration |
+| Chase-Lev slot-reuse data race | ThreadSanitizer |
+| Auto-grain clamp off by one | ThreadSanitizer as a *slow* operating point, not as a race detector |
+| Arena aligning offsets instead of addresses | sweeping alignments 1–256 rather than the usual few |
+| Arena overruns invisible to ASan | manual poisoning, verified with a deliberate negative control |
+| Scheduler drifting over long runs | a 999-vs-1000 count that could have been "fixed" with a tolerance |
+| `World::load` failing open, leaving a half-built world | feeding it every truncation of a valid save |
+
+The pattern is consistent enough to be a rule: **a green functional test is
+evidence the code does what you thought of, not that it is correct.** The
+sanitizer builds, the adversarial orderings (far surface drawn second, destroy
+from the front, load every truncation) and the closed-form expectations are what
+actually found things.
+
+Three test expectations were themselves wrong — a projected quad area, a
+bow-on camera angle, and a mirror check that would have passed on two blank
+frames. Each was fixed by deriving the expected value from geometry rather than
+by loosening the assertion, which is the habit that makes the rest of the suite
+worth trusting.
 
 ## Phase 2 — Sea and ship — *~12 em*
 
