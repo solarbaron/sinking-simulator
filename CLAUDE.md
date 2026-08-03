@@ -79,6 +79,7 @@ most useful thing to know about this codebase:
 | Scheduler drifting over long runs | a 999-vs-1000 count a tolerance would have hidden |
 | `World::load` leaving a half-built world | every truncation of a valid save |
 | Under-tessellated hull inventing ±6% displacement | a short-wave test that should have cancelled |
+| Radiation solver returning **negative** damping at four frequencies in the seakeeping band | a near-field/far-field **energy balance**, not any coefficient test |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct.
