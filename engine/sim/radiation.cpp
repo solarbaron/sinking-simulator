@@ -1058,6 +1058,64 @@ std::array<double, 6> RadiationForce::memoryForce() const {
     return force;
 }
 
+// --- Stations from a hull mesh -----------------------------------------------
+
+RadiationHull radiationHullFromMesh(const TriMesh& hull, double waterlineZ, int stationCount,
+                                    double density) {
+    RadiationHull out;
+    out.density = density;
+    if (hull.verts.empty() || stationCount < 2) return out;
+
+    Vec3 lo = hull.verts[0], hi = hull.verts[0];
+    for (const Vec3& v : hull.verts) {
+        lo = {std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+        hi = {std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
+    }
+    if (!(waterlineZ > lo.z)) return out;
+    out.draft = waterlineZ - lo.z;
+
+    // Inset from the extreme ends. A slab at the stem or transom collects almost
+    // no volume, so beam and area both go to zero and their ratio -- the area
+    // coefficient -- is whatever the rounding says. Strip theory has nothing
+    // useful to contribute there in any case.
+    const double length = hi.x - lo.x;
+    const double inset = 0.5 * length / stationCount;
+    const double first = lo.x + inset;
+    const double span = (length - 2.0 * inset);
+    const double thickness = span / (stationCount - 1);
+
+    const double wide = (hi.y - lo.y) + 1.0;
+    for (int i = 0; i < stationCount; ++i) {
+        const double x = first + span * i / (stationCount - 1);
+        const double half = 0.5 * thickness;
+        // The wetted slab: everything between two transverse planes and below the
+        // waterline. clipToBox is the same routine the compartment carving uses.
+        const TriMesh slab = clipToBox(hull, {x - half, lo.y - wide, lo.z - wide},
+                                       {x + half, hi.y + wide, waterlineZ});
+        if (slab.verts.empty()) continue;
+
+        double beamLo = slab.verts[0].y, beamHi = slab.verts[0].y, keel = slab.verts[0].z;
+        for (const Vec3& v : slab.verts) {
+            beamLo = std::min(beamLo, v.y);
+            beamHi = std::max(beamHi, v.y);
+            keel = std::min(keel, v.z);
+        }
+
+        RadiationStation station;
+        station.x = x;
+        station.beam = beamHi - beamLo;
+        station.draft = waterlineZ - keel;
+        // Sectional area is the slab's volume over its thickness. Taking it from
+        // the same integrator the hydrostatics use means a hull that displaces
+        // what it should also has stations that add up to what they should.
+        const double area = integrate(slab).volume / thickness;
+        if (station.beam <= 0 || station.draft <= 0 || area <= 0) continue;
+        station.areaCoefficient = area / (station.beam * station.draft);
+        out.stations.push_back(station);
+    }
+    return out;
+}
+
 // --- Validity ----------------------------------------------------------------
 
 std::vector<std::string> validateRadiationHull(const RadiationHull& hull,

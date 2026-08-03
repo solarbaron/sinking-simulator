@@ -49,18 +49,11 @@ bool announced = false;
 
 // The PNG round trip is part of every check here, so the suite must not fail
 // merely because one machine's scratch directory is another machine's nothing.
-const std::string& outputDirectory() {
-    static const std::string chosen = [] {
-        const std::string preferred =
-            "/tmp/claude-1000/-home-solarbaron-git/49c48569-121e-4a97-b437-25941d58fd05/scratchpad";
-        const std::string probe = preferred + "/.ocean_probe";
-        std::ofstream file(probe);
-        if (!file) return std::string("/tmp");
-        file.close();
-        std::remove(probe.c_str());
-        return preferred;
-    }();
-    return chosen;
+// testing::scratchDir() is the shared answer; it returns a trailing separator.
+std::string outputDirectory() {
+    std::string dir = testing::scratchDir();
+    if (!dir.empty() && dir.back() == '/') dir.pop_back();
+    return dir;
 }
 
 bool setup(gpu::Device& device, gpu::OceanRenderer& renderer) {
@@ -96,10 +89,15 @@ bool renderThroughPng(gpu::OceanRenderer& renderer, const sim::Mat4& mvp,
 }
 
 // A single wave train, which is the only sea whose surface has a closed form.
-// `sim::WaveField::regular()` is landing on master for exactly this and should
-// replace this body when it merges; until then a one-frequency, one-direction sea
-// state is the same object through the API this worktree has, and
-// tests/test_waves.cpp already asserts it is exactly a cos(k x - omega t + phi).
+//
+// `sim::WaveField::regular()` now exists and was written partly for this, but
+// this helper deliberately keeps the SeaState form. A one-bin spectrum places its
+// component at the *energy centroid*, not at the peak: Hs 3 m / Tp 9 s gives
+// omega 0.837 rather than 2 pi / Tp = 0.698, so a 88 m wave rather than a 126 m
+// one. Swapping to regular() would therefore either change the wave every
+// resolution check here is tuned against, or require the centroid frequency as a
+// magic constant. Both are worse than deriving it. tests/test_waves.cpp already
+// asserts a single component is exactly a cos(k x - omega t + phi).
 sim::WaveField monochromaticSea(double significantHeight, double peakPeriod, double direction) {
     sim::SeaState sea;
     sea.significantHeight = significantHeight;

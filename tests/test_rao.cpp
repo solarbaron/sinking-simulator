@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-// Validation of the response-amplitude-operator machinery.
+// Validation of the response-amplitude-operator machinery and of the radiation
+// coupling that feeds it.
 //
 // This file has two halves, and they fail in different ways. The harmonic fit is
 // pure arithmetic with exact answers, so it is asserted exactly. The RAO itself
@@ -21,6 +22,7 @@
 #include <vector>
 
 using namespace sim;
+using testing::expectEqual;
 using testing::expectNear;
 using testing::expectTrue;
 
@@ -278,6 +280,151 @@ void testSweepIsOrderedAndDeterministic() {
                first[0].heave > first[2].heave);
 }
 
+
+// --- Radiation coupling ------------------------------------------------------
+
+// Stations are read off the hull mesh by clipping it into slabs, so a box barge
+// has an exact answer: every section is a rectangle of the full beam and draft,
+// and its area coefficient is exactly 1.
+void testStationsFromAMeshAreExactForABox() {
+    const Ship box = makeBarge(32);
+    const RadiationHull sections = radiationHullFromMesh(box.hull, 4.0, 11);
+
+    expectEqual("every requested station was produced",
+                static_cast<long long>(sections.stations.size()), 11LL);
+    expectNear("draft comes from the mesh", sections.draft, 4.0, 1e-12);
+
+    double worstBeam = 0, worstDraft = 0, worstSigma = 0;
+    for (const RadiationStation& st : sections.stations) {
+        worstBeam = std::max(worstBeam, std::abs(st.beam - 16.0));
+        worstDraft = std::max(worstDraft, std::abs(st.draft - 4.0));
+        worstSigma = std::max(worstSigma, std::abs(st.areaCoefficient - 1.0));
+    }
+    expectTrue("a box has full beam at every station", worstBeam < 1e-9);
+    expectTrue("and full draft", worstDraft < 1e-9);
+    // Sectional area over B*T. Anything but 1 means the slab volume, the beam or
+    // the draft disagree with each other.
+    expectTrue("and a rectangular area coefficient of exactly 1", worstSigma < 1e-12);
+
+    // Stations must be inset from the ends: a slab at the stem collects no volume
+    // and its area coefficient is whatever the rounding says.
+    expectTrue("stations are inset from the extreme ends",
+               sections.stations.front().x > -30.0 && sections.stations.back().x < 30.0);
+}
+
+// A barge with radiation attached, built once: the 2D solve over every station
+// and frequency costs seconds, and this file needs it three times.
+const Ship& radiatingBarge() {
+    static const Ship ship = [] {
+        Ship s = makeBarge(32);
+        s.initialise(0.0);
+        s.attachRadiation(4.0, 9);
+        return s;
+    }();
+    return ship;
+}
+
+// The regression this exists for: an earlier version fitted the retardation
+// function over 1.3 s of a 20 s decay, which places the state-space poles near
+// zero. The model then *integrates* velocity instead of damping it, and the ship
+// reached NaN in five steps. A free decay that stays bounded and shrinks is the
+// direct statement that the memory term is a damper.
+void testRadiationMemoryDampsRatherThanDiverges() {
+    Ship ship = radiatingBarge();
+    expectTrue("radiation is attached", ship.radiation.has_value());
+    expectTrue("some entries got state-space models", ship.radiation->modelCount() > 0);
+
+    const Sea still(0.0);
+    const double datum = ship.state.position.z;
+    const double release = 0.5;
+    ship.state.position.z += release;
+
+    double earlyPeak = 0, latePeak = 0, worst = 0;
+    bool finite = true;
+    for (int i = 1; i <= 6000; ++i) {          // 30 s at dt = 0.005
+        ship.step(0.005, still);
+        const double z = std::abs(ship.state.position.z - datum);
+        finite = finite && std::isfinite(z);   // asserted once, not 6000 times
+        worst = std::max(worst, z);
+        if (i > 400 && i <= 1600) earlyPeak = std::max(earlyPeak, z);
+        if (i > 4800) latePeak = std::max(latePeak, z);
+    }
+    expectTrue("heave stays finite for the whole run", finite);
+
+    // A diverging model blows past the release amplitude immediately; a damper
+    // cannot exceed it by more than the integrator's own overshoot.
+    expectTrue("the motion never exceeds what it was released from", worst < 1.2 * release);
+    expectTrue("the oscillation is real before it decays", earlyPeak > 0.05 * release);
+    expectTrue("and has decayed by the end", latePeak < 0.5 * earlyPeak);
+}
+
+// The strongest check on the coupling: the time-domain Cummins model must agree
+// with the frequency-domain table it was built from.
+//
+// Cummins splits radiation into an instantaneous A_inf plus a memory
+// convolution, and the memory carries the whole frequency dependence. So a free
+// decay settling at omega_d must behave as though its added mass were A(omega_d)
+// from the table -- *not* A_inf. Those differ by 60% here, which is what makes
+// this a test rather than a coincidence: getting A_inf into the mass matrix and
+// dropping the memory term entirely would fail it badly.
+void testFreeDecayAgreesWithTheFrequencyDomainTable() {
+    Ship ship = radiatingBarge();
+    const RadiationHull sections = radiationHullFromMesh(ship.hull, 4.0, 9);
+    const RadiationTable table = stripTheoryTable(sections, radiationFrequencyGrid(0.2, 2.5, 40));
+
+    const double mass = 60.0 * 16.0 * 4.0 * kRhoSeawater;
+    const double stiffness = kRhoSeawater * kGravity * 60.0 * 16.0;
+
+    const Sea still(0.0);
+    const double datum = ship.state.position.z;
+    ship.state.position.z += 0.5;
+
+    // Upward zero crossings of the heave deviation, linearly interpolated.
+    std::vector<double> crossings;
+    double previous = 0.5;
+    const double dt = 0.005;
+    for (int i = 1; i <= 8000; ++i) {
+        ship.step(dt, still);
+        const double z = ship.state.position.z - datum;
+        if (previous < 0 && z >= 0)
+            crossings.push_back(i * dt - dt * z / (z - previous));
+        previous = z;
+    }
+    expectTrue("the decay produced enough cycles to time", crossings.size() >= 4);
+    if (crossings.size() < 4) return;
+
+    double total = 0;
+    for (std::size_t i = 2; i < crossings.size(); ++i) total += crossings[i] - crossings[i - 1];
+    const double period = total / static_cast<double>(crossings.size() - 2);
+    const double omegaDamped = 2.0 * kPi / period;
+
+    // What added mass that period implies, against what the table says at that
+    // frequency.
+    const double implied = stiffness * (period / (2.0 * kPi)) * (period / (2.0 * kPi)) - mass;
+    double fromTable = 0;
+    for (int i = 0; i + 1 < table.size(); ++i)
+        if (table.omega[i] <= omegaDamped && omegaDamped <= table.omega[i + 1]) {
+            const double f = (omegaDamped - table.omega[i]) /
+                             (table.omega[i + 1] - table.omega[i]);
+            fromTable = table.addedMass[static_cast<std::size_t>(i)][2][2] * (1 - f) +
+                        table.addedMass[static_cast<std::size_t>(i) + 1][2][2] * f;
+        }
+    expectTrue("the decay frequency lies inside the table", fromTable > 0);
+
+    expectNear("the free decay sees A(omega_d) from the table", implied, fromTable,
+               0.15 * fromTable);
+
+    // The guard that makes the above meaningful. If the memory term were missing
+    // and only A_inf reached the mass matrix, `implied` would sit at A_inf, and a
+    // 15% tolerance on the wrong quantity would still look like agreement unless
+    // the two are known to be far apart.
+    const double aInf = table.addedMassInfinite[2][2];
+    expectTrue("A_inf and A(omega_d) are far enough apart for this to discriminate",
+               std::abs(aInf - fromTable) > 0.4 * fromTable);
+    expectTrue("and the decay follows A(omega_d), not A_inf",
+               std::abs(implied - fromTable) < std::abs(implied - aInf));
+}
+
 }  // namespace
 
 void runRaoTests() {
@@ -291,4 +438,7 @@ void runRaoTests() {
     testShortWavesAreIgnored();
     testHeaveExcitationCancelsWhenTheWavelengthMatchesTheShip();
     testSweepIsOrderedAndDeterministic();
+    testStationsFromAMeshAreExactForABox();
+    testRadiationMemoryDampsRatherThanDiverges();
+    testFreeDecayAgreesWithTheFrequencyDomainTable();
 }

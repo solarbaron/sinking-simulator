@@ -55,6 +55,7 @@
 // stripTheoryTable() does the transfer to the baseline origin.
 #pragma once
 
+#include "../core/geometry.hpp"
 #include "../core/math.hpp"
 
 #include <array>
@@ -327,6 +328,21 @@ private:
     Matrix6 addedMassInfinite_{};
     double worstRelativeRms_ = 0;
 };
+
+// Derive stations from an actual hull mesh, so a radiation table can be built
+// for any ship asset rather than only for a hand-written station list.
+//
+// Each station is measured by clipping the hull to a thin slab about x and
+// reading the result: sectional area is the slab's volume over its thickness,
+// beam is the width of the wetted part, draft is the waterline down to the
+// lowest wetted point. That reuses the clipping and integration the hydrostatics
+// already depend on, rather than adding a second, differently-wrong way to ask
+// what shape the hull is at a given station.
+//
+// `stationCount` slabs are spread over the wetted length, avoiding the very ends
+// where a section degenerates to a point and the area coefficient is meaningless.
+RadiationHull radiationHullFromMesh(const TriMesh& hull, double waterlineZ, int stationCount = 21,
+                                    double density = kRhoSeawater);
 
 // Every way this hull and frequency grid sit outside what strip theory and this
 // implementation can honestly claim. Advisory, like Ship::validate().

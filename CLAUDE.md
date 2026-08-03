@@ -85,6 +85,8 @@ most useful thing to know about this codebase:
 | Under-tessellated hull inventing ±6% displacement | a short-wave test that should have cancelled |
 | Sea surface queried 6× more than necessary | timing the real tick instead of extrapolating |
 | Radiation solver returning **negative** damping at four frequencies in the seakeeping band | a near-field/far-field **energy balance**, not any coefficient test |
+| Retardation fitted over 1.3 s of a 20 s decay, turning a damper into an integrator | a free-decay test, after the ship reached NaN in five steps |
+| Radiation damping added *on top of* the modal damping standing in for it | comparing an RAO sweep before and after, not any single run |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct.

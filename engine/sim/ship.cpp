@@ -404,25 +404,69 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
     ++stabilityRefreshCounter_;
 
     const double dispMass = seaDensity * std::max(sub.volume, 0.0);
-    const Vec3 mEff{mp.mass + addedMassSurge * dispMass,
-                    mp.mass + addedMassSway  * dispMass,
-                    mp.mass + addedMassHeave * dispMass};
+    Vec3 mEff{mp.mass + addedMassSurge * dispMass,
+              mp.mass + addedMassSway  * dispMass,
+              mp.mass + addedMassHeave * dispMass};
 
     Mat3 Ieff = mp.inertiaAboutCog;
     Ieff(0, 0) *= (1.0 + addedInertiaRoll);
     Ieff(1, 1) *= (1.0 + addedInertiaPitch);
     Ieff(2, 2) *= (1.0 + addedInertiaYaw);
 
+    // With a radiation model, the guessed coefficients give way to this hull's
+    // own infinite-frequency added mass. Only the diagonal is taken: the
+    // integrator below inverts a 3x3 inertia and divides by a per-axis mass, so
+    // there is nowhere for the sway-roll coupling A_24 to go. That coupling is
+    // real and matters for roll, and taking the diagonal is an approximation this
+    // integrator's shape forces rather than one the physics justifies -- see
+    // docs/02-simulation.md.
+    if (radiation.has_value()) {
+        const Matrix6& aInf = radiation->addedMassInfinite();
+        // Surge keeps its coefficient. Strip theory does not decline to answer
+        // for surge by oversight -- a strip has no longitudinal radiation problem
+        // at all, and surge added mass is entirely a three-dimensional end
+        // effect -- so A_inf[0][0] is a structural zero, not a measurement of
+        // zero. Taking it would delete a real term rather than improve it.
+        mEff.y = mp.mass + aInf[1][1];
+        mEff.z = mp.mass + aInf[2][2];
+        Ieff(0, 0) = mp.inertiaAboutCog(0, 0) + aInf[3][3];
+        Ieff(1, 1) = mp.inertiaAboutCog(1, 1) + aInf[4][4];
+        Ieff(2, 2) = mp.inertiaAboutCog(2, 2) + aInf[5][5];
+    }
+
     const Vec3 vBody = R.transposed() * state.velocity;
     const Vec3 wBody = R.transposed() * state.angularVelocity;
 
     const double kHeave = seaDensity * kGravity * std::max(cachedWaterplaneArea_, 1.0);
-    const Vec3 cLin{2 * zetaHeave * std::sqrt(kHeave * mEff.x) * 0.05,
-                    2 * zetaHeave * std::sqrt(kHeave * mEff.y) * 0.30,
-                    2 * zetaHeave * std::sqrt(kHeave * mEff.z)};
-    const Vec3 cAng{2 * zetaRoll  * std::sqrt(cachedKRoll_  * Ieff(0, 0)),
-                    2 * zetaPitch * std::sqrt(cachedKPitch_ * Ieff(1, 1)),
-                    0.02 * Ieff(2, 2)};
+    Vec3 cLin{2 * zetaHeave * std::sqrt(kHeave * mEff.x) * 0.05,
+              2 * zetaHeave * std::sqrt(kHeave * mEff.y) * 0.30,
+              2 * zetaHeave * std::sqrt(kHeave * mEff.z)};
+    Vec3 cAng{2 * zetaRoll  * std::sqrt(cachedKRoll_  * Ieff(0, 0)),
+              2 * zetaPitch * std::sqrt(cachedKPitch_ * Ieff(1, 1)),
+              0.02 * Ieff(2, 2)};
+
+    // With radiation attached, the modal dampers in the modes it covers have to
+    // go, or the ship is damped twice.
+    //
+    // That is not a subtlety, it is what these coefficients *were*: a lumped
+    // stand-in for radiation, which is the dominant damping in heave, sway and
+    // pitch. Leaving them in alongside the real thing cost 27% of mid-frequency
+    // heave in the first version of this coupling -- a wrong answer that looks
+    // entirely reasonable, since a ship that moves too little in waves reads as
+    // stiff rather than as broken.
+    //
+    // Roll and yaw keep theirs. Roll radiation damping is genuinely small and the
+    // mechanism that matters is viscous -- eddies and bilge keels, which
+    // roll_damping.{hpp,cpp} computes by Ikeda's method and which is not yet
+    // wired into this integrator; deleting roll's stand-in before that lands
+    // would leave the one mode that most needs damping with almost none. Surge
+    // keeps its damper too, since strip theory contributes no surge radiation at
+    // all. Quadratic drag is untouched throughout: it is viscous and separate.
+    if (radiation.has_value()) {
+        cLin.y = 0.0;
+        cLin.z = 0.0;
+        cAng.y = 0.0;
+    }
 
     // Quadratic drag on the projected areas of the box around the hull.
     const Vec3 ext = hullHi - hullLo;
@@ -439,6 +483,18 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
         tBody[i] -= cAng[i] * wBody[i];
     }
 
+    // The wave-memory force: waves this ship radiated earlier, still nearby and
+    // still pushing back. Advanced with the body-frame velocity and subtracted,
+    // per the sign convention in radiation.hpp.
+    if (radiation.has_value()) {
+        radiation->step({vBody.x, vBody.y, vBody.z, wBody.x, wBody.y, wBody.z}, dt);
+        const std::array<double, 6> memory = radiation->memoryForce();
+        for (int i = 0; i < 3; ++i) {
+            fBody[i] -= memory[i];
+            tBody[i] -= memory[i + 3];
+        }
+    }
+
     const Vec3 aBody{fBody.x / mEff.x, fBody.y / mEff.y, fBody.z / mEff.z};
     const Vec3 alphaBody = inverse(Ieff) * (tBody - cross(wBody, Ieff * wBody));
 
@@ -450,6 +506,27 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
     state.velocity = vCog - cross(state.angularVelocity, rc);
     state.position += state.velocity * dt;
     state.orientation = state.orientation.integrated(state.angularVelocity, dt);
+}
+
+RadiationTable Ship::attachRadiation(double waterlineZ, int stationCount, int stateOrder) {
+    const RadiationHull sections = radiationHullFromMesh(hull, waterlineZ, stationCount, seaDensity);
+    // The band a ship actually meets. Below 0.2 rad/s waves are swell the hull
+    // simply follows; above 2.5 they are ripples against a ship's length, and the
+    // 2D solve gets expensive exactly where the answer stops mattering.
+    const std::vector<double> omega = radiationFrequencyGrid(0.2, 2.5, 40);
+    const RadiationTable table = stripTheoryTable(sections, omega);
+
+    // Sample the fit from the hull's own memory rather than from a guess. Ask K
+    // for the heave entry over a generous window, find where it has decayed, then
+    // fit over twice that -- the model has to reproduce the whole tail, because
+    // truncating it is precisely what turns a damper into an integrator.
+    constexpr double kFitStep = 0.1;   // s; K is smooth on this scale
+    const std::vector<double> probe = retardationFunction(table, 2, 2, kFitStep, 1200);
+    const double decay = memoryDecayTime(probe, kFitStep, 0.01);
+    const int samples = std::clamp(static_cast<int>(2.0 * decay / kFitStep), 200, 1200);
+
+    radiation.emplace(table, kFitStep, samples, stateOrder);
+    return table;
 }
 
 void Ship::step(double dt, const Sea& sea) {

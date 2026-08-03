@@ -577,6 +577,86 @@ A hull whose stations are geometrically similar could share solves outright — 
 That is the obvious next factor if table construction ever becomes the
 bottleneck.
 
+### Radiation coupled into the ship — **implemented, opt-in**
+
+`Ship::attachRadiation(waterlineZ)` builds a table from the hull's *own* sections
+and attaches it. `radiationHullFromMesh()` derives the stations by clipping the
+hull into slabs and reading each one — sectional area is the slab's volume over
+its thickness, so the same integrator that gets displacement right also gets the
+stations right. On a box barge that is exact: beam and draft to zero error, area
+coefficient to one ulp.
+
+It is opt-in, and the scalar coefficients stay the default. The flooding
+scenarios predate radiation and are validated against their own behaviour;
+arriving physics should not silently rewrite a validated result.
+
+**What the hull's own numbers said about the guesses.** For the 60 × 16 × 4 m
+barge, as multiples of displaced mass:
+
+| | guessed | measured |
+|---|---|---|
+| heave | 1.10 | **1.885** |
+| sway | 0.90 | **0.190** |
+
+Both wrong, in opposite directions, and both explicable: a wide shallow section
+drags a great deal of water vertically and almost none edgewise, where it is
+nearly a thin plate.
+
+**Two errors were made wiring this up and both are worth recording.**
+
+*The fit window.* `attachRadiation()` deliberately takes **no timestep**. The
+first version passed the simulation `dt` straight into the state-space fit, which
+sampled K(t) over 1.3 s of a 20 s decay. A fit that sees only the first 6% of the
+retardation function sees something nearly constant, places its poles near zero,
+and produces a model that *integrates* velocity instead of damping it — the ship
+reached NaN in five steps. The fit is now sampled from `memoryDecayTime()`, which
+is a property of the hull. `RadiationForce::step()` is an exact zero-order hold
+and genuinely does not care what dt it is driven at, which is what lets the two
+be separated.
+
+*Damping counted twice.* The modal damping coefficients **were** radiation — a
+lumped stand-in for it. Adding the real thing alongside them cost 27% of
+mid-frequency heave. With radiation attached, the sway, heave and pitch modal
+dampers are switched off. Roll keeps its stand-in, because roll radiation damping
+is genuinely small and the mechanism that matters is viscous; deleting it before
+Ikeda is wired into this integrator would leave the mode that most needs damping
+with almost none. Surge keeps its damper too, since strip theory contributes no
+surge radiation at all. Quadratic drag is untouched: it is viscous and separate.
+
+That last point generalises. `A_inf[0][0]` is a **structural zero, not a measured
+zero** — a strip has no longitudinal radiation problem, and surge added mass is
+entirely a three-dimensional end effect. Taking `A_inf` wholesale would have
+deleted a real term while looking like an improvement.
+
+**Validation.** The load-bearing check is that the time-domain model agrees with
+the frequency-domain table it was built from. Cummins splits radiation into an
+instantaneous `A_inf` plus a memory convolution, and the memory carries the whole
+frequency dependence — so a free decay settling at ω_d must behave as though its
+added mass were `A(ω_d)`, *not* `A_inf`. Measured: the decay implies 1.170 × M
+against the table's 1.258 × M at that frequency, 6.9% apart, where `A_inf` is
+1.885 × M and would be 61% away. The test carries that gap as an explicit guard,
+because a 15% tolerance on the wrong quantity would otherwise look like agreement.
+
+Attaching radiation also produces a heave resonance the ship did not have before,
+and leaves the Froude–Krylov sinc zeros exactly where they were — correct, since
+radiation changes the response and not the excitation.
+
+**Cost.** Building the table is 2.1 s at 9 stations and 4.8 s at 21; the runtime
+memory term is free — under a microsecond a tick for seven state-space models,
+below the noise floor of a tick measurement. That is the intended shape: an
+expensive coefficient table computed once, and a convolution cheap enough to run
+at 100 Hz.
+
+**Limits, beyond the ones the radiation module already lists.** Only the
+*diagonal* of `A_inf` is used: the integrator inverts a 3×3 inertia and divides by
+a per-axis mass, so there is nowhere for the sway–roll coupling `A_24` to go. That
+coupling is real and matters for roll. And `A_inf`'s rotational block is
+referenced to the body-frame origin on the baseline, while the inertia it is
+added to is about the centre of gravity — a frame mismatch that affects roll and
+must be resolved when Ikeda damping is wired in and roll is validated properly.
+Heave is unaffected (translation-invariant) and pitch is unaffected given strip
+theory's zero surge added mass.
+
 ### Viscous roll damping — **implemented**
 
 Potential flow gives no roll damping at all — it is entirely viscous and it is the

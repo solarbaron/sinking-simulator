@@ -18,8 +18,10 @@
 #pragma once
 
 #include "../core/geometry.hpp"
+#include "radiation.hpp"
 #include "waves.hpp"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -151,8 +153,19 @@ public:
     double zetaPitch = 0.30;
 
     // Added-mass coefficients as multiples of the displaced mass / inertia.
+    //
+    // These are plausible textbook figures, not this hull's. They are used only
+    // while no radiation model is attached; attachRadiation() replaces them with
+    // A_inf computed from the hull's own sections. Keeping both means the
+    // flooding scenarios, which predate radiation and are validated against
+    // their own behaviour, are untouched by its arrival.
     double addedMassSurge = 0.05, addedMassSway = 0.9, addedMassHeave = 1.1;
     double addedInertiaRoll = 0.25, addedInertiaPitch = 1.0, addedInertiaYaw = 0.6;
+
+    // Frequency-dependent radiation, when the ship has been given it. Held by
+    // value, not shared: the memory states are part of *this* ship's history, and
+    // two copies riding the same states would be two ships pretending to be one.
+    std::optional<RadiationForce> radiation;
 
     RigidState state;
 
@@ -163,6 +176,25 @@ public:
 
     // Advance the flooding network and the rigid body by dt seconds.
     void step(double dt, const Sea& sea);
+
+    // Build a radiation model from this hull's own sections and attach it, so
+    // added mass and the wave-memory force stop being guesses. `waterlineZ` is
+    // the still-water plane in body coordinates; call after initialise().
+    //
+    // Deliberately takes no timestep. The state-space fit is sampled from the
+    // *ship's memory*, which is a property of the hull -- tens of seconds -- and
+    // has nothing to do with how finely the simulation is stepped. An earlier
+    // version passed the simulation dt straight through and fitted K(t) over
+    // 1.3 s of a 20 s decay: the fit then sees a nearly constant K, places its
+    // poles near zero, and the resulting model integrates velocity instead of
+    // damping it. The ship diverged to NaN in five steps. RadiationForce::step()
+    // is an exact zero-order hold and genuinely does not care what dt it is
+    // driven at, which is what makes this separation possible.
+    //
+    // Returns the table it built, because worstEnergyResidual and repairedSolves
+    // are the numbers that say whether to trust it, and swallowing them here
+    // would be the wrong kind of convenience.
+    RadiationTable attachRadiation(double waterlineZ, int stationCount = 21, int stateOrder = 6);
 
     Diagnostics diagnostics(const Sea& sea) const;
 
