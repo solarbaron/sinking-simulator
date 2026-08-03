@@ -1,0 +1,49 @@
+# Inert until this repo has a remote. Committed anyway because
+# docs/05-data-modding-validation.md commits to validation running in CI rather
+# than as a one-time exercise, and a workflow file is the machine-readable form
+# of that promise.
+name: verify
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake g++-13
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100
+          g++ --version && cmake --version && ninja --version
+
+      # No GPU on a CI runner, so the Vulkan suites skip rather than fail. That is
+      # deliberate: a test suite that starts requiring a GPU stops being runnable
+      # where it is worth the most.
+      - name: Full gate
+        run: ./scripts/verify.sh full
+
+      - name: Sanitizers
+        run: ./scripts/verify.sh sanitize
+
+  # Numerical accuracy is a regression surface like any other. The benchmarks
+  # print measured figures the docs quote; if those drift, the docs are wrong.
+  benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake g++-13
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100
+      - name: Build
+        run: cmake -S . -B build -G Ninja && ninja -C build
+      - name: Job system throughput and grain scaling
+        run: ./build/job_bench

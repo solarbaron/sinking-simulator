@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#
+# Cheap checks only. The real gate is scripts/verify.sh; a commit hook that takes
+# a minute gets bypassed with --no-verify and then never runs again.
+#
+# Everything here is something that has actually gone wrong in this repo.
+set -uo pipefail
+fail=0
+note() { printf '  \033[0;31m✗\033[0m %s\n' "$1"; fail=1; }
+
+staged="$(git diff --cached --name-only --diff-filter=ACM)"
+[ -z "$staged" ] && exit 0
+
+# 1. Conflict markers. Merging three parallel worktrees made this a live risk.
+while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  if git show ":$f" 2>/dev/null | grep -qE '^(<<<<<<< |>>>>>>> |=======$)'; then
+    note "$f contains an unresolved conflict marker"
+  fi
+done <<< "$staged"
+
+# 2. Agent worktrees and build output. `git add -A` swept .claude/worktrees into
+#    a commit once; .gitignore covers it, but belt and braces.
+echo "$staged" | grep -E '^\.claude/worktrees/|^build[^/]*/' | while read -r f; do
+  note "$f looks like build output or an agent worktree"
+done
+echo "$staged" | grep -E '^\.claude/worktrees/|^build[^/]*/' -q && fail=1
+
+# 3. Large binaries. The audit of an external harness turned on exactly this:
+#    committed prebuilt binaries nobody can verify against their source.
+while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+  if [ "$size" -gt 1048576 ]; then
+    note "$f is $((size / 1024)) KB — commit large binaries deliberately, not by accident"
+  fi
+done <<< "$staged"
+
+if [ "$fail" -ne 0 ]; then
+  printf '\npre-commit checks failed. Fix, or bypass deliberately with --no-verify.\n'
+  exit 1
+fi
+exit 0

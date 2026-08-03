@@ -177,6 +177,25 @@ identifying one architectural change before any of that phase existed to rewrite
 - **[07 — FEM spike findings](docs/07-fem-spike-findings.md)** — what the
   measurements said and what changed because of them.
 
+## Working on it
+
+```sh
+./scripts/install-git-hooks.sh   # once: conflict markers, stray binaries, worktrees
+./scripts/verify.sh              # quick    build + 1309 checks          ~10 s
+./scripts/verify.sh full         # + clean rebuild, GPU, scenarios       ~150 s
+./scripts/verify.sh sanitize     # + AddressSanitizer and ThreadSanitizer
+```
+
+**Warnings are failures.** The build is `-Wall -Wextra -Wpedantic` and has been
+warning-clean since Phase 0, so one warning means the signal is decaying. Note
+that an incremental build cannot see a warning in a file it did not recompile,
+which is why `full` compiles everything from scratch in a throwaway directory.
+
+`CLAUDE.md` carries the conventions, the testing philosophy, the settled
+architecture decisions, and a table of every defect that shipped green on its
+functional tests along with the instrument that actually caught it. That table is
+the most useful page in the repo.
+
 ## Repository layout
 
 ```

@@ -2,4 +2,8 @@ build/
 compile_commands.json
 *.csv
 .cache/
-.claude/
+# Agent worktrees and transient session state only -- .claude/settings.json is
+# project configuration and is tracked deliberately.
+.claude/worktrees/
+.claude/state/
+build-*/
