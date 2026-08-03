@@ -32,6 +32,7 @@ int main() {
 #if defined(SHIPSIM_HAS_VULKAN) && !defined(__SANITIZE_THREAD__)
     runDeviceTests();
     runOffscreenTests();
+    runOceanTests();
 #elif defined(SHIPSIM_HAS_VULKAN)
     std::printf("\n--- vulkan device ---\n     skipped under ThreadSanitizer"
                 " (driver is not instrumented)\n");

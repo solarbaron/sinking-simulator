@@ -91,7 +91,7 @@ if(Vulkan_FOUND AND GLSLC)
   set(SHADER_OUT ${CMAKE_BINARY_DIR}/shaders)
   file(MAKE_DIRECTORY ${SHADER_OUT})
   set(SPV_FILES)
-  foreach(SHADER tet_forces.comp node_integrate.comp mesh.vert mesh.frag)
+  foreach(SHADER tet_forces.comp node_integrate.comp mesh.vert mesh.frag ocean.vert ocean.frag)
     add_custom_command(
       OUTPUT ${SHADER_OUT}/${SHADER}.spv
       COMMAND ${GLSLC} -O
@@ -103,15 +103,18 @@ if(Vulkan_FOUND AND GLSLC)
   endforeach()
   add_custom_target(shipsim_shaders DEPENDS ${SPV_FILES})
 
-  target_sources(shipsim_engine PRIVATE engine/gpu/device.cpp engine/gpu/offscreen.cpp)
+  target_sources(shipsim_engine PRIVATE engine/gpu/device.cpp engine/gpu/offscreen.cpp
+                                        engine/gpu/ocean.cpp)
   # The `{VK_STRUCTURE_TYPE_X}` idiom value-initialises the remaining fields,
   # which is exactly what Vulkan wants. Scoped to this file so the rest of the
   # library keeps the warning.
-  set_source_files_properties(engine/gpu/device.cpp engine/gpu/offscreen.cpp PROPERTIES
+  set_source_files_properties(engine/gpu/device.cpp engine/gpu/offscreen.cpp
+                              engine/gpu/ocean.cpp PROPERTIES
     COMPILE_OPTIONS "-Wno-missing-field-initializers")
   target_link_libraries(shipsim_engine PUBLIC Vulkan::Vulkan)
   target_compile_definitions(shipsim_engine PUBLIC SHIPSIM_HAS_VULKAN=1)
-  target_sources(shipsim_tests PRIVATE tests/test_device.cpp tests/test_offscreen.cpp)
+  target_sources(shipsim_tests PRIVATE tests/test_device.cpp tests/test_offscreen.cpp
+                                       tests/test_ocean.cpp)
   target_compile_definitions(shipsim_tests PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}")
   add_dependencies(shipsim_tests shipsim_shaders)
 
