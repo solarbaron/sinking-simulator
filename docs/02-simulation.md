@@ -167,6 +167,47 @@ A vectorised sincos is still worth roughly 4× on top and is the right next step
 for large spectra; it is no longer the *first* step, and 128 components now fit
 in 28% of the budget without it.
 
+**How many components? — and a methodological lesson.** The default is 48 × 12 =
+576. Two experiments were run to find out whether that is necessary, and *both
+were dominated by their own noise*, which is the more useful result.
+
+The first measured wave-train recurrence by autocorrelation. It ranked 96
+components worse than 64, every "worst lag" landed near the half-record limit,
+and the ranking was not monotone — the signature of an extreme-value statistic
+over an estimator whose variance grows with lag, not of a real effect.
+
+The second ran the ferry in a seaway and compared RMS motions across component
+counts, using **seed-to-seed spread as the yardstick**. That framing was right
+and it is what exposed the problem: over 160 s records with three seeds, seed
+noise (heave 0.18–0.41 m) is as large as the variation across component counts
+(0.53–0.75 m). Only one finding survives it, and it is consistent in sign across
+every comparison:
+
+| | roll, RMS deg | pitch, RMS deg |
+|---|---|---|
+| long-crested (M = 1) | 1.65 – 2.33 | 2.04 – 2.49 |
+| spread (M = 8) | 2.49 – 2.98 | 1.61 – 1.73 |
+
+**Directional resolution matters and frequency resolution, above about 16 bins,
+does not.** A long-crested sea under-predicts roll by 30–40% and over-predicts
+pitch, because spreading moves energy off the head-on components that drive pitch
+and onto the oblique ones that drive roll. Equal-energy binning already
+reproduces Hs to within 2% at N = 8, so the frequency axis was never the
+constraint.
+
+The first version of that study also computed heave RMS about zero rather than
+about the mean, so it reported the ship's static draft (6.15 m) rather than its
+motion. It looked beautifully converged across every configuration, for the
+obvious reason.
+
+The lesson worth keeping: **a statistical instrument answered neither question,
+while the deterministic one answered both.** An RAO needs a single regular wave,
+has no random phase and therefore no seed noise, and is checkable against closed
+forms. The response spectrum then follows as |RAO(ω)|²·S(ω) without simulating a
+random sea at all. Component count is consequently a *recurrence and visual
+variety* question — how long before the sea visibly repeats — not an accuracy
+one.
+
 **Still to build here:** the FFT-on-a-tiled-grid path for rendering (physics
 keeps the analytic sum — interpolating a rendering grid loses exactly the detail
 that decides whether a hatch immerses); second-order Stokes correction for steep
@@ -250,6 +291,63 @@ The honest way to do wave loads on a large ship is potential flow. Plan:
   depending only on wave phase. That error would ride silently through every
   seakeeping result. Two panels along the length already gave the exact answer in
   that case, but the rule to build to is several panels per wavelength.
+
+### Response amplitude operators — **implemented**
+
+`engine/sim/rao.{hpp,cpp}`. An RAO is the transfer function between a regular
+wave and a ship's motion, and it is the quantity model basins publish — so it is
+the one place this simulator can be checked against the outside world rather than
+against itself. The measurement is made the way a basin makes it: run the ship in
+a regular wave, discard the transient, fit a harmonic to what is left. Nothing
+linearises the ship or reads a coefficient out of the solver.
+
+Supporting this, `WaveField` gained an explicit-component constructor and
+`WaveField::regular(A, ω, direction, phase)`. The constructor **recomputes**
+wavenumber and the direction unit vector from ω and direction rather than
+trusting them: a caller-supplied wavenumber contradicting ω²/g would give a wave
+that propagates at a forbidden speed while looking entirely normal.
+
+The response is extracted by least squares against `[1, cos ωt, sin ωt]`, not a
+DFT bin, because a record holding a non-integer number of cycles leaks — and
+leaks smoothly enough to pass for physics. Two exactness claims are kept apart in
+the tests: least squares recovers the frequency it is *fitting* exactly on any
+window, but rejecting a *different* frequency needs a whole number of cycles.
+Measured, a window short by one sample in twenty thousand moves the amplitude in
+the fifth decimal place.
+
+**What the barge sweep shows.** A 60 m × 16 m box at 4 m draft, head seas:
+
+| ω | λ/L | heave | pitch | heave phase |
+|---|---|---|---|---|
+| 0.25 | 16.4 | 1.03 | 1.07 | −9° |
+| 0.70 | 2.1 | 0.89 | 1.32 | +9° |
+| 1.00 | 0.97 | **0.04** | 0.55 | −71° |
+| 1.45 | 0.49 | **0.02** | 0.08 | −130° |
+| 2.20 | 0.21 | 0.02 | 0.00 | — |
+
+Three features are emergent rather than coded, and each is a closed form:
+
+- **Both asymptotes.** Long waves are ridden one-for-one and short waves ignored.
+  The 3% excess at ω = 0.25 is not error: it is the dynamic magnification of an
+  oscillator below resonance, `1/(1 − (ω/ω_n)²) = 1.026` for a heave natural
+  frequency of √(g/T) ≈ 1.57 rad/s.
+- **Pitch lags the surface elevation by 96°**, because pitch follows the wave
+  *slope*, which is the derivative of elevation — 90° out of phase.
+- **The Froude–Krylov sinc zeros.** A constant-section box integrates the wave
+  pressure along its length as `sin(kL/2)/(kL/2)`, which vanishes at `kL = 2π` and
+  `4π` — wavelengths of exactly L and L/2, where the crest over one half of the
+  ship cancels the trough over the other. Both notches appear, at 61.6 m and
+  29.3 m against a 60 m ship. This is now the strongest test in the seakeeping
+  suite: no coefficient can be tuned to produce it, and if the surface
+  integration ever stops resolving the hull, or the wave's spatial phase is
+  dropped, the notches are the first thing to go while both asymptotes still pass.
+
+**Not yet valid:** forward speed. `encounterFrequency()` is implemented and tested
+for sign and magnitude (ω_e = ω − ω²U cos µ / g), but `RaoSettings::forwardSpeed`
+only sets the frequency the response is fitted at — it does not propel the hull.
+Zero-speed RAOs are the validated case. Comparison against published RAOs for a
+real hull waits on the radiation coefficients below, since without added mass the
+heave natural frequency is too high.
 
 ### Viscous roll damping — **implemented**
 

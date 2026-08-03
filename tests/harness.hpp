@@ -16,6 +16,14 @@ void expectEqual(const std::string& what, long long got, long long want);
 int checkCount();
 int failureCount();
 
+// A writable directory for test output, with a trailing separator.
+//
+// Tests that write PNGs used to hard-code an absolute scratch path belonging to
+// one machine, which meant they could only ever pass there -- and `full` runs
+// the GPU suites, so the committed CI workflow would have failed on its first
+// run. Honours $SHIPSIM_TEST_TMPDIR, then $TMPDIR, then falls back to /tmp.
+const std::string& scratchDir();
+
 }  // namespace testing
 
 // Each suite lives in its own translation unit and is called from tests/main.cpp.
@@ -33,3 +41,4 @@ void runSchedulerTests();
 void runSerialiseTests();
 void runWorldIoTests();
 void runWaveTests();
+void runRaoTests();

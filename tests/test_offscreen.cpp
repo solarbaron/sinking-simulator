@@ -27,8 +27,7 @@ namespace {
 
 constexpr std::uint32_t kWidth = 256;
 constexpr std::uint32_t kHeight = 256;
-const std::string kScratch =
-    "/tmp/claude-1000/-home-solarbaron-git/49c48569-121e-4a97-b437-25941d58fd05/scratchpad/";
+const std::string& kScratch = testing::scratchDir();
 
 bool announced = false;
 

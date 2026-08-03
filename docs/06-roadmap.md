@@ -132,11 +132,25 @@ worth trusting.
   roll decay and scale invariance (`02-simulation.md` §2)
 - ~~**Propulsion, rudder, MMG manoeuvring**~~ **done** — blade-element propeller
   over four quadrants, Fujii rudder, KVLCC2 manoeuvring set (§7)
-- Nonlinear Froude–Krylov: couple the wave field to the hull integral and feed
-  the result into `Ship` — the two halves now exist and are separately validated
+- ~~**Nonlinear Froude–Krylov**~~ **done** — `Sea` carries an optional `WaveField`;
+  `Ship` integrates buoyancy against the actual surface and openings read the
+  local elevation, so a breach under a crest floods faster than one under a trough
+- ~~**Response amplitude operators**~~ **done** — `engine/sim/rao.{hpp,cpp}`
+  measures RAOs the way a basin does: regular wave, discard the transient, fit a
+  harmonic. Both asymptotes and *both* Froude–Krylov sinc zeros come out
+  emergent (`02-simulation.md` §2). This is the instrument the milestone is
+  defined against, so it had to exist before the thing it measures.
 - BEM offline pipeline + Cummins state-space radiation at runtime
 - Ocean rendering, hull rendering, basic materials
 - **Milestone:** drive a ship in a real seaway. Validated against published RAOs.
+
+**Performance, now measured rather than projected.** The wave-field query is
+essentially 100% of a wavy tick. Evaluating the surface once per hull *vertex*
+rather than once per triangle *corner* removed a 6× redundancy for no change in
+any answer, taking a 128-component sea from 52% to 28% of a 100 Hz budget and a
+576-component sea from 225% to 119%. A vectorised sincos is still worth ~4× and
+is the next step for large spectra — it is simply no longer the *first* step,
+which is what extrapolating from a per-component figure had suggested.
 
 At the end of Phase 2 there is a ship simulator, without the damage.
 

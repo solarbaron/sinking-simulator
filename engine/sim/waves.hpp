@@ -144,6 +144,26 @@ public:
     // phase stream, so adding a swell train does not disturb the wind sea.
     explicit WaveField(const std::vector<SeaState>& seas);
 
+    // An explicit component list: regression fixtures, mods shipping a measured
+    // rather than parametric spectrum, and the regular wave below.
+    //
+    // The derived fields are recomputed from omega and direction rather than
+    // trusted. A caller-supplied wavenumber that disagreed with omega^2/g would
+    // give a wave that propagates at the wrong speed while still looking
+    // perfectly like a wave, which is precisely the class of error this codebase
+    // keeps finding the hard way.
+    explicit WaveField(std::vector<WaveComponent> components);
+
+    // A single regular (monochromatic) wave train: eta = A cos(k x' - omega t + phase),
+    // with x' measured along `direction` and k = omega^2 / g.
+    //
+    // This is not a sea state -- no spectrum, no random phase, no spreading. It
+    // is the standard test signal for a response amplitude operator, and the one
+    // case where both the surface and a linear ship response have textbook
+    // closed forms to assert against.
+    static WaveField regular(double amplitude, double omega, double direction = 0.0,
+                             double phase = 0.0);
+
     double elevation(double x, double y, double t) const;
     // Kinematics at a point. z is measured from the still-water plane and is
     // clamped to <= 0 before the exp(k z) decay: above still water the

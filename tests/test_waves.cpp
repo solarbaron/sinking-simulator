@@ -766,6 +766,90 @@ void testSuperposedSeaStates() {
 
 }  // namespace
 
+// --- Regular waves -----------------------------------------------------------
+
+// A monochromatic train is the test signal for a response amplitude operator, so
+// it has to be exactly the wave it claims to be, not approximately.
+void testRegularWaveIsTheExactAiryForm() {
+    const double amplitude = 1.75, omega = 0.7, phase = 0.4;
+    const WaveField field = WaveField::regular(amplitude, omega, 0.0, phase);
+    expectEqual("a regular wave has exactly one component",
+                static_cast<long long>(field.components().size()), 1LL);
+
+    const double k = omega * omega / kGravity;
+    expectNear("the wavenumber comes from the dispersion relation",
+               field.components()[0].wavenumber, k, 1e-12);
+
+    double worst = 0;
+    for (double t : {0.0, 1.3, 7.9, 40.0})
+        for (double x : {-120.0, -13.0, 0.0, 55.5, 310.0}) {
+            const double want = amplitude * std::cos(k * x - omega * t + phase);
+            worst = std::max(worst, std::abs(field.elevation(x, 0.0, t) - want));
+        }
+    expectTrue("elevation is A cos(kx - wt + phase) everywhere", worst < 1e-12);
+
+    // A wave along +x must not vary along y at all -- not "to tolerance".
+    double crossVariation = 0;
+    for (double y : {-500.0, -20.0, 20.0, 500.0})
+        crossVariation = std::max(crossVariation,
+                                  std::abs(field.elevation(30.0, y, 2.0) -
+                                           field.elevation(30.0, 0.0, 2.0)));
+    expectTrue("a long-crested wave along +x is constant along y", crossVariation == 0.0);
+
+    // m0 = A^2/2 for a single component, so Hs = 2 sqrt(2) A. This is worth
+    // asserting because it is the one statistic the spectral path and the
+    // explicit path must agree on.
+    expectNear("significant height of a regular wave is 2 sqrt(2) A",
+               field.significantHeight(), 2.0 * std::sqrt(2.0) * amplitude, 1e-12);
+}
+
+// The crest must travel at the phase speed g/omega. A wave of the right shape
+// moving at the wrong speed is the failure this file was written to catch, and a
+// regular wave makes it checkable exactly rather than statistically.
+void testRegularWaveCrestTravelsAtThePhaseSpeed() {
+    const double omega = 0.9;
+    const WaveField field = WaveField::regular(2.0, omega, 0.0, 0.0);
+    const double c = kGravity / omega;
+
+    // The crest at t = 0 sits at x = 0; at time t it must sit at x = c t.
+    double worst = 0;
+    for (double t : {0.0, 3.0, 11.0, 25.0}) {
+        const double crestX = c * t;
+        worst = std::max(worst, std::abs(field.elevation(crestX, 0.0, t) - 2.0));
+    }
+    expectTrue("the crest stays a crest when followed at g/omega", worst < 1e-9);
+
+    // And is demonstrably not a crest when followed at the group speed, which is
+    // half of it -- otherwise the check above would pass for a standing wave.
+    expectTrue("following at the group speed instead does not track the crest",
+               std::abs(field.elevation(0.5 * c * 25.0, 0.0, 25.0) - 2.0) > 0.5);
+}
+
+// The explicit-component constructor recomputes the derived fields. Hand it a
+// wavenumber that contradicts omega and check it is overruled: a component that
+// kept it would propagate at a forbidden speed and look entirely normal.
+void testExplicitComponentsCannotBreakDispersion() {
+    WaveComponent bogus;
+    bogus.amplitude = 1.0;
+    bogus.omega = 1.2;
+    bogus.direction = kPi / 3.0;
+    bogus.wavenumber = 99.0;   // nonsense
+    bogus.dirX = 0.0;          // inconsistent with direction
+    bogus.dirY = 0.0;
+    const WaveField field(std::vector<WaveComponent>{bogus});
+
+    const WaveComponent& c = field.components()[0];
+    expectNear("a contradictory wavenumber is recomputed from omega", c.wavenumber,
+               1.2 * 1.2 / kGravity, 1e-12);
+    expectNear("the direction unit vector is recomputed too", c.dirX, std::cos(kPi / 3.0), 1e-12);
+    expectNear("and its y part", c.dirY, std::sin(kPi / 3.0), 1e-12);
+
+    // A zeroed direction vector would have made elevation independent of
+    // position, so this also proves the recomputation reached the evaluator.
+    expectTrue("the field actually varies in space after correction",
+               std::abs(field.elevation(20.0, 5.0, 0.0) - field.elevation(0.0, 0.0, 0.0)) > 1e-6);
+}
+
 void runWaveTests() {
     std::printf("\n--- spectral wave field ---\n");
     testSpectrumIntegratesToTheRequestedHs();
@@ -790,4 +874,7 @@ void runWaveTests() {
     testSeedDeterminism();
     testDegenerateFields();
     testSuperposedSeaStates();
+    testRegularWaveIsTheExactAiryForm();
+    testRegularWaveCrestTravelsAtThePhaseSpeed();
+    testExplicitComponentsCannotBreakDispersion();
 }

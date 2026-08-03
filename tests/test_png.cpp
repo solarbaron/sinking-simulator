@@ -146,8 +146,7 @@ void testImageSpanningMultipleDeflateBlocks() {
 
 void testFileRoundTrip() {
     const Image source = makePattern(33, 17);
-    const std::string path = "/tmp/claude-1000/-home-solarbaron-git/"
-                             "49c48569-121e-4a97-b437-25941d58fd05/scratchpad/png_roundtrip.png";
+    const std::string path = testing::scratchDir() + "png_roundtrip.png";
     expectTrue("the image writes to disk", core::writePng(path, source));
 
     Image loaded;

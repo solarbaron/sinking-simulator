@@ -9,13 +9,17 @@ of truth.
 ## The one command
 
 ```sh
-./scripts/verify.sh            # quick    build + tests            ~10 s
-./scripts/verify.sh full       # + clean rebuild, GPU, scenarios   ~5 min
-./scripts/verify.sh sanitize   # + ASan and TSan                   ~10 min
+./scripts/verify.sh            # quick    build + tests            ~6 s
+./scripts/verify.sh full       # + clean rebuild, GPU, scenarios   ~150 s
+./scripts/verify.sh sanitize   # + ASan and TSan                   ~180 s
 ```
 
-Run `quick` constantly, `sanitize` before committing anything touching
-concurrency or raw memory. **Warnings are failures** — the build is
+Run `quick` constantly and `sanitize` **before every commit** — on an idle
+machine it is 180 s against `full`'s 150 s, so the extra coverage is nearly free
+and there is no reason to reserve it for concurrency or raw-memory work. (Those
+are idle figures: sharing the box with one busy benchmark took the same gate to
+358 s. Budget accordingly before assuming it has hung.) **Warnings are
+failures** — the build is
 `-Wall -Wextra -Wpedantic` and has been warning-clean since Phase 0, so a single
 warning means the signal is degrading.
 
@@ -79,6 +83,7 @@ most useful thing to know about this codebase:
 | Scheduler drifting over long runs | a 999-vs-1000 count a tolerance would have hidden |
 | `World::load` leaving a half-built world | every truncation of a valid save |
 | Under-tessellated hull inventing ±6% displacement | a short-wave test that should have cancelled |
+| Sea surface queried 6× more than necessary | timing the real tick instead of extrapolating |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct.
@@ -110,7 +115,11 @@ corrections where a claim was measured and turned out wrong (convergence order,
 job-size targets, the Ikeda nondimensionalisation).
 
 Prefer measuring over asserting: if a cheap experiment settles a design question,
-run the experiment.
+run the experiment. **An extrapolated figure can be numerically right and still
+point at the wrong fix** — the wave-cost estimate predicted 23 ms/tick correctly
+and prescribed a vectorised sincos, while the actual first fix was a 6× query
+redundancy that no per-component figure could reveal. Extrapolate to decide
+whether to measure, not to decide what to do.
 
 ## Notes
 

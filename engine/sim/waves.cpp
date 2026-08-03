@@ -304,6 +304,29 @@ WaveField::WaveField(const std::vector<SeaState>& seas) {
     for (std::size_t i = 0; i < seas.size(); ++i) addSeaState(seas[i], i);
 }
 
+WaveField::WaveField(std::vector<WaveComponent> components)
+    : components_(std::move(components)) {
+    // Recompute rather than trust: wavenumber and the direction unit vector are
+    // functions of omega and direction, and letting a caller set them
+    // independently would allow a wave that propagates at a speed the dispersion
+    // relation forbids -- visually and statistically indistinguishable from a
+    // correct one.
+    for (WaveComponent& c : components_) {
+        c.wavenumber = deepWaterWavenumber(c.omega);
+        c.dirX = std::cos(c.direction);
+        c.dirY = std::sin(c.direction);
+    }
+}
+
+WaveField WaveField::regular(double amplitude, double omega, double direction, double phase) {
+    WaveComponent c;
+    c.amplitude = amplitude;
+    c.omega = omega;
+    c.direction = direction;
+    c.phase = phase;
+    return WaveField(std::vector<WaveComponent>{c});
+}
+
 void WaveField::addSeaState(const SeaState& sea, std::uint64_t stream) {
     const Spectrum spectrum(sea);
     const int frequencies = std::max(sea.frequencyCount, 1);
