@@ -140,7 +140,15 @@ worth trusting.
   harmonic. Both asymptotes and *both* Froude–Krylov sinc zeros come out
   emergent (`02-simulation.md` §2). This is the instrument the milestone is
   defined against, so it had to exist before the thing it measures.
-- BEM offline pipeline + Cummins state-space radiation at runtime
+- ~~**Cummins state-space radiation at runtime**~~ **done, strip theory not BEM** —
+  `engine/sim/radiation.{hpp,cpp}` and `Ship::attachRadiation()`. The offline BEM
+  pipeline this line originally promised is *not* here and this is not a
+  substitute for it: sectional coefficients come from an exact 2D close-fit source
+  solve over Lewis forms, integrated by strip theory. `RadiationTable` is the only
+  thing the Cummins machinery consumes, so replacing strip theory with a real
+  panel code later changes how that table is filled and nothing else.
+  Stations are derived from the hull mesh itself, so any ship asset gets a table
+  (`02-simulation.md` §2)
 - ~~**Ocean rendering**~~ **done** — a displaced grid driven by `sim::WaveField`
   itself, asserted against `elevation()` through the whole render path
   (`03-renderer-audio.md`)
@@ -152,6 +160,18 @@ worth trusting.
   `05-data-modding-validation.md` §4). 0.26 ms of GPU time at 1080p for a whole ship
   and sea on the target card
 - **Milestone:** drive a ship in a real seaway. Validated against published RAOs.
+  **Not met, and the remaining gap is specific.** Every piece of machinery now
+  exists — spectral sea, nonlinear Froude–Krylov, radiation with memory, an RAO
+  instrument, and a renderer showing the ship in the sea it is actually
+  responding to. What is missing is **forward speed**. `encounterFrequency()` is
+  implemented and tested, but `RaoSettings::forwardSpeed` only chooses the
+  frequency the response is fitted at; it does not propel the hull, and the
+  propulsion module is not coupled to the seakeeping path. The standard published
+  benchmarks — the S-175 containership above all — are tabulated at Fn ≈ 0.275,
+  so comparing against them is not merely untried but currently *meaningless*.
+  Zero-speed RAOs are the validated case. Coupling propulsion into the wavy path
+  is therefore the next task, and it is a prerequisite for the milestone rather
+  than an item beside it.
 
 **Performance, now measured rather than projected.** The wave-field query is
 essentially 100% of a wavy tick. Evaluating the surface once per hull *vertex*
