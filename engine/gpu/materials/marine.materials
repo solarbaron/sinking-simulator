@@ -1,0 +1,88 @@
+# The shipped marine material set.
+#
+# This file is the definition, not a copy of one -- there is no material table in
+# any header and no enumeration in any shader. `gpu::MaterialLibrary::load` reads
+# it, the fragment shader indexes the storage buffer built from it, and a mod adds
+# a surface by loading a second file of exactly this form afterwards. A repeated
+# name overrides, so a mod can also restate one of these.
+#
+#   material NAME
+#       base_colour  r g b     linear reflectance, each within [0, 1]
+#       roughness    x         perceptual, within [0.03, 1]; alpha = x^2
+#       metalness    x         within [0, 1]; 0 dielectric, 1 conductor
+#       opacity      x         optional, default 1 (carried, not yet rendered)
+#
+# base_colour, roughness and metalness are all required: a block that stops short
+# is rejected rather than completed with defaults.
+#
+# Values are linear reflectances, not sRGB swatches. Paint over steel is a
+# dielectric however metallic the substrate is -- only the bare and blasted
+# surfaces are conductors, and that distinction is most of what makes a ship's
+# topside read as painted rather than as raw metal.
+
+# Marine topcoat over primer, the light grey most of a hull is actually painted.
+# Semi-gloss enamel: bright, but far from a mirror.
+material painted_steel_topside
+    base_colour 0.68 0.70 0.72
+    roughness   0.35
+    metalness   0.00
+
+# The band at the waterline, between the antifouling and the topside. Dark, and
+# rougher than the topside because it lives in the splash zone.
+material boot_topping
+    base_colour 0.045 0.040 0.042
+    roughness   0.42
+    metalness   0.00
+
+# Cuprous-oxide antifouling. Matt by design -- a self-polishing coating is
+# ablating, so it never holds a gloss.
+material antifouling
+    base_colour 0.26 0.065 0.045
+    roughness   0.72
+    metalness   0.00
+
+# Blasted or mill-scale steel, the only genuinely metallic surface here. F0 is
+# the base colour rather than 0.04, which is what makes it read as metal.
+material bare_steel
+    base_colour 0.56 0.57 0.58
+    roughness   0.40
+    metalness   1.00
+
+# Rust is iron oxide, and oxide is an insulator. Metalness 0 is not an
+# approximation here: corroded steel stops behaving like a conductor optically,
+# which is why rust looks like dirt rather than like tarnish.
+material rusted_steel
+    base_colour 0.30 0.12 0.055
+    roughness   0.92
+    metalness   0.00
+
+# Holystoned timber deck. Wide, diffuse, and light enough to matter to the
+# ambient term.
+material timber_deck
+    base_colour 0.50 0.39 0.24
+    roughness   0.60
+    metalness   0.00
+
+# Wheelhouse glazing, seen from outside. Opacity is recorded but the pass does
+# not yet honour it (no transparency sort, no refraction), so this renders as the
+# very smooth dark dielectric that glass is when it is reflecting the sky.
+material glass
+    base_colour 0.030 0.035 0.040
+    roughness   0.05
+    metalness   0.00
+    opacity     0.12
+
+# The sea, so it goes through the same pipeline as the hull and therefore shares
+# the depth buffer rather than being composited beside it.
+#
+# **This base colour is deliberately above the physical one.** Real water has an
+# albedo of two or three per cent and takes almost all of its apparent brightness
+# from the sky reflected in it plus subsurface scattering, and neither exists yet;
+# at 0.02 the sea renders very nearly black, which is correct and useless. Five
+# per cent stands in for the missing terms. It comes back down when the reflection
+# work lands -- and being a number in a file rather than a constant in a shader is
+# the point of it living here.
+material sea_water
+    base_colour 0.050 0.150 0.210
+    roughness   0.09
+    metalness   0.00
