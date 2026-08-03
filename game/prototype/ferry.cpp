@@ -1,0 +1,220 @@
+// SPDX-License-Identifier: MIT
+#include "ferry.hpp"
+
+#include <cmath>
+
+namespace game {
+
+using namespace sim;
+
+namespace {
+
+constexpr double kHalfBeam    = 10.0;   // moulded half breadth, m
+constexpr double kDesignDraft = 5.5;    // m
+constexpr double kDepth       = 15.0;   // m to the top of the accommodation block
+// Ro-pax ferries carry a great deal of steel and passenger accommodation high up,
+// and run intact GM in the 1.5-3 m band -- stiff enough to pass the criteria,
+// nowhere near stiff enough to survive water on the vehicle deck.
+constexpr double kKG          = 12.60;  // m, vertical centre of gravity, light condition
+
+// Longitudinal fullness: parallel midbody between +/-30 m, a fine bow and a
+// fuller stern. u is normalised half-length.
+double longitudinalFullness(double x) {
+    const double u = x / 60.0;
+    if (u > 0.5) {
+        const double t = (u - 0.5) / 0.5;
+        return 1.0 - 0.85 * t * t;
+    }
+    if (u < -0.5) {
+        const double t = (-u - 0.5) / 0.5;
+        return 1.0 - 0.55 * t * t;
+    }
+    return 1.0;
+}
+
+// Vertical fullness: a broad flat bottom reaching full beam by the turn of the
+// bilge at 3.2 m. Ferries are close to box-shaped, which is exactly why their
+// waterplane inertia is large and their damaged stability is fragile.
+double verticalFullness(double z) {
+    if (z >= 3.2) return 1.0;
+    return 0.55 + 0.45 * std::pow(z / 3.2, 0.8);
+}
+
+TriMesh buildHull() {
+    const std::vector<double> waterlines{0.0, 1.0, 1.8, 2.6, 3.2, 4.2,
+                                         5.5, 7.0, 9.0, 11.0, 12.5, kDepth};
+    std::vector<Station> stations;
+    for (int i = 0; i <= 24; ++i) {
+        Station s;
+        s.x = -60.0 + 120.0 * i / 24.0;
+        const double fx = longitudinalFullness(s.x);
+        for (double z : waterlines)
+            s.halfBeam.push_back(kHalfBeam * fx * verticalFullness(z));
+        stations.push_back(s);
+    }
+    return makeHullFromStations(stations, waterlines);
+}
+
+Compartment box(std::string name, Vec3 lo, Vec3 hi, double permeability,
+                bool vented = false) {
+    Compartment c;
+    c.name = std::move(name);
+    c.mesh = makeBox(lo, hi);
+    c.permeability = permeability;
+    c.ventedToAtmosphere = vented;
+    return c;
+}
+
+Opening orifice(std::string name, int a, int b, Vec3 pos, double area, double cd,
+                OpeningKind kind, bool open) {
+    Opening o;
+    o.name = std::move(name);
+    o.a = a;
+    o.b = b;
+    o.pos = pos;
+    o.area = area;
+    o.dischargeCoeff = cd;
+    o.kind = kind;
+    o.open = open;
+    return o;
+}
+
+}  // namespace
+
+Ship buildFerry() {
+    Ship ship;
+    ship.hull = buildHull();
+    ship.deckEdgeZ = 7.0;  // vehicle deck: the level that decides whether she lives
+
+    // --- Subdivision -------------------------------------------------------
+    // Lower deck spaces sit on the double bottom at 1.8 m and run to the
+    // bulkhead deck at 7.0 m.
+    ship.compartments = {
+        box("forepeak",          {  44, -3.0, 1.8}, { 56,  3.0, 12.5}, 0.97),
+        box("fwd_hold_p",        {  20,  0.0, 1.8}, { 44,  8.0,  7.0}, 0.95),
+        box("fwd_hold_s",        {  20, -8.0, 1.8}, { 44,  0.0,  7.0}, 0.95),
+        box("engine_room_p",     {  -8,  0.0, 1.8}, { 20,  8.0,  7.0}, 0.85),
+        box("engine_room_s",     {  -8, -8.0, 1.8}, { 20,  0.0,  7.0}, 0.85),
+        box("aft_hold_p",        { -38,  0.0, 1.8}, { -8,  8.0,  7.0}, 0.95),
+        box("aft_hold_s",        { -38, -8.0, 1.8}, { -8,  0.0,  7.0}, 0.95),
+        box("steering_gear",     { -56, -5.0, 1.8}, {-38,  5.0,  7.0}, 0.90),
+        box("wing_tank_fwd_p",   {  20,  8.0, 3.2}, { 44,  9.7,  7.0}, 0.98),
+        box("wing_tank_fwd_s",   {  20, -9.7, 3.2}, { 44, -8.0,  7.0}, 0.98),
+        box("wing_tank_aft_p",   { -38,  8.0, 3.2}, { -8,  9.7,  7.0}, 0.98),
+        box("wing_tank_aft_s",   { -38, -9.7, 3.2}, { -8, -8.0,  7.0}, 0.98),
+        box("double_bottom_fwd", {   4, -5.0, 0.0}, { 44,  5.0,  1.8}, 0.98),
+        box("double_bottom_aft", { -44, -5.0, 0.0}, {  4,  5.0,  1.8}, 0.98),
+        // One undivided space, 100 m long and 19 m wide, one deck above the
+        // waterline. Nothing else on the ship can generate a free surface moment
+        // remotely this large.
+        box("vehicle_deck",      { -50, -9.7, 7.0}, { 50,  9.7, 12.5}, 0.90, true),
+        box("accommodation",     { -40, -9.0,12.5}, { 34,  9.0, 15.0}, 0.95, true),
+    };
+
+    const int forepeak   = ship.findCompartment("forepeak");
+    const int fwdHoldP   = ship.findCompartment("fwd_hold_p");
+    const int fwdHoldS   = ship.findCompartment("fwd_hold_s");
+    const int erP        = ship.findCompartment("engine_room_p");
+    const int erS        = ship.findCompartment("engine_room_s");
+    const int aftHoldP   = ship.findCompartment("aft_hold_p");
+    const int aftHoldS   = ship.findCompartment("aft_hold_s");
+    const int steering   = ship.findCompartment("steering_gear");
+    const int wingFwdP   = ship.findCompartment("wing_tank_fwd_p");
+    const int wingFwdS   = ship.findCompartment("wing_tank_fwd_s");
+    const int wingAftP   = ship.findCompartment("wing_tank_aft_p");
+    const int wingAftS   = ship.findCompartment("wing_tank_aft_s");
+    const int dbFwd      = ship.findCompartment("double_bottom_fwd");
+    const int dbAft      = ship.findCompartment("double_bottom_aft");
+    const int vehDeck    = ship.findCompartment("vehicle_deck");
+
+    // --- Flow network ------------------------------------------------------
+    ship.openings = {
+        // The casualty: a 2.4 m^2 tear in the starboard shell, 2.5 m below the
+        // waterline, opening straight into the starboard engine room.
+        orifice("breach_er_s", kSea, erS, {6, -9.0, 3.0}, 2.4, 0.62,
+                OpeningKind::Breach, true),
+
+        // Watertight door on the centreline, left open on passage as they so
+        // often are. Closing it is the single highest-value action available.
+        orifice("wt_door_er", erS, erP, {6, 0.0, 2.2}, 3.6, 0.75,
+                OpeningKind::Door, true),
+
+        // Escape trunks up to the vehicle deck. Downflooding paths once the
+        // engine rooms fill above 7 m.
+        orifice("escape_er_s", erS, vehDeck, {14, -4.0, 7.0}, 1.0, 0.70,
+                OpeningKind::Hatch, false),
+        orifice("escape_er_p", erP, vehDeck, {14,  4.0, 7.0}, 1.0, 0.70,
+                OpeningKind::Hatch, false),
+
+        // Vehicle deck side openings -- freeing ports and the shell doors around
+        // the ramp, all sitting just above the deck at 7 m. Dry and irrelevant
+        // right up until the ship settles far enough to put them under, at which
+        // point they admit the sea onto a 100 x 19 m undivided deck and the free
+        // surface moment does the rest.
+        orifice("downflood_ramp_s", kSea, vehDeck, { 46, -9.2, 7.2}, 1.2, 0.60,
+                OpeningKind::Breach, true),
+        orifice("downflood_port_s", kSea, vehDeck, {-10, -9.6, 7.1}, 0.8, 0.60,
+                OpeningKind::Breach, true),
+        orifice("downflood_port_p", kSea, vehDeck, {-10,  9.6, 7.1}, 0.8, 0.60,
+                OpeningKind::Breach, true),
+
+        // An unsealed cable transit through the aft engine room bulkhead. Four
+        // hundred square centimetres, and it will flood the aft hold anyway.
+        orifice("cable_transit", erS, aftHoldS, {-8, -4.0, 2.0}, 0.04, 0.60,
+                OpeningKind::Pipe, true),
+
+        // Air escapes. Generously sized on manned spaces, deliberately mean on
+        // the wing tanks, whose small air pipes will trap air and hold them
+        // partly buoyant for a long time.
+        orifice("vent_er_s",    erS,      kSea, { 10, -6.0, 12.5}, 0.50, 0.80, OpeningKind::Vent, true),
+        orifice("vent_er_p",    erP,      kSea, { 10,  6.0, 12.5}, 0.50, 0.80, OpeningKind::Vent, true),
+        orifice("vent_fh_p",    fwdHoldP, kSea, { 32,  6.0, 12.5}, 0.20, 0.80, OpeningKind::Vent, true),
+        orifice("vent_fh_s",    fwdHoldS, kSea, { 32, -6.0, 12.5}, 0.20, 0.80, OpeningKind::Vent, true),
+        orifice("vent_ah_p",    aftHoldP, kSea, {-24,  6.0, 12.5}, 0.20, 0.80, OpeningKind::Vent, true),
+        orifice("vent_ah_s",    aftHoldS, kSea, {-24, -6.0, 12.5}, 0.20, 0.80, OpeningKind::Vent, true),
+        orifice("vent_steer",   steering, kSea, {-46,  0.0, 12.5}, 0.15, 0.80, OpeningKind::Vent, true),
+        orifice("vent_fpk",     forepeak, kSea, { 50,  0.0, 12.5}, 0.10, 0.80, OpeningKind::Vent, true),
+        orifice("airpipe_wfp",  wingFwdP, kSea, { 32,  9.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),
+        orifice("airpipe_wfs",  wingFwdS, kSea, { 32, -9.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),
+        orifice("airpipe_wap",  wingAftP, kSea, {-24,  9.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),
+        orifice("airpipe_was",  wingAftS, kSea, {-24, -9.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),
+        orifice("airpipe_dbf",  dbFwd,    kSea, { 24,  0.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),
+        orifice("airpipe_dba",  dbAft,    kSea, {-24,  0.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),
+
+        // Counterflooding: sea suction into the port wing tanks, to buy back
+        // upright trim at the cost of freeboard.
+        orifice("cf_valve_aft_p", kSea, wingAftP, {-24, 9.7, 3.4}, 0.40, 0.65,
+                OpeningKind::Pipe, false),
+        orifice("cf_valve_fwd_p", kSea, wingFwdP, { 32, 9.7, 3.4}, 0.40, 0.65,
+                OpeningKind::Pipe, false),
+        // Cross-flooding duct: the passive version, which equalises without a
+        // valve to open but drops freeboard on both sides.
+        orifice("crossflood_aft", wingAftS, wingAftP, {-24, 0.0, 3.4}, 0.30, 0.85,
+                OpeningKind::Pipe, false),
+    };
+
+    // --- Pumps -------------------------------------------------------------
+    // 216 m^3/h each. Against a 2.4 m^2 breach admitting some 38,000 m^3/h this
+    // is not a rounding error away from useless -- it *is* useless, and the sim
+    // should make that obvious.
+    ship.pumps = {
+        {"bilge_er_s", erS,  0.060, 25.0, false, 0.0},
+        {"bilge_er_p", erP,  0.060, 25.0, false, 0.0},
+        {"bilge_ah_s", aftHoldS, 0.060, 25.0, false, 0.0},
+        {"ballast_wing_p", wingAftP, 0.100, 25.0, false, 0.0},
+    };
+
+    // --- Weights -----------------------------------------------------------
+    // Light displacement is defined as whatever floats her at the design draft
+    // with every compartment dry, so the hull form and the loading stay
+    // consistent even if the offsets above are edited.
+    const double designVolume =
+        integrateBelowPlane(ship.hull, Vec3{0, 0, 1}, kDesignDraft).volume;
+    ship.lightshipMass = designVolume * kRhoSeawater;
+    ship.lightshipCog = {-1.5, 0.0, kKG};
+    ship.gyradii = {7.0, 28.0, 29.0};
+
+    return ship;
+}
+
+}  // namespace game

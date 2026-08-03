@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: MIT
+//
+// Validation of the geometric and hydrostatic core against closed-form answers.
+// Everything downstream -- flooding rates, stability, capsize -- is only as good
+// as these integrals, so they get checked against algebra rather than eyeballed.
+#include "engine/core/geometry.hpp"
+#include "engine/sim/ship.hpp"
+
+#include <cstdio>
+#include <string>
+
+using namespace sim;
+
+namespace {
+
+int failures = 0;
+int checks = 0;
+
+void expectNear(const std::string& what, double got, double want, double tol) {
+    ++checks;
+    if (std::abs(got - want) > tol) {
+        std::printf("  FAIL %-52s got %+.9g  want %+.9g  (tol %.2g)\n",
+                    what.c_str(), got, want, tol);
+        ++failures;
+    }
+}
+
+void expectTrue(const std::string& what, bool cond) {
+    ++checks;
+    if (!cond) {
+        std::printf("  FAIL %s\n", what.c_str());
+        ++failures;
+    }
+}
+
+// --- Closed-mesh integration -----------------------------------------------
+
+void testBoxIntegrals() {
+    const TriMesh box = makeBox({-2, -3, -4}, {6, 5, 4});  // 8 x 8 x 8
+    const VolumeIntegral v = integrate(box);
+    expectNear("box volume", v.volume, 512.0, 1e-9);
+    expectNear("box centroid x", v.centroid.x, 2.0, 1e-9);
+    expectNear("box centroid y", v.centroid.y, 1.0, 1e-9);
+    expectNear("box centroid z", v.centroid.z, 0.0, 1e-9);
+}
+
+void testAxisAlignedClip() {
+    const TriMesh box = makeBox({0, 0, 0}, {10, 4, 6});  // 240 m^3
+    // Cut horizontally at z = 1.5: a 10 x 4 x 1.5 slab.
+    const VolumeIntegral lower = integrateBelowPlane(box, {0, 0, 1}, 1.5);
+    expectNear("axis-aligned clip volume", lower.volume, 60.0, 1e-9);
+    expectNear("axis-aligned clip centroid z", lower.centroid.z, 0.75, 1e-9);
+    expectNear("axis-aligned clip centroid x", lower.centroid.x, 5.0, 1e-9);
+
+    // Degenerate ends must be exact, not merely close.
+    expectNear("clip below everything", integrateBelowPlane(box, {0, 0, 1}, -1).volume, 0.0, 1e-12);
+    expectNear("clip above everything", integrateBelowPlane(box, {0, 0, 1}, 99).volume, 240.0, 1e-9);
+}
+
+void testTiltedClipAgainstAlgebra() {
+    // A unit cube cut by a plane through the origin with normal (1,1,1)/sqrt(3)
+    // keeps exactly one corner tetrahedron of the cube: volume 1/6.
+    const TriMesh cube = makeBox({0, 0, 0}, {1, 1, 1});
+    const Vec3 n = normalize(Vec3{1, 1, 1});
+    const VolumeIntegral cut = integrateBelowPlane(cube, n, dot(n, Vec3{1, 0, 0}));
+    expectNear("tilted clip: corner tetrahedron volume", cut.volume, 1.0 / 6.0, 1e-12);
+    // Centroid of that tetrahedron is the average of its four vertices.
+    expectNear("tilted clip: centroid x", cut.centroid.x, 0.25, 1e-12);
+}
+
+void testVolumeSolveRoundTrip() {
+    const TriMesh box = makeBox({-30, -8, 0}, {30, 8, 10});
+    const Vec3 n = normalize(Vec3{0.12, -0.25, 1.0});  // an arbitrary heel and trim
+    for (double target : {50.0, 900.0, 4800.0, 9000.0}) {
+        const double off = solvePlaneOffsetForVolume(box, n, target, -1e30, 1e30);
+        const double got = integrateBelowPlane(box, n, off).volume;
+        expectNear("volume solve round trip @ " + std::to_string(target), got, target,
+                   1e-6 * target);
+    }
+}
+
+// --- Hydrostatics -----------------------------------------------------------
+
+// A homogeneous box floats at a draft of (rho_body / rho_water) * height.
+// This is Archimedes' principle and the engine has no excuse to miss it.
+void testArchimedes() {
+    Ship s;
+    s.hull = makeBox({-25, -6, 0}, {25, 6, 8});
+    s.deckEdgeZ = 8.0;
+    const double expectedDraft = 3.0;
+    const double volume = 50.0 * 12.0 * expectedDraft;
+    s.lightshipMass = volume * kRhoSeawater;
+    s.lightshipCog = {0, 0, 4.0};
+    s.gyradii = {4.0, 14.0, 14.0};
+    s.initialise(0.0);
+
+    // Let any residual transient settle.
+    for (int i = 0; i < 20000; ++i) s.step(0.005, 0.0);
+
+    const Diagnostics d = s.diagnostics(0.0);
+    expectNear("box barge floats at Archimedean draft", d.draftMidship, expectedDraft, 0.01);
+    expectNear("box barge stays upright (heel)", d.heelDeg, 0.0, 0.05);
+    expectNear("box barge stays upright (trim)", d.trimDeg, 0.0, 0.05);
+
+    // Metacentric radius of a rectangular waterplane: BM = I/V = L*B^3/12 / V.
+    const double bm = (50.0 * 12.0 * 12.0 * 12.0 / 12.0) / volume;
+    const double kb = expectedDraft / 2.0;
+    expectNear("box barge GM matches KB + BM - KG", d.gmTransverse,
+               kb + bm - s.lightshipCog.z, 0.02);
+}
+
+// Free surface effect: the same mass of water, loose in a wide tank instead of
+// bolted down as solid ballast, must reduce GM by rho*i/displacement.
+void testFreeSurfaceEffect() {
+    auto makeBarge = [](bool liquid) {
+        Ship s;
+        s.hull = makeBox({-25, -6, 0}, {25, 6, 8});
+        s.deckEdgeZ = 8.0;
+        s.compartments = {[&] {
+            Compartment c;
+            c.name = "tank";
+            c.mesh = makeBox({-20, -5, 0.0}, {20, 5, 4.0});
+            c.permeability = 1.0;
+            c.ventedToAtmosphere = true;
+            c.waterVolume = liquid ? 200.0 : 0.0;  // 200 m^3, a shallow layer
+            return c;
+        }()};
+        // Keep total displacement identical between the two cases by moving the
+        // equivalent mass into the lightship when the tank is dry.
+        const double waterMass = 200.0 * kRhoSeawater;
+        s.lightshipMass = 50.0 * 12.0 * 3.0 * kRhoSeawater - (liquid ? waterMass : 0.0);
+        // Solid ballast sits at the same height the loose water would.
+        const double solidZ = 0.5;
+        s.lightshipCog = {0, 0, liquid ? 4.0
+                                       : (4.0 * (50.0 * 12.0 * 3.0 * kRhoSeawater - waterMass)
+                                          + solidZ * waterMass)
+                                             / (50.0 * 12.0 * 3.0 * kRhoSeawater)};
+        if (!liquid) s.lightshipMass = 50.0 * 12.0 * 3.0 * kRhoSeawater;
+        s.gyradii = {4.0, 14.0, 14.0};
+        s.initialise(0.0);
+        return s;
+    };
+
+    const Ship loose = makeBarge(true);
+    const Ship solid = makeBarge(false);
+    const double gmLoose = loose.diagnostics(0.0).gmTransverse;
+    const double gmSolid = solid.diagnostics(0.0).gmTransverse;
+
+    // i = l*b^3/12 for the 40 x 10 m tank surface; the correction is rho*i/Delta.
+    const double i = 40.0 * 10.0 * 10.0 * 10.0 / 12.0;
+    const double displacementVolume = 50.0 * 12.0 * 3.0;
+    const double expectedLoss = i / displacementVolume;
+
+    expectTrue("free surface reduces GM", gmLoose < gmSolid);
+    expectNear("free surface loss matches rho*i/displacement", gmSolid - gmLoose,
+               expectedLoss, 0.15 * expectedLoss);
+}
+
+// Air trapped in a sealed compartment must arrest flooding once its pressure
+// balances the outside head -- the reason capsized hulls stay up for hours.
+void testTrappedAirArrestsFlooding() {
+    Ship s;
+    s.hull = makeBox({-25, -6, 0}, {25, 6, 8});
+    s.deckEdgeZ = 8.0;
+
+    Compartment sealed;
+    sealed.name = "sealed_void";
+    sealed.mesh = makeBox({-10, -4, 0.0}, {10, 4, 3.0});
+    sealed.permeability = 1.0;
+    s.compartments = {sealed};
+
+    Opening hole;
+    hole.name = "hole";
+    hole.a = kSea;
+    hole.b = 0;
+    hole.pos = {0, -4, 0.2};
+    hole.area = 0.5;
+    s.openings = {hole};  // no vent anywhere: the air has nowhere to go
+
+    s.lightshipMass = 50.0 * 12.0 * 3.0 * kRhoSeawater;
+    s.lightshipCog = {0, 0, 4.0};
+    s.gyradii = {4.0, 14.0, 14.0};
+    s.initialise(0.0);
+
+    for (int i = 0; i < 120000; ++i) s.step(0.005, 0.0);
+
+    const Compartment& c = s.compartments[0];
+    expectTrue("sealed compartment took some water", c.fillFraction() > 0.05);
+    expectTrue("trapped air stopped it filling", c.fillFraction() < 0.95);
+    expectTrue("trapped air is above atmospheric", c.airPressure > kPatm * 1.02);
+
+    // Boyle's law check: the air was compressed from the full compartment volume
+    // to the remaining void, isothermally.
+    const double p0V0 = kPatm * c.grossVolume;
+    expectNear("isothermal compression conserves pV", c.airPressure * c.airVolume(),
+               p0V0, 0.02 * p0V0);
+}
+
+// Water must not appear or vanish: the sum over compartments has to equal what
+// crossed the hull boundary.
+void testMassConservation() {
+    Ship s;
+    s.hull = makeBox({-25, -6, 0}, {25, 6, 8});
+    s.deckEdgeZ = 8.0;
+
+    auto vented = [](const char* name, Vec3 lo, Vec3 hi) {
+        Compartment c;
+        c.name = name;
+        c.mesh = makeBox(lo, hi);
+        c.permeability = 1.0;
+        c.ventedToAtmosphere = true;
+        return c;
+    };
+    s.compartments = {vented("a", {-20, -5, 0}, {0, 5, 4}),
+                      vented("b", {0, -5, 0}, {20, 5, 4})};
+
+    Opening breach;
+    breach.name = "breach";
+    breach.a = kSea;
+    breach.b = 0;
+    breach.pos = {-10, -5, 0.5};
+    breach.area = 0.3;
+
+    Opening door;
+    door.name = "door";
+    door.a = 0;
+    door.b = 1;
+    door.pos = {0, 0, 0.1};
+    door.area = 1.0;
+    s.openings = {breach, door};
+
+    s.lightshipMass = 50.0 * 12.0 * 3.0 * kRhoSeawater;
+    s.lightshipCog = {0, 0, 4.0};
+    s.gyradii = {4.0, 14.0, 14.0};
+    s.initialise(0.0);
+
+    double crossedBoundary = 0.0;
+    const double dt = 0.005;
+    for (int i = 0; i < 40000; ++i) {
+        s.step(dt, 0.0);
+        for (const Opening& o : s.openings)
+            if (o.name == "breach" && o.lastFlowWasWater) crossedBoundary += o.lastFlow * dt;
+    }
+
+    double held = 0.0;
+    for (const Compartment& c : s.compartments) held += c.waterVolume;
+    expectNear("water in compartments equals water through the breach", held, crossedBoundary,
+               1e-3 * std::max(held, 1.0));
+
+    // While the breach is admitting water the two spaces do *not* sit level: an
+    // orifice only passes flow when there is a head difference across it, so the
+    // damaged side runs a few centimetres high. Shut the breach and the offset
+    // must decay to nothing.
+    const double headWhileFlooding =
+        std::abs(s.compartments[0].surfaceWorldZ - s.compartments[1].surfaceWorldZ);
+    expectTrue("a head difference drives flow through the door", headWhileFlooding > 0.01);
+
+    for (Opening& o : s.openings)
+        if (o.name == "breach") o.open = false;
+    for (int i = 0; i < 40000; ++i) s.step(dt, 0.0);
+
+    expectTrue("compartments level off once inflow stops",
+               std::abs(s.compartments[0].surfaceWorldZ - s.compartments[1].surfaceWorldZ) < 0.01);
+
+    double heldAfter = 0.0;
+    for (const Compartment& c : s.compartments) heldAfter += c.waterVolume;
+    expectNear("no water created or destroyed while settling", heldAfter, held, 1e-6 * held);
+}
+
+}  // namespace
+
+int main() {
+    std::printf("shipsim core validation\n");
+    testBoxIntegrals();
+    testAxisAlignedClip();
+    testTiltedClipAgainstAlgebra();
+    testVolumeSolveRoundTrip();
+    testArchimedes();
+    testFreeSurfaceEffect();
+    testTrappedAirArrestsFlooding();
+    testMassConservation();
+
+    std::printf("%d checks, %d failures\n", checks, failures);
+    return failures == 0 ? 0 : 1;
+}
