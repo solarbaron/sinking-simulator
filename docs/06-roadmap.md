@@ -80,7 +80,11 @@ without.
 - ~~**Vulkan device**~~ **done** — shared instance/device/queue/allocation,
   graduated from the FEM spike, degrades cleanly with no GPU
   (`01-architecture.md` §4)
-- Render graph, bindless setup, offscreen debug renderer
+- ~~**Offscreen debug renderer**~~ **done** — colour+depth target, render pass,
+  indexed triangle pipeline, PNG readback, all assertions closed-form
+  (`01-architecture.md` §4)
+- Render graph and bindless setup — deferred past the Phase 1 milestone, which
+  the push-constant path already satisfies
 - **Milestone:** watch the current ferry scenario in 3D, in real time, with a
   free camera and a wireframe of the flooding compartments.
 

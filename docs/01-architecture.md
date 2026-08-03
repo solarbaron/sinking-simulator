@@ -427,6 +427,36 @@ Validated against an independent implementation as well as itself: Python's
 reproduces the exact pixels, and `file(1)` identifies the result as
 `PNG image data, 8-bit/color RGBA, non-interlaced`.
 
+`engine/gpu/offscreen.cpp` is the renderer half: a colour + depth target, a
+`VkRenderPass` and framebuffer, and a pipeline drawing indexed triangles with the
+whole transform arriving as one push-constant matrix — so a draw needs no
+descriptor set, keeping the debug renderer independent of the bindless work that
+comes later. Render passes rather than dynamic rendering, matching what
+`03-renderer-audio.md` already committed to for Pascal; the explicit attachment
+layouts also make the readback path visible, since the colour attachment ends the
+pass already in `TRANSFER_SRC_OPTIMAL`.
+
+Every rendering assertion is a closed form worked out **before** the render:
+
+| Check | Closed form |
+|---|---|
+| Clear | exactly `width * height` pixels of the clear colour |
+| Coverage | a half-viewport triangle covers half the pixels, within one pixel row |
+| Depth | a nearer surface owns *every* pixel and the farther one owns none |
+| Position | the drawn centroid matches `sim::clipToPixel`, within two pixels |
+| Area | a quad's pixel area follows from its world size and the frustum |
+
+The depth check is the one that carries weight, and it is deliberately
+adversarial: the **far** surface is drawn *second*. Near-then-far produces a
+correct image even with depth testing switched off entirely, so only the reverse
+order proves the depth buffer is doing anything.
+
+One test failure during this work was the test's arithmetic, not the renderer's:
+a quad 0.7 world units across, at a depth where the viewport spans 20 units,
+covers about 81 pixels — and the assertion demanded more than 100. The fix was to
+derive the expected area from the geometry rather than to lower the threshold,
+which is now what the test asserts.
+
 ## 5. Memory
 
 - **Arena allocators per frame and per lane** — implemented in
