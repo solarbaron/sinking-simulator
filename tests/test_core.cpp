@@ -12,6 +12,7 @@
 #include <string>
 
 using namespace sim;
+using testing::expectEqual;
 using testing::expectNear;
 using testing::expectTrue;
 
@@ -285,6 +286,58 @@ void testWavySurfaceIsNotSecretlyFlat() {
         integrateBelowSurface(hull, [](double, double) { return 100.0; });
     expectNear("a surface above the whole hull submerges all of it", drowned.volume,
                integrate(hull).volume, 1e-6 * integrate(hull).volume);
+}
+
+// The height field is evaluated once per vertex, not once per triangle corner.
+// That is a performance property with no effect on any answer, so nothing else
+// in this file would notice if a refactor undid it -- and it is worth about a
+// factor of two on a wavy tick, because with a 128-component spectrum the
+// surface query *is* the tick.
+//
+// Two configurations pin it exactly rather than approximately: with the surface
+// below the whole hull every triangle takes the dry early-out, so the corner
+// form asks 3*tris and the vertex form asks exactly verts; with the surface
+// above it, both add three quadrature points per triangle on top.
+void testSurfaceIsQueriedOncePerVertex() {
+    const TriMesh hull = testHull();
+    const auto verts = static_cast<long long>(hull.verts.size());
+    const auto tris = static_cast<long long>(hull.tris.size());
+    expectTrue("the mesh has more corners than vertices, or there is nothing to save",
+               3 * tris > verts);
+
+    long long dryQueries = 0;
+    const VolumeIntegral dry =
+        integrateBelowSurface(hull, [&](double, double) { ++dryQueries; return -100.0; });
+    expectEqual("a hull entirely above the surface is queried once per vertex", dryQueries, verts);
+    expectEqual("and displaces nothing", static_cast<long long>(dry.volume), 0LL);
+
+    // Submerged, every triangle is wet -- but not every triangle is quadratured.
+    // The integrand F = (0, 0, z - h) points straight up, so a panel whose normal
+    // is horizontal carries no flux and is dropped before the quadrature runs.
+    // On a ship that is not a corner case: the side plating is vertical, and here
+    // it is 45% of the hull.
+    long long upright = 0;
+    for (const Tri& t : hull.tris)
+        if (0.5 * cross(hull.verts[t.b] - hull.verts[t.a],
+                        hull.verts[t.c] - hull.verts[t.a]).z != 0.0)
+            ++upright;
+    expectTrue("the hull really does have vertical plating to skip", upright < tris * 3 / 4);
+
+    long long wetQueries = 0;
+    const VolumeIntegral wet =
+        integrateBelowSurface(hull, [&](double, double) { ++wetQueries; return 100.0; });
+    expectEqual("a submerged hull adds three quadrature points per sloping triangle, no more",
+                wetQueries, verts + 3 * upright);
+    expectNear("and displaces its whole volume", wet.volume, integrate(hull).volume,
+               1e-6 * integrate(hull).volume);
+
+    // Evaluating eagerly must not let vertices no triangle uses into the answer.
+    TriMesh padded = hull;
+    for (int i = 0; i < 32; ++i) padded.verts.push_back({1e4 + i, -1e4, -1e4});
+    const auto wave = [](double x, double) { return 5.0 + 2.0 * std::cos(x * 0.1); };
+    expectNear("unreferenced vertices do not perturb the integral",
+               integrateBelowSurface(padded, wave).volume,
+               integrateBelowSurface(hull, wave).volume, 1e-9);
 }
 
 // --- Ships in waves ----------------------------------------------------------
@@ -701,6 +754,7 @@ void runCoreTests() {
     testWavySurfaceReducesToThePlaneCase();
     testSinusoidalSurfaceAgainstAnalyticVolume();
     testWavySurfaceIsNotSecretlyFlat();
+    testSurfaceIsQueriedOncePerVertex();
     testZeroAmplitudeWaveFieldMatchesFlatWater();
     testCrestDisplacesMoreThanTrough();
     testLongWavesLiftTheShipAndShortWavesDoNot();

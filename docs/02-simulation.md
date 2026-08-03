@@ -134,14 +134,38 @@ and `pow` here are still libm's, and move to the in-tree implementations when
 those land.
 
 **Cost, measured (one core, `-O2`, glibc `libm`).** Construction is ~2 ms per sea state,
-one-off. Evaluation is ~11 ns per component for elevation and ~20 ns for full
-kinematics, so a 576-component sea costs 6.3 µs per elevation query and 11.4 µs
-per kinematics query. That is affordable for hundreds of query points per tick
-and **not** for thousands: a 2000-panel hull wanting kinematics at 100 Hz is
-23 ms/tick on one core, against a 10 ms budget. The naive `std::cos` loop is the
-whole of it, so the work is a vectorised sincos over the component array, and a
-per-tick phase recurrence where the query point is not moving. Worth doing before
-the Froude–Krylov integration, not after.
+one-off. Evaluation is ~10–12 ns per component for elevation and ~20 ns for full
+kinematics, so a 576-component sea costs ~6 µs per elevation query.
+
+The extrapolation from that figure — "a 2000-panel hull at 100 Hz is 23 ms/tick
+against a 10 ms budget, so the work is a vectorised sincos" — was measured once
+the Froude–Krylov coupling existed, and **the number was right while the
+prescription was wrong.** The whole-tick figures for the 120 m ferry (1196
+triangles, 600 vertices) came out at 22.5 ms with the default 48×12 spectrum,
+and the wave field accounted for essentially 100% of it. But the first fix was
+not vectorisation:
+
+| | queries per buoyancy integration | ms/tick, 128 components | ms/tick, 576 |
+|---|---|---|---|
+| height evaluated per triangle corner | 3948 | 5.19 | 22.47 |
+| height evaluated per **vertex** | 960 | 2.76 | 11.87 |
+
+Euler's formula gives `tris ≈ 2·verts` on a closed mesh, so the corner form asked
+the same question about six times over. Hoisting it is arithmetically identical —
+same values, same subtraction, bit-identical results — and worth 2.1× on its own.
+Two further properties fell out of measuring rather than assuming:
+
+- **Vertical plating is free.** The integrand `F = (0, 0, z − h)` points along z,
+  so a panel with a horizontal normal carries no flux and never reaches the
+  quadrature. On this hull that is 45% of the triangles — a ship's sides, exactly
+  where a naive cost model would put the panels.
+- Fitting tick cost against component count gives ~2000 elevation queries per
+  step, against 960 for the buoyancy integral. The rest is compartment
+  free-surface queries, which is where the next reduction is if one is needed.
+
+A vectorised sincos is still worth roughly 4× on top and is the right next step
+for large spectra; it is no longer the *first* step, and 128 components now fit
+in 28% of the budget without it.
 
 **Still to build here:** the FFT-on-a-tiled-grid path for rendering (physics
 keeps the analytic sum — interpolating a rendering grid loses exactly the detail

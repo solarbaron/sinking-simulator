@@ -122,11 +122,23 @@ VolumeIntegral integrateBelowSurface(const TriMesh& mesh, HeightField&& height) 
     double volume = 0;
     Vec3 moment{};
 
+    // Evaluate the surface once per *vertex*, not once per triangle corner. On a
+    // closed mesh Euler's formula gives tris ~ 2*verts, so the corner form asks
+    // the same question about six times over -- measured at 3588 queries against
+    // 600 distinct points on the ferry hull. That matters because the surface
+    // query is not incidental: with a 128-component wave spectrum it accounts for
+    // essentially the entire tick, so removing the redundancy is worth more than
+    // vectorising what remains.
+    std::vector<double> vertexHeight(mesh.verts.size());
+    for (std::size_t i = 0; i < mesh.verts.size(); ++i)
+        vertexHeight[i] = height(mesh.verts[i].x, mesh.verts[i].y);
+
     Vec3 poly[8];
     for (const Tri& t : mesh.tris) {
         const Vec3 tri[3] = {mesh.verts[t.a], mesh.verts[t.b], mesh.verts[t.c]};
+        const double surfaceAt[3] = {vertexHeight[t.a], vertexHeight[t.b], vertexHeight[t.c]};
         double depth[3];
-        for (int i = 0; i < 3; ++i) depth[i] = tri[i].z - height(tri[i].x, tri[i].y);
+        for (int i = 0; i < 3; ++i) depth[i] = tri[i].z - surfaceAt[i];
         if (depth[0] > 0 && depth[1] > 0 && depth[2] > 0) continue;  // wholly dry
 
         int count = 0;
