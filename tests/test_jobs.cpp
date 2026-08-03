@@ -197,6 +197,95 @@ void testSingleThreadedModeWorks() {
     expectEqual("single-threaded job still runs", ran.load(), 1);
 }
 
+// --- grain auto-tuning -------------------------------------------------------
+
+// The tuner must still tile the range exactly, probe included. A probe that
+// forgets to hand its elements to the body, or hands them over twice, is the
+// obvious way to get this wrong.
+void testAutoGrainCoversRangeExactlyOnce() {
+    for (unsigned workers : {0u, 4u, 15u}) {
+        JobSystem jobs(workers);
+        constexpr std::size_t kBegin = 61, kEnd = 400061;
+        std::vector<std::atomic<int>> visits(kEnd);
+        for (auto& v : visits) v.store(0);
+
+        jobs.parallelForAuto(kBegin, kEnd, [&](std::size_t b, std::size_t e) {
+            for (std::size_t i = b; i < e; ++i) visits[i].fetch_add(1, std::memory_order_relaxed);
+        });
+
+        int wrong = 0;
+        for (std::size_t i = 0; i < kEnd; ++i)
+            if (visits[i].load() != (i >= kBegin ? 1 : 0)) ++wrong;
+        expectEqual("auto grain tiles its range, workers=" + std::to_string(workers), wrong, 0);
+    }
+}
+
+// Burn a controlled amount of time per element so the tuner has something real
+// to measure. Volatile stops it being optimised into nothing.
+inline void burn(int iterations) {
+    volatile double x = 1.0;
+    for (int i = 0; i < iterations; ++i) x = x * 1.0000001 + 0.5;
+}
+
+// The point of a tuner is that it responds to cost. Expensive elements must get
+// a smaller grain than cheap ones -- if they do not, it is not tuning, it is
+// just picking a constant.
+void testAutoGrainRespondsToElementCost() {
+    JobSystem jobs(8);
+    constexpr std::size_t kCount = 200000;
+
+    const auto cheap = jobs.parallelForAuto(0, kCount, [](std::size_t b, std::size_t e) {
+        for (std::size_t i = b; i < e; ++i) burn(1);
+    });
+    const auto expensive = jobs.parallelForAuto(0, kCount / 20, [](std::size_t b, std::size_t e) {
+        for (std::size_t i = b; i < e; ++i) burn(200);
+    });
+
+    expectTrue("cheap elements were measured as cheaper than expensive ones",
+               cheap.nsPerElement < expensive.nsPerElement);
+    expectTrue("expensive elements get a smaller grain than cheap ones",
+               expensive.grain < cheap.grain);
+    expectTrue("both runs dispatched rather than falling back to serial",
+               !cheap.ranSerially && !expensive.ranSerially);
+}
+
+// Chunk count must land inside the band the benchmark justified: enough chunks
+// per lane to balance the tail, few enough that dispatch stays negligible.
+void testAutoGrainStaysInsideItsBand() {
+    for (unsigned workers : {2u, 8u, 15u}) {
+        JobSystem jobs(workers);
+        const auto lanes = static_cast<std::size_t>(jobs.laneCount());
+        const auto result = jobs.parallelForAuto(0, 400000, [](std::size_t b, std::size_t e) {
+            for (std::size_t i = b; i < e; ++i) burn(4);
+        });
+
+        const std::string suffix = ", workers=" + std::to_string(workers);
+        expectTrue("auto grain dispatched" + suffix, !result.ranSerially && result.chunks > 0);
+        expectTrue("at least kMinChunksPerLane chunks per lane" + suffix,
+                   result.chunks >= lanes * JobSystem::kMinChunksPerLane);
+        expectTrue("at most kMaxChunksPerLane chunks per lane" + suffix,
+                   result.chunks <= lanes * JobSystem::kMaxChunksPerLane);
+        expectTrue("chunks times grain covers the remaining range" + suffix,
+                   result.chunks * result.grain >= 400000 - result.probeElements);
+    }
+}
+
+// Work too small to be worth dispatching must be run on the spot. Paying a
+// dispatch round trip to parallelise a microsecond of work is a net loss.
+void testAutoGrainRunsTinyWorkSerially() {
+    JobSystem jobs(8);
+    std::atomic<int> visited{0};
+    const auto result = jobs.parallelForAuto(0, 32, [&](std::size_t b, std::size_t e) {
+        visited.fetch_add(static_cast<int>(e - b), std::memory_order_relaxed);
+    });
+    expectTrue("a trivial range is run serially", result.ranSerially);
+    expectEqual("a serial run still visits every element", visited.load(), 32);
+    expectEqual("an empty range does nothing",
+                static_cast<long long>(jobs.parallelForAuto(5, 5, [](std::size_t, std::size_t) {
+                                            }).probeElements),
+                0);
+}
+
 }  // namespace
 
 void runJobTests() {
@@ -208,4 +297,8 @@ void runJobTests() {
     testDequeOverflowRunsEverything();
     testDeterministicReduction();
     testWorkReachesWorkers();
+    testAutoGrainCoversRangeExactlyOnce();
+    testAutoGrainRespondsToElementCost();
+    testAutoGrainStaysInsideItsBand();
+    testAutoGrainRunsTinyWorkSerially();
 }

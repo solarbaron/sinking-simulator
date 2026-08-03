@@ -112,8 +112,24 @@ Three conclusions:
 
 **Grain dominates everything else.** At a fixed worker count, the span between
 the worst and best grain is around 40×. Nothing else in the job system comes
-close to mattering that much, which is why grain auto-tuning is a Phase 1 item
-and the queue rewrite is not.
+close to mattering that much, which is why grain auto-tuning was built and the
+queue rewrite was not.
+
+`parallelForAuto()` acts on this: it probes with a geometrically growing prefix
+on the calling thread, derives cost per element, and picks a grain targeting
+10 µs chunks — clamped so the chunk count stays between 2 and 64 per lane, for
+tail balance at one end and dispatch cost at the other. The probe is real work,
+not a discarded sample. Measured against the fixed-grain sweep on the same
+workload, it matches or beats the best hand-picked grain (5.60 ms vs 6.07 ms at
+23 workers) without being told anything about the body.
+
+**Auto-grain is for `parallelFor` only, never `parallelReduce`.** The grain comes
+from a wall-clock probe, so it varies between runs; a reduction chunked that way
+would fold its partials in a different order each time and lose the bit-identical
+property that the whole determinism argument rests on. `parallelReduce` therefore
+requires an explicit grain and always will. This is the one place where the
+performance work and the determinism requirement genuinely conflict, and
+determinism wins.
 
 **The Chase-Lev revisit is cancelled, on evidence.** Uncontended dispatch is
 0.2% of a 10 µs chunk; even the worst-case contended figure is ~2.5%, and that

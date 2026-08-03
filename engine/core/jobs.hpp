@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -81,6 +82,28 @@ public:
     template <typename F>
     void parallelFor(std::size_t begin, std::size_t end, std::size_t grain, const F& body);
 
+    // What the auto-tuner decided. Returned rather than hidden so callers can
+    // see it, and so tests can assert on it instead of inferring it.
+    struct AutoGrain {
+        std::size_t grain = 0;           // chosen chunk size, 0 if run serially
+        std::size_t chunks = 0;          // dispatched chunks, excluding the probe
+        std::size_t probeElements = 0;   // elements consumed measuring the cost
+        double      nsPerElement = 0;    // measured cost
+        bool        ranSerially = false; // too little work to be worth dispatching
+    };
+
+    // parallelFor with the grain chosen from a measurement rather than from the
+    // caller's guess. `tools/job_bench` shows a ~40x swing between a bad grain
+    // and a good one, against ~0.2% from dispatch cost -- this is where the
+    // leverage is.
+    //
+    // NOT for anything whose result depends on chunk boundaries. The grain here
+    // comes from a wall-clock probe, so it varies run to run; a reduction chunked
+    // this way would fold its partials in a different order each time. That is
+    // why parallelReduce still requires an explicit grain and always will.
+    template <typename F>
+    AutoGrain parallelForAuto(std::size_t begin, std::size_t end, const F& body);
+
     // Deterministic parallel reduction. `body(chunkBegin, chunkEnd)` returns a
     // partial result per chunk; `combine(a, b)` folds two partials.
     //
@@ -93,6 +116,22 @@ public:
 
     // Execute jobs until `counter` reaches zero. Helps rather than blocks.
     void wait(Counter& counter);
+
+    // Tuning constants, all derived from tools/job_bench measurements.
+    // Efficiency plateaus around 2 us chunks, so 10 us is comfortably inside the
+    // flat region with margin for the probe being wrong.
+    static constexpr double kTargetChunkNanos = 10'000.0;
+    // Below this there is less work than a dispatch round trip is worth.
+    static constexpr double kSerialThresholdNanos = 20'000.0;
+    // Probe until the measurement is this long, so it is well clear of clock
+    // resolution rather than measuring timer noise.
+    static constexpr double kMinProbeNanos = 2'000.0;
+    // At least this many chunks per lane, or the tail of the loop is one lane
+    // working while the rest idle. The sweep shows balance degrading once chunks
+    // get very large for exactly this reason.
+    static constexpr std::size_t kMinChunksPerLane = 2;
+    // And at most this many, so a cheap body does not drown in dispatch.
+    static constexpr std::size_t kMaxChunksPerLane = 64;
 
 private:
     struct Job {
@@ -214,6 +253,64 @@ void JobSystem::parallelFor(std::size_t begin, std::size_t end, std::size_t grai
     Counter counter;
     dispatch(counter, begin, end, grain, body);
     wait(counter);
+}
+
+template <typename F>
+JobSystem::AutoGrain JobSystem::parallelForAuto(std::size_t begin, std::size_t end,
+                                                const F& body) {
+    AutoGrain result;
+    if (begin >= end) return result;
+    const std::size_t total = end - begin;
+
+    // Probe by running a growing prefix on this thread and timing it. Growing
+    // geometrically matters: a fixed probe size is either too small to measure
+    // for cheap elements, or a large serial stall for expensive ones. This way
+    // the probe costs a bounded few microseconds either way -- and it is real
+    // work, not a throwaway sample.
+    using Clock = std::chrono::steady_clock;
+    std::size_t probed = 0;
+    double elapsedNanos = 0.0;
+    std::size_t step = 1;
+    while (probed < total && elapsedNanos < kMinProbeNanos) {
+        const std::size_t take = std::min(step, total - probed);
+        const auto start = Clock::now();
+        body(begin + probed, begin + probed + take);
+        elapsedNanos +=
+            std::chrono::duration<double, std::nano>(Clock::now() - start).count();
+        probed += take;
+        step *= 4;
+    }
+
+    result.probeElements = probed;
+    result.nsPerElement = probed > 0 ? elapsedNanos / static_cast<double>(probed) : 0.0;
+
+    const std::size_t remaining = total - probed;
+    if (remaining == 0) {
+        result.ranSerially = true;
+        return result;
+    }
+
+    const double remainingNanos = result.nsPerElement * static_cast<double>(remaining);
+    if (remainingNanos < kSerialThresholdNanos) {
+        body(begin + probed, end);
+        result.ranSerially = true;
+        return result;
+    }
+
+    const auto lanes = static_cast<double>(laneCount());
+    double grain = kTargetChunkNanos / std::max(result.nsPerElement, 1e-9);
+    // Clamp so the chunk count stays inside the band that keeps both load
+    // balance and dispatch cost reasonable.
+    const double upper =
+        std::max(1.0, static_cast<double>(remaining) / (lanes * kMinChunksPerLane));
+    const double lower =
+        std::max(1.0, static_cast<double>(remaining) / (lanes * kMaxChunksPerLane));
+    grain = std::clamp(grain, lower, upper);
+
+    result.grain = std::max<std::size_t>(1, static_cast<std::size_t>(grain));
+    result.chunks = (remaining + result.grain - 1) / result.grain;
+    parallelFor(begin + probed, end, result.grain, body);
+    return result;
 }
 
 template <typename T, typename Body, typename Combine>

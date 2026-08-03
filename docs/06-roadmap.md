@@ -52,11 +52,12 @@ without.
 - ~~**Job throughput and grain-scaling benchmark**~~ **done** — `tools/job_bench`.
   Dispatch costs 17–23 ns uncontended; efficiency plateaus at ~2 µs chunks; the
   penalty for bad grain is ~40×. Numbers and caveats in `01-architecture.md` §1.
-- **Grain auto-tuning** — size chunks from a measured cost estimate rather than
-  taking the caller's number on faith. The benchmark confirms this is where the
-  leverage is: ~40× from grain against ~0.2% from dispatch. Target chunks of
-  roughly 5–20 µs, with a floor on chunk count relative to lane count, since the
-  sweep also shows balance degrading once chunks exceed ~150 µs.
+- ~~**Grain auto-tuning**~~ **done** — `parallelForAuto()` probes for cost and
+  targets 10 µs chunks, clamped to 2–64 chunks per lane. Matches or beats the
+  best hand-picked grain without being told the element cost. Restricted to
+  `parallelFor`; `parallelReduce` keeps an explicit grain because a
+  timing-derived one would break bit-identical reductions
+  (`01-architecture.md` §1).
 - ~~**Chase-Lev revisit**~~ **cancelled on evidence.** Dispatch is 0.2% of a
   10 µs chunk, and the sweep shows no dispatch-limited regime at plateau grains,
   so a faster queue has nothing to recover. Reopen only if a profile shows queue

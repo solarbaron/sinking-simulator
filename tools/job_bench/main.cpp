@@ -183,6 +183,29 @@ void measureWorkerScaling(std::size_t elements, std::size_t grain, double baseli
     }
 }
 
+// --- 3b. Does the auto-tuner land in the plateau? ----------------------------
+
+void measureAutoGrain(std::size_t elements, double baselineMs) {
+    std::printf("\n3b. Auto-tuned grain vs the sweep\n");
+    std::printf("     %8s %12s %12s %10s %12s\n", "workers", "grain", "chunks", "ms", "speedup");
+
+    for (unsigned workers : {8u, 23u}) {
+        JobSystem jobs(workers);
+        std::vector<LaneAccumulator> lanes(jobs.laneCount());
+        JobSystem::AutoGrain chosen;
+        const double ms = bestOf(3, [&] {
+            chosen = jobs.parallelForAuto(0, elements, [&](std::size_t b, std::size_t e) {
+                lanes[jobs.currentLane()].value += sumRange(b, e);
+            });
+        });
+        g_sink = lanes[0].value;
+        std::printf("     %8u %12zu %12zu %10.2f %11.2fx\n", workers, chosen.grain, chosen.chunks,
+                    ms, baselineMs / ms);
+    }
+    std::printf("     Compare against the sweep above: the tuner should land on the flat\n");
+    std::printf("     part of the curve without having been told the element cost.\n");
+}
+
 // --- 4. Correctness under all of the above -----------------------------------
 
 void checkResultsAreStable(std::size_t elements, std::size_t grain) {
@@ -235,6 +258,7 @@ int main() {
                 targetGrain);
 
     measureWorkerScaling(kElements, targetGrain, baselineMs);
+    measureAutoGrain(kElements, baselineMs);
     checkResultsAreStable(kElements, targetGrain);
 
     // What this all means for the Chase-Lev question.
