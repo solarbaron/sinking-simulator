@@ -27,6 +27,7 @@ void runEcsTests();
 void runDeviceTests();
 void runOffscreenTests();
 void runPngTests();
+void runPropulsionTests();
 void runSchedulerTests();
 void runSerialiseTests();
 void runWorldIoTests();
