@@ -508,19 +508,135 @@ compartment filling around you.
 
 ---
 
-## 7. Propulsion, manoeuvring and machinery
+## 7. Propulsion, manoeuvring and machinery — **partly implemented**
 
-- **Propellers**: open-water curves (K_T, K_Q vs J) per propeller, wake fraction
-  and thrust deduction from the hull, four-quadrant data so astern and crash-stop
-  work, cavitation inception and its thrust breakdown, and ventilation when the
-  propeller emerges in a seaway.
-- **Manoeuvring**: MMG-style modular model — hull, propeller, rudder terms
-  separately identified — rather than a monolithic derivative set, so damage to
-  one part degrades one term. Shallow water effects, bank effect, ship-to-ship
-  interaction, and current.
-- **Steering**: rudder with stall, hydraulic steering gear with real rates and
-  failure modes, azimuth thrusters, Voith-Schneider, waterjets, bow and stern
-  thrusters with their speed-dependent effectiveness loss.
+### What exists — `engine/sim/propulsion.hpp` / `.cpp`
+
+Propeller, rudder and MMG hull, identified separately so damage to one degrades
+one term. The module produces body-frame surge/sway/yaw contributions in the
+same convention as `engine/sim/ship.hpp` (+x forward, +y to port, +z up; yaw
+about +z, so positive yaw rate and positive rudder angle both mean "to port").
+It also carries a self-contained 3-DOF horizontal-plane integrator
+(`Manoeuvring`) so a turning circle can be measured without dragging in flooding
+and hydrostatics; coupling into the 6-DOF rigid body is a separate change.
+
+**Propeller.** Open-water K_T and K_Q from a single equivalent blade section at
+0.7R, evaluated over all four quadrants of (advance speed, shaft speed) as one
+expression rather than four cases. Wake fraction (Va = u(1−w)) and thrust
+deduction ((1−t)T) are explicit. The four-quadrant behaviour is structural, not
+tuned: astern rotation in ahead flow gives astern thrust because the section
+angle of attack says so, so a crash stop cannot produce forward thrust.
+
+The choice of a blade-element form over the Wageningen B-series regression is
+deliberate. The regression is 39 terms for K_T and 47 for 10 K_Q, is
+first-quadrant only, says nothing about astern rotation, and a single
+mis-transcribed coefficient produces a curve that looks entirely plausible and
+is wrong. The blade-element form instead makes the invariants algebraic:
+`eta = J·K_T/(2π·K_Q) = tan(β)·(L cos β − D sin β)/(L sin β + D cos β)`, which is
+identically 1 at zero section drag and strictly below 1 for any positive drag —
+so the efficiency ceiling is a property of the algebra, not of the coefficients.
+
+**Rudder.** Fujii's normal force `F_N = ½ρA_R f_α U_R² sin α_R` with
+`f_α = 6.13Λ/(Λ+2.25)`, the inflow speed and angle taken inside the propeller
+race, and the hull-interaction factors (1−t_R), (1+a_H) and the effective lever
+x_R + a_H·x_H applied to surge, sway and yaw respectively. Past the stall angle
+the normal force falls away from the linear extrapolation towards the
+finite-aspect-ratio broadside value instead of growing without bound. The race
+term is written as `u_P(1−κ) + κ√(u_P² + 8K_T n²D²/π)` rather than the usual
+`u_P(1 + κ(√(1 + 8K_T/(πJ²)) − 1))`; the two are identical for J > 0 and only
+the first is finite at bollard pull, which is the condition a tug lives in.
+
+**Hull.** The MMG standard-method polynomial (surge with R_0, X_vv, X_vr, X_rr,
+X_vvvv; sway and yaw with the full cubic set), written in the form where the
+reference speed U divides out term by term — the raw non-dimensional form has
+v′⁴ and r′³ terms that are singular at U = 0 and this one is bounded there. The
+published derivatives are identified in a frame with y and r to starboard; they
+carry into this frame's port-positive convention unchanged because every term is
+odd under the joint flip (v, r, Y, N) → (−v, −r, −Y, −N), which is asserted in
+`tests/test_propulsion.cpp` rather than assumed.
+
+**Measured behaviour** (KVLCC2 defaults, 15.5 kn approach, 111 rpm):
+
+| quantity | model | published / expected |
+|---|---|---|
+| bollard K_T, P/D = 1.0, A_E/A_0 = 0.70 | 0.347 | ≈ 0.35 (B4-70) |
+| bollard 10 K_Q, same | 0.493 | ≈ 0.48 (B4-70) |
+| zero-thrust advance ratio | 0.849 | ≈ 0.85 (B4-70) |
+| peak open-water efficiency | 0.672 at J = 0.710 | ≈ 0.66 at J ≈ 0.68 |
+| steady turning radius, 35° rudder | 1.13 L (360 m) | ≈ 1.1 L |
+| drift angle at 35° | 19.4° | ≈ 17–20° |
+| speed retained at 35° | 41 % | ≈ 40 % |
+| steady turning radius, 20° / 10° | 1.76 L / 2.73 L | — |
+
+### Which coefficients are real and which are placeholders
+
+**Published, and used as published.** Fujii's `f_α = 6.13Λ/(Λ+2.25)`. The MMG
+hull, propeller-hull and rudder-hull interaction structure and its KVLCC2
+coefficient set (R_0′, the X/Y/N derivative polynomial, m_x′, m_y′, J_z′, w_P,
+t_P, t_R, a_H, x_H′, l_R′, ε, κ) and the KVLCC2 principal particulars. **These
+were transcribed from the MMG standard-method literature and have not been
+checked against a primary source in this worktree** — the turning-circle and
+drift-angle agreement above is evidence the set is at least self-consistent, but
+treat any individual number as unverified until someone opens the paper.
+
+**Calibration, not measurement.** Every free constant of the blade-section
+model: `pitchEffectiveness` 0.853, `sectionLiftSlope` 4.0,
+`sectionNormalForceMax` 1.4, `sectionDragCoeff` 0.018, `solidity` 0.194,
+`solidityExponent` 0.2. They were fitted so the first-quadrant curve reproduces
+the published B4-70 magnitudes in the table above; the fit is good but it is a
+fit, and the propeller is not a specific propeller. The rudder stall constants
+(`stallAngle` 30°, `postStallWidth` 20°, `postStallDrop` 0.25,
+`broadsideCoeff` 1.20) are engineering judgement in the right range, not
+identified data. `flowStraightening` is a single value (0.5) where the KVLCC2
+identification lists 0.395 and 0.640 for the two signs of the rudder drift
+angle; that asymmetry comes from single-screw propeller rotation, is not
+otherwise modelled here, and using it would make port and starboard turns
+differ for reasons the rest of the model cannot explain.
+
+**Per-ship identification is the eventual answer.** These defaults exist so the
+module has something to be tested against, not because a ferry is a VLCC.
+
+### Validity limits
+
+- **Deep water, no waves, no current, no bank.** Shallow-water, bank and
+  ship-to-ship interaction are all unmodelled and all matter in the places
+  ships actually manoeuvre.
+- **Horizontal plane only.** No heel-induced hydrodynamic terms, so the heel a
+  ship takes in a hard turn (and the sway/yaw coupling that follows) is absent.
+- **Astern thrust is exactly the mirror of ahead thrust** at zero advance. Real
+  propellers make roughly 70 % astern because the sections are not symmetric.
+  The model's symmetry is a clean, testable idealisation and is optimistic.
+- **Crash-stop distances are optimistic** for a second reason: with no engine
+  model the shaft reverses instantly and delivers full torque astern. The
+  measured head reach of 3.0 L is a fraction of a real VLCC's 8–15 L. This is
+  the prime-mover item below, not a propeller problem.
+- **No cavitation, no ventilation, no propeller emergence.** The propeller is
+  assumed fully submerged in solid water at all times.
+- **The blade-section model is a one-radius approximation.** It has no blade
+  count dependence at all, and only a weak, calibrated dependence on blade area
+  ratio; radial load distribution, skew and rake do not appear.
+- **The MMG polynomial is a fit within its identification range.** Non-dimensional
+  yaw rate r′ = rL/U is clamped at 1.5 (`kMaxYawRatio`) before the polynomial is
+  evaluated. A hard-over turn reaches about 0.89, so the clamp is inactive in
+  normal manoeuvring — it exists so a near-stationary spinning ship produces
+  something bounded rather than a confident extrapolation. Low-speed and
+  pure-rotation manoeuvring needs a different model.
+- **The rudder race model assumes the rudder is downstream of the propeller.**
+  Going astern the augmentation is switched off and the rudder sees the bare
+  wake, which is the right sign but not a real astern-flow steering model.
+
+### Still to build
+
+- **Propellers**: cavitation inception and its thrust breakdown, ventilation
+  when the propeller emerges in a seaway, per-ship open-water curves (either
+  measured tables or a verified B-series regression) instead of one calibrated
+  section model.
+- **Manoeuvring**: shallow water effects, bank effect, ship-to-ship interaction,
+  current, and the heel coupling. Coupling the module's forces into the 6-DOF
+  rigid body in `engine/sim/ship.cpp`.
+- **Steering**: hydraulic steering gear with real rates and failure modes,
+  azimuth thrusters, Voith-Schneider, waterjets, bow and stern thrusters with
+  their speed-dependent effectiveness loss.
 - **Prime movers**: diesel engine model with turbocharger lag, fuel rack, governor,
   cooling and lubrication circuits, and the failure modes that follow when those
   circuits are damaged or flooded. Steam plant (boiler, turbine, condenser) for

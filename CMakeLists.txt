@@ -34,6 +34,7 @@ add_library(shipsim_engine
   engine/core/scheduler.cpp
   engine/core/serialise.cpp
   engine/sim/ship.cpp
+  engine/sim/propulsion.cpp
   engine/sim/fem.cpp
   engine/sim/roll_damping.cpp
   engine/sim/waves.cpp
@@ -65,6 +66,7 @@ add_executable(shipsim_tests
   tests/test_core.cpp
   tests/test_ecs.cpp
   tests/test_png.cpp
+  tests/test_propulsion.cpp
   tests/test_roll_damping.cpp
   tests/test_scheduler.cpp
   tests/test_serialise.cpp

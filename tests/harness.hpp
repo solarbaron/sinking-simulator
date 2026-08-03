@@ -27,6 +27,7 @@ void runEcsTests();
 void runDeviceTests();
 void runOffscreenTests();
 void runPngTests();
+void runPropulsionTests();
 void runRollDampingTests();
 void runSchedulerTests();
 void runSerialiseTests();
