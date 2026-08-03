@@ -375,6 +375,27 @@ same thread", so the device tests sit out the TSan build specifically; jobs,
 arenas and the scheduler still run under it, which is where the concurrency
 actually is.
 
+### Camera conventions
+
+`Mat4`, `lookAt()` and `perspective()` in `engine/core/math.hpp` are column-major
+to match GLSL's layout, so a matrix pushes straight to a shader with no
+transpose.
+
+`perspective()` targets **Vulkan** clip space specifically: x and y in [-1, 1]
+with **y pointing down**, and **z in [0, 1]** rather than OpenGL's [-1, 1]. Both
+conventions are worth stating because getting either wrong produces an image that
+looks almost right — a Y axis flipped for OpenGL renders vertically mirrored,
+which is invisible on a symmetric scene, and an OpenGL depth range on Vulkan
+hardware silently uses half the depth buffer, which shows up much later as
+z-fighting nobody can explain.
+
+These are tested against closed forms rather than by inspection, because the
+whole point of having them is that every rendering assertion downstream can be
+stated as "this world point lands on that pixel": at 90° vertical field of view
+and ten units of depth, the top of the frustum is exactly ten units up, so
+`(0, 10, 0)` must land on pixel row zero. A point behind the eye is reported as
+unprojectable rather than wrapping round to a plausible-looking pixel.
+
 ### Offscreen verification harness
 
 Rendering is verified by drawing to an image, writing a PNG, reading it back and

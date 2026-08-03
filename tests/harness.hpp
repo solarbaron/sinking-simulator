@@ -19,6 +19,7 @@ int failureCount();
 }  // namespace testing
 
 // Each suite lives in its own translation unit and is called from tests/main.cpp.
+void runCameraTests();
 void runCoreTests();
 void runJobTests();
 void runArenaTests();

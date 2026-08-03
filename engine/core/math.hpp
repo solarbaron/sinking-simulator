@@ -125,6 +125,83 @@ inline Mat3 pointInertia(double m, const Vec3& r) {
     return I;
 }
 
+// Column-major 4x4, matching GLSL's mat4 memory layout so a matrix can be pushed
+// straight to a shader with no transpose. m[column * 4 + row].
+struct Mat4 {
+    std::array<double, 16> m{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+    constexpr double& operator()(int row, int column) { return m[column * 4 + row]; }
+    constexpr double  operator()(int row, int column) const { return m[column * 4 + row]; }
+
+    static constexpr Mat4 identity() { return {}; }
+
+    constexpr Mat4 operator*(const Mat4& other) const {
+        Mat4 result;
+        for (int c = 0; c < 4; ++c)
+            for (int r = 0; r < 4; ++r) {
+                double sum = 0;
+                for (int k = 0; k < 4; ++k) sum += (*this)(r, k) * other(k, c);
+                result(r, c) = sum;
+            }
+        return result;
+    }
+
+    // Full homogeneous transform, returning w alongside so callers can do the
+    // perspective divide themselves and detect points behind the eye.
+    constexpr void transform(const Vec3& point, double out[4]) const {
+        for (int r = 0; r < 4; ++r)
+            out[r] = (*this)(r, 0) * point.x + (*this)(r, 1) * point.y +
+                     (*this)(r, 2) * point.z + (*this)(r, 3);
+    }
+
+    void toFloats(float out[16]) const {
+        for (int i = 0; i < 16; ++i) out[i] = static_cast<float>(m[i]);
+    }
+};
+
+// Right-handed view matrix: the camera sits at `eye` looking toward `target`.
+inline Mat4 lookAt(const Vec3& eye, const Vec3& target, const Vec3& up) {
+    const Vec3 forward = normalize(target - eye);
+    const Vec3 right = normalize(cross(forward, up));
+    const Vec3 trueUp = cross(right, forward);
+
+    Mat4 view;
+    view(0, 0) = right.x;   view(0, 1) = right.y;   view(0, 2) = right.z;
+    view(1, 0) = trueUp.x;  view(1, 1) = trueUp.y;  view(1, 2) = trueUp.z;
+    view(2, 0) = -forward.x; view(2, 1) = -forward.y; view(2, 2) = -forward.z;
+    view(0, 3) = -dot(right, eye);
+    view(1, 3) = -dot(trueUp, eye);
+    view(2, 3) = dot(forward, eye);
+    view(3, 0) = 0; view(3, 1) = 0; view(3, 2) = 0; view(3, 3) = 1;
+    return view;
+}
+
+// Perspective projection into **Vulkan** clip space: x and y in [-1, 1] with y
+// pointing *down* the screen, and z in [0, 1] rather than OpenGL's [-1, 1].
+// Getting either convention wrong renders a vertically mirrored image or a depth
+// buffer that only uses half its range -- both of which look almost right.
+inline Mat4 perspective(double fovYRadians, double aspect, double nearPlane, double farPlane) {
+    const double f = 1.0 / std::tan(fovYRadians * 0.5);
+    Mat4 projection;
+    projection.m.fill(0.0);
+    projection(0, 0) = f / aspect;
+    projection(1, 1) = -f;  // Vulkan's y axis points down
+    projection(2, 2) = farPlane / (nearPlane - farPlane);
+    projection(2, 3) = nearPlane * farPlane / (nearPlane - farPlane);
+    projection(3, 2) = -1.0;
+    return projection;
+}
+
+// Clip-space position to pixel coordinates, doing the perspective divide.
+// Returns false for points at or behind the eye, where the divide is meaningless.
+inline bool clipToPixel(const double clip[4], double width, double height, double& outX,
+                        double& outY) {
+    if (clip[3] <= 1e-12) return false;
+    outX = (clip[0] / clip[3] * 0.5 + 0.5) * width;
+    outY = (clip[1] / clip[3] * 0.5 + 0.5) * height;
+    return true;
+}
+
 struct Quat {
     double w = 1, x = 0, y = 0, z = 0;
 

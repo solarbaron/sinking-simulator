@@ -20,6 +20,7 @@ extern "C" const char* __lsan_default_suppressions() {
 
 int main() {
     std::printf("shipsim validation\n");
+    runCameraTests();
     runCoreTests();
     runJobTests();
     runArenaTests();

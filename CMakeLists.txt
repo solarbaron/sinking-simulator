@@ -59,6 +59,7 @@ add_executable(shipsim_tests
   tests/main.cpp
   tests/harness.cpp
   tests/test_arena.cpp
+  tests/test_camera.cpp
   tests/test_core.cpp
   tests/test_ecs.cpp
   tests/test_png.cpp
