@@ -23,4 +23,5 @@ void runCoreTests();
 void runJobTests();
 void runArenaTests();
 void runEcsTests();
+void runSchedulerTests();
 void runSerialiseTests();

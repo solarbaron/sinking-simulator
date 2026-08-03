@@ -258,6 +258,26 @@ has a stable step around 1.5 µs, which is ~700 substeps per 1 ms of sim time. T
 is why the damage zone is spatially adaptive and time-boxed rather than always-on
 (see `02-simulation.md` §3).
 
+Implemented in `engine/core/scheduler.cpp`. Each system declares a rate in
+simulation time, a dilation band it can honour, and a catch-up ceiling; systems
+declare prerequisites and the scheduler derives dependency levels, running
+everything within a level in parallel on the job system.
+
+**Simulation time is accumulated in integer nanoseconds.** Floating point is used
+exactly once per advance, converting the wall delta; every step-count decision
+after that is integer division. This is not fastidiousness — the first version
+accumulated seconds in a `double`, and 600 advances of 1/60 s summed to fractionally
+under 10 s, so a 100 Hz system ran 999 times instead of 1000. Over a forty-minute
+flooding casualty, let alone a campaign, that drift compounds and makes the
+schedule depend on how the frame times happened to be sliced. With an integer
+clock the remainder carries exactly and a given sequence of advances produces the
+same schedule on any platform, however long it runs.
+
+Two related properties fall out and are tested: step counts for the whole frame
+are decided *before* any system runs, so a system that overran cannot change how
+often its neighbours update; and the catch-up ceiling discards its surplus rather
+than carrying it, since carrying it only guarantees the same overrun next frame.
+
 ### Time dilation as a first-class feature
 
 A structural failure worth watching happens over 50 ms. Flooding worth watching

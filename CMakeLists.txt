@@ -30,6 +30,7 @@ add_library(shipsim_engine
   engine/core/ecs.cpp
   engine/core/geometry.cpp
   engine/core/jobs.cpp
+  engine/core/scheduler.cpp
   engine/core/serialise.cpp
   engine/sim/ship.cpp
   engine/sim/fem.cpp
@@ -59,6 +60,7 @@ add_executable(shipsim_tests
   tests/test_arena.cpp
   tests/test_core.cpp
   tests/test_ecs.cpp
+  tests/test_scheduler.cpp
   tests/test_serialise.cpp
   tests/test_jobs.cpp
 )

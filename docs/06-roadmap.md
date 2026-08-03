@@ -68,9 +68,11 @@ without.
   schema-tolerant save format, and stable name-derived component ids so
   archetype ordering no longer depends on registration order
   (`01-architecture.md` §2). Save/load of a whole World still to come. across builds
-- Multi-rate scheduler with time dilation — continuation-style, so the steady
-  state never calls `wait()`; this is what makes fibers unnecessary rather than
-  merely deferred (`01-architecture.md` §1)
+- ~~**Multi-rate scheduler with time dilation**~~ **done** — per-system rates in
+  simulation time, dilation bands that gate solvers a fast-forward cannot
+  afford, catch-up ceilings, dependency levels run in parallel, and an integer
+  nanosecond clock so the schedule never drifts (`01-architecture.md` §3)
+- World save/load built on the serialiser
 - Vulkan device, render graph, bindless setup, a debug renderer
 - **Milestone:** watch the current ferry scenario in 3D, in real time, with a
   free camera and a wireframe of the flooding compartments.
