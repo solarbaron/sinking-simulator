@@ -37,7 +37,7 @@ Mat3 boxInertia(double m, const Vec3& e) {
 // Setup
 // ---------------------------------------------------------------------------
 
-void Ship::initialise(double seaLevel) {
+void Ship::initialise(const Sea& sea) {
     boundingBox(hull, hullLo, hullHi);
 
     for (Compartment& c : compartments) {
@@ -52,10 +52,10 @@ void Ship::initialise(double seaLevel) {
     // Drop the hull to its floating waterline before the first tick, so the sim
     // does not open with a large transient heave.
     state.position.z = 0;
-    updateInternalFreeSurfaces(seaLevel);
+    updateInternalFreeSurfaces(sea);
     const MassProperties mp = massProperties();
-    state.position.z = equilibriumDraftAt(state.orientation, seaLevel, mp.mass);
-    updateInternalFreeSurfaces(seaLevel);
+    state.position.z = equilibriumDraftAt(state.orientation, sea, mp.mass);
+    updateInternalFreeSurfaces(sea);
 }
 
 std::vector<std::string> Ship::validate() const {
@@ -116,8 +116,8 @@ double Ship::totalFloodwaterMass() const {
 // Free surfaces
 // ---------------------------------------------------------------------------
 
-void Ship::updateInternalFreeSurfaces(double seaLevel) {
-    (void)seaLevel;
+void Ship::updateInternalFreeSurfaces(const Sea& sea) {
+    (void)sea;
     const Mat3 R = state.orientation.toMat3();
     const Vec3 up = bodyFrameUp(R);
 
@@ -163,10 +163,15 @@ void Ship::updateInternalFreeSurfaces(double seaLevel) {
     }
 }
 
-Ship::SideState Ship::sideStateAt(int idx, const Vec3& worldPos, double seaLevel) const {
+Ship::SideState Ship::sideStateAt(int idx, const Vec3& worldPos, const Sea& sea) const {
     if (idx == kSea) {
-        if (worldPos.z < seaLevel)
-            return {kPatm + seaDensity * kGravity * (seaLevel - worldPos.z), true};
+        // The head at an opening is measured to the *local* free surface, not to
+        // the still-water level: a breach under a crest floods faster than the
+        // same breach under a trough, and that difference is a large part of why
+        // damage in a seaway is worse than damage alongside.
+        const double surface = sea.heightAt(worldPos.x, worldPos.y);
+        if (worldPos.z < surface)
+            return {kPatm + seaDensity * kGravity * (surface - worldPos.z), true};
         return {kPatm, false};
     }
     const Compartment& c = compartments[static_cast<std::size_t>(idx)];
@@ -179,7 +184,7 @@ Ship::SideState Ship::sideStateAt(int idx, const Vec3& worldPos, double seaLevel
 // Orifice network
 // ---------------------------------------------------------------------------
 
-void Ship::solveFlowNetwork(double dt, double seaLevel) {
+void Ship::solveFlowNetwork(double dt, const Sea& sea) {
     const Mat3 R = state.orientation.toMat3();
     const auto n = compartments.size();
 
@@ -203,8 +208,8 @@ void Ship::solveFlowNetwork(double dt, double seaLevel) {
         if (!o.open || o.area <= 0) continue;
 
         const Vec3 worldPos = R * o.pos + state.position;
-        const SideState sa = sideStateAt(o.a, worldPos, seaLevel);
-        const SideState sb = sideStateAt(o.b, worldPos, seaLevel);
+        const SideState sa = sideStateAt(o.a, worldPos, sea);
+        const SideState sb = sideStateAt(o.b, worldPos, sea);
 
         const double dp = sa.pressure - sb.pressure;
         if (std::abs(dp) < 1e-3) continue;  // below the noise floor of the solve
@@ -267,7 +272,7 @@ void Ship::solveFlowNetwork(double dt, double seaLevel) {
         Compartment& c = compartments[static_cast<std::size_t>(p.compartment)];
         // Centrifugal pumps lose output as discharge head rises; overboard discharge
         // means lifting from the compartment's water surface to the sea surface.
-        const double head = std::max(0.0, seaLevel - c.surfaceWorldZ);
+        const double head = std::max(0.0, sea.level - c.surfaceWorldZ);
         const double efficiency = std::clamp(1.0 - head / std::max(p.maxHead, 1e-6), 0.0, 1.0);
         const double q = p.capacity * efficiency;
         const double dv = std::min(q * dt, std::max(c.waterVolume + dWater[p.compartment], 0.0));
@@ -324,24 +329,42 @@ Ship::MassProperties Ship::massProperties() const {
 // Rigid body
 // ---------------------------------------------------------------------------
 
-double Ship::equilibriumDraftAt(const Quat& orientation, double seaLevel,
+double Ship::equilibriumDraftAt(const Quat& orientation, const Sea& sea,
                                 double targetMass) const {
     const Vec3 up = bodyFrameUp(orientation.toMat3());
     const double offset =
         solvePlaneOffsetForVolume(hull, up, targetMass / seaDensity, -kInf, kInf);
     // world_z(x) = dot(up, x) + position.z, so the surface sits at offset + position.z.
-    return seaLevel - offset;
+    return sea.level - offset;
 }
 
-void Ship::integrateRigidBody(double dt, double seaLevel) {
+void Ship::integrateRigidBody(double dt, const Sea& sea) {
     const Mat3 R = state.orientation.toMat3();
     const Vec3 up = bodyFrameUp(R);
-    const double planeOffset = seaLevel - state.position.z;
+    const double planeOffset = sea.level - state.position.z;
 
     const PlaneSweep hullSweep(hull, up);
-    const VolumeIntegral sub = hullSweep.below(planeOffset);
     const MassProperties mp = massProperties();
     const Vec3 cogWorld = R * mp.cog + state.position;
+
+    // Buoyancy. Flat water is clipped by a single plane in the body frame, which
+    // is exact and cheap. A wave field is not a plane and is a function of world
+    // x and y, so the hull has to be carried into world coordinates and
+    // integrated against the surface itself -- this is the nonlinear
+    // Froude-Krylov restoring force, evaluated over the instantaneous wetted
+    // surface rather than about a mean waterline.
+    VolumeIntegral sub;
+    Vec3 cbWorld;
+    if (sea.flat()) {
+        sub = hullSweep.below(planeOffset);
+        cbWorld = R * sub.centroid + state.position;
+    } else {
+        worldHullScratch_ = hull;
+        for (Vec3& v : worldHullScratch_.verts) v = R * v + state.position;
+        sub = integrateBelowSurface(worldHullScratch_,
+                                    [&](double x, double y) { return sea.heightAt(x, y); });
+        cbWorld = sub.centroid;  // already world, no transform needed
+    }
 
     Vec3 force{0, 0, -mp.mass * kGravity};
     Vec3 torque{0, 0, 0};  // about cogWorld
@@ -349,7 +372,6 @@ void Ship::integrateRigidBody(double dt, double seaLevel) {
     Vec3 buoyancy{0, 0, 0};
     if (sub.volume > 0) {
         buoyancy = Vec3{0, 0, seaDensity * kGravity * sub.volume};
-        const Vec3 cbWorld = R * sub.centroid + state.position;
         force += buoyancy;
         torque += cross(cbWorld - cogWorld, buoyancy);
     }
@@ -404,7 +426,7 @@ void Ship::integrateRigidBody(double dt, double seaLevel) {
 
     // Quadratic drag on the projected areas of the box around the hull.
     const Vec3 ext = hullHi - hullLo;
-    const double draft = std::max(0.1, seaLevel - (state.position.z + hullLo.z));
+    const double draft = std::max(0.1, sea.level - (state.position.z + hullLo.z));
     const Vec3 projArea{ext.y * draft, ext.x * draft, ext.x * ext.y};
     const Vec3 dragCoeff{0.10, 1.00, 1.50};
 
@@ -430,21 +452,21 @@ void Ship::integrateRigidBody(double dt, double seaLevel) {
     state.orientation = state.orientation.integrated(state.angularVelocity, dt);
 }
 
-void Ship::step(double dt, double seaLevel) {
-    updateInternalFreeSurfaces(seaLevel);
-    solveFlowNetwork(dt, seaLevel);
-    updateInternalFreeSurfaces(seaLevel);
-    integrateRigidBody(dt, seaLevel);
+void Ship::step(double dt, const Sea& sea) {
+    updateInternalFreeSurfaces(sea);
+    solveFlowNetwork(dt, sea);
+    updateInternalFreeSurfaces(sea);
+    integrateRigidBody(dt, sea);
 }
 
 // ---------------------------------------------------------------------------
 // Stability analysis
 // ---------------------------------------------------------------------------
 
-double Ship::rightingArmAtHeel(double heelRad, double seaLevel) const {
+double Ship::rightingArmAtHeel(double heelRad, const Sea& sea) const {
     // GZ depends only on hull form and mass distribution, not on where the sea
     // surface happens to sit in world coordinates.
-    (void)seaLevel;
+    (void)sea;
     // Positive heel puts starboard (-y) down.
     const Quat q = Quat::fromAxisAngle(Vec3{1, 0, 0}, heelRad);
     const Mat3 R = q.toMat3();
@@ -477,13 +499,29 @@ double Ship::rightingArmAtHeel(double heelRad, double seaLevel) const {
     return -(bWorld.y - gWorld.y);
 }
 
-Diagnostics Ship::diagnostics(double seaLevel) const {
+Diagnostics Ship::diagnostics(const Sea& sea) const {
     Diagnostics d;
     const Mat3 R = state.orientation.toMat3();
     const Vec3 up = bodyFrameUp(R);
-    const double planeOffset = seaLevel - state.position.z;
+    const double planeOffset = sea.level - state.position.z;
 
-    const VolumeIntegral sub = integrateBelowPlane(hull, up, planeOffset);
+    // Displacement follows the actual free surface, so a ship on a crest reads a
+    // larger displaced volume than the same ship in a trough. The stability
+    // figures below deliberately stay still-water: GZ and GM are defined about a
+    // mean waterline, and quoting a "GM in waves" would be inventing a quantity
+    // naval architecture does not have.
+    VolumeIntegral sub;
+    if (sea.flat()) {
+        sub = integrateBelowPlane(hull, up, planeOffset);
+    } else {
+        TriMesh worldHull = hull;
+        for (Vec3& v : worldHull.verts) v = R * v + state.position;
+        const VolumeIntegral world = integrateBelowSurface(
+            worldHull, [&](double x, double y) { return sea.heightAt(x, y); });
+        sub.volume = world.volume;
+        // Report the centre of buoyancy in the body frame, as the flat path does.
+        sub.centroid = R.transposed() * (world.centroid - state.position);
+    }
     const MassProperties mp = massProperties();
 
     d.buoyantVolume = sub.volume;
@@ -494,7 +532,7 @@ Diagnostics Ship::diagnostics(double seaLevel) const {
     heelTrimFromRotation(R, d.heelDeg, d.trimDeg);
     d.heelDeg *= kRadToDeg;
     d.trimDeg *= kRadToDeg;
-    d.draftMidship = seaLevel - (state.position.z + hullLo.z);
+    d.draftMidship = sea.level - (state.position.z + hullLo.z);
 
     const double h = 0.05;
     d.waterplaneArea = (integrateBelowPlane(hull, up, planeOffset + h).volume -
@@ -502,9 +540,9 @@ Diagnostics Ship::diagnostics(double seaLevel) const {
 
     double heelRad = 0, trimRad = 0;
     heelTrimFromRotation(R, heelRad, trimRad);
-    d.gzRighting = rightingArmAtHeel(heelRad, seaLevel);
+    d.gzRighting = rightingArmAtHeel(heelRad, sea);
     const double eps = 0.03;
-    d.gmTransverse = (rightingArmAtHeel(eps, seaLevel) - rightingArmAtHeel(-eps, seaLevel))
+    d.gmTransverse = (rightingArmAtHeel(eps, sea) - rightingArmAtHeel(-eps, sea))
                      / (2 * eps);
 
     // Lowest point of the weather deck edge relative to the sea.
@@ -512,7 +550,7 @@ Diagnostics Ship::diagnostics(double seaLevel) const {
     for (const Vec3& v : hull.verts) {
         if (v.z < deckEdgeZ - 1e-6) continue;
         const double wz = dot(up, v) + state.position.z;
-        minFreeboard = std::min(minFreeboard, wz - seaLevel);
+        minFreeboard = std::min(minFreeboard, wz - sea.level);
     }
     d.freeboardMin = std::isfinite(minFreeboard) ? minFreeboard : 0.0;
 

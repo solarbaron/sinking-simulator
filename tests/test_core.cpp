@@ -5,6 +5,7 @@
 // as these integrals, so they get checked against algebra rather than eyeballed.
 #include "engine/core/geometry.hpp"
 #include "engine/sim/ship.hpp"
+#include "engine/sim/waves.hpp"
 #include "harness.hpp"
 
 #include <cstdio>
@@ -286,6 +287,217 @@ void testWavySurfaceIsNotSecretlyFlat() {
                integrate(hull).volume, 1e-6 * integrate(hull).volume);
 }
 
+// --- Ships in waves ----------------------------------------------------------
+
+namespace {
+
+// A plain box barge, so every hydrostatic quantity has a closed form -- but
+// tessellated along its length rather than built from makeBox().
+//
+// This is not cosmetic. makeBox() gives two triangles per face, and a single
+// 60 m panel under a wave shorter than itself picks up a *phase-dependent*
+// buoyancy error of around 6% of displacement, sign and all. Under-tessellation
+// does not merely blur the answer, it invents or destroys displacement, and the
+// error would ride silently through every seakeeping result. See
+// testHullMustResolveTheWavelength below.
+Ship makeBarge(int lengthDivisions = 24) {
+    Ship s;
+    std::vector<Station> stations;
+    for (int i = 0; i <= lengthDivisions; ++i) {
+        Station station;
+        station.x = -30.0 + 60.0 * i / lengthDivisions;
+        station.halfBeam = {8.0, 8.0};
+        stations.push_back(station);
+    }
+    s.hull = makeHullFromStations(stations, {0.0, 12.0});
+    s.deckEdgeZ = 12.0;
+    s.lightshipMass = 60.0 * 16.0 * 4.0 * kRhoSeawater;  // floats at 4 m
+    s.lightshipCog = {0, 0, 5.0};
+    s.gyradii = {5.0, 16.0, 16.0};
+    return s;
+}
+
+// A single-component sea of known amplitude and wavelength. Phase is seeded, so
+// the caller finds a crest by scanning time rather than by assuming one.
+SeaState oneWave(double waveHeight, double wavelength) {
+    SeaState state;
+    state.significantHeight = waveHeight;
+    // Deep-water dispersion: lambda = g T^2 / (2 pi).
+    state.peakPeriod = std::sqrt(2.0 * kPi * wavelength / kGravity);
+    state.frequencyCount = 1;
+    state.directionCount = 1;
+    state.spreadingExponent = 1e6;  // long-crested
+    state.meanDirection = 0.0;      // travelling along +x
+    state.seed = 20240607;
+    return state;
+}
+
+// Time at which the surface at the origin is highest / lowest, found by scan.
+void findCrestAndTrough(const WaveField& field, double period, double& crest,
+                        double& trough) {
+    double best = -1e30, worst = 1e30;
+    for (int i = 0; i < 720; ++i) {
+        const double t = period * i / 720.0;
+        const double e = field.elevation(0, 0, t);
+        if (e > best) { best = e; crest = t; }
+        if (e < worst) { worst = e; trough = t; }
+    }
+}
+
+void settle(Ship& ship, const Sea& sea, int steps) {
+    for (int i = 0; i < steps; ++i) ship.step(0.02, sea);
+}
+
+}  // namespace
+
+// A wave field of zero height must reproduce still water exactly. This is the
+// load-bearing check: it drives the wavy code path -- world-space hull,
+// integrateBelowSurface, per-quadrature height evaluation -- against an answer
+// the flat path already computes a completely different way.
+void testZeroAmplitudeWaveFieldMatchesFlatWater() {
+    const SeaState calm = oneWave(0.0, 200.0);
+    const WaveField field(calm);
+
+    Ship flat = makeBarge();
+    flat.initialise(0.0);
+    Ship wavy = makeBarge();
+    wavy.initialise(0.0);
+
+    Sea sea;
+    sea.waves = &field;
+    sea.level = 0.0;
+
+    settle(flat, 0.0, 1500);
+    settle(wavy, sea, 1500);
+
+    expectNear("a zero-amplitude wave field floats the ship at the still-water draft",
+               wavy.diagnostics(sea).draftMidship, flat.diagnostics(0.0).draftMidship, 1e-4);
+    expectNear("and gives the same displaced volume",
+               wavy.diagnostics(sea).buoyantVolume, flat.diagnostics(0.0).buoyantVolume,
+               1e-3 * flat.diagnostics(0.0).buoyantVolume);
+    expectTrue("and leaves the ship upright",
+               std::abs(wavy.diagnostics(sea).heelDeg) < 0.05);
+}
+
+// Held at a fixed position, a hull under a crest must displace more water than
+// the same hull under a trough. If it does not, the height field is being
+// ignored somewhere between the Sea and the integral.
+void testCrestDisplacesMoreThanTrough() {
+    const SeaState state = oneWave(4.0, 300.0);
+    const WaveField field(state);
+    double crest = 0, trough = 0;
+    findCrestAndTrough(field, state.peakPeriod, crest, trough);
+
+    Ship ship = makeBarge();
+    ship.initialise(0.0);
+
+    Sea atCrest;
+    atCrest.waves = &field;
+    atCrest.time = crest;
+    Sea atTrough = atCrest;
+    atTrough.time = trough;
+
+    const double crestVolume = ship.diagnostics(atCrest).buoyantVolume;
+    const double troughVolume = ship.diagnostics(atTrough).buoyantVolume;
+    const double still = ship.diagnostics(0.0).buoyantVolume;
+
+    expectTrue("a crest displaces more than still water", crestVolume > still);
+    expectTrue("a trough displaces less than still water", troughVolume < still);
+
+    // Closed form: over a 300 m wave the 60 m barge is nearly under a uniform
+    // elevation, so the extra displacement is close to waterplane area times the
+    // local surface rise. Within 20%, which is the wave's curvature over the hull.
+    const double area = 60.0 * 16.0;
+    const double rise = field.elevation(0, 0, crest);
+    expectNear("the extra displacement is the waterplane area times the surface rise",
+               crestVolume - still, area * rise, 0.20 * area * rise);
+}
+
+// A wave far longer than the ship is locally a slowly tilting flat surface, so
+// the ship contours it: at equilibrium it sits a full wave amplitude higher on a
+// crest than in still water. A wave far shorter than the ship averages out along
+// the hull and barely moves it. Getting these two limits right is most of what
+// makes a seakeeping model believable.
+void testLongWavesLiftTheShipAndShortWavesDoNot() {
+    Ship still = makeBarge();
+    still.initialise(0.0);
+    settle(still, 0.0, 1500);
+    const double stillZ = still.state.position.z;
+
+    // Long wave: 600 m against a 60 m hull.
+    {
+        const SeaState state = oneWave(3.0, 600.0);
+        const WaveField field(state);
+        double crest = 0, trough = 0;
+        findCrestAndTrough(field, state.peakPeriod, crest, trough);
+        const double amplitude = field.elevation(0, 0, crest);
+
+        Ship ship = makeBarge();
+        ship.initialise(0.0);
+        Sea sea;
+        sea.waves = &field;
+        sea.time = crest;  // frozen at the crest, so equilibrium is well defined
+        settle(ship, sea, 3000);
+
+        const double lift = ship.state.position.z - stillZ;
+        expectTrue("the amplitude is worth measuring against", amplitude > 0.5);
+        expectNear("a wave ten times the ship length lifts it by the full amplitude",
+                   lift, amplitude, 0.25 * amplitude);
+    }
+
+    // Short wave: 12 m against the same 60 m hull, five wavelengths along it.
+    {
+        const SeaState state = oneWave(3.0, 12.0);
+        const WaveField field(state);
+        double crest = 0, trough = 0;
+        findCrestAndTrough(field, state.peakPeriod, crest, trough);
+        const double amplitude = field.elevation(0, 0, crest);
+
+        Ship ship = makeBarge();
+        ship.initialise(0.0);
+        Sea sea;
+        sea.waves = &field;
+        sea.time = crest;
+        settle(ship, sea, 3000);
+
+        const double lift = std::abs(ship.state.position.z - stillZ);
+        expectTrue("a wave a fifth of the ship length barely lifts it",
+                   lift < 0.30 * amplitude);
+    }
+}
+
+// The hull mesh must resolve the wave, and the failure mode when it does not is
+// the dangerous kind: not noise, but a systematic phase-dependent gain or loss of
+// buoyancy. A single panel spanning several wavelengths samples the surface at
+// three points and reports whatever those three points happen to say.
+void testHullMustResolveTheWavelength() {
+    const double amplitude = 1.06, wavelength = 12.0;
+    const double k = 2.0 * kPi / wavelength;
+    // Phase offset chosen so the error does not cancel by symmetry -- with a
+    // symmetric phase a coarse mesh looks deceptively fine.
+    auto wave = [&](double x, double) {
+        return amplitude * std::cos(k * (x + 0.37 * wavelength));
+    };
+
+    // Five whole wavelengths along a 60 m hull: the exact extra displacement is
+    // zero, because the crests and troughs cancel over the waterplane.
+    double coarse = 0, fine = 0;
+    for (int divisions : {1, 2, 8, 64}) {
+        Ship barge = makeBarge(divisions);
+        TriMesh hull = barge.hull;
+        for (Vec3& v : hull.verts) v.z -= 4.0;  // float it at 4 m draft
+        const double flat = integrateBelowSurface(hull, [](double, double) { return 0.0; }).volume;
+        const double wavy = integrateBelowSurface(hull, wave).volume;
+        if (divisions == 1) coarse = wavy - flat;
+        if (divisions == 64) fine = wavy - flat;
+    }
+
+    expectTrue("a single-panel hull invents a large spurious displacement",
+               std::abs(coarse) > 100.0);
+    expectNear("a resolved hull correctly cancels a whole number of wavelengths", fine, 0.0,
+               1e-6);
+}
+
 // --- Hydrostatics -----------------------------------------------------------
 
 // A homogeneous box floats at a draft of (rho_body / rho_water) * height.
@@ -489,6 +701,10 @@ void runCoreTests() {
     testWavySurfaceReducesToThePlaneCase();
     testSinusoidalSurfaceAgainstAnalyticVolume();
     testWavySurfaceIsNotSecretlyFlat();
+    testZeroAmplitudeWaveFieldMatchesFlatWater();
+    testCrestDisplacesMoreThanTrough();
+    testLongWavesLiftTheShipAndShortWavesDoNot();
+    testHullMustResolveTheWavelength();
     testArchimedes();
     testFreeSurfaceEffect();
     testTrappedAirArrestsFlooding();

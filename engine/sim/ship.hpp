@@ -18,6 +18,7 @@
 #pragma once
 
 #include "../core/geometry.hpp"
+#include "waves.hpp"
 
 #include <string>
 #include <vector>
@@ -26,6 +27,26 @@ namespace sim {
 
 // Sentinel compartment index meaning "the sea / open atmosphere outside the hull".
 inline constexpr int kSea = -1;
+
+// The water the ship floats on.
+//
+// Implicitly constructible from a still-water level, so every existing call site
+// that passed a bare `double` keeps working and keeps taking the fast path. That
+// matters: flat water is clipped by a single plane, which is exact and cheap,
+// while a wave field costs a height evaluation per quadrature point.
+struct Sea {
+    Sea() = default;
+    Sea(double stillWaterLevel) : level(stillWaterLevel) {}  // NOLINT: implicit on purpose
+
+    double level = 0.0;               // still-water level, m
+    const WaveField* waves = nullptr; // null means flat water
+    double time = 0.0;                // s, for evaluating the wave field
+
+    bool flat() const { return waves == nullptr; }
+    double heightAt(double x, double y) const {
+        return waves == nullptr ? level : level + waves->elevation(x, y, time);
+    }
+};
 
 struct Compartment {
     std::string name;
@@ -138,17 +159,17 @@ public:
     // --- Lifecycle ---
 
     // Caches gross volumes and puts the ship at its floating equilibrium.
-    void initialise(double seaLevel);
+    void initialise(const Sea& sea);
 
     // Advance the flooding network and the rigid body by dt seconds.
-    void step(double dt, double seaLevel);
+    void step(double dt, const Sea& sea);
 
-    Diagnostics diagnostics(double seaLevel) const;
+    Diagnostics diagnostics(const Sea& sea) const;
 
     // Righting arm at a forced heel angle, with the ship free to sink to its
     // equilibrium draft and the floodwater free to re-level. Sweeping this gives
     // a true damaged-condition GZ curve.
-    double rightingArmAtHeel(double heelRad, double seaLevel) const;
+    double rightingArmAtHeel(double heelRad, const Sea& sea) const;
 
     // Structural sanity of the ship definition, checked once after initialise().
     // Returns a human-readable problem per entry; empty means the definition is
@@ -168,9 +189,9 @@ private:
         Mat3   inertiaAboutCog{};  // body frame
     };
 
-    void updateInternalFreeSurfaces(double seaLevel);
-    void solveFlowNetwork(double dt, double seaLevel);
-    void integrateRigidBody(double dt, double seaLevel);
+    void updateInternalFreeSurfaces(const Sea& sea);
+    void solveFlowNetwork(double dt, const Sea& sea);
+    void integrateRigidBody(double dt, const Sea& sea);
 
     MassProperties massProperties() const;
 
@@ -179,10 +200,15 @@ private:
         double pressure = kPatm;
         bool   isWater = false;
     };
-    SideState sideStateAt(int compartmentIndex, const Vec3& worldPos, double seaLevel) const;
+    SideState sideStateAt(int compartmentIndex, const Vec3& worldPos, const Sea& sea) const;
 
     // Sinkage/attitude-only hydrostatic solve, used by the GZ sweep.
-    double equilibriumDraftAt(const Quat& orientation, double seaLevel, double targetMass) const;
+    double equilibriumDraftAt(const Quat& orientation, const Sea& sea, double targetMass) const;
+
+    // Reused each tick when the sea is wavy: the hull must be integrated in world
+    // coordinates because the surface is a function of world x and y, and
+    // reallocating a 600-vertex mesh per tick is pure waste.
+    mutable TriMesh worldHullScratch_;
 
     double cachedWaterplaneArea_ = 0;
     double cachedKRoll_ = 0;

@@ -107,6 +107,15 @@ Vec3 waterplaneMoments(const TriMesh& mesh, const Vec3& n, double planeOffset);
 // quadrature's leading term. A box under a cosine surface reaches 1e-11 relative
 // error at 1028 triangles.
 //
+// **The mesh must resolve the surface.** This is the one way to use the routine
+// badly, and it fails in the dangerous direction: a panel spanning several
+// wavelengths samples the surface at three points and reports whatever those
+// three points say, so the error is a systematic, phase-dependent gain or loss
+// of volume rather than noise. Measured on a 60 m barge under a 12 m wave, a
+// single-panel bottom face invents plus or minus 6% of the ship's displacement
+// depending only on where the crests happen to fall; two panels along the length
+// already give the exact answer. Several panels per wavelength, always.
+//
 // `height` is any callable with signature double(double x, double y).
 template <typename HeightField>
 VolumeIntegral integrateBelowSurface(const TriMesh& mesh, HeightField&& height) {

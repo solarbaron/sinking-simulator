@@ -196,10 +196,36 @@ The honest way to do wave loads on a large ship is potential flow. Plan:
   approximated by a fitted state-space model (4–8 states per DOF, identified
   offline). This is the standard marine-simulation approach and it is cheap at
   runtime.
-- **Nonlinear Froude–Krylov and restoring**: integrated over the *instantaneous*
-  wetted surface each tick rather than the mean position. The engine already has
-  exactly the routine this needs. This is what captures a ship's behaviour in
-  large waves, where linear theory quietly stops being true.
+- **Nonlinear Froude–Krylov and restoring** — **implemented**. `Sea` carries an
+  optional `WaveField`; when present, `Ship` transforms the hull into world
+  coordinates and integrates buoyancy against the actual surface with
+  `integrateBelowSurface()`, rather than clipping by a plane at a mean waterline.
+  Openings read the *local* surface too, so a breach under a crest floods faster
+  than the same breach under a trough — a large part of why damage in a seaway is
+  worse than damage alongside. Flat water keeps the old single-plane path, which
+  is exact and much cheaper, and `Sea` is implicitly constructible from a `double`
+  so still-water callers are unchanged.
+
+  Three behaviours are asserted, and the middle one is the load-bearing check:
+
+  | Check | Why it matters |
+  |---|---|
+  | A zero-amplitude wave field reproduces still water | drives the entire wavy path against an answer the flat path computes a completely different way |
+  | A wave ten times the ship length lifts it by the full amplitude | the ship contours a long wave |
+  | A wave a fifth of the ship length barely moves it | crests and troughs cancel along the hull |
+
+  Still-water quantities stay still-water on purpose: GZ and GM are defined about
+  a mean waterline, and quoting a "GM in waves" would invent a figure naval
+  architecture does not have.
+
+  **The hull mesh must resolve the wavelength.** This turned up as a failing test
+  and is worth stating loudly, because the failure mode is not blurring. A panel
+  spanning several wavelengths samples the surface at three quadrature points and
+  reports whatever they say, so an under-tessellated hull *invents or destroys*
+  displacement — measured at ±6% on a 60 m barge under a 12 m wave, with the sign
+  depending only on wave phase. That error would ride silently through every
+  seakeeping result. Two panels along the length already gave the exact answer in
+  that case, but the rule to build to is several panels per wavelength.
 
 ### Viscous roll damping — **implemented**
 
