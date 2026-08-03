@@ -9,12 +9,31 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
+# Sanitizer builds. The job system is the reason this exists: a work-stealing
+# deque that passes its functional tests can still be riddled with data races,
+# and only a sanitizer run will say so.
+#   cmake -S . -B build-tsan -DSHIPSIM_SANITIZE=thread
+#   cmake -S . -B build-asan -DSHIPSIM_SANITIZE=address
+set(SHIPSIM_SANITIZE "" CACHE STRING "Sanitizer to build with: thread, address, or empty")
+if(SHIPSIM_SANITIZE STREQUAL "thread")
+  add_compile_options(-fsanitize=thread -g -O1)
+  add_link_options(-fsanitize=thread)
+elseif(SHIPSIM_SANITIZE STREQUAL "address")
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
+  add_link_options(-fsanitize=address,undefined)
+elseif(NOT SHIPSIM_SANITIZE STREQUAL "")
+  message(FATAL_ERROR "SHIPSIM_SANITIZE must be 'thread', 'address', or empty")
+endif()
+
 add_library(shipsim_engine
   engine/core/geometry.cpp
+  engine/core/jobs.cpp
   engine/sim/ship.cpp
   engine/sim/fem.cpp
 )
 target_include_directories(shipsim_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+find_package(Threads REQUIRED)
+target_link_libraries(shipsim_engine PUBLIC Threads::Threads)
 target_compile_options(shipsim_engine PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(shipsim
@@ -27,7 +46,13 @@ target_compile_options(shipsim PRIVATE -Wall -Wextra)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 enable_testing()
-add_executable(shipsim_tests tests/test_core.cpp)
+add_executable(shipsim_tests
+  tests/main.cpp
+  tests/harness.cpp
+  tests/test_core.cpp
+  tests/test_jobs.cpp
+)
+target_include_directories(shipsim_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(shipsim_tests PRIVATE shipsim_engine)
 target_compile_options(shipsim_tests PRIVATE -Wall -Wextra)
 add_test(NAME core COMMAND shipsim_tests)

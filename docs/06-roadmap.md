@@ -44,7 +44,9 @@ All run today.
 Everything in `01-architecture.md` that the current single-threaded prototype does
 without.
 
-- Job system, archetype ECS, arena allocators
+- ~~Job system~~ **done** — work-stealing with task helping, deterministic
+  reductions, verified under ThreadSanitizer (`01-architecture.md` §1)
+- Archetype ECS, arena allocators
 - Reflection and serialisation, save/load
 - Multi-rate scheduler with time dilation
 - Vulkan device, render graph, bindless setup, a debug renderer

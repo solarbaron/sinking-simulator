@@ -5,33 +5,16 @@
 // as these integrals, so they get checked against algebra rather than eyeballed.
 #include "engine/core/geometry.hpp"
 #include "engine/sim/ship.hpp"
+#include "harness.hpp"
 
 #include <cstdio>
 #include <string>
 
 using namespace sim;
+using testing::expectNear;
+using testing::expectTrue;
 
 namespace {
-
-int failures = 0;
-int checks = 0;
-
-void expectNear(const std::string& what, double got, double want, double tol) {
-    ++checks;
-    if (std::abs(got - want) > tol) {
-        std::printf("  FAIL %-52s got %+.9g  want %+.9g  (tol %.2g)\n",
-                    what.c_str(), got, want, tol);
-        ++failures;
-    }
-}
-
-void expectTrue(const std::string& what, bool cond) {
-    ++checks;
-    if (!cond) {
-        std::printf("  FAIL %s\n", what.c_str());
-        ++failures;
-    }
-}
 
 // --- Closed-mesh integration -----------------------------------------------
 
@@ -385,8 +368,8 @@ void testMassConservation() {
 
 }  // namespace
 
-int main() {
-    std::printf("shipsim core validation\n");
+void runCoreTests() {
+    std::printf("\n--- geometry, hydrostatics and flooding ---\n");
     testBoxIntegrals();
     testAxisAlignedClip();
     testTiltedClipAgainstAlgebra();
@@ -399,7 +382,4 @@ int main() {
     testFreeSurfaceEffect();
     testTrappedAirArrestsFlooding();
     testMassConservation();
-
-    std::printf("%d checks, %d failures\n", checks, failures);
-    return failures == 0 ? 0 : 1;
 }

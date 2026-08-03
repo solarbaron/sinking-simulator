@@ -11,22 +11,60 @@ frame if written naively. Every architectural decision below follows from that.
 
 ## 1. Threading model
 
-**Work-stealing job system, fibers, no per-system threads.**
+**Work-stealing job system, no per-system threads.** Implemented in
+`engine/core/jobs.cpp`.
 
 - One worker thread per hardware thread minus one. On the 24-thread development
-  machine, 23 workers.
-- Jobs are small (target 50–500 µs) and expressed as parallel-for over ranges, not
-  as long-lived tasks. Fibers let a job yield on a dependency without blocking a
-  worker.
+  machine, 23 workers. Zero workers is a supported configuration and every
+  concurrency test runs it, because it is the debugging and determinism baseline.
+- Jobs are small (target 50–500 µs) and expressed as parallel-for over ranges,
+  not as long-lived tasks.
 - The frame is a DAG of jobs built fresh each tick. No system ever calls another
   system directly; they declare read/write sets over component types and the
   scheduler derives ordering.
-- Deterministic reduction order everywhere results are summed across threads
-  (fixed-size per-thread bins combined in index order, never in completion order).
+- Deterministic reduction order everywhere results are summed across threads.
   Floating-point addition is not associative and multiplayer will not forgive it.
 
-The scheduler is a straight implementation of the Naughty Dog / `enkiTS` model.
-This is not the place to innovate.
+### Two decisions the implementation reached, with reasons
+
+**Task helping, not fibers.** A thread that waits on a counter executes other
+jobs while it waits, rather than parking. This gets the property fibers were
+wanted for -- a nested `parallelFor` inside a job must not deadlock the pool --
+without a fiber runtime, and it is what `enkiTS` actually does. (The earlier text
+here named both Naughty Dog and enkiTS as the model; those are two different
+designs, and enkiTS is the one being followed.) Fibers remain the option if a job
+ever needs to yield mid-body rather than only at a wait point; nothing in the
+simulation currently does.
+
+**Bounded MPMC ring per lane, not a Chase-Lev deque.** Chase-Lev is the faster
+structure and was implemented first. It is only safe when a queue slot is an
+atomic that can be read speculatively and thrown away; a job record here is 80
+bytes, so that speculative read is a plain struct copy racing with the owner's
+write. ThreadSanitizer found it immediately. Claiming the slot with the CAS
+before reading does not fix it either -- advancing `top` does not reserve the
+slot, so once later thieves push `top` past it the owner may reuse it while the
+first thief has still not copied it out. The Vyukov ring gives every cell a
+sequence number that makes each access exclusive by construction. Chase-Lev is
+recoverable later with atomic pointers plus epoch reclamation; at 50–500 µs per
+job, one CAS in each direction is not what limits anything.
+
+**Reductions bin per chunk, not per lane.** `parallelReduce` stores a partial per
+chunk and folds them in chunk index order. Binning per lane would still be
+non-deterministic, because a lane accumulates whichever chunks it happened to
+win, in whatever order it won them. Tested by requiring bit-identical results
+from 0, 1, 2, 7, 15 and 23 workers against the ordered single-threaded fold.
+
+### Verification
+
+Concurrency correctness is not something functional tests establish on their own.
+The job system is checked three ways, all in CI:
+
+- 29 invariant assertions (`tests/test_jobs.cpp`): exactly-once execution, range
+  tiling with no gaps or overlaps, three-deep nesting without deadlock at 0, 1, 2
+  and 8 workers, ring overflow losing no work, and bit-identical reductions.
+- ThreadSanitizer, via `cmake -DSHIPSIM_SANITIZE=thread`. This is what caught the
+  Chase-Lev race; the functional tests passed the whole time it was there.
+- AddressSanitizer and UBSan, via `cmake -DSHIPSIM_SANITIZE=address`.
 
 ## 2. Entity model
 
