@@ -94,6 +94,18 @@ if(Vulkan_FOUND AND GLSLC)
   endforeach()
   add_custom_target(shipsim_shaders DEPENDS ${SPV_FILES})
 
+  target_sources(shipsim_engine PRIVATE engine/gpu/device.cpp)
+  # The `{VK_STRUCTURE_TYPE_X}` idiom value-initialises the remaining fields,
+  # which is exactly what Vulkan wants. Scoped to this file so the rest of the
+  # library keeps the warning.
+  set_source_files_properties(engine/gpu/device.cpp PROPERTIES
+    COMPILE_OPTIONS "-Wno-missing-field-initializers")
+  target_link_libraries(shipsim_engine PUBLIC Vulkan::Vulkan)
+  target_compile_definitions(shipsim_engine PUBLIC SHIPSIM_HAS_VULKAN=1)
+  target_sources(shipsim_tests PRIVATE tests/test_device.cpp)
+  target_compile_definitions(shipsim_tests PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}")
+  add_dependencies(shipsim_tests shipsim_shaders)
+
   add_executable(fem_spike tools/fem_spike/main.cpp engine/gpu/fem_gpu.cpp)
   add_dependencies(fem_spike shipsim_shaders)
   target_link_libraries(fem_spike PRIVATE shipsim_engine Vulkan::Vulkan)

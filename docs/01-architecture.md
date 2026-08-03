@@ -347,6 +347,34 @@ fixed. Anything requiring reproducibility must therefore consume *events* from
 the field solvers (a tear, its geometry, the resulting orifice area) rather than
 their raw state.
 
+### Vulkan context
+
+`engine/gpu/device.cpp` owns the objects whose lifetime spans everything:
+instance, physical device, device, queue, command pool and a shared staging
+buffer. It is not an abstraction layer over Vulkan and does not try to be — the
+render graph and bindless descriptor work belong a layer up, and everything else
+gets raw handles.
+
+It is the FEM spike's code, generalised now that a second consumer exists, rather
+than a fresh implementation: that code had already been run against a real GPU
+with its timings verified (`07-fem-spike-findings.md`). Spike code graduating
+into the engine is the intended outcome of a spike.
+
+**Every entry point degrades rather than aborts when there is no GPU.** `create()`
+returns a reason; the test suite skips its GPU checks and stays green on a
+headless box. A suite that starts requiring a GPU to pass stops being runnable in
+CI, which is where it is worth the most.
+
+**Sanitizer noise from the driver is scoped, not silenced.** The Vulkan loader
+pulls in the NVIDIA stack, which pulls in libdbus, which leaks on exit — every
+frame of every reported leak sits inside those libraries and none inside ours, so
+they are suppressed *by library name* via `__lsan_default_suppressions()` rather
+than by turning the leak checker off, which would hide our own leaks too.
+ThreadSanitizer aborts inside the uninstrumented driver with "nested bug in the
+same thread", so the device tests sit out the TSan build specifically; jobs,
+arenas and the scheduler still run under it, which is where the concurrency
+actually is.
+
 ### Offscreen verification harness
 
 Rendering is verified by drawing to an image, writing a PNG, reading it back and

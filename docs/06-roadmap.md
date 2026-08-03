@@ -77,7 +77,10 @@ without.
   (`01-architecture.md` §2)
 - ~~**Offscreen verification harness**~~ **done** — dependency-free PNG codec,
   externally validated (`01-architecture.md` §4)
-- Vulkan device, render graph, bindless setup, a debug renderer
+- ~~**Vulkan device**~~ **done** — shared instance/device/queue/allocation,
+  graduated from the FEM spike, degrades cleanly with no GPU
+  (`01-architecture.md` §4)
+- Render graph, bindless setup, offscreen debug renderer
 - **Milestone:** watch the current ferry scenario in 3D, in real time, with a
   free camera and a wireframe of the flooding compartments.
 
