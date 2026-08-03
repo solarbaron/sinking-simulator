@@ -52,6 +52,10 @@ public:
     bool readU32(std::uint32_t& out);
     bool readU64(std::uint64_t& out);
     bool skip(std::size_t count);
+    // An independent reader over a slice of the same buffer. Used when a first
+    // pass records where each payload starts and a second pass decodes them --
+    // reading a length-prefixed field twice is cheaper than buffering it.
+    ByteReader sliceAt(std::size_t offset, std::size_t length) const;
 
     bool failed() const { return failed_; }
     std::size_t remaining() const { return bytes_.size() - cursor_; }

@@ -62,6 +62,7 @@ add_executable(shipsim_tests
   tests/test_ecs.cpp
   tests/test_scheduler.cpp
   tests/test_serialise.cpp
+  tests/test_worldio.cpp
   tests/test_jobs.cpp
 )
 target_include_directories(shipsim_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

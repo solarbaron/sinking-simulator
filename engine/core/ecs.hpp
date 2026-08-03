@@ -15,6 +15,7 @@
 #pragma once
 
 #include "reflect.hpp"
+#include "serialise.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -49,6 +50,10 @@ struct ComponentInfo {
     // Hash of the type's name. Unlike the runtime ComponentId this does not
     // depend on which type happened to be touched first.
     std::uint64_t stableId = 0;
+    // Reflection for the component, when it has any. Null means the component
+    // can still be stored and queried, but a save can only carry it as an opaque
+    // blob that no other build can be trusted to interpret.
+    const TypeInfo* type = nullptr;
 };
 
 // Process-wide type registry. A ComponentId is only an array index: it is handed
@@ -61,7 +66,12 @@ public:
     static ComponentRegistry& instance();
 
     ComponentId registerType(std::size_t size, std::size_t alignment, const char* name,
-                             std::uint64_t stableId);
+                             std::uint64_t stableId, const TypeInfo* type);
+    // Runtime id for a saved stable id, or kUnknownComponent when this build has
+    // no such component. Loading must cope with the second case rather than
+    // refusing the whole save.
+    static constexpr ComponentId kUnknownComponent = 0xFFFF;
+    ComponentId findByStableId(std::uint64_t stableId) const;
     // Orders two components by stable id, giving archetypes a canonical key that
     // is identical across builds and link orders.
     bool lessByStableId(ComponentId a, ComponentId b) const {
@@ -87,10 +97,10 @@ ComponentId componentId() {
         if constexpr (Reflected<T>) {
             const TypeInfo& type = Reflect<T>::info();
             return ComponentRegistry::instance().registerType(sizeof(T), alignof(T), type.name,
-                                                              type.stableId);
+                                                              type.stableId, &type);
         } else {
             return ComponentRegistry::instance().registerType(
-                sizeof(T), alignof(T), typeid(T).name(), stableHash(typeid(T).name()));
+                sizeof(T), alignof(T), typeid(T).name(), stableHash(typeid(T).name()), nullptr);
         }
     }();
     return id;
@@ -143,6 +153,19 @@ public:
     // Component ids of an archetype, in canonical (stable id) order. Exposed for
     // the editor and for tests that need to check the ordering invariant.
     const std::vector<ComponentId>& archetypeIds(std::size_t index) const;
+
+    // --- persistence ---
+    // Writes every entity, its components and the handle bookkeeping needed for
+    // saved Entity values to keep resolving. Reflected components are written
+    // field by field and survive schema changes; unreflected ones go out as
+    // size-tagged opaque blobs, which is build-local and refused on load if the
+    // size no longer matches.
+    void save(ByteWriter& writer) const;
+    // Replaces the world's contents. Returns false on a malformed stream,
+    // leaving the world empty rather than half-loaded. Components this build
+    // does not know are skipped; the entities carrying them still load.
+    bool load(ByteReader& reader);
+    void clear();
     // Entities per chunk for the archetype holding exactly Cs. Exposed so tests
     // can drive the multi-chunk paths rather than guessing at the threshold.
     template <typename... Cs>
@@ -165,6 +188,9 @@ private:
         bool alive = false;
     };
 
+    // The decoding half of load(). Kept separate so load() can guarantee that a
+    // failure leaves nothing behind, whatever point it failed at.
+    bool loadImpl(ByteReader& reader);
     std::uint32_t findOrCreateArchetype(const std::vector<ComponentId>& sortedIds);
     // Appends a row and returns (chunk, row). Allocates a chunk if needed.
     std::pair<std::uint32_t, std::uint32_t> appendRow(std::uint32_t archetypeIndex, Entity entity);

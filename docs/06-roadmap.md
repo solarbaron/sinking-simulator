@@ -72,7 +72,9 @@ without.
   simulation time, dilation bands that gate solvers a fast-forward cannot
   afford, catch-up ceilings, dependency levels run in parallel, and an integer
   nanosecond clock so the schedule never drifts (`01-architecture.md` §3)
-- World save/load built on the serialiser
+- ~~**World save/load**~~ **done** — whole-world persistence with surviving
+  entity handles, unknown-component tolerance and a byte-identical round trip
+  (`01-architecture.md` §2)
 - Vulkan device, render graph, bindless setup, a debug renderer
 - **Milestone:** watch the current ferry scenario in 3D, in real time, with a
   free camera and a wireframe of the flooding compartments.

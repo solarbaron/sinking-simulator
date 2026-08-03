@@ -18,10 +18,17 @@ ComponentRegistry& ComponentRegistry::instance() {
 }
 
 ComponentId ComponentRegistry::registerType(std::size_t size, std::size_t alignment,
-                                            const char* name, std::uint64_t stableId) {
+                                            const char* name, std::uint64_t stableId,
+                                            const TypeInfo* type) {
     const auto id = static_cast<ComponentId>(infos_.size());
-    infos_.push_back({size, alignment, name, stableId});
+    infos_.push_back({size, alignment, name, stableId, type});
     return id;
+}
+
+ComponentId ComponentRegistry::findByStableId(std::uint64_t stableId) const {
+    for (std::size_t i = 0; i < infos_.size(); ++i)
+        if (infos_[i].stableId == stableId) return static_cast<ComponentId>(i);
+    return kUnknownComponent;
 }
 
 World::~World() {
@@ -235,6 +242,211 @@ void World::destroy(Entity entity) {
     ++record.generation;
     freeIndices_.push_back(entity.index);
     --liveEntities_;
+}
+
+// --- persistence -------------------------------------------------------------
+//
+// Format, all little-endian via ByteWriter:
+//
+//   magic u32, version u32
+//   recordCount u32, then that many generation u32
+//   freeCount u32, then that many index u32
+//   entityCount u32, then per entity:
+//     index u32, generation u32, componentCount u32
+//     per component: stableId u64, reflected u8, byteLength u32, payload
+//
+// The generation table comes first because handle staleness is part of the world
+// state: an Entity saved and then destroyed must still read as dead after a
+// reload, which means the generation counters of *unoccupied* indices matter too.
+
+namespace {
+constexpr std::uint32_t kWorldMagic = 0x57504853u;  // "SHPW"
+constexpr std::uint32_t kWorldVersion = 1u;
+}  // namespace
+
+void World::save(ByteWriter& writer) const {
+    const ComponentRegistry& registry = ComponentRegistry::instance();
+
+    writer.writeU32(kWorldMagic);
+    writer.writeU32(kWorldVersion);
+
+    writer.writeU32(static_cast<std::uint32_t>(records_.size()));
+    for (const Record& record : records_) writer.writeU32(record.generation);
+
+    writer.writeU32(static_cast<std::uint32_t>(freeIndices_.size()));
+    for (std::uint32_t index : freeIndices_) writer.writeU32(index);
+
+    writer.writeU32(static_cast<std::uint32_t>(liveEntities_));
+
+    // Archetype then chunk then row: the same order queries use, so a saved
+    // world reloads with its iteration order intact.
+    for (const auto& archetype : archetypes_) {
+        for (const Chunk& chunk : archetype->chunks) {
+            const auto* entities =
+                reinterpret_cast<const Entity*>(chunk.data + archetype->entityOffset);
+            for (std::uint32_t row = 0; row < chunk.count; ++row) {
+                writer.writeU32(entities[row].index);
+                writer.writeU32(entities[row].generation);
+                writer.writeU32(static_cast<std::uint32_t>(archetype->ids.size()));
+
+                for (std::size_t slot = 0; slot < archetype->ids.size(); ++slot) {
+                    const ComponentInfo& info = registry.info(archetype->ids[slot]);
+                    const std::byte* source =
+                        chunk.data + archetype->offsets[slot] + row * info.size;
+
+                    writer.writeU64(info.stableId);
+                    writer.writeU8(info.type != nullptr ? 1u : 0u);
+                    const std::size_t lengthOffset = writer.size();
+                    writer.writeU32(0);
+                    const std::size_t payloadStart = writer.size();
+
+                    if (info.type != nullptr) {
+                        serialiseObject(*info.type, source, writer);
+                    } else {
+                        // Opaque: only this build can interpret it, so record the
+                        // size and let the reader refuse a mismatch.
+                        writer.writeU32(static_cast<std::uint32_t>(info.size));
+                        writer.writeRaw(source, info.size);
+                    }
+                    writer.patchU32(lengthOffset,
+                                    static_cast<std::uint32_t>(writer.size() - payloadStart));
+                }
+            }
+        }
+    }
+}
+
+void World::clear() {
+    for (auto& archetype : archetypes_)
+        for (Chunk& chunk : archetype->chunks)
+            ::operator delete(chunk.data, std::align_val_t{64});
+    archetypes_.clear();
+    archetypeLookup_.clear();
+    records_.clear();
+    freeIndices_.clear();
+    liveEntities_ = 0;
+}
+
+bool World::load(ByteReader& reader) {
+    clear();
+    if (loadImpl(reader)) return true;
+    // A partly decoded world is worse than no world: a caller that ignores the
+    // return value would then be simulating a ship missing an arbitrary suffix
+    // of its entities. Fail closed.
+    clear();
+    return false;
+}
+
+bool World::loadImpl(ByteReader& reader) {
+    const ComponentRegistry& registry = ComponentRegistry::instance();
+
+    std::uint32_t magic = 0, version = 0;
+    if (!reader.readU32(magic) || !reader.readU32(version)) return false;
+    if (magic != kWorldMagic || version != kWorldVersion) return false;
+
+    std::uint32_t recordCount = 0;
+    if (!reader.readU32(recordCount)) return false;
+    // A count is only believable if the bytes to back it exist. Trusting it as a
+    // resize argument is how a corrupt file becomes an allocation failure.
+    if (recordCount > reader.remaining() / sizeof(std::uint32_t)) return false;
+    records_.resize(recordCount);
+    for (std::uint32_t i = 0; i < recordCount; ++i) {
+        if (!reader.readU32(records_[i].generation)) return false;
+        records_[i].alive = false;
+    }
+
+    std::uint32_t freeCount = 0;
+    if (!reader.readU32(freeCount)) return false;
+    if (freeCount > reader.remaining() / sizeof(std::uint32_t)) return false;
+    freeIndices_.resize(freeCount);
+    for (std::uint32_t i = 0; i < freeCount; ++i)
+        if (!reader.readU32(freeIndices_[i])) return false;
+
+    std::uint32_t entityCount = 0;
+    if (!reader.readU32(entityCount)) return false;
+    if (entityCount > recordCount) return false;  // cannot have more live than records
+
+    std::vector<ComponentId> ids;
+    for (std::uint32_t e = 0; e < entityCount; ++e) {
+        std::uint32_t index = 0, generation = 0, componentCount = 0;
+        if (!reader.readU32(index) || !reader.readU32(generation) ||
+            !reader.readU32(componentCount))
+            return false;
+        if (index >= recordCount) return false;
+        if (records_[index].generation != generation) return false;
+        if (records_[index].alive) return false;  // the same index twice
+        // Each component costs at least its 13-byte header.
+        if (componentCount > reader.remaining() / 13 + 1) return false;
+
+        // First pass: read the headers, note where each payload sits, and learn
+        // which components this build can actually place. The archetype has to
+        // be known in full before a row exists to decode into.
+        struct SavedComponent {
+            std::uint64_t stableId = 0;
+            bool reflected = false;
+            std::size_t offset = 0;
+            std::size_t length = 0;
+        };
+        std::vector<SavedComponent> saved;
+        saved.reserve(componentCount);
+        ids.clear();
+
+        for (std::uint32_t c = 0; c < componentCount; ++c) {
+            SavedComponent component;
+            std::uint8_t reflected = 0;
+            std::uint32_t byteLength = 0;
+            if (!reader.readU64(component.stableId) || !reader.readU8(reflected) ||
+                !reader.readU32(byteLength))
+                return false;
+            component.reflected = reflected != 0;
+            component.offset = reader.cursor();
+            component.length = byteLength;
+            if (!reader.skip(byteLength)) return false;
+            saved.push_back(component);
+
+            const ComponentId id = registry.findByStableId(component.stableId);
+            if (id == ComponentRegistry::kUnknownComponent) continue;  // not in this build
+            const ComponentInfo& info = registry.info(id);
+            // A component that gained or lost reflection since the save cannot be
+            // decoded either way round; skip it rather than guess.
+            if (component.reflected != (info.type != nullptr)) continue;
+            ids.push_back(id);
+        }
+
+        const std::uint32_t archetype = findOrCreateArchetype(detail::sortedIds(ids));
+        const Entity entity{index, generation};
+        const auto [chunkIndex, row] = appendRow(archetype, entity);
+        records_[index].archetype = archetype;
+        records_[index].chunk = chunkIndex;
+        records_[index].row = row;
+        records_[index].alive = true;
+        ++liveEntities_;
+
+        // Second pass: decode the payloads that have somewhere to land.
+        for (const SavedComponent& component : saved) {
+            const ComponentId id = registry.findByStableId(component.stableId);
+            if (id == ComponentRegistry::kUnknownComponent) continue;
+            const ComponentInfo& info = registry.info(id);
+            if (component.reflected != (info.type != nullptr)) continue;
+
+            void* target = componentPointer(archetype, chunkIndex, row, id);
+            if (target == nullptr) continue;
+
+            ByteReader payload = reader.sliceAt(component.offset, component.length);
+            if (info.type != nullptr) {
+                if (!deserialiseObject(*info.type, target, payload)) return false;
+            } else {
+                std::uint32_t blobSize = 0;
+                if (!payload.readU32(blobSize)) return false;
+                // Refuse a blob whose size no longer matches the component:
+                // reading it in would be a silent reinterpretation.
+                if (blobSize != info.size) continue;
+                if (!payload.readRaw(target, blobSize)) return false;
+            }
+        }
+    }
+
+    return !reader.failed();
 }
 
 bool World::alive(Entity entity) const {

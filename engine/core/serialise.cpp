@@ -136,6 +136,12 @@ bool ByteReader::readU64(std::uint64_t& out) {
     return true;
 }
 
+ByteReader ByteReader::sliceAt(std::size_t offset, std::size_t length) const {
+    if (offset > bytes_.size() || length > bytes_.size() - offset)
+        return ByteReader(std::span<const std::byte>{});
+    return ByteReader(bytes_.subspan(offset, length));
+}
+
 bool ByteReader::skip(std::size_t count) {
     if (!require(count)) return false;
     cursor_ += count;

@@ -25,3 +25,4 @@ void runArenaTests();
 void runEcsTests();
 void runSchedulerTests();
 void runSerialiseTests();
+void runWorldIoTests();
