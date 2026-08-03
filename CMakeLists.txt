@@ -27,6 +27,7 @@ endif()
 
 add_library(shipsim_engine
   engine/core/arena.cpp
+  engine/core/ecs.cpp
   engine/core/geometry.cpp
   engine/core/jobs.cpp
   engine/sim/ship.cpp
@@ -56,6 +57,7 @@ add_executable(shipsim_tests
   tests/harness.cpp
   tests/test_arena.cpp
   tests/test_core.cpp
+  tests/test_ecs.cpp
   tests/test_jobs.cpp
 )
 target_include_directories(shipsim_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

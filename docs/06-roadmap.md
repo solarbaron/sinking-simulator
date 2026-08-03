@@ -62,8 +62,10 @@ without.
   10 µs chunk, and the sweep shows no dispatch-limited regime at plateau grains,
   so a faster queue has nothing to recover. Reopen only if a profile shows queue
   contention. This is what the benchmark was for.
-- Archetype ECS
-- Reflection and serialisation, save/load
+- ~~**Archetype ECS**~~ **done** — SoA chunk storage, generational entity
+  handles, archetype transitions, chunked queries (`01-architecture.md` §2)
+- Reflection and serialisation, save/load — also the fix for component ids
+  currently being first-use-order rather than stable across builds
 - Multi-rate scheduler with time dilation — continuation-style, so the steady
   state never calls `wait()`; this is what makes fibers unnecessary rather than
   merely deferred (`01-architecture.md` §1)

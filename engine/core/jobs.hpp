@@ -297,17 +297,27 @@ JobSystem::AutoGrain JobSystem::parallelForAuto(std::size_t begin, std::size_t e
         return result;
     }
 
-    const auto lanes = static_cast<double>(laneCount());
-    double grain = kTargetChunkNanos / std::max(result.nsPerElement, 1e-9);
     // Clamp so the chunk count stays inside the band that keeps both load
     // balance and dispatch cost reasonable.
-    const double upper =
-        std::max(1.0, static_cast<double>(remaining) / (lanes * kMinChunksPerLane));
-    const double lower =
-        std::max(1.0, static_cast<double>(remaining) / (lanes * kMaxChunksPerLane));
-    grain = std::clamp(grain, lower, upper);
+    //
+    // The bounds are computed in integers, and the lower one rounds *up*. Doing
+    // this in doubles and truncating at the end lets the chosen grain fall just
+    // below the lower bound, which puts the chunk count one over the ceiling.
+    // The normal build never reached the clamp; a ThreadSanitizer build did,
+    // because its instrumentation makes the body slow enough to drive the
+    // tuner into that regime.
+    const std::size_t lanes = laneCount();
+    const std::size_t maxChunks = std::max<std::size_t>(1, lanes * kMaxChunksPerLane);
+    const std::size_t minChunks = std::max<std::size_t>(1, lanes * kMinChunksPerLane);
+    const std::size_t lowerGrain = std::max<std::size_t>(1, (remaining + maxChunks - 1) / maxChunks);
+    const std::size_t upperGrain =
+        std::max(lowerGrain, std::max<std::size_t>(1, remaining / minChunks));
 
-    result.grain = std::max<std::size_t>(1, static_cast<std::size_t>(grain));
+    const double targetGrain = kTargetChunkNanos / std::max(result.nsPerElement, 1e-9);
+    const auto fromCost = targetGrain >= static_cast<double>(upperGrain)
+                              ? upperGrain
+                              : static_cast<std::size_t>(targetGrain);
+    result.grain = std::clamp(fromCost, lowerGrain, upperGrain);
     result.chunks = (remaining + result.grain - 1) / result.grain;
     parallelFor(begin + probed, end, result.grain, body);
     return result;

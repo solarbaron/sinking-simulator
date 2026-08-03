@@ -22,3 +22,4 @@ int failureCount();
 void runCoreTests();
 void runJobTests();
 void runArenaTests();
+void runEcsTests();
