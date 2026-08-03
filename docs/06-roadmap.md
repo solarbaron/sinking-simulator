@@ -124,11 +124,17 @@ worth trusting.
 
 ## Phase 2 — Sea and ship — *~12 em*
 
-- Wave field (spectral, FFT, shared between physics and rendering)
+- ~~**Wave field**~~ **done** — JONSWAP/PM directional spectra, equal-energy
+  binning, analytic evaluation with orbital kinematics (`02-simulation.md` §2)
+- ~~**Buoyancy under a wavy free surface**~~ **done** — `integrateBelowSurface()`,
+  the routine nonlinear Froude-Krylov needs (`01-architecture.md`)
+- ~~**Ikeda viscous roll damping**~~ **done** — all five components, validated by
+  roll decay and scale invariance (`02-simulation.md` §2)
+- ~~**Propulsion, rudder, MMG manoeuvring**~~ **done** — blade-element propeller
+  over four quadrants, Fujii rudder, KVLCC2 manoeuvring set (§7)
+- Nonlinear Froude–Krylov: couple the wave field to the hull integral and feed
+  the result into `Ship` — the two halves now exist and are separately validated
 - BEM offline pipeline + Cummins state-space radiation at runtime
-- Nonlinear Froude–Krylov on the instantaneous wetted surface
-- Ikeda viscous roll damping
-- Propulsion, rudder, MMG manoeuvring
 - Ocean rendering, hull rendering, basic materials
 - **Milestone:** drive a ship in a real seaway. Validated against published RAOs.
 
