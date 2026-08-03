@@ -78,12 +78,78 @@ The honest way to do wave loads on a large ship is potential flow. Plan:
   exactly the routine this needs. This is what captures a ship's behaviour in
   large waves, where linear theory quietly stops being true.
 
-### Viscous roll damping
+### Viscous roll damping — **implemented**
 
 Potential flow gives no roll damping at all — it is entirely viscous and it is the
-difference between a ship that rolls 8° and one that rolls 35°. Ikeda's empirical
-method (friction, eddy, lift, bilge keel, and appendage components) as the
-baseline, with per-ship tuning against roll decay tests.
+difference between a ship that rolls 8° and one that rolls 35°.
+
+`engine/sim/roll_damping.{hpp,cpp}` implements Ikeda's method and returns the
+equivalent linear coefficient B44 (N·m·s/rad) together with its components, so
+which mechanism is doing the work is always visible. Inputs are hull form
+(Lpp, B, d, Cb, Cm, roll-axis height above keel, bilge radius), bilge keel
+dimensions, and the operating point — roll amplitude, roll frequency, forward
+speed.
+
+**Empirical basis, component by component.** All of it is fitted to model
+experiments; none of it is derivable.
+
+| Component | Source | Behaviour |
+|---|---|---|
+| Friction | Kato (1958) + Tamiya's speed correction, via ITTC 7.5-02-07-04.5 (2.13)–(2.17) | Amplitude *cancels exactly*; ∝ √ω; the only component with a Reynolds number in it |
+| Eddy | Simplified Ikeda regression, Kawahara, Maekawa & Ikeda, STAB 2009 eq. (31), fitted to Ikeda's own sectional method | ∝ ω·φ_a exactly (a linearised quadratic moment); collapses with forward speed per ITTC (2.21) |
+| Lift | Ikeda et al. (1978), ITTC (2.10)–(2.11) | Exactly zero at zero speed, exactly linear in speed, amplitude independent |
+| Bilge keel | Ikeda's sectional pressure model, ITTC (2.24)–(2.32), split into normal-force and hull-pressure parts | Grows with amplitude, but to a **finite non-zero limit** as φ_a → 0, because C_D rises as the Keulegan–Carpenter number falls |
+| Wave (radiation) | **Not computed** — an input coefficient | Belongs to the BEM pipeline above; 5–30% of the total per ITTC |
+
+Nondimensionalisation follows ITTC (2.4): `B44hat = B44 / (ρ ∇ B²) · √(B/2g)`.
+Note the *multiplication* by √(B/2g); dividing by it leaves a quantity with units
+of s⁻² and destroys the Froude scale invariance that makes B44hat useful.
+
+**Measured on the reference hull** (170 × 25 × 6.5 m ro-pax, Cb 0.55, Cm 0.98,
+KG 11.0 m, 34 × 0.6 m bilge keels; T_roll 13.9 s at GM 2.0 m): viscous B44hat is
+0.0081 bare and 0.0439 with keels at ω̂ = 1.1 and 20°, i.e. 6.3% of critical
+damping at the natural roll frequency and 10° — which is where `Ship::zetaRoll`
+was guessed at 0.08. Bilge keels are 80% of the total, the eddy component
+essentially all of the rest at zero speed, and friction 1.6% at full scale
+against 8.2% for a 2 m model of the same hull (ITTC quotes 1–3% and 8–10%).
+
+**Validity limits — where this stops being trustworthy.** `validateRollDamping()`
+reports the first group; the rest cannot be detected from the parameters at all
+and are recorded here because that is the only place they can live.
+
+1. *Regression domain* (Kawahara et al., their own stated limits): 0.5 ≤ Cb ≤
+   0.85, 2.5 ≤ B/d ≤ 4.5, −1.5 ≤ OG/d ≤ 0.2, 0.9 ≤ Cm ≤ 0.99, and for keels
+   0.01 ≤ b_BK/B ≤ 0.06, 0.05 ≤ l_BK/Lpp ≤ 0.4.
+2. *Hull form.* The fits come from a methodical series of conventional
+   displacement cargo hulls. Kawahara et al. state explicitly that accuracy
+   "might decrease remarkably" for buttock-flow sterns — which is exactly the
+   modern large passenger ship and pure car carrier. Hard-chine hulls need the
+   separate chine formulation (ITTC §2.3); barges, planing hulls and multihulls
+   each have their own. None of those are implemented.
+3. *Section idealisation for bilge keels.* Vertical side, horizontal bottom,
+   quarter-circle bilge, keel at the 45° point and normal to the shell. A slender
+   high-speed hull with a small bilge radius gets the moment levers wrong.
+4. *High centre of gravity.* OG/d below −1.5 is extrapolation, and a high roll
+   axis was the specific case that broke the earlier version of the simple
+   formula. A top-heavy ro-pax at −0.7 is inside the range but near the edge of
+   the data.
+5. *Appendages other than bilge keels are absent*: no skeg, rudder, stabiliser
+   fin, shaft bracket or bossing. ITTC gives a skeg formulation (§2.2.5.2) that
+   is not implemented.
+6. *Equivalent linearisation.* B44 is only valid at the amplitude, frequency and
+   speed it was asked for; it must be re-evaluated as the operating point moves.
+   Very large rolls where the bilge keel emerges from the water need Bassler's
+   piecewise treatment and are not modelled.
+7. *Scale.* The friction component alone has a Reynolds effect, so a B44hat
+   measured on a model must not be reused at full scale without correcting it.
+8. Deep, calm, unrestricted water. No shallow-water correction; no forward-speed
+   effect on the bilge keel component (ITTC judges it small and it is neglected).
+
+**Next**: per-ship tuning against roll decay tests — a per-component scale factor
+identified from a measured decay curve, which is how this is done in practice and
+what turns a ±25% method into a ±10% one for a specific ship. Then the skeg and
+rudder components, and feeding B44 into the rigid-body roll equation in place of
+`Ship::zetaRoll`.
 
 ### The hard cases
 
