@@ -8,6 +8,7 @@
 // bytes that read as plausible values. A chunk capacity computed loosely
 // overruns into the next array. Every check below targets one of those.
 #include "engine/core/ecs.hpp"
+#include "engine/core/reflect.hpp"
 #include "harness.hpp"
 
 #include <algorithm>
@@ -20,8 +21,6 @@ using core::Entity;
 using core::World;
 using testing::expectEqual;
 using testing::expectTrue;
-
-namespace {
 
 struct Position {
     double x = 0, y = 0, z = 0;
@@ -39,6 +38,16 @@ struct Tag {
 struct alignas(64) Wide {
     double values[8]{};
 };
+
+// Reflected so its component id carries a name-derived stable id rather than a
+// mangled-name fallback. testArchetypeOrderFollowsStableIds checks that.
+SHIPSIM_REFLECT_BEGIN(Position)
+    SHIPSIM_FIELD(x)
+    SHIPSIM_FIELD(y)
+    SHIPSIM_FIELD(z)
+SHIPSIM_REFLECT_END(Position)
+
+namespace {
 
 void testEntityLifetime() {
     World world;
@@ -263,6 +272,32 @@ void testIterationOrderIsDeterministic() {
     expectEqual("iteration yields no duplicates", static_cast<long long>(unique.size()), 400);
 }
 
+// Archetype component order must be a property of the types, not of which one
+// the process happened to touch first, or two builds disagree on iteration order
+// and replays diverge.
+void testArchetypeOrderFollowsStableIds() {
+    World world;
+    world.create(Position{}, Velocity{}, Mass{}, Tag{});
+
+    const core::ComponentRegistry& registry = core::ComponentRegistry::instance();
+    bool sorted = true;
+    bool sawTheArchetype = false;
+    for (std::size_t a = 0; a < world.archetypeCount(); ++a) {
+        const auto& ids = world.archetypeIds(a);
+        if (ids.size() == 4) sawTheArchetype = true;
+        for (std::size_t i = 1; i < ids.size(); ++i)
+            if (!(registry.info(ids[i - 1]).stableId < registry.info(ids[i]).stableId))
+                sorted = false;
+    }
+    expectTrue("the four-component archetype exists", sawTheArchetype);
+    expectTrue("archetype components are ordered by stable id, not by runtime id", sorted);
+
+    // And the stable id really is the hash of the name, not an index.
+    expectTrue("a reflected component's stable id is the hash of its name",
+               registry.info(core::componentId<Position>()).stableId ==
+                   core::stableHash("Position"));
+}
+
 }  // namespace
 
 void runEcsTests() {
@@ -275,4 +310,5 @@ void runEcsTests() {
     testMultipleChunks();
     testComponentAlignmentInChunks();
     testIterationOrderIsDeterministic();
+    testArchetypeOrderFollowsStableIds();
 }

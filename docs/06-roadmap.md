@@ -64,8 +64,10 @@ without.
   contention. This is what the benchmark was for.
 - ~~**Archetype ECS**~~ **done** — SoA chunk storage, generational entity
   handles, archetype transitions, chunked queries (`01-architecture.md` §2)
-- Reflection and serialisation, save/load — also the fix for component ids
-  currently being first-use-order rather than stable across builds
+- ~~**Reflection and serialisation**~~ **done** — macro-based type description,
+  schema-tolerant save format, and stable name-derived component ids so
+  archetype ordering no longer depends on registration order
+  (`01-architecture.md` §2). Save/load of a whole World still to come. across builds
 - Multi-rate scheduler with time dilation — continuation-style, so the steady
   state never calls `wait()`; this is what makes fibers unnecessary rather than
   merely deferred (`01-architecture.md` §1)

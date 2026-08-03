@@ -18,9 +18,9 @@ ComponentRegistry& ComponentRegistry::instance() {
 }
 
 ComponentId ComponentRegistry::registerType(std::size_t size, std::size_t alignment,
-                                            const char* name) {
+                                            const char* name, std::uint64_t stableId) {
     const auto id = static_cast<ComponentId>(infos_.size());
-    infos_.push_back({size, alignment, name});
+    infos_.push_back({size, alignment, name, stableId});
     return id;
 }
 
@@ -31,9 +31,16 @@ World::~World() {
 }
 
 int World::slotOf(const Archetype& archetype, ComponentId id) {
-    const auto it = std::lower_bound(archetype.ids.begin(), archetype.ids.end(), id);
-    if (it == archetype.ids.end() || *it != id) return -1;
-    return static_cast<int>(it - archetype.ids.begin());
+    // Linear rather than binary: the list is sorted by stable id, not by the
+    // value being searched for, and archetypes hold few enough components that a
+    // scan is faster than carrying the comparator around anyway.
+    for (std::size_t i = 0; i < archetype.ids.size(); ++i)
+        if (archetype.ids[i] == id) return static_cast<int>(i);
+    return -1;
+}
+
+const std::vector<ComponentId>& World::archetypeIds(std::size_t index) const {
+    return archetypes_[index]->ids;
 }
 
 std::uint32_t World::findOrCreateArchetype(const std::vector<ComponentId>& sortedIds) {

@@ -14,6 +14,8 @@
 // must be trivially copyable, and they are never destructed.
 #pragma once
 
+#include "reflect.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -44,17 +46,27 @@ struct ComponentInfo {
     std::size_t size = 0;
     std::size_t alignment = 0;
     std::string name;
+    // Hash of the type's name. Unlike the runtime ComponentId this does not
+    // depend on which type happened to be touched first.
+    std::uint64_t stableId = 0;
 };
 
-// Process-wide type registry. Ids are handed out on first use, so they are
-// stable within a run but their *values* depend on which type is touched first.
-// Nothing may depend on the numeric value; archetypes sort by id purely to get a
-// canonical key. Stable cross-run ids are a job for the reflection pass.
+// Process-wide type registry. A ComponentId is only an array index: it is handed
+// out on first use, so its numeric value depends on which type was touched first
+// and is meaningless outside the run that produced it. Everything that must be
+// reproducible -- archetype ordering, and therefore iteration order -- keys off
+// ComponentInfo::stableId instead, which is a hash of the type's name.
 class ComponentRegistry {
 public:
     static ComponentRegistry& instance();
 
-    ComponentId registerType(std::size_t size, std::size_t alignment, const char* name);
+    ComponentId registerType(std::size_t size, std::size_t alignment, const char* name,
+                             std::uint64_t stableId);
+    // Orders two components by stable id, giving archetypes a canonical key that
+    // is identical across builds and link orders.
+    bool lessByStableId(ComponentId a, ComponentId b) const {
+        return infos_[a].stableId < infos_[b].stableId;
+    }
     const ComponentInfo& info(ComponentId id) const { return infos_[id]; }
     std::size_t count() const { return infos_.size(); }
 
@@ -68,8 +80,19 @@ ComponentId componentId() {
                   "components are relocated between chunks with memcpy");
     static_assert(std::is_trivially_destructible_v<T>,
                   "components are never destructed");
-    static const ComponentId id =
-        ComponentRegistry::instance().registerType(sizeof(T), alignof(T), typeid(T).name());
+    // A reflected component names itself; anything else falls back to the
+    // compiler's mangled name, which is stable within a toolchain but not across
+    // them. Reflecting a component is what makes its data portable.
+    static const ComponentId id = [] {
+        if constexpr (Reflected<T>) {
+            const TypeInfo& type = Reflect<T>::info();
+            return ComponentRegistry::instance().registerType(sizeof(T), alignof(T), type.name,
+                                                              type.stableId);
+        } else {
+            return ComponentRegistry::instance().registerType(
+                sizeof(T), alignof(T), typeid(T).name(), stableHash(typeid(T).name()));
+        }
+    }();
     return id;
 }
 
@@ -117,6 +140,9 @@ public:
 
     std::size_t entityCount() const { return liveEntities_; }
     std::size_t archetypeCount() const { return archetypes_.size(); }
+    // Component ids of an archetype, in canonical (stable id) order. Exposed for
+    // the editor and for tests that need to check the ordering invariant.
+    const std::vector<ComponentId>& archetypeIds(std::size_t index) const;
     // Entities per chunk for the archetype holding exactly Cs. Exposed so tests
     // can drive the multi-chunk paths rather than guessing at the threshold.
     template <typename... Cs>
@@ -169,8 +195,13 @@ private:
 
 namespace detail {
 
+// Canonical component order for an archetype. Sorting by stable id rather than
+// by the runtime index is what keeps archetype identity -- and therefore query
+// iteration order -- the same from one build to the next.
 inline std::vector<ComponentId> sortedIds(std::vector<ComponentId> ids) {
-    std::sort(ids.begin(), ids.end());
+    const ComponentRegistry& registry = ComponentRegistry::instance();
+    std::sort(ids.begin(), ids.end(),
+              [&](ComponentId a, ComponentId b) { return registry.lessByStableId(a, b); });
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     return ids;
 }
