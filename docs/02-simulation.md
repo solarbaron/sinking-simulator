@@ -22,11 +22,13 @@ floodwater free to re-level.
 
 **Next, in order:**
 
-1. **Compartment geometry from CSG rather than authored boxes.** Compartments
-   should be derived by intersecting the hull interior with bulkhead and deck
-   planes, so they follow the hull form instead of poking through it. Needs a
-   robust mesh boolean; plan is to use exact predicates (Shewchuk) with a
-   fallback to a signed-distance-field voxelisation when the boolean fails.
+1. ~~**Compartment geometry from CSG rather than authored boxes.**~~ **Done.**
+   `clipByPlane` / `clipToBox` carve each compartment out of the hull interior:
+   Sutherland-Hodgman per triangle, cut edges welded on a spatial hash, chained
+   into loops and capped by ear clipping. Validated by cutting a hull into a grid
+   and checking the cell volumes sum to the whole. Still to do: exact predicates
+   (Shewchuk) for robustness on degenerate input, nested cap loops (a plane
+   through a hollow mast), and non-planar bulkheads.
 2. **Permeability from contents, not a constant.** Currently a scalar per
    compartment. Should be derived from the actual cargo, machinery and outfit
    volumes placed in the space, and should change as cargo shifts or burns.

@@ -79,6 +79,122 @@ void testVolumeSolveRoundTrip() {
     }
 }
 
+// --- Constructive solid geometry --------------------------------------------
+
+// A hull shaped like the real thing: fine at the ends, full amidships, with a
+// turn of the bilge. Non-convex enough to be a fair test of the clipper.
+TriMesh testHull() {
+    const std::vector<double> waterlines{0.0, 1.0, 2.0, 3.2, 5.0, 7.0, 10.0};
+    std::vector<Station> stations;
+    for (int i = 0; i <= 20; ++i) {
+        Station s;
+        s.x = -50.0 + 100.0 * i / 20.0;
+        const double u = std::abs(s.x) / 50.0;
+        const double fx = u < 0.6 ? 1.0 : 1.0 - 0.8 * std::pow((u - 0.6) / 0.4, 2.0);
+        for (double z : waterlines)
+            s.halfBeam.push_back(9.0 * fx * (z >= 3.2 ? 1.0 : 0.5 + 0.5 * z / 3.2));
+        stations.push_back(s);
+    }
+    return makeHullFromStations(stations, waterlines);
+}
+
+// Watertightness is the precondition for every integral in the engine, and it is
+// silently violated rather than loudly: a mesh with one strip wound backwards
+// still produces plausible-looking numbers. Check the generators directly.
+void testMeshesAreWatertight() {
+    expectTrue("makeBox produces a closed manifold", isClosedManifold(makeBox({0, 0, 0}, {2, 3, 4})));
+    expectTrue("makeHullFromStations produces a closed manifold", isClosedManifold(testHull()));
+
+    const TriMesh hull = testHull();
+    expectTrue("clipByPlane output is a closed manifold",
+               isClosedManifold(clipByPlane(hull, {0, 0, 1}, 4.0)));
+    expectTrue("clipToBox output is a closed manifold",
+               isClosedManifold(clipToBox(hull, {-10, -3, 1}, {15, 3, 6})));
+
+    // The integral is reference-point independent only on a closed mesh, so
+    // disagreement between the two routines is the symptom to watch for.
+    const double whole = integrate(hull).volume;
+    for (double off : {40.0, 80.0, 200.0})
+        expectNear("integrateBelowPlane above the mesh equals the whole volume",
+                   integrateBelowPlane(hull, {0, 0, 1}, off).volume, whole, 1e-9 * whole);
+}
+
+// The capped solid produced by clipByPlane() must enclose exactly the volume the
+// cap-free integrator reports for the same half-space. If the cap leaks, or is
+// wound backwards, or a loop is dropped, these disagree immediately.
+void testClipMatchesIntegral() {
+    const TriMesh hull = testHull();
+    const Vec3 normals[] = {{1, 0, 0}, {0, 0, 1}, {0, 1, 0},
+                            normalize(Vec3{0.3, -0.8, 0.5})};
+    const double offsets[] = {-20.0, 0.0, 3.7, 12.0};
+
+    for (const Vec3& n : normals)
+        for (double off : offsets) {
+            const double want = integrateBelowPlane(hull, n, off).volume;
+            const TriMesh cut = clipByPlane(hull, n, off);
+            const VolumeIntegral got = integrate(cut);
+            expectNear("clip volume matches integral", got.volume, want,
+                       std::max(1e-6, 1e-6 * std::abs(want)));
+            if (want > 1.0) {
+                const Vec3 wantC = integrateBelowPlane(hull, n, off).centroid;
+                expectNear("clip centroid matches integral (z)", got.centroid.z, wantC.z, 1e-4);
+            }
+        }
+}
+
+// Compartments carved out of the hull must tile it: cut the same hull into a grid
+// of boxes and the volumes have to add back up to the whole, with nothing lost in
+// the cracks and nothing counted twice.
+void testSubdivisionTiles() {
+    const TriMesh hull = testHull();
+    const double whole = integrate(hull).volume;
+
+    const double xs[] = {-60, -30, -5, 20, 60};
+    const double ys[] = {-20, -4, 0, 4, 20};
+    const double zs[] = {-1, 2.5, 6.0, 20};
+
+    double sum = 0;
+    int nonEmpty = 0;
+    for (int i = 0; i + 1 < 5; ++i)
+        for (int j = 0; j + 1 < 5; ++j)
+            for (int k = 0; k + 1 < 4; ++k) {
+                const TriMesh cell =
+                    clipToBox(hull, {xs[i], ys[j], zs[k]}, {xs[i + 1], ys[j + 1], zs[k + 1]});
+                if (cell.tris.empty()) continue;
+                const double v = integrate(cell).volume;
+                expectTrue("subdivision cell has non-negative volume", v > -1e-6);
+                sum += v;
+                ++nonEmpty;
+            }
+
+    expectTrue("subdivision produced cells", nonEmpty > 20);
+    expectNear("subdivision volumes sum to the hull volume", sum, whole, 1e-4 * whole);
+}
+
+// A compartment carved from the hull must actually be inside the hull -- the
+// failure the hand-authored boxes had.
+void testClippedCompartmentStaysInsideHull() {
+    const TriMesh hull = testHull();
+    // A box far wider than the hull at the bow, where the hull is finest.
+    const TriMesh naive = makeBox({35, -9, 0}, {50, 9, 7});
+    const TriMesh carved = clipToBox(hull, {35, -9, 0}, {50, 9, 7});
+
+    const double naiveV = integrate(naive).volume;
+    const double carvedV = integrate(carved).volume;
+    expectTrue("naive box overstates a fine-ended compartment", naiveV > carvedV * 1.3);
+
+    // Every vertex of the carved compartment must lie within the hull's own
+    // half-breadth at its station.
+    bool inside = true;
+    for (const Vec3& p : carved.verts) {
+        const double u = std::abs(p.x) / 50.0;
+        const double fx = u < 0.6 ? 1.0 : 1.0 - 0.8 * std::pow((u - 0.6) / 0.4, 2.0);
+        const double halfBeam = 9.0 * fx * (p.z >= 3.2 ? 1.0 : 0.5 + 0.5 * std::max(p.z, 0.0) / 3.2);
+        if (std::abs(p.y) > halfBeam + 0.05) inside = false;
+    }
+    expectTrue("carved compartment stays within the hull envelope", inside);
+}
+
 // --- Hydrostatics -----------------------------------------------------------
 
 // A homogeneous box floats at a draft of (rho_body / rho_water) * height.
@@ -275,6 +391,10 @@ int main() {
     testAxisAlignedClip();
     testTiltedClipAgainstAlgebra();
     testVolumeSolveRoundTrip();
+    testMeshesAreWatertight();
+    testClipMatchesIntegral();
+    testSubdivisionTiles();
+    testClippedCompartmentStaysInsideHull();
     testArchimedes();
     testFreeSurfaceEffect();
     testTrappedAirArrestsFlooding();

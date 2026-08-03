@@ -15,29 +15,30 @@ constexpr double kDepth       = 15.0;   // m to the top of the accommodation blo
 // Ro-pax ferries carry a great deal of steel and passenger accommodation high up,
 // and run intact GM in the 1.5-3 m band -- stiff enough to pass the criteria,
 // nowhere near stiff enough to survive water on the vehicle deck.
-constexpr double kKG          = 12.60;  // m, vertical centre of gravity, light condition
+constexpr double kKG          = 7.80;   // m, vertical centre of gravity, light condition
 
-// Longitudinal fullness: parallel midbody between +/-30 m, a fine bow and a
+// Longitudinal fullness: parallel midbody between +/-24 m, a fine bow and a
 // fuller stern. u is normalised half-length.
 double longitudinalFullness(double x) {
     const double u = x / 60.0;
-    if (u > 0.5) {
-        const double t = (u - 0.5) / 0.5;
-        return 1.0 - 0.85 * t * t;
+    if (u > 0.4) {
+        const double t = (u - 0.4) / 0.6;
+        return 1.0 - 0.88 * t * t;
     }
-    if (u < -0.5) {
-        const double t = (-u - 0.5) / 0.5;
+    if (u < -0.4) {
+        const double t = (-u - 0.4) / 0.6;
         return 1.0 - 0.55 * t * t;
     }
     return 1.0;
 }
 
-// Vertical fullness: a broad flat bottom reaching full beam by the turn of the
-// bilge at 3.2 m. Ferries are close to box-shaped, which is exactly why their
-// waterplane inertia is large and their damaged stability is fragile.
+// Vertical fullness: rise of floor from a narrow keel out to full beam at the
+// turn of the bilge, 4 m up. Together with the above this gives Cb = 0.66 and
+// Cwp = 0.86 at the design draft -- a fine-ended but wide-waterplane form, which
+// is what makes a ferry's damaged stability fragile.
 double verticalFullness(double z) {
-    if (z >= 3.2) return 1.0;
-    return 0.55 + 0.45 * std::pow(z / 3.2, 0.8);
+    if (z >= 4.0) return 1.0;
+    return 0.30 + 0.70 * std::pow(z / 4.0, 0.75);
 }
 
 TriMesh buildHull() {
@@ -55,11 +56,16 @@ TriMesh buildHull() {
     return makeHullFromStations(stations, waterlines);
 }
 
-Compartment box(std::string name, Vec3 lo, Vec3 hi, double permeability,
-                bool vented = false) {
+// A compartment is the hull interior cut by its own bulkhead and deck planes, so
+// its volume is whatever the hull form actually leaves between them. The planes
+// below are deliberately set wider than the hull at the ends and low down; the
+// clip trims them back to the shell rather than the author having to guess where
+// the turn of the bilge is.
+Compartment carve(const TriMesh& hull, std::string name, Vec3 lo, Vec3 hi,
+                  double permeability, bool vented = false) {
     Compartment c;
     c.name = std::move(name);
-    c.mesh = makeBox(lo, hi);
+    c.mesh = clipToBox(hull, lo, hi);
     c.permeability = permeability;
     c.ventedToAtmosphere = vented;
     return c;
@@ -89,26 +95,30 @@ Ship buildFerry() {
     // --- Subdivision -------------------------------------------------------
     // Lower deck spaces sit on the double bottom at 1.8 m and run to the
     // bulkhead deck at 7.0 m.
+    const TriMesh& h = ship.hull;
     ship.compartments = {
-        box("forepeak",          {  44, -3.0, 1.8}, { 56,  3.0, 12.5}, 0.97),
-        box("fwd_hold_p",        {  20,  0.0, 1.8}, { 44,  8.0,  7.0}, 0.95),
-        box("fwd_hold_s",        {  20, -8.0, 1.8}, { 44,  0.0,  7.0}, 0.95),
-        box("engine_room_p",     {  -8,  0.0, 1.8}, { 20,  8.0,  7.0}, 0.85),
-        box("engine_room_s",     {  -8, -8.0, 1.8}, { 20,  0.0,  7.0}, 0.85),
-        box("aft_hold_p",        { -38,  0.0, 1.8}, { -8,  8.0,  7.0}, 0.95),
-        box("aft_hold_s",        { -38, -8.0, 1.8}, { -8,  0.0,  7.0}, 0.95),
-        box("steering_gear",     { -56, -5.0, 1.8}, {-38,  5.0,  7.0}, 0.90),
-        box("wing_tank_fwd_p",   {  20,  8.0, 3.2}, { 44,  9.7,  7.0}, 0.98),
-        box("wing_tank_fwd_s",   {  20, -9.7, 3.2}, { 44, -8.0,  7.0}, 0.98),
-        box("wing_tank_aft_p",   { -38,  8.0, 3.2}, { -8,  9.7,  7.0}, 0.98),
-        box("wing_tank_aft_s",   { -38, -9.7, 3.2}, { -8, -8.0,  7.0}, 0.98),
-        box("double_bottom_fwd", {   4, -5.0, 0.0}, { 44,  5.0,  1.8}, 0.98),
-        box("double_bottom_aft", { -44, -5.0, 0.0}, {  4,  5.0,  1.8}, 0.98),
+        // Stops at the bulkhead deck: above 7 m the space forward is vehicle deck.
+        carve(h, "forepeak",          {  44, -20, 1.8}, {  70,  20,  7.0}, 0.97),
+        carve(h, "fwd_hold_p",        {  20,   0, 1.8}, {  44,  20,  7.0}, 0.95),
+        carve(h, "fwd_hold_s",        {  20, -20, 1.8}, {  44,   0,  7.0}, 0.95),
+        carve(h, "engine_room_p",     {  -8,   0, 1.8}, {  20,   8,  7.0}, 0.85),
+        carve(h, "engine_room_s",     {  -8,  -8, 1.8}, {  20,   0,  7.0}, 0.85),
+        carve(h, "aft_hold_p",        { -38,   0, 1.8}, {  -8,   8,  7.0}, 0.95),
+        carve(h, "aft_hold_s",        { -38,  -8, 1.8}, {  -8,   0,  7.0}, 0.95),
+        carve(h, "steering_gear",     { -70, -20, 1.8}, { -38,  20,  7.0}, 0.90),
+        // Wing tanks now taper into the turn of the bilge instead of being a slab
+        // hanging outside the shell, which is what they are on a real ship.
+        carve(h, "wing_tank_fwd_p",   {  20,   8, 1.8}, {  44,  20,  7.0}, 0.98),
+        carve(h, "wing_tank_fwd_s",   {  20, -20, 1.8}, {  44,  -8,  7.0}, 0.98),
+        carve(h, "wing_tank_aft_p",   { -38,   8, 1.8}, {  -8,  20,  7.0}, 0.98),
+        carve(h, "wing_tank_aft_s",   { -38, -20, 1.8}, {  -8,  -8,  7.0}, 0.98),
+        carve(h, "double_bottom_fwd", {   4, -20, 0.0}, {  44,  20,  1.8}, 0.98),
+        carve(h, "double_bottom_aft", { -44, -20, 0.0}, {   4,  20,  1.8}, 0.98),
         // One undivided space, 100 m long and 19 m wide, one deck above the
         // waterline. Nothing else on the ship can generate a free surface moment
         // remotely this large.
-        box("vehicle_deck",      { -50, -9.7, 7.0}, { 50,  9.7, 12.5}, 0.90, true),
-        box("accommodation",     { -40, -9.0,12.5}, { 34,  9.0, 15.0}, 0.95, true),
+        carve(h, "vehicle_deck",      { -50, -20, 7.0}, {  50,  20, 12.5}, 0.90, true),
+        carve(h, "accommodation",     { -40, -20,12.5}, {  34,  20, 15.0}, 0.95, true),
     };
 
     const int forepeak   = ship.findCompartment("forepeak");

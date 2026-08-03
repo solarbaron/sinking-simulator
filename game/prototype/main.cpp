@@ -102,7 +102,12 @@ void printCompartments(const Ship& s) {
 int main(int argc, char** argv) {
     std::string scenario = "doors";
     double duration = 900.0;
-    double dt = 0.01;
+    // The flooding solution is converged well below this: heel, trim, draft and
+    // floodwater agree to four significant figures from dt = 0.005 to dt = 0.04.
+    // The system is stiff in restoring force but heavily damped, and the orifice
+    // flows change far more slowly than the step, so 0.02 s is a safety margin
+    // rather than a requirement.
+    double dt = 0.02;
     std::string csvPath;
 
     for (int i = 1; i < argc; ++i) {
@@ -118,10 +123,20 @@ int main(int argc, char** argv) {
     const double seaLevel = 0.0;
     ship.initialise(seaLevel);
 
+    for (const std::string& problem : ship.validate())
+        std::fprintf(stderr, "  ship definition: %s\n", problem.c_str());
+
     const Diagnostics intact = ship.diagnostics(seaLevel);
     std::printf("=== 120 m ro-pax ferry, intact condition ===\n");
     std::printf("  displacement      %10.0f t\n", intact.displacementMass / 1000.0);
     std::printf("  draft (midship)   %10.2f m\n", intact.draftMidship);
+    const double lengthOverall = ship.hullHi.x - ship.hullLo.x;
+    const double beam = ship.hullHi.y - ship.hullLo.y;
+    std::printf("  L x B x D         %6.0f x %.0f x %.1f m\n", lengthOverall, beam,
+                ship.hullHi.z - ship.hullLo.z);
+    std::printf("  block coeff Cb    %10.3f\n",
+                intact.buoyantVolume / (lengthOverall * beam * intact.draftMidship));
+    std::printf("  waterplane Cwp    %10.3f\n", intact.waterplaneArea / (lengthOverall * beam));
     std::printf("  waterplane area   %10.0f m2\n", intact.waterplaneArea);
     std::printf("  KG                %10.2f m\n", intact.centreOfGravity.z);
     std::printf("  KB                %10.2f m\n", intact.centreOfBuoyancy.z);
@@ -178,6 +193,18 @@ int main(int argc, char** argv) {
     }
 
     const Diagnostics fin = ship.diagnostics(seaLevel);
+    // "Still afloat" is not a verdict. A ship lying at 55 degrees with negative GM
+    // and water still coming in has already been lost; it just has not finished.
+    if (std::string_view(outcome).starts_with("still")) {
+        if (fin.gmTransverse < 0 && std::abs(fin.heelDeg) > 20.0)
+            outcome = "LOST - lolled over with negative GM, flooding continuing";
+        else if (fin.gmTransverse < 0)
+            outcome = "LOST - negative GM, loll imminent";
+        else if (fin.freeboardMin < 0)
+            outcome = "SURVIVED but the deck edge is under; no margin left";
+        else
+            outcome = "SURVIVED - positive GM, deck edge dry";
+    }
     std::printf("\n=== Outcome at t+%.0fs: %s ===\n", t, outcome);
     std::printf("  heel %.1f deg, trim %.1f deg, draft %.2f m, %.0f t of floodwater aboard\n",
                 fin.heelDeg, fin.trimDeg, fin.draftMidship, fin.floodwaterMass / 1000.0);

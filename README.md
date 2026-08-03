@@ -22,7 +22,7 @@ slice.
 ```sh
 cmake -S . -B build -G Ninja
 ninja -C build
-./build/shipsim_tests                       # 29 validation checks against closed-form answers
+./build/shipsim_tests                       # 116 validation checks against closed-form answers
 ./build/shipsim --scenario=none             # 120 m ferry, holed, nobody does anything
 ./build/shipsim --scenario=doors            # close the watertight door
 ./build/shipsim --scenario=full             # full damage control response
@@ -31,29 +31,47 @@ ninja -C build
 
 ## What slice 1 already does
 
-A 120 m ro-pax ferry, 16 compartments over four levels, is holed by a 2.4 m²
-tear in the starboard shell 2.5 m below the waterline. From there the simulation
-takes over. Three runs, same ship, same damage, different decisions:
+A 120 m ro-pax ferry — 8984 t, Cb 0.66, intact GM 2.00 m, 16 compartments carved
+out of the hull form over four levels — is holed by a 2.4 m² tear in the
+starboard shell 2.5 m below the waterline. From there the simulation takes over.
+Three runs, same ship, same damage, different decisions:
 
 | Scenario | Action taken | Outcome |
 |---|---|---|
-| `none` | nothing | founders at **t+555 s**, GM −2.6 m, 3251 t of floodwater |
-| `doors` | close the watertight door at t+45 s | **capsizes at t+330 s** — *sooner* |
-| `full` | door, pumps, early counterflood, secure the vehicle deck | **survives** — steady 6.3° list, GM +1.7 m |
+| `none` | nothing | GM negative by t+900 s, lolls to **53° by t+1800 s**, 7293 t aboard at the end |
+| `doors` | close the watertight door at t+45 s | **capsizes at t+915 s** |
+| `full` | door, pumps, early counterflood, secure the vehicle deck | **survives** — 12.4° list, GM +1.41 m, 1733 t |
 
 The middle row is not a bug and it is the reason this is worth building. Closing
-the door stops the two engine rooms cross-equalising, so ~700 t of asymmetric
+the door stops the two engine rooms cross-equalising, so the asymmetric
 floodwater becomes a list; the list pushes the starboard vehicle-deck openings
-under; water spreads across a 100 × 19 m undivided deck; the free surface moment
-destroys GM and she goes over. Symmetric flooding drowns her more slowly than
-asymmetric flooding rolls her. Nobody scripted that — it falls out of the
-integrals.
+under; water spreads across a 100 × 19 m undivided deck — 3896 t of it by the
+end — and the free surface moment finishes her. Symmetric flooding drowns her
+more slowly than asymmetric flooding rolls her. Nobody scripted that; it falls
+out of the integrals.
 
-The same physics also declines to let you cheat. In an earlier run the
-counterflooding attempt failed, and it failed for the right reason: by the time
-the valves were opened the ship had listed far enough to lift the port sea
-suctions clear of the water. Counterflooding is a thing you do *early* or not at
-all, and the simulation will not tell you that in a tooltip.
+The same physics declines to let you cheat. In an earlier run the counterflooding
+attempt failed, and it failed for the right reason: by the time the valves were
+opened the ship had listed far enough to lift the port sea suctions clear of the
+water. Counterflooding is a thing you do *early* or not at all, and the
+simulation will not tell you that in a tooltip.
+
+Trapped air is doing real work too. In the `doors` run, the final compartment
+table shows spaces the sea never directly reached:
+
+```
+compartment            gross m3   fill %    P kPa   water t
+fwd_hold_s                 1074     18.8    124.8       197
+wing_tank_fwd_s             108     31.7    148.3        35
+aft_hold_s                 1232     25.3    122.2       304
+```
+
+Past about 40° of heel those compartments' vent pipes go under, so the sea starts
+down the vents — and stops, because the air it has to displace can only leave by
+the same submerged pipe. Each one settles at a fill fraction set by where its
+air pressure balances the outside head, 1.2 to 1.5 atmospheres. That behaviour
+was never written down anywhere; it is two lines of orifice physics meeting
+Boyle's law.
 
 ## How the flooding model works
 
@@ -87,6 +105,21 @@ surface. It uses the divergence theorem about a reference point *on* the cutting
 plane, so cap tetrahedra vanish identically and no cap geometry is ever built —
 correct for any mesh topology, including planes that cut a compartment into
 several separate loops.
+
+**Compartments are carved, not authored.** Each one is the hull interior clipped
+by its own bulkhead and deck planes, using a mesh boolean that welds the cut
+edges, chains them into loops and caps them by ear clipping. So a wing tank
+tapers into the turn of the bilge and a forepeak narrows into the stem, instead
+of being a box that pokes out through the shell. `testSubdivisionTiles` cuts a
+hull into a grid of cells and checks the volumes sum back to the whole.
+
+That work also turned up a bug that had been silently poisoning every number in
+the project: `makeHullFromStations` wound its keel and deck strips opposite to
+the shell plating, so the hull was never a closed, consistently-wound manifold.
+Volume integrals on such a mesh do not fail — they return plausible, wrong
+answers that depend on where you put the reference point. The hull was overstating
+displacement by 40%. There is now an `isClosedManifold` check and `Ship::validate()`
+runs it at load, because this class of error is invisible until you go looking.
 
 ## Where this is going
 

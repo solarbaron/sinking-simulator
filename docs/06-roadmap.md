@@ -26,8 +26,11 @@ Numerical core, flooding, air, damaged stability, validation harness.
 - Compartments, two-phase orifice network, compressible trapped air
 - 6-DOF rigid body with hydrostatics, added mass, measured damping
 - Damaged GZ curves with floodwater re-levelling
-- 29 closed-form validation checks
-- A 120 m ferry that sinks, capsizes, or survives depending on what you do
+- Mesh boolean (clip, weld, cap by ear clipping) so compartments are carved out
+  of the hull form rather than authored as boxes
+- Watertightness checking and load-time ship definition validation
+- 116 closed-form validation checks
+- A 120 m ferry that lolls over, capsizes, or survives depending on what you do
 
 **Deliverable:** `./build/shipsim`. Runs today.
 
@@ -161,12 +164,16 @@ Phase 0 ✅ ──▶ Phase 1 ──┬──▶ Phase 2 ──┬──▶ Phas
 
 ## What to do next
 
-The immediate next step is not Phase 1. It is two smaller things that de-risk it:
+**Done since this document was written:** compartment CSG, which found and fixed a
+hull winding bug that had been overstating displacement by 40%. See `README.md`.
 
-1. **Compartment CSG** (`02-simulation.md` §1.1). The prototype's hand-placed
-   boxes poke through the hull, which caps the accuracy of every volume in the
-   ship. This is a day or two of work and it improves every number the sim
-   produces.
-2. **A GPU tet-FEM spike** — one steel plate, explicit solver, compute shader,
+The remaining pre-Phase-1 item:
+
+1. **A GPU tet-FEM spike** — one steel plate, explicit solver, compute shader,
    measured throughput on the 1070 Ti. A weekend, and it tells you whether Phase 3
-   is a plan or a wish before you spend 20 engineer-months finding out.
+   is a plan or a wish before you spend 18 engineer-months finding out.
+
+Then Phase 1, with one lesson carried forward from Phase 0: **every geometric
+representation gets a validity check that runs at load.** The winding bug cost
+nothing to fix and would have cost a great deal to find later, because the
+simulation kept producing believable numbers the whole time it was wrong.

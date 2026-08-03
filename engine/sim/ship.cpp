@@ -58,6 +58,48 @@ void Ship::initialise(double seaLevel) {
     updateInternalFreeSurfaces(seaLevel);
 }
 
+std::vector<std::string> Ship::validate() const {
+    std::vector<std::string> problems;
+    auto note = [&](const std::string& s) { problems.push_back(s); };
+
+    if (!isClosedManifold(hull)) note("hull is not a closed, consistently wound manifold");
+    const double hullVolume = integrate(hull).volume;
+    if (hullVolume <= 0) note("hull volume is not positive");
+
+    double subdivided = 0;
+    for (const Compartment& c : compartments) {
+        if (c.mesh.tris.empty()) { note("compartment '" + c.name + "' is empty"); continue; }
+        if (!isClosedManifold(c.mesh))
+            note("compartment '" + c.name + "' is not a closed manifold");
+        if (c.grossVolume <= 0)
+            note("compartment '" + c.name + "' has non-positive volume");
+        if (c.permeability <= 0 || c.permeability > 1)
+            note("compartment '" + c.name + "' has permeability outside (0, 1]");
+        subdivided += c.grossVolume;
+    }
+    // Compartments that overlap would push the total past the hull; the converse
+    // (a shortfall) is normal and just means unmodelled voids and structure.
+    if (subdivided > hullVolume * 1.001)
+        note("compartments total " + std::to_string(subdivided) + " m3, more than the hull's " +
+             std::to_string(hullVolume) + " m3 -- the subdivision overlaps");
+
+    for (const Opening& o : openings) {
+        const int n = static_cast<int>(compartments.size());
+        if (o.a != kSea && (o.a < 0 || o.a >= n))
+            note("opening '" + o.name + "' references a compartment that does not exist");
+        if (o.b != kSea && (o.b < 0 || o.b >= n))
+            note("opening '" + o.name + "' references a compartment that does not exist");
+        if (o.a == o.b) note("opening '" + o.name + "' connects a space to itself");
+        if (o.area < 0) note("opening '" + o.name + "' has negative area");
+    }
+    for (const Pump& p : pumps)
+        if (p.compartment < 0 || p.compartment >= static_cast<int>(compartments.size()))
+            note("pump '" + p.name + "' references a compartment that does not exist");
+
+    if (lightshipMass <= 0) note("lightship mass is not positive");
+    return problems;
+}
+
 int Ship::findCompartment(std::string_view name) const {
     for (std::size_t i = 0; i < compartments.size(); ++i)
         if (compartments[i].name == name) return static_cast<int>(i);
@@ -82,15 +124,31 @@ void Ship::updateInternalFreeSurfaces(double seaLevel) {
     for (Compartment& c : compartments) {
         c.waterVolume = std::clamp(c.waterVolume, 0.0, c.floodableVolume());
 
-        // Permeability: the liquid occupies a geometric region larger than its own
-        // volume, because part of that region is structure and cargo it flows around.
-        const double geometricRegion = c.waterVolume / std::max(c.permeability, 1e-6);
-        c.surfaceOffset = solvePlaneOffsetForVolume(c.mesh, up, geometricRegion, -kInf, kInf);
-        c.surfaceWorldZ = c.surfaceOffset + state.position.z;
+        if (c.waterVolume <= 1e-9) {
+            // Dry. Most compartments on a ship are, most of the time, and the
+            // solve below is the single most expensive thing in the tick -- so
+            // this early-out is worth more than any micro-optimisation in it.
+            // Park the surface below the deepest point of the space, so an
+            // opening down there still reads as being in air.
+            double deepest = kInf;
+            for (const Vec3& v : c.mesh.verts) deepest = std::min(deepest, dot(up, v));
+            c.surfaceOffset = deepest - 1.0;
+            c.surfaceWorldZ = c.surfaceOffset + state.position.z;
+            c.waterCentroid = (c.bboxLo + c.bboxHi) * 0.5;
+        } else {
+            // Permeability: the liquid occupies a geometric region larger than its
+            // own volume, because part of that region is structure and cargo it
+            // flows around.
+            const double geometricRegion = c.waterVolume / std::max(c.permeability, 1e-6);
+            const PlaneSweep sweep(c.mesh, up);
+            c.surfaceOffset =
+                sweep.solveOffsetForVolume(geometricRegion, c.grossVolume, c.surfaceOffset);
+            c.surfaceWorldZ = c.surfaceOffset + state.position.z;
 
-        const VolumeIntegral vi = integrateBelowPlane(c.mesh, up, c.surfaceOffset);
-        c.waterCentroid = vi.volume > 1e-9 ? vi.centroid
-                                           : (c.bboxLo + c.bboxHi) * 0.5;
+            const VolumeIntegral vi = sweep.below(c.surfaceOffset);
+            c.waterCentroid = vi.volume > 1e-9 ? vi.centroid
+                                               : (c.bboxLo + c.bboxHi) * 0.5;
+        }
 
         // Isothermal, not adiabatic: a few tonnes of steel bulkhead is an enormous
         // heat sink next to the air in a compartment, so trapped air tracks ambient
@@ -280,7 +338,8 @@ void Ship::integrateRigidBody(double dt, double seaLevel) {
     const Vec3 up = bodyFrameUp(R);
     const double planeOffset = seaLevel - state.position.z;
 
-    const VolumeIntegral sub = integrateBelowPlane(hull, up, planeOffset);
+    const PlaneSweep hullSweep(hull, up);
+    const VolumeIntegral sub = hullSweep.below(planeOffset);
     const MassProperties mp = massProperties();
     const Vec3 cogWorld = R * mp.cog + state.position;
 
@@ -302,15 +361,14 @@ void Ship::integrateRigidBody(double dt, double seaLevel) {
     // far more slowly than the ship moves.
     if (stabilityRefreshCounter_ % 16 == 0) {
         const double h = 0.05;
-        cachedWaterplaneArea_ =
-            (integrateBelowPlane(hull, up, planeOffset + h).volume -
-             integrateBelowPlane(hull, up, planeOffset - h).volume) / (2 * h);
+        cachedWaterplaneArea_ = (hullSweep.below(planeOffset + h).volume -
+                                 hullSweep.below(planeOffset - h).volume) / (2 * h);
 
         auto angularStiffness = [&](const Vec3& axisWorld) {
             const double eps = 2e-3;
             const Quat q2 = Quat::fromAxisAngle(axisWorld, eps) * state.orientation;
             const Mat3 R2 = q2.toMat3();
-            const VolumeIntegral s2 = integrateBelowPlane(hull, bodyFrameUp(R2), planeOffset);
+            const VolumeIntegral s2 = PlaneSweep(hull, bodyFrameUp(R2)).below(planeOffset);
             const Vec3 fb2{0, 0, seaDensity * kGravity * s2.volume};
             const Vec3 cb2 = R2 * s2.centroid + state.position;
             const Vec3 t2 = cross(cb2 - cogWorld, fb2);

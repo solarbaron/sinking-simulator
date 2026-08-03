@@ -150,6 +150,13 @@ public:
     // a true damaged-condition GZ curve.
     double rightingArmAtHeel(double heelRad, double seaLevel) const;
 
+    // Structural sanity of the ship definition, checked once after initialise().
+    // Returns a human-readable problem per entry; empty means the definition is
+    // self-consistent. Bad subdivision does not crash anything -- it quietly
+    // produces wrong volumes and therefore a wrong ship -- so it is worth an
+    // explicit check rather than trust.
+    std::vector<std::string> validate() const;
+
     // Convenience accessors.
     int findCompartment(std::string_view name) const;
     double totalFloodwaterMass() const;

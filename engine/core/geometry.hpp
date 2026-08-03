@@ -42,6 +42,40 @@ VolumeIntegral integrate(const TriMesh& mesh);
 // meshes of any topology, including ones the plane cuts into several loops.
 VolumeIntegral integrateBelowPlane(const TriMesh& mesh, const Vec3& n, double planeOffset);
 
+// A mesh bound to one plane *direction*, with every vertex's projection onto that
+// direction computed once.
+//
+// The free-surface solve clips the same mesh against a dozen parallel planes to
+// find one water level, and then does it again next tick, and the plane normal is
+// the same for every compartment in the ship because they all share the same
+// gravity. Under those conditions the per-triangle dot products dominate --
+// a vertex shared by six triangles gets projected twelve times per clip. Hoisting
+// them out is the single largest win available in the hydrostatic inner loop.
+class PlaneSweep {
+public:
+    PlaneSweep(const TriMesh& mesh, const Vec3& n);
+
+    // Volume and centroid of the region satisfying dot(n, x) <= offset.
+    VolumeIntegral below(double offset) const;
+
+    // Offset at which below() returns targetVolume. `guess` warm-starts a tight
+    // bracket; pass the mesh's total volume to avoid recomputing it.
+    double solveOffsetForVolume(double targetVolume, double fullVolume, double guess,
+                                double bracket = 0.35, int iterations = 40) const;
+
+    double loOffset() const { return lo_; }
+    double hiOffset() const { return hi_; }
+
+private:
+    double illinois(double targetVolume, double lo, double hi, double flo, double fhi,
+                    double tol, int iterations) const;
+
+    const TriMesh*      mesh_;
+    Vec3                n_;
+    std::vector<double> projected_;  // dot(n, verts[i])
+    double              lo_ = 0, hi_ = 0;
+};
+
 // Second moment of area of the plane-mesh intersection (the "waterplane"), about
 // axes through the intersection's own centroid. i.x is the transverse moment that
 // drives free-surface effect; i.y is the longitudinal moment. Returns area in .z.
@@ -54,6 +88,51 @@ Vec3 waterplaneMoments(const TriMesh& mesh, const Vec3& n, double planeOffset);
 // regula falsi; volume is monotone in the offset, so it always converges.
 double solvePlaneOffsetForVolume(const TriMesh& mesh, const Vec3& n, double targetVolume,
                                  double loOffset, double hiOffset, int iterations = 40);
+
+// Warm-started form, for the per-tick case where the answer moves only slightly
+// between calls. `guess` is the previous solution and `fullVolume` the mesh's
+// cached total, which saves a whole-mesh pass on every call. Brackets tightly
+// around the guess and widens only if that bracket does not contain the root, so
+// the common case costs a handful of mesh clips instead of a dozen or more.
+double solvePlaneOffsetForVolumeWarm(const TriMesh& mesh, const Vec3& n, double targetVolume,
+                                     double fullVolume, double guess, double bracket = 0.35,
+                                     int iterations = 40);
+
+// --- Constructive solid geometry --------------------------------------------
+//
+// integrateBelowPlane() answers "how much is below this plane" without ever
+// building the cut surface, which is what makes it fast enough to run per tick.
+// Authoring a compartment is the opposite problem: it happens once, at load, and
+// it needs the actual capped solid so the result can be clipped again later.
+
+// True when every directed edge occurs exactly once -- that is, the mesh is a
+// closed, consistently wound 2-manifold. Every volume integral in this engine
+// silently returns nonsense on a mesh that fails this, so anything built by a
+// generator, an importer or a boolean should be checked once at load.
+bool isClosedManifold(const TriMesh& mesh, double weldEpsilon = 1e-6);
+
+// A retained half-space: the region satisfying dot(n, x) <= offset.
+struct HalfSpace {
+    Vec3   n;
+    double offset = 0;
+};
+
+// Clip a closed mesh by a half-space, returning a closed mesh.
+//
+// The cut is capped: boundary edges left by the clip are welded, chained into
+// loops and triangulated by ear clipping. Assumes the intersection loops are
+// simple and non-nested, which holds for ship sections cut by bulkhead and deck
+// planes but would not for, say, a plane slicing through a hollow mast.
+TriMesh clipByPlane(const TriMesh& mesh, const Vec3& n, double offset,
+                    double weldEpsilon = 1e-6);
+
+TriMesh clipByHalfSpaces(const TriMesh& mesh, const std::vector<HalfSpace>& halfSpaces);
+
+// The common authoring case: carve a compartment out of the hull interior with
+// six axis-aligned bulkhead and deck planes. Unlike makeBox(), the result follows
+// the hull form, so a wing tank tapers into the turn of the bilge and a forepeak
+// narrows into the stem instead of poking out through the shell.
+TriMesh clipToBox(const TriMesh& mesh, const Vec3& lo, const Vec3& hi);
 
 // --- Primitive builders -----------------------------------------------------
 
