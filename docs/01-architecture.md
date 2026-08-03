@@ -17,8 +17,10 @@ frame if written naively. Every architectural decision below follows from that.
 - One worker thread per hardware thread minus one. On the 24-thread development
   machine, 23 workers. Zero workers is a supported configuration and every
   concurrency test runs it, because it is the debugging and determinism baseline.
-- Jobs are small (target 50–500 µs) and expressed as parallel-for over ranges,
-  not as long-lived tasks.
+- Jobs are small and expressed as parallel-for over ranges, not as long-lived
+  tasks. The original target here was 50–500 µs; **measurement says that is about
+  25× more conservative than it needs to be** — see "What the benchmark said"
+  below. Chunks reach full efficiency from roughly 2 µs.
 - The frame is a DAG of jobs built fresh each tick. No system ever calls another
   system directly; they declare read/write sets over component types and the
   scheduler derives ordering.
@@ -90,6 +92,40 @@ chunk and folds them in chunk index order. Binning per lane would still be
 non-deterministic, because a lane accumulates whichever chunks it happened to
 win, in whatever order it won them. Tested by requiring bit-identical results
 from 0, 1, 2, 7, 15 and 23 workers against the ordered single-threaded fold.
+
+### What the benchmark said
+
+`tools/job_bench` (run it; it prints the machine's load average, because these
+numbers depend on it). Measured on the 24-thread development box under a load
+average of ~11, so treat the absolute millisecond columns as the reliable
+measurement and derived speedups as indicative — the single-threaded baseline
+alone varied by 2.1× between runs, which the tool now reports rather than hides.
+
+| Quantity | Measured |
+|---|---|
+| Dispatch, uncontended (0 workers) | **17–23 ns/job** |
+| Dispatch, 16–23 workers, all jobs from one lane | ~250 ns/job |
+| Chunk size at which efficiency plateaus | **≈ 2 µs** |
+| Penalty for getting grain wrong | **~40×** (grain 16 vs the plateau) |
+
+Three conclusions:
+
+**Grain dominates everything else.** At a fixed worker count, the span between
+the worst and best grain is around 40×. Nothing else in the job system comes
+close to mattering that much, which is why grain auto-tuning is a Phase 1 item
+and the queue rewrite is not.
+
+**The Chase-Lev revisit is cancelled, on evidence.** Uncontended dispatch is
+0.2% of a 10 µs chunk; even the worst-case contended figure is ~2.5%, and that
+case is empty jobs all submitted from one lane, which maximises steal pressure
+and does not occur with real work. At plateau grains the sweep shows no
+dispatch-limited regime at all, so there is nothing for a faster queue to
+recover. Revisit only if a profile shows queue contention.
+
+**Efficiency falls off well before 23 workers.** 8 workers reach ~5.7×, 16 reach
+~6.7×, 23 reach ~6.9×. How much of that is the job system and how much is a
+machine already running at load 11 cannot be separated here; it needs a quiet
+box before any conclusion is drawn about worker-count tuning.
 
 ### Verification
 

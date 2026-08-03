@@ -47,6 +47,10 @@ target_compile_options(shipsim PRIVATE -Wall -Wextra)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 enable_testing()
+add_executable(job_bench tools/job_bench/main.cpp)
+target_link_libraries(job_bench PRIVATE shipsim_engine)
+target_compile_options(job_bench PRIVATE -Wall -Wextra)
+
 add_executable(shipsim_tests
   tests/main.cpp
   tests/harness.cpp

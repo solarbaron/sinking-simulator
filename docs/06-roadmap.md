@@ -49,13 +49,18 @@ without.
 - ~~**Arena allocators**~~ **done** — per-frame, per-lane bump allocators with
   ASan poisoning of the unused region (`01-architecture.md` §5). These are what
   make the Chase-Lev handle scheme below safe without a reclamation scheme.
-- **Job throughput and grain-scaling benchmark** — jobs/second, and parallelFor
-  speedup as a function of grain and worker count. The queue and grain decisions
-  are currently folklore; this is what makes them measured.
-- **Grain auto-tuning** — size chunks toward the 50 µs target rather than taking
-  the caller's number on faith. Expected to matter more than the queue structure.
-- **Chase-Lev revisit** — deque of 32-bit handles into the per-frame arena, if
-  and only if the benchmark says queue overhead is visible. Explicitly skippable.
+- ~~**Job throughput and grain-scaling benchmark**~~ **done** — `tools/job_bench`.
+  Dispatch costs 17–23 ns uncontended; efficiency plateaus at ~2 µs chunks; the
+  penalty for bad grain is ~40×. Numbers and caveats in `01-architecture.md` §1.
+- **Grain auto-tuning** — size chunks from a measured cost estimate rather than
+  taking the caller's number on faith. The benchmark confirms this is where the
+  leverage is: ~40× from grain against ~0.2% from dispatch. Target chunks of
+  roughly 5–20 µs, with a floor on chunk count relative to lane count, since the
+  sweep also shows balance degrading once chunks exceed ~150 µs.
+- ~~**Chase-Lev revisit**~~ **cancelled on evidence.** Dispatch is 0.2% of a
+  10 µs chunk, and the sweep shows no dispatch-limited regime at plateau grains,
+  so a faster queue has nothing to recover. Reopen only if a profile shows queue
+  contention. This is what the benchmark was for.
 - Archetype ECS
 - Reflection and serialisation, save/load
 - Multi-rate scheduler with time dilation — continuation-style, so the steady
