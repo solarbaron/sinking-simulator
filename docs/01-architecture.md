@@ -196,8 +196,12 @@ their raw state.
 
 ## 5. Memory
 
-- Arena allocators per frame and per subsystem; the global allocator is off-limits
-  during a tick.
+- **Arena allocators per frame and per lane** — implemented in
+  `engine/core/arena.cpp`. The global allocator is off-limits during a tick: it
+  takes a lock and it is unpredictable, and a 100 Hz tick that occasionally stalls
+  in `malloc` is a 100 Hz tick that occasionally misses. `FrameArenas` gives one
+  arena per job-system lane, so allocation needs no atomics at all — the arena
+  itself is deliberately not thread-safe.
 - Pool allocators for the churn-heavy things (particles, fire cells, FEM zones).
 - Chunked SoA for entity data as above.
 - Asset streaming is virtual-texture style for the exterior world; ship interiors
@@ -205,6 +209,30 @@ their raw state.
   flooding is unacceptable.
 
 Budget target for a 300 m vessel: 6 GB resident, 2 GB of that simulation state.
+Arena sizing is meant to come from measured `highWaterMark()`, not from guesses.
+
+### Two things the arena implementation settled
+
+**Align the address, not the offset.** The obvious implementation rounds the
+running offset up to the requested alignment. That is correct only while the
+requested alignment does not exceed the block's own alignment; past that it
+silently returns under-aligned memory, and nothing faults until someone does an
+aligned SIMD store. Caught by testing alignments from 1 to 256 rather than the
+handful anyone writes by hand.
+
+**Arenas are poisoned under AddressSanitizer.** A bump allocator is one large
+valid heap block as far as ASan is concerned, so an overrun past an allocation,
+or a read after `reset()`, is an invisible scribble inside memory ASan considers
+legitimately ours — precisely the class of bug arenas make easier to write. The
+unused tail is kept poisoned and only the bytes actually handed out are
+unpoisoned, including the alignment padding, so overruns land in poisoned space.
+Verified with a negative control: a 64-byte write into a 16-byte arena allocation
+is reported as use-after-poison.
+
+**No destructors, ever.** `create<T>()` refuses anything not trivially
+destructible rather than silently leaking it, and `allocateArray<T>()` avoids
+array placement-new entirely — the standard permits it to demand an unspecified
+cookie, which would overrun an allocator sized to `sizeof(T) * count`.
 
 ## 6. Module boundaries
 

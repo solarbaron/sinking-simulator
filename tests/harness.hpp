@@ -21,3 +21,4 @@ int failureCount();
 // Each suite lives in its own translation unit and is called from tests/main.cpp.
 void runCoreTests();
 void runJobTests();
+void runArenaTests();

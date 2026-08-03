@@ -26,6 +26,7 @@ elseif(NOT SHIPSIM_SANITIZE STREQUAL "")
 endif()
 
 add_library(shipsim_engine
+  engine/core/arena.cpp
   engine/core/geometry.cpp
   engine/core/jobs.cpp
   engine/sim/ship.cpp
@@ -49,6 +50,7 @@ enable_testing()
 add_executable(shipsim_tests
   tests/main.cpp
   tests/harness.cpp
+  tests/test_arena.cpp
   tests/test_core.cpp
   tests/test_jobs.cpp
 )

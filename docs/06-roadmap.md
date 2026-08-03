@@ -46,9 +46,9 @@ without.
 
 - ~~Job system~~ **done** — work-stealing with task helping, deterministic
   reductions, verified under ThreadSanitizer (`01-architecture.md` §1)
-- **Arena allocators** — per-frame and per-subsystem bump allocators. Ordered
-  ahead of the ECS because the job queue needs them too: they are what makes the
-  Chase-Lev handle scheme below safe without a reclamation scheme.
+- ~~**Arena allocators**~~ **done** — per-frame, per-lane bump allocators with
+  ASan poisoning of the unused region (`01-architecture.md` §5). These are what
+  make the Chase-Lev handle scheme below safe without a reclamation scheme.
 - **Job throughput and grain-scaling benchmark** — jobs/second, and parallelFor
   speedup as a function of grain and worker count. The queue and grain decisions
   are currently folklore; this is what makes them measured.
