@@ -347,6 +347,37 @@ fixed. Anything requiring reproducibility must therefore consume *events* from
 the field solvers (a tear, its geometry, the resulting orifice area) rather than
 their raw state.
 
+### Offscreen verification harness
+
+Rendering is verified by drawing to an image, writing a PNG, reading it back and
+asserting on pixel content. A windowed check cannot run in CI, and "it looked
+right" is not a test.
+
+`engine/core/png.cpp` is a written-not-imported PNG codec, because the dependency
+budget for this phase is a windowing library and nothing else. PNG needs a zlib
+stream, but deflate permits *stored* blocks, so a valid file needs only CRC-32,
+Adler-32 and a few headers. The files are larger than a real encoder would
+produce; they are read by tests, not shipped. All five scanline filters are
+implemented in both directions, so the decoder can read images this encoder did
+not write.
+
+Two things the tests are pointed at, because a codec that is quietly wrong makes
+every rendering test built on it worthless:
+
+- **Corruption must be detected, not tolerated.** A decoder that ignores CRCs
+  returns a scrambled image, which is worse than failing. Every single-bit flip
+  and every truncation of a valid file is required to be rejected.
+- **Multi-block images.** A stored deflate block carries a 16-bit length, so
+  anything past 64 KB of scanline data spans several. Getting the chaining wrong
+  truncates the image at exactly that boundary, which a small test image would
+  never reveal — so one test image is deliberately 200 x 200 and asserts on the
+  far corner.
+
+Validated against an independent implementation as well as itself: Python's
+`zlib` decompresses the IDAT, the CRCs check out, a separately written unfilter
+reproduces the exact pixels, and `file(1)` identifies the result as
+`PNG image data, 8-bit/color RGBA, non-interlaced`.
+
 ## 5. Memory
 
 - **Arena allocators per frame and per lane** — implemented in

@@ -9,6 +9,7 @@ int main() {
     runJobTests();
     runArenaTests();
     runEcsTests();
+    runPngTests();
     runSchedulerTests();
     runSerialiseTests();
     runWorldIoTests();

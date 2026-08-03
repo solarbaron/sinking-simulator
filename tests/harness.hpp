@@ -23,6 +23,7 @@ void runCoreTests();
 void runJobTests();
 void runArenaTests();
 void runEcsTests();
+void runPngTests();
 void runSchedulerTests();
 void runSerialiseTests();
 void runWorldIoTests();

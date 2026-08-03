@@ -75,6 +75,8 @@ without.
 - ~~**World save/load**~~ **done** — whole-world persistence with surviving
   entity handles, unknown-component tolerance and a byte-identical round trip
   (`01-architecture.md` §2)
+- ~~**Offscreen verification harness**~~ **done** — dependency-free PNG codec,
+  externally validated (`01-architecture.md` §4)
 - Vulkan device, render graph, bindless setup, a debug renderer
 - **Milestone:** watch the current ferry scenario in 3D, in real time, with a
   free camera and a wireframe of the flooding compartments.
