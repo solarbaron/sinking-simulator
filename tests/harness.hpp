@@ -26,6 +26,7 @@ void runArenaTests();
 void runEcsTests();
 void runDeviceTests();
 void runOffscreenTests();
+void runOceanTests();
 void runPngTests();
 void runPropulsionTests();
 void runRollDampingTests();
