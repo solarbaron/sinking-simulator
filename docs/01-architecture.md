@@ -27,14 +27,35 @@ frame if written naively. Every architectural decision below follows from that.
 
 ### Two decisions the implementation reached, with reasons
 
-**Task helping, not fibers.** A thread that waits on a counter executes other
-jobs while it waits, rather than parking. This gets the property fibers were
-wanted for -- a nested `parallelFor` inside a job must not deadlock the pool --
-without a fiber runtime, and it is what `enkiTS` actually does. (The earlier text
-here named both Naughty Dog and enkiTS as the model; those are two different
-designs, and enkiTS is the one being followed.) Fibers remain the option if a job
-ever needs to yield mid-body rather than only at a wait point; nothing in the
-simulation currently does.
+**Task helping, not fibers. Fibers are rejected, not deferred.** A thread that
+waits on a counter executes other jobs while it waits, rather than parking. This
+gets the property fibers were wanted for -- a nested `parallelFor` inside a job
+must not deadlock the pool -- without a fiber runtime. (The earlier text here
+named both Naughty Dog and enkiTS as the model; those are two different designs,
+and enkiTS -- which helps rather than switching fibers -- is the one being
+followed.)
+
+Fibers do buy three things helping does not: bounded stack growth under deep
+nesting, wait latency bounded by the actual dependency rather than by the longest
+unrelated job a helper picks up, and freedom from the reentrancy hazard where a
+helping thread runs a job conflicting with the one it is suspended inside.
+
+They are still the wrong trade here. The cost is per-fiber stacks (hundreds of
+64-512 KB allocations), degraded debugger and profiler support, sanitizer
+annotations at every switch, and -- worst -- `thread_local` ceasing to be stable,
+because a fiber may resume on a different thread. `currentLane()` is thread_local
+today, and that pattern is everywhere in an engine. That is a broad class of
+subtle bugs adopted across the whole codebase to fix a problem this workload does
+not have: wide parallel-fors over homogeneous data, shallow nesting, comparable
+job durations.
+
+**The real answer is to make waiting rare rather than cheap.** Continuation-style
+scheduling -- a job declares "when this counter drains, schedule that job" -- means
+nothing blocks and there is nothing to help with. This is already what the DAG
+below implies: if the scheduler derives ordering from declared read/write sets,
+systems should not be calling `wait()` in the steady state at all. Helping then
+survives only at the frame boundary and in tools and tests, which is exactly where
+it is safe. See the multi-rate scheduler item in `06-roadmap.md` Phase 1.
 
 **Bounded MPMC ring per lane, not a Chase-Lev deque.** Chase-Lev is the faster
 structure and was implemented first. It is only safe when a queue slot is an
@@ -44,9 +65,25 @@ write. ThreadSanitizer found it immediately. Claiming the slot with the CAS
 before reading does not fix it either -- advancing `top` does not reserve the
 slot, so once later thieves push `top` past it the owner may reuse it while the
 first thief has still not copied it out. The Vyukov ring gives every cell a
-sequence number that makes each access exclusive by construction. Chase-Lev is
-recoverable later with atomic pointers plus epoch reclamation; at 50–500 µs per
-job, one CAS in each direction is not what limits anything.
+sequence number that makes each access exclusive by construction.
+
+Chase-Lev is worth recovering, and the route does **not** require epoch or
+hazard-pointer reclamation. Store a **32-bit handle** (lane + index) in the deque
+and keep payloads in the per-frame arena described in §5. The speculative read
+then becomes a well-defined relaxed load of four bytes; a stale handle is
+harmless because it is discarded on CAS failure; and a valid handle always points
+at live storage, because nothing in the arena is recycled until the frame
+quiesces. The allocator that makes this safe is already specified — the queue was
+simply built before it existed. The MPMC ring is the correct thing to have in the
+meantime, not a permanent answer.
+
+**Grain matters more than either.** A `parallelFor` over 250 k elements at grain
+97 produces 2578 chunks of roughly 1-2 µs each, against a queue overhead near
+1 µs — that is the only regime where queue choice is visible at all, and the fix
+is not a faster queue but auto-tuning grain toward the 50 µs target. Both claims
+are currently folklore: there is no job throughput benchmark yet, and until there
+is, the Chase-Lev question stays open on purpose rather than being settled by
+assertion.
 
 **Reductions bin per chunk, not per lane.** `parallelReduce` stores a partial per
 chunk and folds them in chunk index order. Binning per lane would still be

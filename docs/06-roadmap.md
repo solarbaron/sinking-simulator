@@ -46,9 +46,21 @@ without.
 
 - ~~Job system~~ **done** — work-stealing with task helping, deterministic
   reductions, verified under ThreadSanitizer (`01-architecture.md` §1)
-- Archetype ECS, arena allocators
+- **Arena allocators** — per-frame and per-subsystem bump allocators. Ordered
+  ahead of the ECS because the job queue needs them too: they are what makes the
+  Chase-Lev handle scheme below safe without a reclamation scheme.
+- **Job throughput and grain-scaling benchmark** — jobs/second, and parallelFor
+  speedup as a function of grain and worker count. The queue and grain decisions
+  are currently folklore; this is what makes them measured.
+- **Grain auto-tuning** — size chunks toward the 50 µs target rather than taking
+  the caller's number on faith. Expected to matter more than the queue structure.
+- **Chase-Lev revisit** — deque of 32-bit handles into the per-frame arena, if
+  and only if the benchmark says queue overhead is visible. Explicitly skippable.
+- Archetype ECS
 - Reflection and serialisation, save/load
-- Multi-rate scheduler with time dilation
+- Multi-rate scheduler with time dilation — continuation-style, so the steady
+  state never calls `wait()`; this is what makes fibers unnecessary rather than
+  merely deferred (`01-architecture.md` §1)
 - Vulkan device, render graph, bindless setup, a debug renderer
 - **Milestone:** watch the current ferry scenario in 3D, in real time, with a
   free camera and a wireframe of the flooding compartments.
