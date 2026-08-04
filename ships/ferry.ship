@@ -1,0 +1,431 @@
+# A 120 m ro-pax ferry: the slice-1 test vessel, as data.
+#
+# This is the same ship as `game/prototype/ferry.cpp`, which stays in the tree as
+# the reference this file is validated against -- `tests/test_shipfile.cpp` builds
+# both and compares the hull mesh, every compartment volume, every opening and the
+# hydrostatics. The C++ is the definition of correct; this file is the definition
+# of *shippable*, because a fleet cannot be a directory of functions.
+#
+# Body frame, as CLAUDE.md sets it: +x forward, +y to port, +z up, origin at
+# midship on the baseline. SI throughout: metres, kilograms, seconds, m2, m3/s.
+#
+# The vehicle deck is the point of this vessel. It is one undivided space 100 m
+# long and 19 m wide, one deck above the waterline, and nothing else aboard can
+# generate a free surface moment remotely as large. That is why ro-pax casualties
+# capsize instead of settling.
+
+ship_format 1
+
+ship ferry_120m
+    # The vehicle deck: the level that decides whether she lives.
+    deck_edge_z 7.0
+
+    # Light displacement is *defined* as whatever floats her at the design draft
+    # with every compartment dry, so the hull form and the loading stay
+    # consistent even if the offsets below are edited. Stating `lightship_mass`
+    # instead would pin the mass and let an edited hull quietly change the draft.
+    lightship_draft 5.5
+
+    # Ro-pax ferries carry a great deal of steel and passenger accommodation high
+    # up, and run intact GM in the 1.5-3 m band -- stiff enough to pass the
+    # criteria, nowhere near stiff enough to survive water on the vehicle deck.
+    lightship_cog -1.5 0.0 7.80
+    gyradii        7.0 28.0 29.0
+
+# --- Hull form ---------------------------------------------------------------
+#
+# The classical offsets table: half-breadths at each waterline, station by
+# station from transom to stem. Longitudinally there is parallel midbody between
+# +/-24 m, a fine bow and a fuller stern; vertically the floor rises from a
+# narrow keel out to full beam at the turn of the bilge, 4 m up. Together those
+# give Cb = 0.66 and Cwp = 0.86 at the design draft -- a fine-ended but
+# wide-waterplane form, which is what makes a ferry's damaged stability fragile.
+#
+# Six decimals is a micron, which is four orders of magnitude finer than any
+# shipyard measures and costs about 1e-8 relative on the compartment volumes
+# against the analytic form in ferry.cpp. The format itself is lossless: a
+# generator that writes seventeen significant figures round-trips bit for bit.
+
+hull
+    waterlines     0.000    1.000    1.800    2.600    3.200    4.200    5.500    7.000    9.000   11.000   12.500   15.000
+
+    station   -60.0   1.350000  2.463693  3.080693  3.630319  4.014576  4.500000  4.500000  4.500000  4.500000  4.500000  4.500000  4.500000
+    station   -55.0   1.776505  3.242046  4.053974  4.777243  5.282898  5.921682  5.921682  5.921682  5.921682  5.921682  5.921682  5.921682
+    station   -50.0   2.139352  3.904227  4.881989  5.752985  6.361918  7.131173  7.131173  7.131173  7.131173  7.131173  7.131173  7.131173
+    station   -45.0   2.438542  4.450236  5.564739  6.557543  7.251637  8.128472  8.128472  8.128472  8.128472  8.128472  8.128472  8.128472
+    station   -40.0   2.674074  4.880073  6.102222  7.190920  7.952054  8.913580  8.913580  8.913580  8.913580  8.913580  8.913580  8.913580
+    station   -35.0   2.845949  5.193737  6.494440  7.653113  8.463169  9.486497  9.486497  9.486497  9.486497  9.486497  9.486497  9.486497
+    station   -30.0   2.954167  5.391230  6.741392  7.944124  8.784982  9.847222  9.847222  9.847222  9.847222  9.847222  9.847222  9.847222
+    station   -25.0   2.998727  5.472550  6.843078  8.063951  8.917493  9.995756  9.995756  9.995756  9.995756  9.995756  9.995756  9.995756
+    station   -20.0   3.000000  5.474874  6.845984  8.067375  8.921279 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000
+    station   -15.0   3.000000  5.474874  6.845984  8.067375  8.921279 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000
+    station   -10.0   3.000000  5.474874  6.845984  8.067375  8.921279 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000
+    station    -5.0   3.000000  5.474874  6.845984  8.067375  8.921279 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000
+    station     0.0   3.000000  5.474874  6.845984  8.067375  8.921279 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000
+    station     5.0   3.000000  5.474874  6.845984  8.067375  8.921279 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000
+    station    10.0   3.000000  5.474874  6.845984  8.067375  8.921279 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000
+    station    15.0   3.000000  5.474874  6.845984  8.067375  8.921279 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000
+    station    20.0   3.000000  5.474874  6.845984  8.067375  8.921279 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000 10.000000
+    station    25.0   2.997963  5.471156  6.841335  8.061897  8.915221  9.993210  9.993210  9.993210  9.993210  9.993210  9.993210  9.993210
+    station    30.0   2.926667  5.341043  6.678637  7.870173  8.703203  9.755556  9.755556  9.755556  9.755556  9.755556  9.755556  9.755556
+    station    35.0   2.753519  5.025055  6.283514  7.404556  8.188302  9.178395  9.178395  9.178395  9.178395  9.178395  9.178395  9.178395
+    station    40.0   2.478519  4.523192  5.655966  6.665046  7.370518  8.261728  8.261728  8.261728  8.261728  8.261728  8.261728  8.261728
+    station    45.0   2.101667  3.835453  4.795992  5.651644  6.249852  7.005556  7.005556  7.005556  7.005556  7.005556  7.005556  7.005556
+    station    50.0   1.622963  2.961839  3.703593  4.364350  4.826302  5.409877  5.409877  5.409877  5.409877  5.409877  5.409877  5.409877
+    station    55.0   1.042407  1.902350  2.378768  2.803164  3.099869  3.474691  3.474691  3.474691  3.474691  3.474691  3.474691  3.474691
+    station    60.0   0.360000  0.656985  0.821518  0.968085  1.070553  1.200000  1.200000  1.200000  1.200000  1.200000  1.200000  1.200000
+
+# --- Subdivision -------------------------------------------------------------
+#
+# Each `box` is six bulkhead and deck planes; the compartment is whatever the hull
+# form leaves between them. The boxes are deliberately set wider than the hull at
+# the ends and low down -- the clip trims them back to the shell, so the author
+# never has to guess where the turn of the bilge is. A box that misses the hull
+# entirely is refused at load rather than becoming a space that never floods.
+#
+# Lower deck spaces sit on the double bottom at 1.8 m and run to the bulkhead
+# deck at 7.0 m.
+
+compartment forepeak
+    # Stops at the bulkhead deck: above 7 m the space forward is vehicle deck.
+    box  44 -20 1.8   70 20 7.0
+    permeability 0.97
+    vented false
+
+compartment fwd_hold_p
+    box  20   0 1.8   44 20 7.0
+    permeability 0.95
+    vented false
+
+compartment fwd_hold_s
+    box  20 -20 1.8   44  0 7.0
+    permeability 0.95
+    vented false
+
+compartment engine_room_p
+    box  -8   0 1.8   20  8 7.0
+    permeability 0.85
+    vented false
+
+compartment engine_room_s
+    box  -8  -8 1.8   20  0 7.0
+    permeability 0.85
+    vented false
+
+compartment aft_hold_p
+    box -38   0 1.8   -8  8 7.0
+    permeability 0.95
+    vented false
+
+compartment aft_hold_s
+    box -38  -8 1.8   -8  0 7.0
+    permeability 0.95
+    vented false
+
+compartment steering_gear
+    box -70 -20 1.8  -38 20 7.0
+    permeability 0.90
+    vented false
+
+# The wing tanks taper into the turn of the bilge rather than hanging outside the
+# shell as a slab, which is what they do on a real ship.
+compartment wing_tank_fwd_p
+    box  20   8 1.8   44 20 7.0
+    permeability 0.98
+    vented false
+
+compartment wing_tank_fwd_s
+    box  20 -20 1.8   44 -8 7.0
+    permeability 0.98
+    vented false
+
+compartment wing_tank_aft_p
+    box -38   8 1.8   -8 20 7.0
+    permeability 0.98
+    vented false
+
+compartment wing_tank_aft_s
+    box -38 -20 1.8   -8 -8 7.0
+    permeability 0.98
+    vented false
+
+compartment double_bottom_fwd
+    box   4 -20 0.0   44 20 1.8
+    permeability 0.98
+    vented false
+
+compartment double_bottom_aft
+    box -44 -20 0.0    4 20 1.8
+    permeability 0.98
+    vented false
+
+# One undivided space, 100 m long and 19 m wide, one deck above the waterline.
+compartment vehicle_deck
+    box -50 -20 7.0    50 20 12.5
+    permeability 0.90
+    vented true
+
+compartment accommodation
+    box -40 -20 12.5   34 20 15.0
+    permeability 0.95
+    vented true
+
+# --- Flow network ------------------------------------------------------------
+#
+# Every hole, door, hatch, vent and pipe is one orifice in one network. Water and
+# air move through the same edges; which phase moves depends only on what is
+# sitting at the opening on the high-pressure side.
+
+# The casualty: a 2.4 m2 tear in the starboard shell, 2.5 m below the waterline,
+# opening straight into the starboard engine room.
+opening breach_er_s
+    between sea engine_room_s
+    at 6 -9.0 3.0
+    area 2.4
+    discharge 0.62
+    kind breach
+    open true
+
+# Watertight door on the centreline, left open on passage as they so often are.
+# Closing it is the single highest-value action available.
+opening wt_door_er
+    between engine_room_s engine_room_p
+    at 6 0.0 2.2
+    area 3.6
+    discharge 0.75
+    kind door
+    open true
+
+# Escape trunks up to the vehicle deck. Downflooding paths once the engine rooms
+# fill above 7 m.
+opening escape_er_s
+    between engine_room_s vehicle_deck
+    at 14 -4.0 7.0
+    area 1.0
+    discharge 0.70
+    kind hatch
+    open false
+
+opening escape_er_p
+    between engine_room_p vehicle_deck
+    at 14 4.0 7.0
+    area 1.0
+    discharge 0.70
+    kind hatch
+    open false
+
+# Vehicle deck side openings -- freeing ports and the shell doors around the
+# ramp, all sitting just above the deck at 7 m. Dry and irrelevant right up until
+# the ship settles far enough to put them under, at which point they admit the
+# sea onto a 100 x 19 m undivided deck and the free surface moment does the rest.
+opening downflood_ramp_s
+    between sea vehicle_deck
+    at 46 -9.2 7.2
+    area 1.2
+    discharge 0.60
+    kind breach
+    open true
+
+opening downflood_port_s
+    between sea vehicle_deck
+    at -10 -9.6 7.1
+    area 0.8
+    discharge 0.60
+    kind breach
+    open true
+
+opening downflood_port_p
+    between sea vehicle_deck
+    at -10 9.6 7.1
+    area 0.8
+    discharge 0.60
+    kind breach
+    open true
+
+# An unsealed cable transit through the aft engine room bulkhead. Four hundred
+# square centimetres, and it will flood the aft hold anyway.
+opening cable_transit
+    between engine_room_s aft_hold_s
+    at -8 -4.0 2.0
+    area 0.04
+    discharge 0.60
+    kind pipe
+    open true
+
+# --- Air escapes -------------------------------------------------------------
+#
+# Generously sized on manned spaces, deliberately mean on the wing tanks, whose
+# small air pipes will trap air and hold them partly buoyant for a long time.
+
+opening vent_er_s
+    between engine_room_s sea
+    at 10 -6.0 12.5
+    area 0.50
+    discharge 0.80
+    kind vent
+    open true
+
+opening vent_er_p
+    between engine_room_p sea
+    at 10 6.0 12.5
+    area 0.50
+    discharge 0.80
+    kind vent
+    open true
+
+opening vent_fh_p
+    between fwd_hold_p sea
+    at 32 6.0 12.5
+    area 0.20
+    discharge 0.80
+    kind vent
+    open true
+
+opening vent_fh_s
+    between fwd_hold_s sea
+    at 32 -6.0 12.5
+    area 0.20
+    discharge 0.80
+    kind vent
+    open true
+
+opening vent_ah_p
+    between aft_hold_p sea
+    at -24 6.0 12.5
+    area 0.20
+    discharge 0.80
+    kind vent
+    open true
+
+opening vent_ah_s
+    between aft_hold_s sea
+    at -24 -6.0 12.5
+    area 0.20
+    discharge 0.80
+    kind vent
+    open true
+
+opening vent_steer
+    between steering_gear sea
+    at -46 0.0 12.5
+    area 0.15
+    discharge 0.80
+    kind vent
+    open true
+
+opening vent_fpk
+    between forepeak sea
+    at 50 0.0 12.5
+    area 0.10
+    discharge 0.80
+    kind vent
+    open true
+
+opening airpipe_wfp
+    between wing_tank_fwd_p sea
+    at 32 9.0 12.5
+    area 0.02
+    discharge 0.70
+    kind vent
+    open true
+
+opening airpipe_wfs
+    between wing_tank_fwd_s sea
+    at 32 -9.0 12.5
+    area 0.02
+    discharge 0.70
+    kind vent
+    open true
+
+opening airpipe_wap
+    between wing_tank_aft_p sea
+    at -24 9.0 12.5
+    area 0.02
+    discharge 0.70
+    kind vent
+    open true
+
+opening airpipe_was
+    between wing_tank_aft_s sea
+    at -24 -9.0 12.5
+    area 0.02
+    discharge 0.70
+    kind vent
+    open true
+
+opening airpipe_dbf
+    between double_bottom_fwd sea
+    at 24 0.0 12.5
+    area 0.02
+    discharge 0.70
+    kind vent
+    open true
+
+opening airpipe_dba
+    between double_bottom_aft sea
+    at -24 0.0 12.5
+    area 0.02
+    discharge 0.70
+    kind vent
+    open true
+
+# --- Counterflooding ---------------------------------------------------------
+#
+# Sea suction into the port wing tanks, to buy back upright trim at the cost of
+# freeboard.
+
+opening cf_valve_aft_p
+    between sea wing_tank_aft_p
+    at -24 9.7 3.4
+    area 0.40
+    discharge 0.65
+    kind pipe
+    open false
+
+opening cf_valve_fwd_p
+    between sea wing_tank_fwd_p
+    at 32 9.7 3.4
+    area 0.40
+    discharge 0.65
+    kind pipe
+    open false
+
+# Cross-flooding duct: the passive version, which equalises without a valve to
+# open but drops freeboard on both sides.
+opening crossflood_aft
+    between wing_tank_aft_s wing_tank_aft_p
+    at -24 0.0 3.4
+    area 0.30
+    discharge 0.85
+    kind pipe
+    open false
+
+# --- Pumps -------------------------------------------------------------------
+#
+# 216 m3/h each. Against a 2.4 m2 breach admitting some 38,000 m3/h this is not a
+# rounding error away from useless -- it *is* useless, and the sim should make
+# that obvious.
+
+pump bilge_er_s
+    drains engine_room_s
+    capacity 0.060
+    max_head 25.0
+    on false
+
+pump bilge_er_p
+    drains engine_room_p
+    capacity 0.060
+    max_head 25.0
+    on false
+
+pump bilge_ah_s
+    drains aft_hold_s
+    capacity 0.060
+    max_head 25.0
+    on false
+
+pump ballast_wing_p
+    drains wing_tank_aft_p
+    capacity 0.100
+    max_head 25.0
+    on false

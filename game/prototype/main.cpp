@@ -3,17 +3,26 @@
 // Slice 1, headless. Hole the ferry and watch what the physics does about it.
 //
 //   ./shipsim [--scenario=none|doors|full] [--duration=900] [--dt=0.01] [--csv=path]
+//              [--ship=path]
 //
 // There is no renderer here on purpose. Everything the eventual game shows on a
 // damage-control board is already decided by this loop; getting it right in a
 // terminal first is much cheaper than getting it right behind a Vulkan swapchain.
+//
+// `--ship` loads a ship definition file instead of calling buildFerry(). It is
+// how a data mod is run, and it is how `verify.sh` checks that `ships/ferry.ship`
+// reaches the same outcomes over 900 s as the compiled ferry -- the unit suite
+// can only afford the first 150 s of that.
 #include "ferry.hpp"
+
+#include "../../engine/sim/shipfile.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace sim;
@@ -109,6 +118,7 @@ int main(int argc, char** argv) {
     // rather than a requirement.
     double dt = 0.02;
     std::string csvPath;
+    std::string shipPath;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view a = argv[i];
@@ -116,10 +126,25 @@ int main(int argc, char** argv) {
         else if (a.starts_with("--duration=")) duration = std::atof(argv[i] + 11);
         else if (a.starts_with("--dt=")) dt = std::atof(argv[i] + 5);
         else if (a.starts_with("--csv=")) csvPath = std::string(a.substr(6));
+        else if (a.starts_with("--ship=")) shipPath = std::string(a.substr(7));
         else { std::fprintf(stderr, "unknown argument: %s\n", argv[i]); return 2; }
     }
 
-    Ship ship = game::buildFerry();
+    Ship ship;
+    if (shipPath.empty()) {
+        ship = game::buildFerry();
+    } else {
+        // Fails closed, and says why. A ship that would not load must not be
+        // silently replaced by the compiled one -- that is how a broken mod ships.
+        ShipDefinition definition;
+        std::string error;
+        if (!loadShipFile(shipPath, definition, error)) {
+            std::fprintf(stderr, "%s\n", error.c_str());
+            return 2;
+        }
+        std::printf("  loaded ship '%s' from %s\n", definition.name.c_str(), shipPath.c_str());
+        ship = std::move(definition.ship);
+    }
     const double seaLevel = 0.0;
     ship.initialise(seaLevel);
 

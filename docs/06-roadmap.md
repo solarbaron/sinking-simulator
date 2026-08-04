@@ -252,6 +252,16 @@ should be honest about that.
 - WASM mod runtime
 - **Milestone:** someone who is not you ships a ship.
 
+**Pulled forward:** the reading half of the ship definition format landed early,
+because the ferry being C++ was blocking anything that needed a second ship.
+`engine/sim/shipfile.{hpp,cpp}` builds a whole `sim::Ship` from text,
+`ships/ferry.ship` is the prototype ferry in it, and `./shipsim --ship=<path>`
+runs one. It matches `game::buildFerry()` to 1e-8 relative on displacement and
+reaches the same 900 s outcomes in all three flooding scenarios. Still to do here:
+the exporter, CSG subdivision from a shared plane set rather than a box per
+compartment, and the importers. See `05-data-modding-validation.md` §1 for what
+the format deliberately cannot yet say.
+
 ## Phase 8 — Breadth — *ongoing*
 
 The fleet and the long tail: cargo dynamics, ice and icing, grounding, collision

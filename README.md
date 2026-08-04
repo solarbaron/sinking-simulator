@@ -27,6 +27,7 @@ ninja -C build
 ./build/shipsim --scenario=doors            # close the watertight door
 ./build/shipsim --scenario=full             # full damage control response
 ./build/shipsim --scenario=full --csv=run.csv
+./build/shipsim --ship=ships/ferry.ship     # the same ferry, read from a text file
 ./build/fem_spike                           # explicit tet FEM: validation + GPU benchmark
 ```
 
@@ -202,7 +203,8 @@ the most useful page in the repo.
 engine/core/     math, closed-mesh volume integration, mesh booleans
 engine/sim/      compartments, orifice network, 6-DOF rigid body, tet FEM
 engine/gpu/      Vulkan compute back-end and shaders for the FEM
-game/prototype/  the ferry definition and the headless scenario driver
+game/prototype/  the reference ferry in C++ and the headless scenario driver
+ships/           ships as data: the same ferry, in the text definition format
 tools/fem_spike/ FEM validation and GPU benchmark
 tests/           closed-form validation of the numerical core
 docs/            the plan
