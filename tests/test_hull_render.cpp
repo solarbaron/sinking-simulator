@@ -32,18 +32,25 @@
 #include "engine/core/geometry.hpp"
 #include "engine/core/math.hpp"
 #include "engine/core/png.hpp"
+#include "engine/gpu/damage.hpp"
 #include "engine/gpu/hull.hpp"
 #include "engine/gpu/material.hpp"
 #include "engine/gpu/ocean.hpp"
+#include "engine/sim/scantlings.hpp"
 #include "engine/sim/ship.hpp"
 #include "engine/sim/waves.hpp"
+#include "engine/sim/zone.hpp"
+#include "game/prototype/ferry.hpp"
 #include "harness.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 using core::Image;
@@ -401,28 +408,41 @@ void testMaterialSetIsData() {
                library.load(std::string(SHIPSIM_MATERIAL_DIR) + "/marine.materials", error));
     if (library.empty()) return;
 
-    const char* wanted[] = {"painted_steel_topside", "boot_topping", "antifouling",
-                            "bare_steel",            "rusted_steel", "timber_deck",
-                            "glass",                 "sea_water"};
+    const char* wanted[] = {"painted_steel_topside", "boot_topping",  "antifouling",
+                            "bare_steel",            "rusted_steel",  "timber_deck",
+                            "glass",                 "sea_water",     "torn_plate_edge"};
     for (const char* name : wanted)
         expectTrue(std::string("the shipped set has '") + name + "'", library.find(name) >= 0);
 
     // Properties of the *set*, which is what the values are for. Paint over steel
-    // is a dielectric however metallic the plate underneath is, so exactly one
-    // surface here may be a conductor; rust is an oxide and must not be one.
-    int conductors = 0;
+    // is a dielectric however metallic the plate underneath is, so the conductors
+    // here are exactly the surfaces with no coating on them at all: blasted plate,
+    // and the fresh fracture a tear leaves. Rust is an oxide and must not be one.
+    // Stated as the partition rather than as a count, so adding a painted surface
+    // and calling it metallic fails as loudly as adding a bare one and not.
+    const char* bare[] = {"bare_steel", "torn_plate_edge"};
+    int conductors = 0, graded = 0;
     double smallestRoughness = 2.0;
     std::string smoothest;
     for (const gpu::Material& material : library.materials()) {
+        const bool unpainted =
+            std::any_of(std::begin(bare), std::end(bare),
+                        [&](const char* name) { return material.name == name; });
         if (material.metalness > 0.5) ++conductors;
+        if (material.metalness != 0.0 && material.metalness != 1.0) ++graded;
+        expectTrue("'" + material.name + "' is a conductor exactly when it is unpainted steel",
+                   (material.metalness > 0.5) == unpainted);
         if (material.roughness < smallestRoughness) {
             smallestRoughness = material.roughness;
             smoothest = material.name;
         }
     }
-    expectEqual("exactly one shipped surface is a conductor", conductors, 1);
-    expectTrue("and it is the bare steel",
+    expectEqual("the shipped conductors are the two unpainted steel surfaces", conductors, 2);
+    expectEqual("and nothing is half a conductor, which is not a thing a surface is", graded, 0);
+    expectTrue("bare steel is one of them",
                library[static_cast<std::size_t>(library.find("bare_steel"))].metalness == 1.0);
+    expectTrue("a fresh fracture is the other",
+               library[static_cast<std::size_t>(library.find("torn_plate_edge"))].metalness == 1.0);
     expectTrue("rust is an oxide, not a conductor",
                library[static_cast<std::size_t>(library.find("rusted_steel"))].metalness == 0.0);
     expectTrue("glass is the smoothest thing on the ship, not " + smoothest, smoothest == "glass");
@@ -2161,6 +2181,1375 @@ void testFrameCost() {
                best.gpuSeconds < 0.016);
 }
 
+// --- Damage: deformation, tears and exposed metal -------------------------------
+//
+// A dented, torn hull looks damaged whatever it is doing, which is the same trap
+// the rest of this file is written against and a worse one -- damage is *supposed*
+// to look irregular, so a wrong answer has cover. So nothing here is eyeballed:
+//
+//   * a hole is checked by firing a known ray through it and asking the
+//     **MaterialId** channel what won the depth test, which is an integer, and the
+//     **Depth** channel how far away it was, which is a plane at a known distance
+//     from a camera looking along its normal and therefore a closed form. A
+//     recoloured panel fails all three readings;
+//   * cracks are counted combinatorially -- an interior edge seen once **is** a
+//     T-junction -- with the transition templates switched off as a control that
+//     demonstrably fires, and with the rendered consequence measured as enclosed
+//     background pixels from four viewpoints;
+//   * the deformation is held against `zone::Solver`'s own node positions as an
+//     equality, because the field is interpolating at the nodes by construction;
+//   * and an undamaged ship is asserted to render **byte for byte** what she
+//     rendered before any of this existed.
+
+// Every directed edge of a triangle soup, counted over **welded positions** rather
+// than vertex indices: a hull carries coincident-but-distinct vertex records along
+// a mirrored seam, and topologically those triangles do share the edge. An
+// interior edge of a closed surface appears exactly twice, once in each direction;
+// a T-junction is exactly an interior edge that appears once. Same instrument as
+// the ocean cascade's and as the manifold check CLAUDE.md records.
+struct MeshCensus {
+    long long interior = 0;    // seen twice, opposite directions
+    long long unmatched = 0;   // seen once: a boundary, or a crack
+    long long malformed = 0;   // seen twice the same way, or more than twice
+    long long degenerate = 0;  // both ends the same welded position
+};
+
+MeshCensus censusMesh(const sim::TriMesh& mesh, double weldEpsilon = 1e-6) {
+    MeshCensus census;
+    std::map<std::array<long long, 3>, std::uint32_t> lookup;
+    std::vector<std::uint32_t> weld(mesh.verts.size());
+    for (std::size_t i = 0; i < mesh.verts.size(); ++i) {
+        const double inverse = 1.0 / weldEpsilon;
+        const std::array<long long, 3> key{std::llround(mesh.verts[i].x * inverse),
+                                           std::llround(mesh.verts[i].y * inverse),
+                                           std::llround(mesh.verts[i].z * inverse)};
+        const auto inserted = lookup.emplace(key, static_cast<std::uint32_t>(lookup.size()));
+        weld[i] = inserted.first->second;
+    }
+
+    std::vector<std::pair<std::uint64_t, int>> edges;
+    edges.reserve(mesh.tris.size() * 3);
+    for (const sim::Tri& tri : mesh.tris) {
+        const std::uint32_t v[3] = {weld[tri.a], weld[tri.b], weld[tri.c]};
+        for (int e = 0; e < 3; ++e) {
+            const std::uint32_t a = v[e], b = v[(e + 1) % 3];
+            if (a == b) { ++census.degenerate; continue; }
+            const std::uint64_t low = std::min(a, b), high = std::max(a, b);
+            edges.emplace_back((static_cast<std::uint64_t>(low) << 32) | high, a < b ? 1 : -1);
+        }
+    }
+    std::sort(edges.begin(), edges.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::size_t i = 0;
+    while (i < edges.size()) {
+        std::size_t j = i;
+        int net = 0;
+        while (j < edges.size() && edges[j].first == edges[i].first) net += edges[j++].second;
+        const std::size_t count = j - i;
+        if (count == 1) ++census.unmatched;
+        else if (count == 2 && net == 0) ++census.interior;
+        else ++census.malformed;
+        i = j;
+    }
+    return census;
+}
+
+// The boundary of the hole, counted from the triangles that were **removed** and
+// not from the mesh that is left. An edge of a removed triangle that no other
+// removed triangle shares is an edge the tear exposed. That number and the cut
+// mesh's unmatched-edge count are two independent routes to the same integer:
+// more unmatched edges than this would be a crack the refinement opened, fewer
+// would be a hole that never opened.
+long long holeBoundaryEdges(const std::vector<sim::Vec3>& verts,
+                            const std::vector<sim::Tri>& removed) {
+    std::map<std::array<long long, 3>, std::uint32_t> lookup;
+    std::vector<std::uint32_t> weld(verts.size());
+    for (std::size_t i = 0; i < verts.size(); ++i) {
+        const std::array<long long, 3> key{std::llround(verts[i].x * 1e6),
+                                           std::llround(verts[i].y * 1e6),
+                                           std::llround(verts[i].z * 1e6)};
+        const auto inserted = lookup.emplace(key, static_cast<std::uint32_t>(lookup.size()));
+        weld[i] = inserted.first->second;
+    }
+    std::map<std::uint64_t, int> seen;
+    for (const sim::Tri& tri : removed) {
+        const std::uint32_t v[3] = {weld[tri.a], weld[tri.b], weld[tri.c]};
+        for (int e = 0; e < 3; ++e) {
+            const std::uint32_t a = v[e], b = v[(e + 1) % 3];
+            if (a == b) continue;
+            const std::uint64_t low = std::min(a, b), high = std::max(a, b);
+            ++seen[(static_cast<std::uint64_t>(low) << 32) | high];
+        }
+    }
+    long long boundary = 0;
+    for (const auto& [key, count] : seen)
+        if (count == 1) ++boundary;
+    return boundary;
+}
+
+// The depth test, done again on the CPU from the same triangles. `gl_FragCoord.z`
+// is interpolated linearly in **screen** space, which is exactly the plane of the
+// projected triangle, so this is the identical arithmetic rather than an
+// approximation of it -- and it is an independent implementation, which is the
+// point. Returns false when nothing covers the sample.
+bool cpuDepthAt(const gpu::SceneMesh& mesh, const sim::Mat4& mvp, double width, double height,
+                double sampleX, double sampleY, double& depth) {
+    bool hit = false;
+    depth = 1e30;
+    const std::vector<gpu::HullVertex>& verts = mesh.vertices();
+    const std::vector<std::uint32_t>& indices = mesh.indices();
+    for (std::size_t t = 0; t + 2 < indices.size(); t += 3) {
+        double px[3], py[3], pz[3];
+        bool visible = true;
+        for (int k = 0; k < 3; ++k) {
+            const gpu::HullVertex& v = verts[indices[t + static_cast<std::size_t>(k)]];
+            const sim::Vec3 world{v.position[0], v.position[1], v.position[2]};
+            double clip[4];
+            mvp.transform(world, clip);
+            if (clip[3] <= 1e-9) { visible = false; break; }
+            if (!sim::clipToPixel(clip, width, height, px[k], py[k])) { visible = false; break; }
+            pz[k] = clip[2] / clip[3];
+        }
+        if (!visible) continue;
+        const double area = (px[1] - px[0]) * (py[2] - py[0]) - (py[1] - py[0]) * (px[2] - px[0]);
+        if (std::abs(area) < 1e-12) continue;
+        const double inverse = 1.0 / area;
+        const double b1 = ((sampleX - px[0]) * (py[2] - py[0]) -
+                           (sampleY - py[0]) * (px[2] - px[0])) * inverse;
+        const double b2 = ((px[1] - px[0]) * (sampleY - py[0]) -
+                           (py[1] - py[0]) * (sampleX - px[0])) * inverse;
+        const double b0 = 1.0 - b1 - b2;
+        if (b0 < 0 || b1 < 0 || b2 < 0) continue;
+        const double z = b0 * pz[0] + b1 * pz[1] + b2 * pz[2];
+        if (z < depth) { depth = z; hit = true; }
+    }
+    return hit;
+}
+
+// Clip-space z of a plane at view distance `t` under `sim::perspective(near, far)`.
+// The projection sends every point at the same view depth to the same z whatever
+// its screen position, so a plane square to the camera has **one** depth and the
+// prediction needs no pixel at all.
+double planeClipDepth(double t, double nearPlane, double farPlane) {
+    const double a = farPlane / (nearPlane - farPlane);
+    const double b = nearPlane * farPlane / (nearPlane - farPlane);
+    return (b - a * t) / t;
+}
+
+// A structural mesh holding exactly the panels this suite places, so a "torn
+// panel" is a rectangle whose corners are known to the millimetre rather than
+// whatever `makeStructuralMesh` happened to lay over the hull. `makeTestShip`'s
+// side is exactly the plane y = -8.5 for |x| <= 17.5 and z >= 3.6, so these
+// corners lie *on* the hull surface and the hole they cut has an exact area.
+sim::StructuralMesh sidePanels(const std::vector<std::array<double, 4>>& extents) {
+    sim::StructuralMesh structure;
+    for (const std::array<double, 4>& e : extents) {   // xLo, xHi, zLo, zHi
+        sim::PlatePanel panel;
+        panel.corner[0] = {e[0], -8.5, e[2]};
+        panel.corner[1] = {e[1], -8.5, e[2]};
+        panel.corner[2] = {e[1], -8.5, e[3]};
+        panel.corner[3] = {e[0], -8.5, e[3]};
+        panel.thickness = 0.012;
+        panel.role = sim::PanelRole::Shell;
+        structure.panels.push_back(panel);
+    }
+    return structure;
+}
+
+// --- Nothing is damaged, so nothing may change ---------------------------------
+
+// The regression that matters most: damage rendering must cost nothing at all when
+// there is no damage. Not "close enough" -- the same bytes, so that a future change
+// to the damaged path cannot drift the undamaged one without this failing.
+void testAnUndamagedShipIsUnchangedByAllOfThis() {
+    sim::Ship ship = makeTestShip();
+    ship.initialise(sim::Sea{0.0});
+
+    const gpu::HullDamage nothing;
+    const gpu::DamagedHull damaged = gpu::buildDamagedHull(ship.hull, nothing);
+
+    expectEqual("an undamaged hull keeps every vertex",
+                static_cast<long long>(damaged.deformed.verts.size()),
+                static_cast<long long>(ship.hull.verts.size()));
+    expectEqual("an undamaged hull keeps every triangle",
+                static_cast<long long>(damaged.deformed.tris.size()),
+                static_cast<long long>(ship.hull.tris.size()));
+    expectEqual("and drops none of them",
+                static_cast<long long>(damaged.droppedTriangles), 0);
+    // Bit-identical, not nearly. `-0.0 + 0.0` is `+0.0`, so adding a zero
+    // displacement would silently change a vertex that carried a negative zero and
+    // this is the assertion that would catch it.
+    bool identical = damaged.deformed.verts.size() == ship.hull.verts.size();
+    for (std::size_t i = 0; identical && i < ship.hull.verts.size(); ++i)
+        identical = std::memcmp(&damaged.deformed.verts[i], &ship.hull.verts[i],
+                                sizeof(sim::Vec3)) == 0;
+    expectTrue("every vertex is bit-identical to the hull's own", identical);
+    bool sameTopology = damaged.deformed.tris.size() == ship.hull.tris.size();
+    for (std::size_t t = 0; sameTopology && t < ship.hull.tris.size(); ++t)
+        sameTopology = damaged.deformed.tris[t].a == ship.hull.tris[t].a &&
+                       damaged.deformed.tris[t].b == ship.hull.tris[t].b &&
+                       damaged.deformed.tris[t].c == ship.hull.tris[t].c;
+    expectTrue("and every triangle indexes the same three of them", sameTopology);
+    expectEqual("no triangle is marked as exposed metal",
+                std::count(damaged.exposed.begin(), damaged.exposed.end(), std::uint8_t{1}), 0);
+
+    // The one arithmetic reason "bit-identical" needs writing rather than falling
+    // out: **`-0.0 + 0.0` is `+0.0`**, so a vertex carrying a negative zero would
+    // come back changed if a zero displacement went through the addition. Neither
+    // ship in this suite happens to carry one -- a hull tabulated from stations has
+    // its centreline at `+0.0` -- so the hazard is real and invisible here, and
+    // this is the mesh that makes it visible. Mutation-tested: removing the guard
+    // is caught by this and by nothing else in the file.
+    sim::TriMesh signedZero;
+    signedZero.verts = {{-0.0, 1.0, 2.0}, {1.0, -0.0, 2.0}, {1.0, 1.0, -0.0}, {-0.0, -0.0, -0.0}};
+    signedZero.tris = {{0, 1, 2}, {0, 2, 3}, {0, 3, 1}, {1, 3, 2}};
+    const gpu::DamagedHull untouched = gpu::buildDamagedHull(signedZero, nothing);
+    bool zerosKeptTheirSign = untouched.deformed.verts.size() == signedZero.verts.size();
+    for (std::size_t i = 0; zerosKeptTheirSign && i < signedZero.verts.size(); ++i)
+        zerosKeptTheirSign = std::memcmp(&untouched.deformed.verts[i], &signedZero.verts[i],
+                                         sizeof(sim::Vec3)) == 0;
+    expectTrue("a vertex carrying a negative zero comes back with its sign", zerosKeptTheirSign);
+    // The guard that the mesh really does carry one, so the check is not about a
+    // tetrahedron of positive zeros.
+    expectTrue("and the mesh under test really does carry negative zeros",
+               std::signbit(signedZero.verts[0].x) && std::signbit(signedZero.verts[3].z));
+
+    // Guard against the whole check being vacuous: the same call with a dent in it
+    // must move the mesh, or "unchanged" is a statement about a function that never
+    // changes anything.
+    gpu::HullDamage dent;
+    dent.addTent({0.0, -8.5, 7.5}, {0, -1, 0}, 4.0, 0.5);
+    const gpu::DamagedHull bent = gpu::buildDamagedHull(ship.hull, dent);
+    expectTrue(label("a dent does refine the mesh, triangles",
+                     static_cast<double>(bent.deformed.tris.size())),
+               bent.deformed.tris.size() > 4 * ship.hull.tris.size());
+    expectTrue(label("and does move it, m", bent.largestDisplacement),
+               bent.largestDisplacement > 0.49 && bent.largestDisplacement < 0.51);
+
+    gpu::Device device;
+    gpu::HullRenderer renderer;
+    if (!setup(device, renderer)) return;
+    gpu::MaterialLibrary library;
+    std::string error;
+    if (!testLibrary(library, error)) return;
+
+    gpu::HullPaint paint;
+    paint.waterlineZ = 5.0;
+    gpu::HullShading shading;
+
+    gpu::SceneMesh plain, viaDamage;
+    expectTrue("the plain path builds: " + error,
+               plain.appendShip(ship, paint, library, shading, error));
+    expectTrue("the damaged path builds: " + error,
+               viaDamage.appendShip(ship, damaged, paint, library, shading, error));
+    bool sameVertices = plain.vertices().size() == viaDamage.vertices().size();
+    if (sameVertices)
+        sameVertices = std::memcmp(plain.vertices().data(), viaDamage.vertices().data(),
+                                   plain.vertices().size() * sizeof(gpu::HullVertex)) == 0;
+    expectTrue("an undamaged ship built through the damaged path is byte for byte the same"
+               " vertex buffer", sameVertices);
+    bool sameIndices = plain.indices().size() == viaDamage.indices().size();
+    if (sameIndices)
+        sameIndices = std::memcmp(plain.indices().data(), viaDamage.indices().data(),
+                                  plain.indices().size() * sizeof(std::uint32_t)) == 0;
+    expectTrue("and the same index buffer", sameIndices);
+
+    const sim::Mat4 mvp = sim::perspective(50.0 * sim::kDegToRad, double(kWidth) / kHeight, 5.0,
+                                           400.0) *
+                          sim::lookAt({-70.0, -90.0, 40.0}, {0, 0, 4}, {0, 0, 1});
+    float matrix[16];
+    mvp.toFloats(matrix);
+    gpu::SceneView view;
+    view.eye[0] = -70.0f;
+    view.eye[1] = -90.0f;
+    view.eye[2] = 40.0f;
+    const float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+
+    Image before, after;
+    if (!renderer.render(matrix, view, plain, library, clear, before)) return;
+    if (!renderer.render(matrix, view, viaDamage, library, clear, after)) return;
+    expectTrue("and renders the identical frame",
+               before.rgba.size() == after.rgba.size() &&
+                   std::memcmp(before.rgba.data(), after.rgba.data(), before.rgba.size()) == 0);
+    // The frame is not blank, so "identical" had something to be identical about.
+    long long lit = 0;
+    for (std::size_t i = 0; i + 3 < before.rgba.size(); i += 4)
+        if (before.rgba[i] > 8) ++lit;
+    expectTrue(label("the frame both paths drew is not empty, lit pixels",
+                     static_cast<double>(lit)),
+               lit > 5000);
+}
+
+// Paint is on the hull. A dented plate keeps the paint it was painted with, and
+// deciding a band from a *displaced* z would slide the boot-topping stripe along
+// the shell as the plating moved -- the same mistake as deciding it in the world
+// frame, one level down.
+//
+// It takes a deliberate configuration to see at all, and constructing it is the
+// point: a dent normal to a **vertical** side moves plating in y and never changes
+// its z, so on the flat of a ship's side the two rules agree exactly and nothing
+// can tell them apart. The field here therefore has a vertical component. The
+// guard counts how many triangles the two rules disagree about, so a scene in
+// which they cannot disagree fails loudly instead of passing.
+void testADentDoesNotRepaintHer() {
+    gpu::MaterialLibrary library;
+    std::string error;
+    if (!testLibrary(library, error)) return;
+
+    sim::Ship ship = makeTestShip();
+    ship.state.orientation = {};
+    ship.state.position = {0, 0, 0};
+
+    gpu::HullDamage damage;
+    // Displacement straight down, over a ball of her side plating.
+    damage.addTent({0.0, -8.5, 6.4}, {0, 0, 1}, 3.0, 0.9);
+    const gpu::DamagedHull damaged = gpu::buildDamagedHull(ship.hull, damage);
+    expectTrue(label("the field moves the plating, m", damaged.largestDisplacement),
+               damaged.largestDisplacement > 0.85);
+
+    gpu::HullPaint paint;
+    paint.waterlineZ = 5.0;   // antifouling below 4.65, boot-topping to 5.85
+    gpu::HullShading shading;
+    gpu::SceneMesh mesh;
+    expectTrue("the damaged ship builds: " + error,
+               mesh.appendShip(ship, damaged, paint, library, shading, error));
+
+    // The band rule, written out here from `HullPaint`'s own documentation rather
+    // than called out of the renderer -- the value of having two is that they are
+    // two.
+    const std::uint32_t band[4] = {static_cast<std::uint32_t>(library.find(paint.underwater)),
+                                   static_cast<std::uint32_t>(library.find(paint.bootTopping)),
+                                   static_cast<std::uint32_t>(library.find(paint.topside)),
+                                   static_cast<std::uint32_t>(library.find(paint.deck))};
+    const auto bandOf = [&](const sim::TriMesh& from, const sim::Tri& tri) {
+        const sim::Vec3& a = from.verts[tri.a];
+        const sim::Vec3& b = from.verts[tri.b];
+        const sim::Vec3& c = from.verts[tri.c];
+        const sim::Vec3 centroid = (a + b + c) / 3.0;
+        const sim::Vec3 normal = normalize(cross(b - a, c - a));
+        if (centroid.z >= paint.deckZ && normal.z >= paint.deckNormalZ) return band[3];
+        if (centroid.z < paint.waterlineZ - paint.bootTopDepth) return band[0];
+        if (centroid.z < paint.waterlineZ + paint.bootTopHeight) return band[1];
+        return band[2];
+    };
+
+    long long wrong = 0, wouldDiffer = 0;
+    for (std::size_t t = 0; t < damaged.rest.tris.size(); ++t) {
+        if (damaged.exposed[t] != 0) continue;
+        const std::uint32_t drawn = mesh.vertices()[t * 3].material;
+        if (drawn != bandOf(damaged.rest, damaged.rest.tris[t])) ++wrong;
+        if (bandOf(damaged.rest, damaged.rest.tris[t]) !=
+            bandOf(damaged.deformed, damaged.deformed.tris[t]))
+            ++wouldDiffer;
+    }
+    std::printf("     paint after a dent: %lld triangle(s) painted from the wrong mesh;"
+                " %lld would change band if it were decided on the deformed one\n",
+                wrong, wouldDiffer);
+    expectEqual("every triangle is painted the band its undeformed plating sits in", wrong, 0);
+    expectTrue(label("and the two rules genuinely disagree here, triangles",
+                     static_cast<double>(wouldDiffer)),
+               wouldDiffer > 30);
+}
+
+// --- Refinement: no crack, proved combinatorially -------------------------------
+
+// Refining part of a mesh and leaving the rest alone is the ocean cascade's problem
+// in a triangle mesh, and it has the cascade's failure: a coarse triangle beside a
+// refined one interpolates straight past the new vertex and leaves a wedge open.
+// The instrument is the same too, and for the same reason -- a cracked hull and a
+// whole one are identical everywhere except at the crack, and a crack is a few
+// pixels.
+void testRefiningPartOfTheHullLeavesNoCrack() {
+    sim::Ship ship = makeTestShip();
+    expectTrue("the undamaged hull is a closed manifold to start with",
+               sim::isClosedManifold(ship.hull));
+
+    gpu::HullDamage dent;
+    dent.addTent({0.0, -8.5, 7.5}, {0, -1, 0}, 4.0, 0.45);
+    const gpu::DamagedHull damaged = gpu::buildDamagedHull(ship.hull, dent);
+
+    const MeshCensus census = censusMesh(damaged.deformed);
+    std::printf("     damage edges: %lld interior, %lld unmatched, %lld malformed,"
+                " %lld degenerate; %zu -> %zu triangles, deepest split %d\n",
+                census.interior, census.unmatched, census.malformed, census.degenerate,
+                damaged.sourceTriangles, damaged.deformed.tris.size(), damaged.deepestSplit);
+
+    expectEqual("a deformed hull with no tear in it has no unmatched edge -- no T-junction,"
+                " no crack", census.unmatched, 0);
+    expectEqual("and none traversed twice the same way, which is a reversed winding in a"
+                " transition triangle", census.malformed, 0);
+    expectEqual("and no degenerate triangle", census.degenerate, 0);
+    expectTrue("the refined hull is still a closed manifold",
+               sim::isClosedManifold(damaged.deformed));
+    // Guards. A refinement that did nothing would pass every line above.
+    expectTrue(label("the refinement actually happened, interior edges",
+                     static_cast<double>(census.interior)),
+               census.interior > 4 * static_cast<long long>(ship.hull.tris.size()));
+    expectTrue(label("and reached the size it was asked for, deepest split",
+                     damaged.deepestSplit),
+               damaged.deepestSplit >= 4);
+    expectTrue("without running into the recursion guard", !damaged.depthLimited);
+
+    // The negative control. Without the transition templates every triangle that
+    // borders a subdivided one keeps its long edge, which is exactly a T-junction
+    // per split boundary edge -- and the census counts them.
+    gpu::HullDamage unstitchedDent = dent;
+    unstitchedDent.params.stitch = false;
+    const gpu::DamagedHull unstitched = gpu::buildDamagedHull(ship.hull, unstitchedDent);
+    const MeshCensus broken = censusMesh(unstitched.deformed);
+    std::printf("     without the transition triangles: %lld unmatched edges\n",
+                broken.unmatched);
+    expectTrue(label("the control fires: an unstitched refinement cracks, unmatched edges",
+                     static_cast<double>(broken.unmatched)),
+               broken.unmatched > 20);
+    expectTrue("and it is not just a coarser mesh -- it still refined",
+               unstitched.deformed.tris.size() > 2 * ship.hull.tris.size());
+
+    // The size criterion is a pure function of position and the mesh grades toward
+    // it: no edge inside the dent may be longer than the target size there, or the
+    // dent has nowhere to happen. Checked on the *rest* mesh, because the criterion
+    // is stated on undeformed positions.
+    double worstRatio = 0;
+    long long insideDent = 0;
+    for (const sim::Tri& tri : damaged.rest.tris) {
+        const sim::Vec3 v[3] = {damaged.rest.verts[tri.a], damaged.rest.verts[tri.b],
+                                damaged.rest.verts[tri.c]};
+        for (int e = 0; e < 3; ++e) {
+            const sim::Vec3 mid = (v[e] + v[(e + 1) % 3]) * 0.5;
+            const double target = dent.targetEdgeSize(mid);
+            if (target > 1e29) continue;
+            ++insideDent;
+            worstRatio = std::max(worstRatio, length(v[(e + 1) % 3] - v[e]) / target);
+        }
+    }
+    std::printf("     %lld edges are inside the graded region; the worst is %.3f of its"
+                " own target size\n", insideDent, worstRatio);
+    expectTrue(label("every edge in the graded region met the size criterion, worst ratio",
+                     worstRatio),
+               worstRatio <= 1.0 + 1e-9);
+    expectTrue("and there were edges in it to meet it", insideDent > 500);
+}
+
+// The census says the mesh has no T-junction. This says a T-junction would have
+// been *visible*, which is a different claim and the one that stops the census
+// from being an argument about numbers nobody can see.
+//
+// Against a closed hull a crack shows the **far side of the hull, from inside** --
+// drawn, because nothing is culled -- so a frame of the ship alone sees nothing at
+// all. That is the trap. So a plate is put on her centreplane, between the two
+// sides, in a material nothing on the outside of the ship uses: invisible through
+// intact plating, visible through a crack, and "is this pixel the centreplane" is
+// an integer the MaterialId channel answers.
+//
+// Four viewpoints around the dent's own normal, because one camera sees one part
+// of a boundary and `docs/03-renderer-audio.md` records a mutation that survived a
+// single view of the cascade and died instantly to the census. The **undamaged**
+// ship through the same four cameras is what says the plate really is hidden, so a
+// clean frame means "no crack" rather than "the camera was pointed wrong".
+void testACrackWouldShowInTheFrame() {
+    gpu::Device device;
+    gpu::HullRenderer renderer;
+    if (!setup(device, renderer)) return;
+    gpu::MaterialLibrary library;
+    std::string error;
+    if (!testLibrary(library, error)) return;
+
+    sim::Ship ship = makeTestShip();
+    ship.state.orientation = {};
+    ship.state.position = {0, 0, 0};
+
+    const sim::Vec3 centre{0.0, -8.5, 7.5};
+    gpu::HullDamage dent;
+    dent.addTent(centre, {0, -1, 0}, 4.0, 0.45);
+    gpu::HullDamage unstitchedDent = dent;
+    unstitchedDent.params.stitch = false;
+    const gpu::HullDamage nothing;
+
+    const gpu::DamagedHull plain = gpu::buildDamagedHull(ship.hull, nothing);
+    const gpu::DamagedHull whole = gpu::buildDamagedHull(ship.hull, dent);
+    const gpu::DamagedHull cracked = gpu::buildDamagedHull(ship.hull, unstitchedDent);
+
+    // On the centreplane and well inside her, so every ray that reaches it has
+    // passed through plating on the way.
+    sim::TriMesh centreplane;
+    centreplane.verts = {{-9.0, 0.0, 4.5}, {9.0, 0.0, 4.5}, {9.0, 0.0, 10.5}, {-9.0, 0.0, 10.5}};
+    centreplane.tris = {{0, 1, 2}, {0, 2, 3}};
+    const auto backdrop = static_cast<std::uint32_t>(library.find("test_cool"));
+
+    gpu::HullPaint paint;
+    paint.waterlineZ = 5.0;
+    gpu::HullShading shading;
+    gpu::SceneView view;
+    view.mode = gpu::HullShadingMode::MaterialId;
+    const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    const sim::Vec3 offsets[4] = {{14.0, -30.0, 5.0},
+                                  {-14.0, -30.0, 5.0},
+                                  {14.0, -30.0, -5.0},
+                                  {-14.0, -30.0, -5.0}};
+    long long worstPlain = 0, worstWhole = 0, totalCracked = 0;
+    for (const sim::Vec3& offset : offsets) {
+        const sim::Vec3 eye = centre + offset;
+        const sim::Mat4 mvp =
+            sim::perspective(45.0 * sim::kDegToRad, double(kWidth) / kHeight, 2.0, 200.0) *
+            sim::lookAt(eye, centre, {0, 0, 1});
+        float matrix[16];
+        mvp.toFloats(matrix);
+        view.eye[0] = float(eye.x);
+        view.eye[1] = float(eye.y);
+        view.eye[2] = float(eye.z);
+
+        const auto throughTheHull = [&](const gpu::DamagedHull& hull) -> long long {
+            gpu::SceneMesh mesh;
+            if (!mesh.appendShip(ship, hull, paint, library, shading, error)) return -1;
+            // Appended **after** the ship, so a broken depth test paints the plate
+            // straight over her and this reports thousands rather than zero -- the
+            // same arrangement the sea is appended in, for the same reason.
+            mesh.appendMesh(centreplane, sim::Mat3{}, {0, 0, 0}, backdrop, gpu::HullShading{});
+            Image image;
+            if (!renderer.render(matrix, view, mesh, library, clear, image)) return -1;
+            long long seen = 0;
+            for (std::uint32_t y = 0; y < kHeight; ++y)
+                for (std::uint32_t x = 0; x < kWidth; ++x) {
+                    std::uint32_t drawn = 0;
+                    if (gpu::decodeMaterialId(image.pixel(x, y), drawn) && drawn == backdrop)
+                        ++seen;
+                }
+            return seen;
+        };
+
+        const long long throughPlain = throughTheHull(plain);
+        const long long throughWhole = throughTheHull(whole);
+        const long long throughCracked = throughTheHull(cracked);
+        if (throughPlain < 0 || throughWhole < 0 || throughCracked < 0) {
+            expectTrue("the scene builds: " + error, false);
+            return;
+        }
+        std::printf("     view (%+.0f %+.0f %+.0f): centreplane pixels -- unrefined %lld,"
+                    " stitched %lld, unstitched %lld\n",
+                    offset.x, offset.y, offset.z, throughPlain, throughWhole, throughCracked);
+        expectEqual("the hull as she was drawn before any of this hides the centreplane"
+                    " completely, so this camera could see a crack if there were one",
+                    throughPlain, 0);
+        expectEqual("and so does the refined, dented one", throughWhole, 0);
+        worstPlain = std::max(worstPlain, throughPlain);
+        worstWhole = std::max(worstWhole, throughWhole);
+        totalCracked += throughCracked;
+    }
+    expectEqual("over all four viewpoints, unrefined", worstPlain, 0);
+    expectEqual("over all four viewpoints, refined", worstWhole, 0);
+    // The control has to fire, or four clean frames prove nothing about the
+    // instrument.
+    expectTrue(label("and an unstitched refinement is seen straight through, pixels",
+                     static_cast<double>(totalCracked)),
+               totalCracked > 0);
+}
+
+// A field with a step in it *is* a seam, and every instrument so far is blind to
+// one: it is a pure function of position, so nothing cracks; the mesh stays a
+// closed manifold, so the census is quiet; the cliff is a fold rather than a hole,
+// so the frame sees a shaded surface. Mutation testing found that hole by
+// replacing the tent's falloff with a constant -- a plate displaced by the full
+// depth right up to the edge of the dent and undisplaced a millimetre further on
+// -- and **nothing failed**.
+//
+// So the field is held to its own Lipschitz constant, and for a tent that constant
+// is exact: a cone of depth `d` over a ball of radius `R` cannot change faster
+// than `d / R`, anywhere. Applied to every edge of the drawn mesh it is a
+// statement about the picture rather than about the function -- no edge of the
+// plating may be stretched by more than the dent's own slope -- which is also the
+// physical statement, since a dent stretches steel and does not teleport it.
+void testTheFieldCannotStepAndTheresNoSeam() {
+    sim::Ship ship = makeTestShip();
+
+    constexpr double kDepth = 0.45, kHalfSpan = 4.0;
+    gpu::HullDamage dent;
+    dent.addTent({0.0, -8.5, 7.5}, {0, -1, 0}, kHalfSpan, kDepth);
+    const gpu::DamagedHull damaged = gpu::buildDamagedHull(ship.hull, dent);
+
+    const double lipschitz = kDepth / kHalfSpan;
+    double worst = 0, longestJump = 0;
+    const auto probe = [&](std::uint32_t a, std::uint32_t b) {
+        const sim::Vec3 rest = damaged.rest.verts[b] - damaged.rest.verts[a];
+        const sim::Vec3 moved =
+            (damaged.deformed.verts[b] - damaged.rest.verts[b]) -
+            (damaged.deformed.verts[a] - damaged.rest.verts[a]);
+        const double span = length(rest);
+        if (span <= 0) return;
+        worst = std::max(worst, length(moved) / span);
+        longestJump = std::max(longestJump, length(moved));
+    };
+    for (const sim::Tri& tri : damaged.rest.tris) {
+        probe(tri.a, tri.b);
+        probe(tri.b, tri.c);
+        probe(tri.c, tri.a);
+    }
+    std::printf("     continuity: the steepest edge of the drawn plating changes the field by"
+                " %.4f of its own length, against the tent's exact %.4f; largest jump across"
+                " one edge %.4f m\n", worst, lipschitz, longestJump);
+    expectTrue(label("no edge of the drawn plating outruns the dent's own slope, ratio", worst),
+               worst <= lipschitz * (1.0 + 1e-9));
+    // Guards. A field that never moved would satisfy that perfectly, and so would
+    // one whose slope was a hundredth of what it claims.
+    expectTrue(label("and the plating really is being stretched, ratio", worst),
+               worst > 0.5 * lipschitz);
+    expectTrue(label("over a mesh fine enough for the bound to bite, triangles",
+                     static_cast<double>(damaged.rest.tris.size())),
+               damaged.rest.tris.size() > 4000);
+
+    // The same statement sampled off the mesh, at a hundred pairs a tenth of a
+    // millimetre apart, swept from the middle of the dent to well outside it --
+    // including across the edge of the tent's support, which is where a field cut
+    // off rather than faded out would step.
+    const double epsilon = 1e-4;
+    double worstProbe = 0;
+    for (int i = 0; i <= 100; ++i) {
+        const double radius = 1.5 * kHalfSpan * i / 100.0;
+        const sim::Vec3 at{radius, -8.5, 7.5};
+        const sim::Vec3 next{radius + epsilon, -8.5, 7.5};
+        worstProbe = std::max(worstProbe,
+                              length(dent.displacementAt(next) - dent.displacementAt(at)));
+    }
+    std::printf("     and off the mesh: the largest change over %.1e m is %.3e m, against"
+                " %.3e m allowed\n", epsilon, worstProbe, lipschitz * epsilon);
+    expectTrue(label("the field itself is continuous across the edge of its own support, m",
+                     worstProbe),
+               worstProbe <= lipschitz * epsilon * (1.0 + 1e-9));
+    expectTrue(label("and it is not flat, m", worstProbe), worstProbe > 0.5 * lipschitz * epsilon);
+}
+
+// A hull carries coincident-but-distinct vertex records wherever it has been
+// mirrored or clipped, and the two sides of such a seam must split their shared
+// edge into **one** midpoint rather than two. Welding the input for the decisions
+// is what does that, and the count is exact: refining a hull whose lower half has
+// been given its own copies of the seam vertices must add precisely as many
+// vertices as refining the hull that shares them.
+void testASeamInTheInputIsNotASeamInTheOutput() {
+    sim::Ship ship = makeTestShip();
+
+    // Every triangle below the dent's centre gets its own copies of its corners,
+    // so the mesh is geometrically identical and topologically torn in two along a
+    // line straight through where the plating is about to be refined.
+    sim::TriMesh seamed;
+    seamed.verts = ship.hull.verts;
+    long long duplicated = 0;
+    for (const sim::Tri& tri : ship.hull.tris) {
+        const sim::Vec3 centroid =
+            (ship.hull.verts[tri.a] + ship.hull.verts[tri.b] + ship.hull.verts[tri.c]) / 3.0;
+        if (centroid.z >= 7.5) { seamed.tris.push_back(tri); continue; }
+        const std::uint32_t corner[3] = {tri.a, tri.b, tri.c};
+        std::uint32_t fresh[3];
+        for (int k = 0; k < 3; ++k) {
+            fresh[k] = static_cast<std::uint32_t>(seamed.verts.size());
+            seamed.verts.push_back(ship.hull.verts[corner[k]]);
+            ++duplicated;
+        }
+        seamed.tris.push_back({fresh[0], fresh[1], fresh[2]});
+    }
+    expectTrue(label("the seamed hull really does carry duplicate records, vertices",
+                     static_cast<double>(duplicated)),
+               duplicated > 300);
+    expectTrue("and it is still the same closed surface", sim::isClosedManifold(seamed));
+
+    gpu::HullDamage dent;
+    dent.addTent({0.0, -8.5, 7.5}, {0, -1, 0}, 4.0, 0.45);
+    const gpu::DamagedHull plain = gpu::buildDamagedHull(ship.hull, dent);
+    const gpu::DamagedHull across = gpu::buildDamagedHull(seamed, dent);
+
+    const long long addedPlain =
+        static_cast<long long>(plain.rest.verts.size() - ship.hull.verts.size());
+    const long long addedAcross =
+        static_cast<long long>(across.rest.verts.size() - seamed.verts.size());
+    std::printf("     seam: refining adds %lld vertices to the shared hull and %lld to the"
+                " one torn along z = 7.5 m\n", addedPlain, addedAcross);
+    expectEqual("a seam in the input adds no extra midpoints, so both sides of it address one"
+                " vertex rather than two that coincide", addedAcross, addedPlain);
+    expectEqual("and the two refinements have the same triangles",
+                static_cast<long long>(across.rest.tris.size()),
+                static_cast<long long>(plain.rest.tris.size()));
+    expectTrue(label("with enough of them for the seam to matter",
+                     static_cast<double>(addedPlain)),
+               addedPlain > 2000);
+    expectEqual("and the refined seamed hull is still whole",
+                censusMesh(across.deformed).unmatched, 0);
+}
+
+// --- A tear is a hole you can see through --------------------------------------
+
+// The claim is not "the panel is drawn differently". It is that the geometry is
+// gone and the frame shows what is behind it. Three readings of the same pixel say
+// so, and a recoloured panel fails all three:
+//
+//   intact                   the hull's own paint, at the hull's own distance
+//   torn, structure behind   that structure's material, at *its* distance
+//   torn, nothing behind     the hull again -- but the far side, from the inside,
+//                            two ship-breadths further away
+//
+// The camera looks square at the side, so every surface in the ray's path is a
+// plane perpendicular to the view axis and its clip-space depth is a closed form
+// in its distance alone.
+void testATornPanelIsAHoleYouCanSeeThrough() {
+    gpu::Device device;
+    gpu::HullRenderer renderer;
+    if (!setup(device, renderer)) return;
+    gpu::MaterialLibrary library;
+    std::string error;
+    if (!testLibrary(library, error)) return;
+
+    sim::Ship ship = makeTestShip();
+    ship.state.orientation = {};
+    ship.state.position = {0, 0, 0};
+    expectTrue("the hull is closed before anything is cut out of it",
+               sim::isClosedManifold(ship.hull));
+
+    // A 4 m by 3 m panel on the flat of her starboard side. `makeTestShip` puts that
+    // side exactly on y = -8.5 over |x| <= 17.5 and z >= 3.6, so the panel lies *on*
+    // the shell and the hole it cuts has an exact area.
+    const sim::StructuralMesh structure = sidePanels({{-2.0, 2.0, 6.0, 9.0}});
+    gpu::HullDamage damage;
+    damage.addTornPanels(structure, {0});
+    expectEqual("one panel is torn", static_cast<long long>(damage.tornPanelCount()), 1);
+    expectNear("and it is the 12 m2 rectangle it was authored as", damage.tornPanelArea(), 12.0,
+               1e-9);
+
+    const gpu::DamagedHull damaged = gpu::buildDamagedHull(ship.hull, damage);
+    std::printf("     tear: %zu -> %zu triangles, %zu dropped, %.3f m2 of hole against"
+                " %.3f m2 of torn panel\n",
+                damaged.sourceTriangles, damaged.deformed.tris.size(), damaged.droppedTriangles,
+                damaged.holeArea, damage.tornPanelArea());
+    // The hole is cut by dropping whole triangles, so its edge is accurate to about
+    // the refinement size: the error is bounded by half a triangle along the
+    // perimeter. 14 m of perimeter at 0.20 m bounds it at 1.4 m2, and it comes in
+    // well inside that.
+    const double perimeter = 2.0 * (4.0 + 3.0);
+    expectTrue(label("the hole is the panel's own area to within half a triangle along its"
+                     " perimeter, m2", damaged.holeArea - 12.0),
+               std::abs(damaged.holeArea - 12.0) <= 0.5 * perimeter * damage.params.fineSize);
+    expectTrue(label("and it is a hole rather than a nick, m2", damaged.holeArea),
+               damaged.holeArea > 10.0);
+
+    // The cut mesh's only unmatched edges are the hole's own boundary, counted
+    // independently from the triangles that were removed. More would be a crack the
+    // refinement opened; fewer would be a hole that never opened.
+    const MeshCensus census = censusMesh(damaged.deformed);
+    const long long boundary = holeBoundaryEdges(damaged.rest.verts, damaged.removed);
+    std::printf("     cut edges: %lld interior, %lld unmatched, %lld malformed; the removed"
+                " triangles expose %lld\n",
+                census.interior, census.unmatched, census.malformed, boundary);
+    expectEqual("every unmatched edge of the cut hull is on the hole's own boundary",
+                census.unmatched, boundary);
+    expectEqual("and nothing is wound the wrong way", census.malformed, 0);
+    expectTrue(label("the hole has a boundary at all, edges", static_cast<double>(boundary)),
+               boundary > 40);
+
+    gpu::HullPaint paint;
+    paint.waterlineZ = 5.0;
+    gpu::HullShading shading;
+
+    // Straight at the middle of the hole, along +y. Every surface the ray meets is
+    // then a plane square to the camera, so its depth is `planeClipDepth` of its
+    // distance and nothing about the pixel enters the prediction.
+    constexpr double kNear = 10.0, kFar = 120.0;
+    const sim::Vec3 eye{0.0, -45.0, 7.5};
+    const sim::Mat4 mvp =
+        sim::perspective(40.0 * sim::kDegToRad, double(kWidth) / kHeight, kNear, kFar) *
+        sim::lookAt(eye, {0.0, 0.0, 7.5}, {0, 0, 1});
+    float matrix[16];
+    mvp.toFloats(matrix);
+    gpu::SceneView view;
+    view.eye[0] = float(eye.x);
+    view.eye[1] = float(eye.y);
+    view.eye[2] = float(eye.z);
+    const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    double clip[4];
+    mvp.transform({0.0, -8.5, 7.5}, clip);
+    double px = 0, py = 0;
+    expectTrue("the middle of the hole projects into the frame",
+               sim::clipToPixel(clip, kWidth, kHeight, px, py));
+    const auto column = static_cast<std::uint32_t>(px);
+    const auto row = static_cast<std::uint32_t>(py);
+
+    // A piece of structure inside her, standing in for the compartment behind the
+    // shell. Its material is one nothing on the outside of the ship uses, so "what
+    // is behind the hole" is an integer.
+    sim::TriMesh bulkhead;
+    bulkhead.verts = {{-6.0, -5.0, 3.0}, {6.0, -5.0, 3.0}, {6.0, -5.0, 12.0}, {-6.0, -5.0, 12.0}};
+    bulkhead.tris = {{0, 1, 2}, {0, 2, 3}};
+    const auto bulkheadMaterial = static_cast<std::uint32_t>(library.find("test_warm"));
+    const auto topside = static_cast<std::uint32_t>(library.find("painted_steel_topside"));
+    expectTrue("the two materials this distinguishes really are different",
+               bulkheadMaterial != topside);
+
+    const gpu::HullDamage nothing;
+    const gpu::DamagedHull intact = gpu::buildDamagedHull(ship.hull, nothing);
+
+    struct Case { const char* what; const gpu::DamagedHull* hull; bool withBulkhead; double distance;
+                  std::uint32_t material; };
+    const Case cases[3] = {
+        {"intact, the near shell", &intact, true, 45.0 - 8.5, topside},
+        {"torn, the structure behind it", &damaged, true, 45.0 - 5.0, bulkheadMaterial},
+        {"torn with nothing behind it, the far side of the hull from inside", &damaged, false,
+         45.0 + 8.5, topside}};
+
+    for (const Case& c : cases) {
+        gpu::SceneMesh mesh;
+        if (!mesh.appendShip(ship, *c.hull, paint, library, shading, error)) {
+            expectTrue(std::string("the scene builds: ") + error, false);
+            return;
+        }
+        if (c.withBulkhead)
+            mesh.appendMesh(bulkhead, sim::Mat3{}, {0, 0, 0}, bulkheadMaterial,
+                            gpu::HullShading{});
+
+        Image identifiers, depths;
+        view.mode = gpu::HullShadingMode::MaterialId;
+        if (!renderer.render(matrix, view, mesh, library, clear, identifiers)) return;
+        view.mode = gpu::HullShadingMode::Depth;
+        if (!renderer.render(matrix, view, mesh, library, clear, depths)) return;
+
+        std::uint32_t drawn = 0;
+        double depth = 0;
+        const bool haveMaterial = gpu::decodeMaterialId(identifiers.pixel(column, row), drawn);
+        const bool haveDepth = gpu::decodeSceneDepth(depths.pixel(column, row), depth);
+        const double predicted = planeClipDepth(c.distance, kNear, kFar);
+        std::printf("     %-58s material %u (want %u), depth %.5f (want %.5f)\n", c.what, drawn,
+                    c.material, depth, predicted);
+
+        expectTrue(std::string("something is drawn at the sample -- ") + c.what,
+                   haveMaterial && haveDepth);
+        expectEqual(std::string("the material at the sample is what lies there -- ") + c.what,
+                    drawn, c.material);
+        // Two codes of the 16-bit channel. The surface is a plane square to the
+        // camera, so this is an equality with a quantisation allowance and not a
+        // tolerance anybody chose.
+        expectNear(std::string("and it is at that surface's own distance -- ") + c.what, depth,
+                   predicted, 2.5 / 65535.0);
+    }
+
+    // The three depths must actually be different, or the equalities above were
+    // satisfied by a frame that never changed.
+    const double near = planeClipDepth(36.5, kNear, kFar);
+    const double behind = planeClipDepth(40.0, kNear, kFar);
+    const double through = planeClipDepth(53.5, kNear, kFar);
+    expectTrue(label("the hole moves the sample more than a thousand depth codes",
+                     (behind - near) * 65535.0),
+               (behind - near) * 65535.0 > 1000.0);
+    expectTrue(label("and further again with nothing behind it, codes",
+                     (through - behind) * 65535.0),
+               (through - behind) * 65535.0 > 1000.0);
+}
+
+// `docs/03-renderer-audio.md` asks for exposed-metal blending on a torn edge, and
+// the material set is data, so this is a material *name* on the plating around the
+// hole rather than a branch in a shader. Two pixels settle it, both integers.
+void testTornEdgesAreDrawnAsExposedMetal() {
+    gpu::Device device;
+    gpu::HullRenderer renderer;
+    if (!setup(device, renderer)) return;
+    gpu::MaterialLibrary library;
+    std::string error;
+    if (!testLibrary(library, error)) return;
+
+    sim::Ship ship = makeTestShip();
+    ship.state.orientation = {};
+    ship.state.position = {0, 0, 0};
+
+    const sim::StructuralMesh structure = sidePanels({{-2.0, 2.0, 6.0, 9.0}});
+    gpu::HullDamage damage;
+    damage.addTornPanels(structure, {0});
+    const gpu::DamagedHull damaged = gpu::buildDamagedHull(ship.hull, damage);
+
+    // The band is a strip of plating outside the hole, so its area is the hole's
+    // perimeter times its width, give or take one triangle either side of the
+    // criterion. That is a closed form, and it is what separates "the band exists"
+    // from "every triangle got marked" and from "none did".
+    double exposedArea = 0;
+    for (std::size_t t = 0; t < damaged.rest.tris.size(); ++t) {
+        if (damaged.exposed[t] == 0) continue;
+        const sim::Tri& tri = damaged.rest.tris[t];
+        exposedArea += 0.5 * length(cross(damaged.rest.verts[tri.b] - damaged.rest.verts[tri.a],
+                                          damaged.rest.verts[tri.c] - damaged.rest.verts[tri.a]));
+    }
+    const double perimeter = 2.0 * (4.0 + 3.0);
+    const double nominal = perimeter * damage.params.exposedWidth;
+    // ...and it is *around the hole*, which is a separate claim and the one a
+    // single camera cannot make: a band mirrored onto her port shell is hidden
+    // behind the ship from every viewpoint that can see the hole. So the band's
+    // extent is checked in the ship's own coordinates, against the rectangle the
+    // panel was authored as. Mutation-tested: dropping the tear's through-thickness
+    // guard puts an identical band on the far side and this is what says so.
+    const double margin = damage.params.exposedWidth + damage.params.fineSize;
+    long long strayed = 0;
+    for (std::size_t t = 0; t < damaged.rest.tris.size(); ++t) {
+        if (damaged.exposed[t] == 0) continue;
+        const sim::Tri& tri = damaged.rest.tris[t];
+        const sim::Vec3 centroid = (damaged.rest.verts[tri.a] + damaged.rest.verts[tri.b] +
+                                    damaged.rest.verts[tri.c]) / 3.0;
+        if (std::abs(centroid.y + 8.5) > margin || std::abs(centroid.x) > 2.0 + margin ||
+            centroid.z < 6.0 - margin || centroid.z > 9.0 + margin)
+            ++strayed;
+    }
+    std::printf("     exposed band: %.3f m2 against a nominal %.3f m2 (%.1f m of hole edge at"
+                " %.2f m wide); %lld triangle(s) outside the panel's own neighbourhood\n",
+                exposedArea, nominal, perimeter, damage.params.exposedWidth, strayed);
+    expectTrue(label("the exposed band is about the hole's perimeter times its width, m2",
+                     exposedArea),
+               exposedArea > 0.5 * nominal && exposedArea < 2.5 * nominal);
+    expectEqual("and every triangle of it is on the struck plating, within the torn panel's"
+                " own neighbourhood", strayed, 0);
+
+    gpu::HullPaint paint;
+    paint.waterlineZ = 5.0;
+    gpu::HullShading shading;
+    gpu::SceneMesh mesh;
+    if (!mesh.appendShip(ship, damaged, paint, library, shading, error)) {
+        expectTrue("the damaged scene builds: " + error, false);
+        return;
+    }
+
+    const sim::Vec3 eye{0.0, -45.0, 7.5};
+    const sim::Mat4 mvp =
+        sim::perspective(40.0 * sim::kDegToRad, double(kWidth) / kHeight, 10.0, 120.0) *
+        sim::lookAt(eye, {0.0, 0.0, 7.5}, {0, 0, 1});
+    float matrix[16];
+    mvp.toFloats(matrix);
+    gpu::SceneView view;
+    view.mode = gpu::HullShadingMode::MaterialId;
+    view.eye[0] = float(eye.x);
+    view.eye[1] = float(eye.y);
+    view.eye[2] = float(eye.z);
+    const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    Image identifiers;
+    if (!renderer.render(matrix, view, mesh, library, clear, identifiers)) return;
+
+    const auto exposed = static_cast<std::uint32_t>(library.find("torn_plate_edge"));
+    const auto topside = static_cast<std::uint32_t>(library.find("painted_steel_topside"));
+    expectTrue("the shipped material set carries a torn-edge surface", library.find(
+                   "torn_plate_edge") >= 0);
+    expectTrue("which is not the topside paint", exposed != topside);
+
+    struct Probe { const char* what; sim::Vec3 at; std::uint32_t material; };
+    const Probe probes[4] = {
+        {"a tenth of a metre above the top of the hole", {0.0, -8.5, 9.10}, exposed},
+        {"a tenth of a metre below the bottom of it", {0.0, -8.5, 5.90}, exposed},
+        {"a metre and a half above it, which is ordinary plating", {0.0, -8.5, 10.5}, topside},
+        {"four metres forward of it", {6.0, -8.5, 7.5}, topside}};
+    for (const Probe& probe : probes) {
+        double clip[4], px = 0, py = 0;
+        mvp.transform(probe.at, clip);
+        if (!sim::clipToPixel(clip, kWidth, kHeight, px, py)) {
+            expectTrue(std::string("the probe projects into the frame -- ") + probe.what, false);
+            continue;
+        }
+        std::uint32_t drawn = 0;
+        const bool have = gpu::decodeMaterialId(
+            identifiers.pixel(static_cast<std::uint32_t>(px), static_cast<std::uint32_t>(py)),
+            drawn);
+        expectTrue(std::string("plating is drawn at the probe -- ") + probe.what, have);
+        expectEqual(std::string("and in the material the damage says -- ") + probe.what, drawn,
+                    probe.material);
+    }
+
+    // Nothing on an intact ship is exposed metal, so the band is a consequence of
+    // the tear rather than of the paint scheme.
+    const gpu::HullDamage nothing;
+    const gpu::DamagedHull intact = gpu::buildDamagedHull(ship.hull, nothing);
+    gpu::SceneMesh whole;
+    if (!whole.appendShip(ship, intact, paint, library, shading, error)) return;
+    Image intactIdentifiers;
+    if (!renderer.render(matrix, view, whole, library, clear, intactIdentifiers)) return;
+    long long exposedPixels = 0, damagedExposedPixels = 0;
+    for (std::uint32_t y = 0; y < kHeight; ++y)
+        for (std::uint32_t x = 0; x < kWidth; ++x) {
+            std::uint32_t drawn = 0;
+            if (gpu::decodeMaterialId(intactIdentifiers.pixel(x, y), drawn) && drawn == exposed)
+                ++exposedPixels;
+            if (gpu::decodeMaterialId(identifiers.pixel(x, y), drawn) && drawn == exposed)
+                ++damagedExposedPixels;
+        }
+    expectEqual("an intact ship shows no exposed metal anywhere in the frame", exposedPixels, 0);
+    expectTrue(label("and a torn one shows a band of it, pixels",
+                     static_cast<double>(damagedExposedPixels)),
+               damagedExposedPixels > 200);
+}
+
+// --- The dent is the solver's, not a drawing of one -----------------------------
+
+// The whole point of drawing damage from `zone.hpp` rather than inventing it is
+// that the picture is the solve. So the field is *interpolating*: it is piecewise
+// linear over the patch's own elements, which means at a mid-surface node the
+// barycentric weights are exactly (1, 0, 0) and the answer is exactly that node's
+// displacement. That is an equality, and it is asserted as one over every node in
+// the patch -- an approximating fit would not survive it, which is why one was
+// rejected.
+//
+// The seam is the other half. `zone::Edge::Clamped` pins the patch perimeter, so
+// the boundary nodes carry displacement **zero** and the field reaches zero inside
+// its own support instead of being cut off at it. That is what makes the join to
+// the undeformed hull a join rather than a step, and it is measured from the
+// solve's own answer rather than assumed.
+void testTheDentIsTheZonesOwnNodePositions() {
+    const sim::Ship ferry = game::buildFerry();
+    const sim::Scantlings scantlings = sim::ferryScantlings();
+    const sim::StructuralMesh structure = sim::makeStructuralMesh(ferry.hull, scantlings);
+
+    // A small patch on her side, driven by a punch. Elastic rather than plastic:
+    // the indenter is kinematic, so the nodes it holds reach the depth either way,
+    // and 273 ns an element against 7.3 us is the difference between a unit test
+    // and a tool.
+    sim::zone::MeshParams meshParams;
+    meshParams.radius = 2.0;
+    meshParams.subdivision = 3;
+    const sim::Vec3 impact{0.0, -9.9, 8.0};
+    const sim::zone::Patch patch = sim::zone::buildPatch(structure, impact, meshParams);
+    if (patch.empty()) {
+        expectTrue("a zone can be promoted on the ferry's side", false);
+        return;
+    }
+
+    sim::zone::SolveParams solveParams;
+    solveParams.plastic = false;
+    solveParams.damping = 0.999;
+    solveParams.indenter.halfLength = 1.0;
+    solveParams.indenter.halfWidth = 0.6;
+    solveParams.indenter.speed = 6.0;
+    solveParams.indenter.rampTime = 2.0e-3;
+    solveParams.indenter.stopAt = 0.18;
+    sim::zone::Solver solver(patch, sim::plasticity::shipSteel(), solveParams);
+    const sim::zone::SolveResult& result = solver.run();
+    std::printf("     zone: %zu elements, %zu nodes, %d steps, %.2f s wall, penetration"
+                " %.3f m\n",
+                patch.elementCount(), patch.nodeCount(), result.steps, result.wallSeconds,
+                result.penetration);
+
+    gpu::HullDamage damage;
+    std::string error;
+    expectTrue("the solved patch becomes a deformation field: " + error,
+               damage.addZone(patch, solver.position(), error));
+
+    // Every mid-surface node, held against the field the renderer will sample.
+    const std::size_t mids = patch.nodeCount() / 2;
+    double worst = 0, largest = 0;
+    for (std::size_t m = 0; m < mids; ++m) {
+        sim::Vec3 rest{}, moved{};
+        for (int k = 0; k < 3; ++k) {
+            const std::size_t lo = (2 * m) * 3 + static_cast<std::size_t>(k);
+            const std::size_t hi = (2 * m + 1) * 3 + static_cast<std::size_t>(k);
+            rest[k] = 0.5 * (patch.mesh.position[lo] + patch.mesh.position[hi]);
+            moved[k] = 0.5 * (solver.position()[lo] + solver.position()[hi]);
+        }
+        const sim::Vec3 wanted = moved - rest;
+        worst = std::max(worst, length(damage.displacementAt(rest) - wanted));
+        largest = std::max(largest, length(wanted));
+    }
+    std::printf("     the field reproduces %zu node displacements to %.3e m; the largest is"
+                " %.4f m and the patch boundary moved %.3e m\n",
+                mids, worst, largest, damage.boundaryDisplacement());
+    expectTrue(label("the field is the solver's own node positions, worst error m", worst),
+               worst < 1e-9);
+    // Guards. A field that returned zero everywhere would reproduce a patch that
+    // never moved, perfectly.
+    expectTrue(label("the patch really did move, m", largest), largest > 0.05);
+    expectNear("and `largestNodeDisplacement` agrees with the nodes it came from",
+               damage.largestNodeDisplacement(), largest, 1e-12);
+    // The seam claim, from the solve rather than from an assumption about it.
+    expectEqual("a clamped patch has not moved its own boundary, which is what lets the"
+                " deformed plating meet the undeformed hull without a step",
+                static_cast<long long>(damage.boundaryDisplacement() * 1e12), 0);
+
+    // Off the patch the field is exactly zero -- not small, zero -- so nothing
+    // outside the promoted plating is touched.
+    const sim::Vec3 farAway[3] = {{40.0, -9.9, 8.0}, {0.0, 9.9, 8.0}, {0.0, -9.9, 2.0}};
+    for (const sim::Vec3& at : farAway) {
+        const sim::Vec3 displacement = damage.displacementAt(at);
+        expectEqual(label("the field is identically zero away from the patch, at x", at.x),
+                    static_cast<long long>(length(displacement) * 1e12), 0);
+    }
+
+    // **A hull wraps, so a point on her far side projects into the same in-plane
+    // cell as a point on the near one**, and the field has to refuse it on the
+    // through-thickness distance alone. Every node of the patch, taken twenty
+    // metres inboard along the patch normal -- which for a strike on her starboard
+    // side is the port shell, node for node.
+    //
+    // Three hand-picked far points did not catch this. One of them was the mirror
+    // of the impact point itself and read zero anyway, because the impact landed on
+    // a stiffener line whose nodes `Stiffeners::RigidSupport` pins: the probe was
+    // in the right place and the *node* it mirrored was the one node under the
+    // punch that could not move. Sweeping every node instead of choosing three is
+    // the fix, and it is the same lesson as sweeping alignments 1-256.
+    const sim::Vec3 inboard = patch.axis * -20.0;
+    double worstThrough = 0;
+    long long mirroredMoving = 0;
+    for (std::size_t m = 0; m < mids; ++m) {
+        sim::Vec3 rest{}, moved{};
+        for (int k = 0; k < 3; ++k) {
+            const std::size_t lo = (2 * m) * 3 + static_cast<std::size_t>(k);
+            const std::size_t hi = (2 * m + 1) * 3 + static_cast<std::size_t>(k);
+            rest[k] = 0.5 * (patch.mesh.position[lo] + patch.mesh.position[hi]);
+            moved[k] = 0.5 * (solver.position()[lo] + solver.position()[hi]);
+        }
+        worstThrough = std::max(worstThrough, length(damage.displacementAt(rest + inboard)));
+        if (length(moved - rest) > 1e-6) ++mirroredMoving;
+    }
+    expectEqual("nothing twenty metres in from the patch moves, node for node, so the far"
+                " side of the ship does not dent when the near side is struck",
+                static_cast<long long>(worstThrough * 1e12), 0);
+    // The guard: those mirrors are mirrors of nodes that *did* move, so the sweep
+    // would report them if the guard were gone. Sixteen of the patch's 112
+    // mid-surface nodes, the rest being pinned by the perimeter or by a stiffener
+    // line -- `Patch::freeFraction` says 36% of the degrees of freedom are free and
+    // this is that, counted.
+    expectTrue(label("and the mirrored nodes had somewhere to move, nodes",
+                     static_cast<double>(mirroredMoving)),
+               mirroredMoving > 10);
+
+    // And through the renderer. The deformed hull is refined to the element size
+    // over the patch, so the drawn surface carries the dent; the frame's depth
+    // channel is held against the same triangles rasterised on the CPU, and against
+    // the *undeformed* ship at the same pixel, which must differ.
+    gpu::Device device;
+    gpu::HullRenderer renderer;
+    if (!setup(device, renderer)) return;
+    gpu::MaterialLibrary library;
+    if (!testLibrary(library, error)) return;
+
+    damage.params.fineSize = 0.15;
+    sim::Ship ship = ferry;
+    ship.state.orientation = {};
+    ship.state.position = {0, 0, 0};
+    const gpu::DamagedHull dented = gpu::buildDamagedHull(ship.hull, damage);
+    const gpu::HullDamage nothing;
+    const gpu::DamagedHull intact = gpu::buildDamagedHull(ship.hull, nothing);
+    std::printf("     the ferry's plating: %zu -> %zu triangles, deepest split %d, largest"
+                " displacement %.4f m, built in %.1f ms\n",
+                dented.sourceTriangles, dented.deformed.tris.size(), dented.deepestSplit,
+                dented.largestDisplacement, dented.buildSeconds * 1e3);
+    expectTrue(label("the drawn hull carries the dent, m", dented.largestDisplacement),
+               dented.largestDisplacement > 0.05);
+    expectEqual("and drawing it opened no crack", censusMesh(dented.deformed).unmatched, 0);
+
+    gpu::HullPaint paint;
+    paint.waterlineZ = 5.5;
+    gpu::HullShading shading;
+    gpu::SceneMesh dentedScene, intactScene;
+    if (!dentedScene.appendShip(ship, dented, paint, library, shading, error)) return;
+    if (!intactScene.appendShip(ship, intact, paint, library, shading, error)) return;
+
+    const sim::Vec3 eye{0.0, -26.0, 8.0};
+    const sim::Mat4 mvp =
+        sim::perspective(40.0 * sim::kDegToRad, double(kWidth) / kHeight, 5.0, 120.0) *
+        sim::lookAt(eye, impact, {0, 0, 1});
+    float matrix[16];
+    mvp.toFloats(matrix);
+    gpu::SceneView view;
+    view.mode = gpu::HullShadingMode::Depth;
+    view.eye[0] = float(eye.x);
+    view.eye[1] = float(eye.y);
+    view.eye[2] = float(eye.z);
+    const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    Image dentedDepth, intactDepth;
+    if (!renderer.render(matrix, view, dentedScene, library, clear, dentedDepth)) return;
+    if (!renderer.render(matrix, view, intactScene, library, clear, intactDepth)) return;
+
+    // The most displaced mid-surface node, projected with `sim::clipToPixel`.
+    sim::Vec3 sampleRest{}, sampleMoved{};
+    double best = -1;
+    for (std::size_t m = 0; m < mids; ++m) {
+        sim::Vec3 rest{}, moved{};
+        for (int k = 0; k < 3; ++k) {
+            const std::size_t lo = (2 * m) * 3 + static_cast<std::size_t>(k);
+            const std::size_t hi = (2 * m + 1) * 3 + static_cast<std::size_t>(k);
+            rest[k] = 0.5 * (patch.mesh.position[lo] + patch.mesh.position[hi]);
+            moved[k] = 0.5 * (solver.position()[lo] + solver.position()[hi]);
+        }
+        if (length(moved - rest) > best) {
+            best = length(moved - rest);
+            sampleRest = rest;
+            sampleMoved = moved;
+        }
+    }
+    double clip[4], px = 0, py = 0;
+    mvp.transform(sampleMoved, clip);
+    expectTrue("the most displaced node projects into the frame",
+               sim::clipToPixel(clip, kWidth, kHeight, px, py));
+    const auto column = static_cast<std::uint32_t>(px);
+    const auto row = static_cast<std::uint32_t>(py);
+    // The rasteriser samples the centre of the pixel, not the projected point.
+    const double sampleX = column + 0.5, sampleY = row + 0.5;
+
+    // The camera looks very nearly along -y at the patch, so the punch's travel is
+    // almost exactly along the view axis and the depth channel can be held against
+    // it directly.
+    const double toward = std::abs(sampleMoved.y - sampleRest.y);
+    double drawnDented = 0, drawnIntact = 0, cpuDented = 0, cpuIntact = 0;
+    expectTrue("the frame drew the dented hull at the sample",
+               gpu::decodeSceneDepth(dentedDepth.pixel(column, row), drawnDented));
+    expectTrue("and the undamaged one",
+               gpu::decodeSceneDepth(intactDepth.pixel(column, row), drawnIntact));
+    expectTrue("the same triangles rasterised on the CPU cover the sample, dented",
+               cpuDepthAt(dentedScene, mvp, kWidth, kHeight, sampleX, sampleY, cpuDented));
+    expectTrue("and intact",
+               cpuDepthAt(intactScene, mvp, kWidth, kHeight, sampleX, sampleY, cpuIntact));
+    std::printf("     at the deepest node: drawn %.5f, CPU %.5f (dented); drawn %.5f, CPU"
+                " %.5f (intact); the dent is worth %.0f depth codes\n",
+                drawnDented, cpuDented, drawnIntact, cpuIntact,
+                (drawnDented - drawnIntact) * 65535.0);
+    // `gl_FragCoord.z` is interpolated linearly in screen space, which is exactly
+    // the plane of the projected triangle, so this is an equality up to the
+    // channel's own 1 / 65535.
+    expectNear("the frame's depth is the depth these triangles have", drawnDented, cpuDented,
+               3.0 / 65535.0);
+    expectNear("and the undamaged frame's is the undamaged triangles'", drawnIntact, cpuIntact,
+               3.0 / 65535.0);
+    // The guard that stops both of those from being satisfied by a renderer that
+    // ignored the damage entirely. The sign is the physics: the punch drives the
+    // plating *inward*, so from a camera outside the hull the dented surface is
+    // **further** away than the intact one. Getting that backwards was the first
+    // version of this line, and the frame said so.
+    expectTrue(label("the dent moved the surface the camera sees, depth codes",
+                     (drawnDented - drawnIntact) * 65535.0),
+               (drawnDented - drawnIntact) * 65535.0 > 60.0);
+    // How far, against what the solver said. A perspective projection sends every
+    // point at the same view depth to the same clip z, so the depth the node
+    // *should* move is `planeClipDepth` of its view depth before and after -- an
+    // exact prediction out of the camera and the solver, with no pixel in it.
+    const sim::Vec3 forward = normalize(impact - eye);
+    const double predicted = planeClipDepth(dot(sampleMoved - eye, forward), 5.0, 120.0) -
+                             planeClipDepth(dot(sampleRest - eye, forward), 5.0, 120.0);
+    std::printf("     the dent is worth %.0f depth codes measured against %.0f predicted from"
+                " %.4f m of travel\n",
+                (drawnDented - drawnIntact) * 65535.0, predicted * 65535.0, toward);
+    // Within a quarter, and the discrepancy is understood: the pixel centre is not
+    // the projected node, and this is the *apex* of the dent, where the plating a
+    // few centimetres to either side is measurably shallower. A quarter still
+    // rejects a dent drawn at half depth or at twice it, which is the failure this
+    // is aimed at; the exact statement about the field is the node-by-node equality
+    // above, which does not go through a pixel at all.
+    expectNear("and by about the amount the camera geometry says that displacement is worth",
+               drawnDented - drawnIntact, predicted, 0.25 * predicted);
+    expectTrue(label("and it moved it the way the punch went, m",
+                     sampleMoved.y - sampleRest.y),
+               sampleMoved.y - sampleRest.y > 0.05);
+}
+
+// --- What damage costs ---------------------------------------------------------
+
+// The claim this has to support is that damage rendering is free until there is
+// damage, and cheap after. Reported rather than asserted tightly -- CLAUDE.md
+// records what a tight timing assertion costs on a shared machine -- except for
+// the one bound that is a design statement rather than a measurement.
+void testDamageCosts() {
+    gpu::Device device;
+    gpu::HullRenderer renderer;
+    if (!setup(device, renderer)) return;
+    gpu::MaterialLibrary library;
+    std::string error;
+    if (!testLibrary(library, error)) return;
+
+    sim::Ship ship = makeTestShip();
+    ship.state.orientation = {};
+    ship.state.position = {0, 0, 0};
+
+    const sim::StructuralMesh structure = sidePanels({{-2.0, 2.0, 6.0, 9.0}});
+    gpu::HullDamage damage;
+    damage.addTornPanels(structure, {0});
+    damage.addTent({0.0, -8.5, 7.5}, {0, -1, 0}, 4.0, 0.45);
+
+    const gpu::HullDamage nothing;
+    const gpu::DamagedHull intact = gpu::buildDamagedHull(ship.hull, nothing);
+    const gpu::DamagedHull damaged = gpu::buildDamagedHull(ship.hull, damage);
+
+    // This is the only scene here that is both dented **and** torn, which makes it
+    // the only one that can say which mesh the hole was measured on. A hole is a
+    // hole in the *plating*, so its area is the undeformed one -- the deformed
+    // triangles are stretched by the dent and would report a larger hole for a
+    // deeper dent through the same panel. Mutation-tested: measuring the deformed
+    // area escapes every scene that has only one of the two.
+    double removedRestArea = 0, removedDeformedArea = 0;
+    for (const sim::Tri& tri : damaged.removed) {
+        const auto area = [&](const sim::TriMesh& mesh) {
+            return 0.5 * length(cross(mesh.verts[tri.b] - mesh.verts[tri.a],
+                                      mesh.verts[tri.c] - mesh.verts[tri.a]));
+        };
+        removedRestArea += area(damaged.rest);
+        removedDeformedArea += area(damaged.deformed);
+    }
+    std::printf("     hole: %.4f m2 reported, %.4f m2 of undeformed plating, %.4f m2 of"
+                " deformed\n", damaged.holeArea, removedRestArea, removedDeformedArea);
+    expectNear("the hole is the area of the plating that was there", damaged.holeArea,
+               removedRestArea, 1e-9);
+    expectTrue(label("and the dent stretched that plating measurably, m2",
+                     removedDeformedArea - removedRestArea),
+               std::abs(removedDeformedArea - removedRestArea) > 0.05);
+
+    gpu::HullPaint paint;
+    paint.waterlineZ = 5.0;
+    gpu::HullShading shading;
+    const sim::Vec3 eye{-30.0, -55.0, 22.0};
+    const sim::Mat4 mvp =
+        sim::perspective(45.0 * sim::kDegToRad, double(kWidth) / kHeight, 2.0, 300.0) *
+        sim::lookAt(eye, {0.0, -6.0, 7.0}, {0, 0, 1});
+    float matrix[16];
+    mvp.toFloats(matrix);
+    gpu::SceneView view;
+    view.eye[0] = float(eye.x);
+    view.eye[1] = float(eye.y);
+    view.eye[2] = float(eye.z);
+    // The sun on the struck side. Nothing here asserts a pixel, so this is purely
+    // so the representative frame below is legible rather than a silhouette.
+    view.sunDirection[0] = -0.30f;
+    view.sunDirection[1] = -0.58f;
+    view.sunDirection[2] = 0.76f;
+    const float clear[4] = {0.55f, 0.68f, 0.82f, 1.0f};
+
+    struct Row { const char* what; const gpu::DamagedHull* hull; };
+    const Row rows[2] = {{"undamaged", &intact}, {"dented and torn", &damaged}};
+    double gpuMs[2] = {0, 0};
+    for (int r = 0; r < 2; ++r) {
+        gpu::SceneMesh mesh;
+        if (!mesh.appendShip(ship, *rows[r].hull, paint, library, shading, error)) return;
+        gpu::FrameCost best;
+        double bestGpu = 1e30;
+        for (int repeat = 0; repeat < 6; ++repeat) {
+            Image image;
+            if (!renderer.render(matrix, view, mesh, library, clear, image)) return;
+            if (renderer.lastFrame().gpuSeconds < bestGpu) {
+                bestGpu = renderer.lastFrame().gpuSeconds;
+                best = renderer.lastFrame();
+            }
+        }
+        gpuMs[r] = best.gpuSeconds * 1e3;
+        std::printf("       %-16s %7zu tris | rebuild %6.2f ms  scene %5.2f ms  upload %5.2f ms"
+                    "  gpu %5.3f ms\n",
+                    rows[r].what, best.triangles, rows[r].hull->buildSeconds * 1e3,
+                    mesh.buildSeconds() * 1e3, best.uploadSeconds * 1e3, gpuMs[r]);
+        if (r == 1) {
+            // Shaded rather than a measurement channel, and kept for the same
+            // reason the ship-in-a-sea frame beside it is: nothing here is
+            // eyeballed, but somebody has to be able to look.
+            Image image;
+            if (!renderer.render(matrix, view, mesh, library, clear, image)) return;
+            const std::string path = testing::scratchDir() + "hull_damaged_ship.png";
+            expectTrue("a representative damaged frame is written: " + path,
+                       core::writePng(path, image));
+            std::printf("     representative frame: %s\n", path.c_str());
+        }
+        expectTrue(label("the GPU time was measured for the ", static_cast<double>(r)),
+                   best.gpuSeconds > 0.0);
+    }
+    // The design statement: a whole damaged ship is still nowhere near the frame's
+    // problem, so none of this needs optimising before what comes after it lands.
+    expectTrue(label("a dented, torn ship still costs well under a 60 Hz frame, ms", gpuMs[1]),
+               gpuMs[1] < 0.016 * 1e3);
+    expectEqual("an undamaged hull is rebuilt without adding a single triangle",
+                static_cast<long long>(intact.deformed.tris.size()),
+                static_cast<long long>(ship.hull.tris.size()));
+}
+
 }  // namespace
 
 void runHullRenderTests() {
@@ -2181,4 +3570,14 @@ void runHullRenderTests() {
     testPortAndStarboardViewsMirror();
     testRenderingIsRepeatableAndTheSceneComposes();
     testFrameCost();
+    testAnUndamagedShipIsUnchangedByAllOfThis();
+    testADentDoesNotRepaintHer();
+    testRefiningPartOfTheHullLeavesNoCrack();
+    testTheFieldCannotStepAndTheresNoSeam();
+    testASeamInTheInputIsNotASeamInTheOutput();
+    testACrackWouldShowInTheFrame();
+    testATornPanelIsAHoleYouCanSeeThrough();
+    testTornEdgesAreDrawnAsExposedMetal();
+    testTheDentIsTheZonesOwnNodePositions();
+    testDamageCosts();
 }

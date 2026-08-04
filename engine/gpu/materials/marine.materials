@@ -86,3 +86,16 @@ material sea_water
     base_colour 0.050 0.150 0.210
     roughness   0.09
     metalness   0.00
+
+# The plating around a hole. Steel that was inside the plate a moment ago: no
+# paint, no mill scale, and no time to oxidise -- brighter and sharper than
+# `bare_steel`, which is a weathered blasted surface rather than a fresh fracture.
+# A conductor, like every unpainted steel surface here.
+#
+# `gpu::HullPaint::tornEdge` names this and `gpu::SceneMesh::appendShip` resolves
+# it only for a damaged ship, so a `.materials` file that predates it still paints
+# an intact one. A mod restates the block to change what a tear looks like.
+material torn_plate_edge
+    base_colour 0.62 0.62 0.63
+    roughness   0.28
+    metalness   1.00

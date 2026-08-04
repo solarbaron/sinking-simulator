@@ -39,6 +39,7 @@
 #include "../core/math.hpp"
 #include "../core/png.hpp"
 #include "../sim/ship.hpp"
+#include "damage.hpp"
 #include "device.hpp"
 #include "material.hpp"
 #include "ocean.hpp"
@@ -105,6 +106,12 @@ struct HullPaint {
     std::string bootTopping = "boot_topping";
     std::string topside = "painted_steel_topside";
     std::string deck = "timber_deck";
+    // The plating around a hole: steel that was inside the plate a moment ago and
+    // has no paint on it. A name like every other band, so a mod restates it or
+    // replaces it in a `.materials` file rather than in a shader -- and it is
+    // resolved **only on the damaged path**, so a library that has never heard of
+    // it still paints an intact ship.
+    std::string tornEdge = "torn_plate_edge";
 
     double waterlineZ = 5.5;      // m, body frame: the design waterline
     double bootTopDepth = 0.35;   // m below it
@@ -125,6 +132,20 @@ public:
     // the library -- a missing material is a broken ship definition, not a grey
     // default.
     bool appendShip(const sim::Ship& ship, const HullPaint& paint,
+                    const MaterialLibrary& library, const HullShading& shading,
+                    std::string& error);
+
+    // The same ship after `damage.hpp` has refined, displaced and cut her plating.
+    // The geometry drawn is `damaged.deformed`; the paint bands are decided on
+    // `damaged.rest`, because paint is on the hull and a dented plate keeps the
+    // paint it was painted with -- deciding a band from a displaced z would slide
+    // the boot-topping around as the plating moved, which is the world-frame
+    // mistake one level down.
+    //
+    // Costs nothing when there is nothing wrong with her: a `DamagedHull` built
+    // from an empty `HullDamage` is the ship's own mesh, and this produces byte
+    // for byte what the call above does.
+    bool appendShip(const sim::Ship& ship, const DamagedHull& damaged, const HullPaint& paint,
                     const MaterialLibrary& library, const HullShading& shading,
                     std::string& error);
 

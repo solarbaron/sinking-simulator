@@ -307,8 +307,28 @@ The longest and highest-risk phase.
   reported as a patch, a pressure and an energy rather than as a velocity change,
   which is the load case the FEM-active zone needs. The rigid half of the
   milestone; what it does *not* do is deform or tear
-- Deformation and tear rendering — not started. `engine/gpu/hull.{hpp,cpp}` draws
-  an undeformed hull from `sim::Ship`; nothing feeds it a deformed one
+- ~~Deformation and tear rendering~~ — done: `engine/gpu/damage.{hpp,cpp}` and
+  `SceneMesh::appendShip`'s damaged overload, measured in `03-renderer-audio.md`.
+  A damaged ship draws as damaged. `zone::Solver`'s displaced nodes become a
+  piecewise-linear field over the patch's own elements — *interpolating*, so the
+  drawn surface passes through every node to 2.8e-17 m — the hull is refined where
+  the damage is because 5 m plating cannot show a 0.2 m dent, torn panels are
+  **removed** so the pixel behind them shows the compartment or the sea, and the
+  plating round a hole takes a material named in a `.materials` file.
+
+  Two things are worth carrying forward. **Joining a deformed patch to an
+  undeformed hull is the ocean cascade's problem in a triangle mesh** and it is
+  solved the same way — a split decided per *edge* from its endpoints alone, an
+  interned midpoint, and transition templates so a neighbour uses it — with the
+  same instrument: an edge census, zero unmatched edges, and a control that leaks
+  840. And **damage costs nothing until there is damage**: an undamaged hull comes
+  back bit-identically, so the damaged and undamaged paths render byte-for-byte
+  identical frames, which is asserted rather than intended.
+
+  What it does not do is the plan's compute-shader skinning off a resident node
+  buffer. `buildDamagedHull` is a 2 ms CPU rebuild that happens when the damage
+  changes, not a per-frame step, and that is the right shape until something
+  promotes and solves a zone *live* — which is the item above this one
 - **Milestone:** ram the ferry. The hull deforms, tears where the stress says it
   should, and the resulting hole floods at a rate the hole's own area determines.
 
@@ -360,6 +380,22 @@ The longest and highest-risk phase.
   absorbs by a factor of ten, so the figures above tear roughly ten times too many
   bays.** The fix is one line; it moves every number this milestone publishes, so it
   is recorded rather than folded in, and it needs a session that re-validates them.
+
+  **And it draws.** `ram_view --frames=N --out=DIR` writes the flooding sequence
+  with the damage in it: plating dished in, the torn bays cut out as holes with the
+  ferry's own compartment meshes visible through them, and exposed metal round
+  their edges. 27 631 triangles at 1280 × 720, 0.15 ms of GPU. The dent's *shape*
+  is the membrane model's own tent kinematics, stated in the tool rather than
+  implied — `indentation.hpp` reports a depth and a torn set and not a surface —
+  and `gpu::HullDamage::addZone` takes the zone's displaced nodes instead when a
+  run can afford the solve.
+
+  Drawing it surfaced one thing about the ship that nothing else had: a
+  `Compartment::mesh` is `clipToBox(hull, ...)`, so its outboard face is not near
+  the shell, it **is** the shell, to the last bit. Drawn together the two z-fight
+  over her whole side. The tool insets its copies by three per cent; the general
+  answer is that an interior wants its own inboard surface rather than a copy of
+  the shell, and that arrives with the compartment rendering in Phase 5.
 
   **What the milestone does not yet include.** The striking ship is rigid, so
   every joule goes into tearing the struck plating — `indentation.hpp` records that

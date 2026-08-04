@@ -35,6 +35,43 @@ std::array<long long, 3> weldKey(const sim::Vec3& p, double epsilon) {
             std::llround(p.z * inverse)};
 }
 
+// The four bands, resolved once. A ship whose paint names a material nobody loaded
+// is a broken ship definition; rendering it grey would hide that until someone
+// looked at it, which is the failure mode docs/05 is written against.
+bool resolveBands(const HullPaint& paint, const MaterialLibrary& library,
+                  std::uint32_t resolved[4], std::string& error) {
+    struct Named { const std::string& name; const char* role; };
+    const Named wanted[4] = {{paint.underwater, "underwater"},
+                             {paint.bootTopping, "boot topping"},
+                             {paint.topside, "topside"},
+                             {paint.deck, "deck"}};
+    for (int i = 0; i < 4; ++i) {
+        const int index = library.find(wanted[i].name);
+        if (index < 0) {
+            error = std::string("the ") + wanted[i].role + " material '" + wanted[i].name +
+                    "' is not in the library";
+            return false;
+        }
+        resolved[i] = static_cast<std::uint32_t>(index);
+    }
+    return true;
+}
+
+// Which band one triangle of the hull falls in, from its centroid and its
+// geometric normal. **Decided in the body frame, not the world frame** -- paint is
+// on the hull, so a ship heeled thirty degrees still has her boot-topping where it
+// was painted, and deciding the bands from world z would slide the waterline
+// stripe around the hull as she rolls.
+std::uint32_t bandFor(const sim::Vec3& a, const sim::Vec3& b, const sim::Vec3& c,
+                      const HullPaint& paint, const std::uint32_t resolved[4]) {
+    const sim::Vec3 centroid = (a + b + c) / 3.0;
+    const sim::Vec3 normal = normalize(cross(b - a, c - a));
+    if (centroid.z >= paint.deckZ && normal.z >= paint.deckNormalZ) return resolved[3];
+    if (centroid.z < paint.waterlineZ - paint.bootTopDepth) return resolved[0];
+    if (centroid.z < paint.waterlineZ + paint.bootTopHeight) return resolved[1];
+    return resolved[2];
+}
+
 }  // namespace
 
 // --- Geometry -----------------------------------------------------------------
@@ -148,49 +185,64 @@ bool SceneMesh::appendShip(const sim::Ship& ship, const HullPaint& paint,
                            std::string& error) {
     const auto started = std::chrono::steady_clock::now();
 
-    struct Named { const std::string& name; const char* role; };
-    const Named wanted[4] = {{paint.underwater, "underwater"},
-                             {paint.bootTopping, "boot topping"},
-                             {paint.topside, "topside"},
-                             {paint.deck, "deck"}};
     std::uint32_t resolved[4]{};
-    for (int i = 0; i < 4; ++i) {
-        const int index = library.find(wanted[i].name);
-        if (index < 0) {
-            // A ship whose paint names a material nobody loaded is a broken ship
-            // definition. Rendering it grey would hide that until someone looked
-            // at it, which is the whole failure mode docs/05 is written against.
-            error = std::string("the ") + wanted[i].role + " material '" + wanted[i].name +
-                    "' is not in the library";
-            return false;
-        }
-        resolved[i] = static_cast<std::uint32_t>(index);
+    if (!resolveBands(paint, library, resolved, error)) return false;
+
+    const sim::Mat3 rotation = ship.state.orientation.toMat3();
+    const sim::Vec3 translation = ship.state.position;
+
+    perFaceMaterial_.resize(ship.hull.tris.size());
+    for (std::size_t t = 0; t < ship.hull.tris.size(); ++t) {
+        const sim::Tri& tri = ship.hull.tris[t];
+        perFaceMaterial_[t] = bandFor(ship.hull.verts[tri.a], ship.hull.verts[tri.b],
+                                      ship.hull.verts[tri.c], paint, resolved);
+    }
+
+    appendTriangles(ship.hull, rotation, translation, shading, perFaceMaterial_.data(), 0);
+    buildSeconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+                         .count();
+    return true;
+}
+
+bool SceneMesh::appendShip(const sim::Ship& ship, const DamagedHull& damaged,
+                           const HullPaint& paint, const MaterialLibrary& library,
+                           const HullShading& shading, std::string& error) {
+    const auto started = std::chrono::steady_clock::now();
+
+    if (damaged.rest.tris.size() != damaged.deformed.tris.size() ||
+        damaged.exposed.size() != damaged.deformed.tris.size()) {
+        error = "the damaged hull's rest and deformed meshes do not have the same topology";
+        return false;
+    }
+
+    std::uint32_t resolved[4]{};
+    if (!resolveBands(paint, library, resolved, error)) return false;
+    // Resolved on this path only, so a library that predates the torn-edge material
+    // still paints an intact ship. Missing is an error rather than a fallback, for
+    // the reason the four bands are.
+    const int tornEdge = library.find(paint.tornEdge);
+    if (tornEdge < 0) {
+        error = "the torn-edge material '" + paint.tornEdge + "' is not in the library";
+        return false;
     }
 
     const sim::Mat3 rotation = ship.state.orientation.toMat3();
     const sim::Vec3 translation = ship.state.position;
 
-    // Paint is decided in the **body** frame. Paint is on the hull, not on the
-    // world: a ship heeled thirty degrees still has its boot-topping where it was
-    // painted, and deciding the bands from world z would slide the waterline
-    // stripe around the hull as she rolls.
-    perFaceMaterial_.resize(ship.hull.tris.size());
-    for (std::size_t t = 0; t < ship.hull.tris.size(); ++t) {
-        const sim::Tri& tri = ship.hull.tris[t];
-        const sim::Vec3& a = ship.hull.verts[tri.a];
-        const sim::Vec3& b = ship.hull.verts[tri.b];
-        const sim::Vec3& c = ship.hull.verts[tri.c];
-        const sim::Vec3 centroid = (a + b + c) / 3.0;
-        const sim::Vec3 normal = normalize(cross(b - a, c - a));
-
-        std::uint32_t material = resolved[2];  // topside
-        if (centroid.z >= paint.deckZ && normal.z >= paint.deckNormalZ) material = resolved[3];
-        else if (centroid.z < paint.waterlineZ - paint.bootTopDepth) material = resolved[0];
-        else if (centroid.z < paint.waterlineZ + paint.bootTopHeight) material = resolved[1];
-        perFaceMaterial_[t] = material;
+    // Bands from the **undeformed** hull, for the same reason they come from the
+    // body frame rather than the world one: a dented plate keeps its paint. Only
+    // the exposed band is a property of the damage.
+    perFaceMaterial_.resize(damaged.rest.tris.size());
+    for (std::size_t t = 0; t < damaged.rest.tris.size(); ++t) {
+        const sim::Tri& tri = damaged.rest.tris[t];
+        perFaceMaterial_[t] =
+            damaged.exposed[t] != 0
+                ? static_cast<std::uint32_t>(tornEdge)
+                : bandFor(damaged.rest.verts[tri.a], damaged.rest.verts[tri.b],
+                          damaged.rest.verts[tri.c], paint, resolved);
     }
 
-    appendTriangles(ship.hull, rotation, translation, shading, perFaceMaterial_.data(), 0);
+    appendTriangles(damaged.deformed, rotation, translation, shading, perFaceMaterial_.data(), 0);
     buildSeconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
                          .count();
     return true;

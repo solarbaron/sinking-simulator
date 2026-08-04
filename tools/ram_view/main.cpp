@@ -40,13 +40,30 @@
 // the subdivision rules are written around, and it falls out here rather than
 // being put in.
 //
+// **It draws, now.** `--frames=N --out=DIR` writes the flooding sequence with the
+// damage in it: the struck plating dished in by the penetration the membrane model
+// reports, the torn bays cut out as holes you see the compartment through, and
+// exposed metal round their edges. The dent's *shape* is the membrane model's own
+// tent kinematics -- `indentation.hpp` reports a depth and a torn set and not a
+// surface -- and `zone.hpp` is what replaces the assumption when a run can afford
+// it; `gpu::HullDamage::addZone` takes its displaced nodes instead.
+//
+// Without `--frames` nothing GPU happens at all, which is why the gate can run
+// this on a machine with no device.
+//
 //   ./ram_view [--speed=M_PER_S] [--aim=X_METRES] [--reach=METRES]
 //              [--duration=SECONDS] [--out=DIR] [--frames=N]
+#include "engine/core/math.hpp"
+#include "engine/core/png.hpp"
+#include "engine/gpu/damage.hpp"
+#include "engine/gpu/hull.hpp"
+#include "engine/gpu/ocean.hpp"
 #include "engine/sim/breach.hpp"
 #include "engine/sim/collision.hpp"
 #include "engine/sim/hullform.hpp"
 #include "engine/sim/indentation.hpp"
 #include "engine/sim/scantlings.hpp"
+#include "engine/sim/waves.hpp"
 #include "game/prototype/ferry.hpp"
 
 #include <cmath>
@@ -183,9 +200,100 @@ int main(int argc, char** argv) {
         std::printf("         ! %s\n", problem.c_str());
     sim::applyBreaches(ferry, breaches);
 
-    // --- 4. Whether she lives ------------------------------------------------
+    // --- 4. What that looks like ---------------------------------------------
+    //
+    // The damage as geometry, in the ferry's own body frame, so it survives her
+    // heeling over. Two things go into it and they come from different places:
+    // the torn bays are exactly the panels `impactDamage` reported, cut out; the
+    // dent is a *shape*, which that model does not report, so it is stated as the
+    // tent its own closed forms are integrals of, over the equivalent radius of
+    // the bays it actually struck.
+    gpu::HullDamage visible;
+    // 0.35 m rather than the 0.20 m default: at 4 m/s she opens 60-odd bays over
+    // a hundred square metres, and refining all of that to 0.20 m is four times
+    // the triangles for a hole whose edge is a panel boundary anyway.
+    visible.params.fineSize = 0.35;
+    visible.addTornPanels(structure, damage.torn);
+    double struckArea = 0;
+    for (int index : damage.panels)
+        if (index >= 0 && static_cast<std::size_t>(index) < structure.panels.size())
+            struckArea += structure.panels[static_cast<std::size_t>(index)].area();
+    const double dentRadius = std::max(std::sqrt(struckArea / sim::kPi), 1.0);
+    // She is struck on the starboard side, which is -y in the body frame.
+    visible.addTent(impact, {0.0, -1.0, 0.0}, dentRadius, damage.penetration);
+    const gpu::DamagedHull damagedHull = gpu::buildDamagedHull(ferry.hull, visible);
+    std::printf("drawn  : %.2f m dent over a %.1f m radius; her %zu hull triangles refine to"
+                " %zu, of which %zu are cut out (%.1f m2 of hole), in %.1f ms\n",
+                damagedHull.largestDisplacement, dentRadius, damagedHull.sourceTriangles,
+                damagedHull.deformed.tris.size() + damagedHull.droppedTriangles,
+                damagedHull.droppedTriangles, damagedHull.holeArea,
+                damagedHull.buildSeconds * 1e3);
+
+    gpu::Device device;
+    gpu::MaterialLibrary library;
+    gpu::HullRenderer renderer;
+    constexpr std::uint32_t kWidth = 1280, kHeight = 720;
+    std::string error;
+    bool drawing = options.frames > 0 && !options.out.empty();
+    if (drawing && !device.create(error)) {
+        std::printf("       no usable GPU (%s) -- not drawing\n", error.c_str());
+        drawing = false;
+    }
+    if (drawing &&
+        !library.load(std::string(SHIPSIM_MATERIAL_DIR) + "/marine.materials", error)) {
+        std::printf("materials: %s\n", error.c_str());
+        return 1;
+    }
+    if (drawing && !renderer.create(device, kWidth, kHeight, SHIPSIM_SHADER_DIR, error)) {
+        std::printf("renderer: %s\n", error.c_str());
+        return 1;
+    }
+
+    sim::SeaState calm;
+    calm.significantHeight = 0.0;
+    const sim::WaveField field(calm);
+    gpu::OceanSurface water;
+    gpu::SceneMesh scene;
+    gpu::HullPaint paint;
+    paint.waterlineZ = 5.5;
+    paint.deckZ = 15.0;
+    gpu::SceneView view;
+    // The sun over the struck side. The default is on her port bow, which is the
+    // side the camera is not on, and a hole lit only by the sky term is a black
+    // patch in a black patch.
+    view.sunDirection[0] = -0.32f;
+    view.sunDirection[1] = -0.58f;
+    view.sunDirection[2] = 0.75f;
+    gpu::HullShading shading;
+    shading.normals = gpu::HullNormals::Smooth;
+
+    // The compartments behind the shell, so a hole is a hole into *something*. They
+    // are the same meshes the flooding solves against -- `Compartment::mesh` -- not
+    // a set of boxes drawn to look like an interior, and they are drawn flat rather
+    // than smoothed because a compartment is a box and its corners are corners.
+    //
+    // They are **inset** before being drawn, and the reason is worth recording: a
+    // compartment is `clipToBox(hull, ...)`, so its outboard face is not merely
+    // near the shell, it *is* the shell -- the same surface, to the last bit. Drawn
+    // as they are, the two z-fight over the whole side and the ship comes out
+    // speckled. Three per cent about each compartment's own centroid is a
+    // rendering-only inset; nothing the sim does uses these copies.
+    sim::TriMesh interior;
+    for (const sim::Compartment& compartment : ferry.compartments) {
+        if (compartment.mesh.verts.empty()) continue;
+        sim::TriMesh inset = compartment.mesh;
+        sim::Vec3 centroid{0, 0, 0};
+        for (const sim::Vec3& v : inset.verts) centroid += v;
+        centroid = centroid / static_cast<double>(inset.verts.size());
+        for (sim::Vec3& v : inset.verts) v = centroid + (v - centroid) * 0.97;
+        interior.append(inset);
+    }
+
+    // --- 5. Whether she lives ------------------------------------------------
     std::printf("\n%8s %10s %8s %8s %8s\n", "t (s)", "flood t", "heel", "trim", "GM");
     const auto steps = static_cast<int>(options.duration / dt);
+    const int framesEvery = drawing ? std::max(1, steps / options.frames) : 0;
+    int frame = 0;
     for (int i = 1; i <= steps; ++i) {
         ferry.step(dt, sea);
         if (i % (steps / 6) == 0 || i == steps) {
@@ -193,7 +301,58 @@ int main(int argc, char** argv) {
             std::printf("%8.0f %10.0f %7.2f° %7.2f° %8.2f\n", i * dt,
                         d.floodwaterMass / 1000.0, d.heelDeg, d.trimDeg, d.gmTransverse);
         }
+        if (!drawing || frame >= options.frames || i % framesEvery != 0) continue;
+
+        // On the struck bow quarter and well above her, in the ship's own frame, so
+        // the hole stays in shot as she lists away from it.
+        const sim::Mat3 R = ferry.state.orientation.toMat3();
+        const sim::Vec3 eye =
+            ferry.state.position + R * sim::Vec3{impact.x + 33.0, -46.0, 19.0};
+        const sim::Vec3 at = ferry.state.position + R * sim::Vec3{impact.x, -8.0, 6.0};
+        water.build(field, gpu::OceanGrid{ferry.state.position.x, ferry.state.position.y, 600.0,
+                                          96},
+                    0.0);
+        scene.clear();
+        // The interior first, the shell over it, the sea last: the depth test then
+        // carries every one of those occlusions rather than the draw order, which is
+        // the arrangement the render tests use deliberately.
+        scene.appendMesh(interior, R, ferry.state.position,
+                         static_cast<std::uint32_t>(library.find("rusted_steel")),
+                         gpu::HullShading{});
+        if (!scene.appendShip(ferry, damagedHull, paint, library, shading, error)) {
+            std::printf("scene: %s\n", error.c_str());
+            return 1;
+        }
+        scene.appendOcean(water, static_cast<std::uint32_t>(library.find("sea_water")));
+
+        const sim::Mat4 mvp =
+            sim::perspective(45.0 * sim::kDegToRad, double(kWidth) / kHeight, 1.0, 900.0) *
+            sim::lookAt(eye, at, {0, 0, 1});
+        float matrix[16];
+        mvp.toFloats(matrix);
+        view.eye[0] = float(eye.x);
+        view.eye[1] = float(eye.y);
+        view.eye[2] = float(eye.z);
+        const float clear[4] = {0.55f, 0.68f, 0.82f, 1.0f};
+
+        core::Image image;
+        if (!renderer.render(matrix, view, scene, library, clear, image)) {
+            std::printf("render failed on frame %d\n", frame);
+            return 1;
+        }
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/ram_%03d.png", options.out.c_str(), frame);
+        if (!core::writePng(path, image)) {
+            std::printf("could not write %s\n", path);
+            return 1;
+        }
+        if (frame == 0)
+            std::printf("       %zu vertices, %zu triangles, gpu %.3f ms -> %s\n",
+                        renderer.lastFrame().vertices, renderer.lastFrame().triangles,
+                        renderer.lastFrame().gpuSeconds * 1e3, path);
+        ++frame;
     }
+    if (drawing) std::printf("       %d frame(s) written to %s\n", frame, options.out.c_str());
 
     const sim::Diagnostics after = ferry.diagnostics(sea);
     std::printf("\noutcome: %s -- %.0f t of water, heel %.1f deg, GM %.2f m\n",
