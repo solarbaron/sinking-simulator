@@ -34,8 +34,11 @@ add_library(shipsim_engine
   engine/core/scheduler.cpp
   engine/core/serialise.cpp
   # Pure data and a text parser -- no Vulkan -- so the material library builds and
-  # is checkable on a machine that has no GPU at all.
+  # is checkable on a machine that has no GPU at all. Damage geometry is the same
+  # kind of thing: mesh arithmetic that turns a solved zone into a hull with a dent
+  # and holes in it, with nothing in it that needs a device.
   engine/gpu/material.cpp
+  engine/gpu/damage.cpp
   engine/sim/ship.cpp
   engine/sim/shipfile.cpp
   engine/sim/breach.cpp
@@ -181,7 +184,10 @@ if(Vulkan_FOUND AND GLSLC)
   target_compile_options(seaway_view PRIVATE -Wall -Wextra)
 
   add_executable(ram_view tools/ram_view/main.cpp game/prototype/ferry.cpp)
+  add_dependencies(ram_view shipsim_shaders)
   target_link_libraries(ram_view PRIVATE shipsim_engine)
+  target_compile_definitions(ram_view PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}"
+    SHIPSIM_MATERIAL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/engine/gpu/materials")
   target_compile_options(ram_view PRIVATE -Wall -Wextra)
 
   add_executable(fem_spike tools/fem_spike/main.cpp engine/gpu/fem_gpu.cpp)

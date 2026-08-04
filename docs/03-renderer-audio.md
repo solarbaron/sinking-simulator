@@ -626,6 +626,326 @@ CPU round-trip.
 - Paint, rust and scorch are separate texture-space layers updated by the sim
   (corrosion state, temperature history), not baked variants.
 
+### Damage — what exists
+
+`engine/gpu/damage.{hpp,cpp}`, `gpu::SceneMesh::appendShip`'s damaged overload,
+`engine/gpu/materials/marine.materials`, `tests/test_hull_render.cpp`,
+`tools/ram_view`. A damaged ship draws as damaged: plating pushed in where the
+zone says it was pushed in, holes where panels tore, and exposed metal round their
+edges.
+
+**It is a sibling of `hull.cpp` and it contains no Vulkan.** The whole of it is
+mesh arithmetic — refine, displace, cut — so it builds and is checkable on a
+machine with no device, which is the same argument that keeps `material.cpp` out
+of the Vulkan-gated sources. That is not cosmetic: the instrument that actually
+catches cracks here is a combinatorial edge census, and it should not need a GPU
+to run.
+
+**It is a rebuild, not a per-frame step.** `buildDamagedHull` produces a body-frame
+`DamagedHull` when the damage changes; `appendShip` applies the rigid-body
+transform every frame as it already did. The plan above puts the skinning in a
+compute shader over a node buffer that never leaves the GPU, and that is still
+right for a zone being solved live. It is not right *yet*, because nothing solves a
+zone live — `06-roadmap.md` still lists adaptive promotion as the largest thing
+outstanding — and a CPU rebuild that costs 2 ms once is not what a frame budget is
+spent on. The interface is the place to change it: `HullDamage::displacementAt` is
+a pure function of an undeformed position, which is exactly what a vertex or
+compute shader would evaluate.
+
+### Joining a deformed patch to an undeformed hull
+
+Two hazards, and they have separate answers. Neither is a tolerance.
+
+- **A crack** — two triangles that shared an edge no longer agreeing where it is.
+  Prevented by construction: the displacement is a **pure function of the
+  undeformed position**. Two triangles sharing a position — by index, or as the
+  coincident-but-distinct vertex records a mirrored hull carries along its seam —
+  are handed the same position and get back the same answer. Nothing is displaced
+  per triangle, and the deformation adds and removes no vertices.
+- **A seam** — a step where the deformed region stops. For a solved zone this is
+  prevented by the boundary condition the solve already has: `zone::Edge::Clamped`
+  pins the patch perimeter, so the outermost nodes carry displacement **exactly
+  zero** and the field reaches zero *inside* its own support instead of being cut
+  off at it. `HullDamage::boundaryDisplacement()` reports the largest displacement
+  on the patch's boundary loop and the test asserts it is zero while the interior
+  maximum is 0.18 m — so this is measured from the solve rather than assumed of it,
+  and a patch solved with a free edge would say so.
+
+  **The general rule is that every source must fade to zero at the edge of its own
+  support, never be cut off at it**, and that is easier to get wrong than the crack
+  is. The membrane tent got it wrong: its falloff ran on the in-plane radius while
+  its support was cut by a slab, so the field stepped at the slab's face. Its
+  support is a *ball* now, and the instrument that would have caught it — holding
+  the field to its own Lipschitz constant — is below.
+
+**The field is the FEM's own, not a fit to it.** `displacementAt` is piecewise
+linear over the patch's own elements, each split into two triangles, evaluated by
+barycentric weights — which makes it *interpolating*: at a mid-surface node the
+weights are exactly (1, 0, 0) and the answer is exactly that node's displacement.
+Measured over every node of a solved patch, **2.8 × 10⁻¹⁷ m**, which is an equality
+and is asserted as one. Inverse-distance (Shepard) weighting was written first and
+rejected: it interpolates only in the limit, it leaves a flat spot at every data
+point, and it turns "does the picture agree with the solver" into a tolerance.
+
+Splitting the quad into triangles rather than inverting the bilinear map is also
+what keeps it C0 — along a shared element edge both sides are linear in the same
+parameter through the same two nodal values, and the diagonal belongs to one
+element — so the field is continuous everywhere and identically zero off the patch.
+It is zero, not small: the test asserts `1e-12`-exact zero a hull's breadth away,
+a compartment down, forty metres forward, and — the check that actually catches
+something — at **every node of the patch mirrored twenty metres inboard**, which is
+the port shell node for node.
+
+**A patch is a surface embedded in a solid, so a through-thickness guard is not
+optional.** A hull wraps; a point on the far side of the ship projects into the
+same in-plane cell as a point on the near side. Without the guard, ramming her
+starboard side dents her port side identically. Mutation-tested, and the first
+version of that test did not catch it — see below.
+
+### Resolution: a dent needs somewhere to happen
+
+The reference ferry's hull is tabulated at 25 stations and 12 waterlines, so her
+plating is drawn at about 5 m × 1.5 m. A 0.2 m dent over a 2 m punch on that mesh
+moves nothing at all — there is no vertex inside the dent to move. **The plating
+has to be refined where the damage is, and refining part of a mesh is the ocean
+cascade's problem in a triangle mesh**: a T-junction is a vertex halfway along a
+neighbour's edge that the neighbour interpolates straight past.
+
+The answer has the same shape as the cascade's — make the two sides of every edge
+decide identically:
+
+- whether an edge splits is a **pure function of its two endpoints**, their length
+  against a target size that depends only on position, so the two triangles sharing
+  it cannot disagree;
+- the midpoint is `(a + b) × 0.5` on the **welded** endpoint positions, which is
+  commutative in IEEE arithmetic and therefore bit-identical from both sides, and
+  it is interned against the welded endpoint pair so both sides address one vertex
+  rather than two that coincide;
+- a triangle with one or two split edges is divided into two or three so that it
+  **uses the midpoint too**. That is the cascade's transition cell.
+
+The recursion is uniform — every child is examined at depth + 1 whatever template
+produced it — so the depth cap cuts both sides of a shared edge at the same depth
+and cannot itself open a crack.
+
+The target size is `fineSize + grading × distance` clamped to `coarseSize`, and
+**`coarseSize` defaults to larger than any ship**, which is what makes an undamaged
+hull cost nothing and a damaged one cost only where it is damaged.
+
+### A tear is a hole, and what that costs
+
+A torn panel is **removed** from the drawn mesh. Not recoloured, not made
+transparent, not moved: the triangles are gone, so the pixel shows what is behind
+them. The rasterisation already permitted this and it is worth noticing why —
+`cullMode` is `NONE` and the fragment shader flips the normal on a back face,
+both of which exist in this document because "a hull is seen from inside once it
+is cut away", and this is that case arriving. **No pipeline state changes, no
+second pass, no sort, no stencil, no `discard`, and no extra vertex attribute.**
+
+What it costs is that the drawn hull stops being closed, so her interior is shaded
+and filled where it used to be free. `sim::Ship::hull` is untouched, so buoyancy
+still integrates a closed mesh — the hole exists in the render mesh only, the same
+separation `breach.hpp` keeps between a hole and the flooding network.
+
+The hole's edge is only as sharp as the refinement, because a triangle is dropped
+when its centroid falls inside a torn panel. Measured on a 4 m × 3 m panel at
+`fineSize` 0.20 m: **12.146 m² of hole against 12.000 m² of panel**, an error of
+1.2%, and the bound is half a triangle along the perimeter. That is why a torn
+panel is also a refinement feature — remove it from the feature set and the hole
+becomes the shape of the hull's own tessellation.
+
+### Exposed metal is a material, not a shader branch
+
+The plating within `exposedWidth` of a hole takes a material *name*,
+`HullPaint::tornEdge`, resolved against the library exactly like the four paint
+bands. The shipped set gains `torn_plate_edge`; a mod restates the block or names
+a different surface, and nothing recompiles. It is resolved **only on the damaged
+path**, so a `.materials` file that predates it still paints an intact ship.
+
+Two things this does not do, both stated rather than pretended away:
+
+- **It is a band, not a blend.** `HullVertex` carries one material index, so two
+  surfaces cannot be mixed per pixel. The plastic-strain-driven blend the plan
+  above asks for needs a second index and a weight on the vertex and a change to
+  `shaders/hull.frag`. The band's area is a closed form — hole perimeter times
+  width — and the test asserts it: 3.29 m² against a nominal 3.50 m².
+- **A conductor with nothing to mirror is dark.** `torn_plate_edge` is
+  `metalness 1.00`, which is right — a fresh fracture is bare steel — and the
+  consequence is that with no image-based lighting its radiance is `base × sky`
+  and the torn edge reads as a **dark rim** rather than as bright metal. That is
+  the same missing term this document already records against `sea_water`'s
+  inflated base colour and the sea's absent specular, and it comes right with the
+  reflection work. Lowering the metalness to make the picture nicer would be
+  putting a wrong number in a data file to compensate for a missing render
+  feature, which is what the material set exists not to do.
+
+Also absent: **procedural jagged geometry** on the torn edge. The hole's outline is
+the panel's, sampled at the refinement size, which is a straight-ish edge with a
+staircase on it rather than torn steel.
+
+### Damage — measured cost
+
+Test ship (796 hull triangles) at 512 × 384 on a GTX 1070 Ti, best of six:
+
+| | triangles | rebuild | scene build | upload | **GPU** |
+|---|---|---|---|---|---|
+| undamaged | 796 | 0.05 ms | 0.01 ms | 0.05 ms | **0.009 ms** |
+| dented and torn | 13 680 | 2.02 ms | 0.24 ms | 0.23 ms | **0.028 ms** |
+
+and `tools/ram_view` on the ferry at 1280 × 720, with the compartments drawn
+behind the shell: 27 631 triangles, **0.15 ms** of GPU. Her 1 196 hull triangles
+refine to 7 568, of which 3 345 are cut out — 44.8 m² of hole at 4 m/s — in 3.7 ms.
+`--frames=N --out=DIR` writes it; the test suite writes `hull_damaged_ship.png`
+into `testing::scratchDir()` beside the ship-in-a-sea frame, for the same reason
+that one exists.
+
+Three things the table is saying:
+
+- **Undamaged costs nothing, and that is asserted rather than measured.** The
+  undamaged path through `buildDamagedHull` returns the ship's own mesh
+  **bit-identically** — same vertex bytes, same triangle indices — the damaged
+  `appendShip` overload then produces a byte-for-byte identical vertex and index
+  buffer, and the rendered frame is byte-for-byte identical. It falls out of the
+  construction rather than being special-cased: with no damage the target size is
+  never exceeded, so nothing splits, and the displacement is exactly zero. The one
+  place that needed care is that **`-0.0 + 0.0` is `+0.0`**, so a zero displacement
+  must not go through the addition at all.
+- **The cost is the rebuild, not the frame.** 2 ms of refine-displace-cut against
+  0.03 ms of GPU. It happens when the damage changes, which at present is once.
+- **The GPU is still not where the frame goes.** 17× the triangles for 3× the GPU
+  time, and 0.15 ms for a whole damaged ship, her compartments and a sea.
+
+### Damage — what the tests are pointed at
+
+A dented, torn hull looks damaged whatever it is doing — a worse trap than the
+sea's, because damage is *supposed* to look irregular, so a wrong answer has cover.
+So nothing is eyeballed.
+
+- **A hole is checked by firing a known ray through it**, at a camera looking square
+  at the side so every surface in the ray's path is a plane perpendicular to the
+  view axis and its clip-space depth is a closed form in its distance alone. Three
+  readings of one pixel, and a recoloured panel fails all three:
+
+  | | material id | depth, from the camera alone |
+  |---|---|---|
+  | intact | her topside paint | 36.5 m |
+  | torn, structure behind it | that structure's own material | 40.0 m |
+  | torn, nothing behind it | her topside paint again — the **far side, from inside** | 53.5 m |
+
+  The third row is the one that matters: it says the hole is see-through rather
+  than see-a-proxy, and the two depth steps are 1700 codes of the 16-bit channel
+  apart, which is asserted so the three equalities cannot be satisfied by a frame
+  that never changed.
+- **Cracks are counted combinatorially**, because a cracked hull and a whole one
+  are identical everywhere except at the crack. Every directed edge over welded
+  positions: a refined, dented hull with no tear in it has **zero** unmatched and
+  zero malformed edges, and is still `sim::isClosedManifold`. With a tear, the
+  unmatched count must equal the hole boundary computed **independently from the
+  removed triangles** — 234 either way — so an edge the tear exposed and an edge a
+  bad refinement opened are told apart rather than lumped together.
+- **The rendered consequence is measured too, and it is nearly blind.** A plate on
+  her centreplane, in a material nothing outside the ship uses, is invisible through
+  intact plating and visible through a crack — the MaterialId channel makes it an
+  integer. Four viewpoints around the dent's normal, with the *undamaged* hull
+  through the same four cameras as the check that the plate really is hidden.
+  **The unstitched control leaks 2 to 8 pixels per view against the census's 840
+  unmatched edges.** That is the general lesson from the cascade again, sharper: the
+  frame can see the defect, but only just, and only because the plate was put there
+  on purpose. Against the ship alone a crack shows the far side of her own hull —
+  drawn, because nothing is culled — and the frame sees nothing at all.
+- **The refinement criterion is asserted as an inequality over every edge it
+  applies to**: no edge inside the graded region may be longer than the target size
+  at its own midpoint. 48 420 edges, worst ratio 0.999.
+- **A step in the field is a seam, and it is invisible to all of the above.** It is
+  a pure function of position, so nothing cracks; the mesh stays a closed manifold,
+  so the census is quiet; the cliff is a fold rather than a hole, so the frame sees
+  a shaded surface. So the field is held to its own **Lipschitz constant**, which
+  for a tent is exact — a cone of depth `d` over a ball of radius `R` cannot change
+  faster than `d / R` — over every edge of the drawn mesh and over a sweep across
+  the edge of its support. The steepest edge comes out at exactly `d / R`, which is
+  the identity a cone satisfies, with a guard that it is not a hundredth of that.
+  Applied to the mesh it is also the physical statement: no edge of the plating may
+  be stretched by more than the dent's own slope, because a dent stretches steel and
+  does not teleport it.
+- **A seam in the *input* is not a seam in the output.** A hull carries
+  coincident-but-distinct vertex records wherever it has been mirrored or clipped,
+  and the two sides of one must split their shared edge into one midpoint rather
+  than two. Refining a hull whose lower half has been given its own copies of every
+  corner adds **exactly** the same 7 672 vertices as refining the hull that shares
+  them, and produces the same triangles.
+- **Guards against vacuity throughout**, each because the first version proved
+  nothing: that the refinement happened at all (interior edges > 4× the source
+  triangle count, deepest split ≥ 4, recursion guard not reached); that the dent
+  moved the mesh (0.45 m of a 0.45 m tent); that the patch moved (0.18 m) while its
+  boundary did not (0.0); that the frame both bit-identical paths drew is not blank;
+  that an intact ship shows **no** exposed-metal pixel anywhere while a torn one
+  shows a band of it.
+
+The deformation is held to the solver two ways, and the difference between them is
+deliberate. **On the CPU it is an equality** — every mid-surface node reproduced to
+2.8e-17 m — because the field interpolates. **Through the frame it is not**, and
+cannot be: the depth channel is read at a pixel *centre*, which is not the projected
+node, and the sample is the apex of a dent where the plating a few centimetres
+either side is measurably shallower. Measured 202 depth codes against 237 predicted
+from the camera and the solver, and the assertion is a quarter — enough to reject a
+dent drawn at half depth, not enough to pretend the pixel is a point. The exact
+statement is the one that never goes through a pixel.
+
+The frame's depth is separately held against **the same triangles rasterised on the
+CPU** — `gl_FragCoord.z` is interpolated linearly in screen space, which is exactly
+the plane of the projected triangle, so that is an equality to the channel's own
+1/65535 and it is an independently written implementation of the depth test.
+
+### Damage — what mutation testing changed
+
+Thirty deliberate defects, in two batches plus a re-check: eighteen across the
+whole path, then ten aimed deliberately at the parts the first eighteen had not
+touched. Most were caught loudly — a transition template removed trips 5 and 11
+assertions, a template that takes the midpoint of the edge that *did not* split
+trips 19, a child wound backwards trips 3 including 14 598 malformed edges, the
+displacement applied with the wrong sign trips 2, drawing the undeformed mesh trips
+2. **Eight escaped on first exposure**, six of them real holes, and every one is
+now caught.
+
+**Three were holes in the first batch, and each is now a test that did not exist:**
+
+| escaped | now caught by |
+|---|---|
+| the through-thickness guard dropped, so ramming her starboard side dents her port side | every node of the patch, mirrored twenty metres inboard along the patch normal. Three hand-picked far points did not catch it, and the reason is worth keeping: one of them *was* the mirror of the impact point and read zero anyway, because the impact landed on a stiffener line whose nodes `Stiffeners::RigidSupport` pins. The probe was in the right place and the node it mirrored was the one node under the punch that could not move. Sweeping every node instead of choosing three is the same lesson as sweeping alignments 1–256 |
+| a zero displacement going through the addition anyway | a four-vertex mesh carrying **negative zeros**. `-0.0 + 0.0` is `+0.0`, and no hull in the project has a negative zero in it — a hull tabulated from stations puts its centreline at `+0.0` — so the hazard is real, invisible on every ship here, and needs a mesh built to show it |
+| paint bands decided on the deformed hull instead of the undeformed one | a displacement field with a **vertical** component, because a dent normal to a vertical side moves plating in y and never changes its z, so on the flat of a ship's side the two rules agree exactly and nothing can tell them apart. The guard counts how many triangles they disagree about — 957 — so a scene in which they *cannot* disagree fails loudly instead of passing |
+
+**Three were holes in the second batch, and one of them was a defect in the code
+rather than only in the tests:**
+
+| escaped | what it was |
+|---|---|
+| **the tent's falloff replaced by a constant** — plating displaced by the full depth right to the edge of the dent and undisplaced a millimetre further on | The most important escape here, because a step in the field **is** a seam and every instrument was blind to it: the field is a pure function of position so nothing cracks; the mesh stays a closed manifold so the census is quiet; the cliff is a fold rather than a hole so the frame sees a shaded surface. Now caught by holding the field to its own Lipschitz constant — a cone of depth `d` over a ball of radius `R` cannot change faster than `d / R` — over every edge of the drawn mesh and over a sweep across the edge of the support. Looking for that instrument found a **real defect**: the tent's falloff ran on the in-plane radius while its support was cut by a slab, so the field stepped at the slab's face. On the flat of a side the plating never reaches that face, which is why nothing saw it. The falloff now runs on the full 3D distance and the guard is gone, because a ball of radius smaller than a ship's half breadth already cannot reach her other side |
+| the exposed-metal band's plane guard dropped, putting an identical band on her port shell | the band's extent checked in the ship's own coordinates against the rectangle the panel was authored as. A single camera cannot make this claim: a band mirrored onto the far side is hidden behind the ship from every viewpoint that can see the hole |
+| the hole's area measured on the deformed triangles rather than the undeformed ones | the one scene that is both dented **and** torn. Every other scene has only one of the two, and with no dent the two areas are identical. A hole is a hole in the *plating*, so its area is the undeformed one; the stretch is 0.08 m² of 12.1 m² here and it grows with the dent |
+
+**Two are equivalent mutants, and saying why is the useful part:**
+
+- **The bucket grid's cell size is not a correctness condition.** Fixing it at a
+  metre instead of the largest triangle extent is invisible to every assertion,
+  which is right: a triangle is registered in *every* bucket its bounding box
+  overlaps and the query uses the same grid, so any cell size finds it. The comment
+  that used to sit there claimed otherwise and has been corrected — occupancy is
+  all the choice buys.
+- **The containment epsilon guards against missing a point, not against getting it
+  wrong.** Loosening it from 1e-9 to 1e-2 changes nothing, because a mesh node is a
+  vertex of *every* triangle that could claim it and the interpolant is linear along
+  a shared edge, so whichever triangle answers gives the same value.
+
+Two other results are worth keeping for what they say about the design rather than
+about the tests. Removing a patch from the refinement feature set leaves the drawn
+dent at **5.4 × 10⁻¹⁸ m** on the ferry's own plating — which is the measurement
+behind "a 0.2 m dent on 5 m triangles moves nothing", stated as a number rather
+than as an argument. And ignoring the grading, so the target size steps instead of
+grading out, trips exactly one assertion and **not** the crack census — correctly,
+because the refinement is crack-free whatever the criterion says. The criterion and
+the stitching are independent, and the tests treat them that way.
+
 ## Water in compartments
 
 The interior water is the hardest rendering problem in the project, because it is
