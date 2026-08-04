@@ -41,12 +41,14 @@ add_library(shipsim_engine
   engine/sim/breach.cpp
   engine/sim/propulsion.cpp
   engine/sim/buckling.cpp
+  engine/sim/collapse.cpp
   engine/sim/collision.cpp
   engine/sim/girder.cpp
   engine/sim/hullform.cpp
   engine/sim/rao.cpp
   engine/sim/scantlings.cpp
   engine/sim/fem.cpp
+  engine/sim/plasticity.cpp
   engine/sim/solid_shell.cpp
   engine/sim/radiation.cpp
   engine/sim/roll_damping.cpp
@@ -79,10 +81,12 @@ add_executable(shipsim_tests
   tests/test_camera.cpp
   tests/test_core.cpp
   tests/test_ecs.cpp
+  tests/test_plasticity.cpp
   tests/test_png.cpp
   tests/test_propulsion.cpp
   tests/test_radiation.cpp
   tests/test_buckling.cpp
+  tests/test_collapse.cpp
   tests/test_collision.cpp
   tests/test_girder.cpp
   tests/test_hullform.cpp

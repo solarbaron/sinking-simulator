@@ -46,11 +46,13 @@ int main() {
     runBreachTests();
     runSchedulerTests();
     runSolidShellTests();
+    runPlasticityTests();
     runSerialiseTests();
     runShipFileTests();
     runWorldIoTests();
     runWaveTests();
     runBucklingTests();
+    runCollapseTests();
     runCollisionTests();
     runGirderTests();
     runHullFormTests();

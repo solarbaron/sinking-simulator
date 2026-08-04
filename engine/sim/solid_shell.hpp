@@ -76,6 +76,7 @@
 // Body frame and SI units per CLAUDE.md.
 #pragma once
 
+#include "plasticity.hpp"
 #include "scantlings.hpp"  // StructuralMaterial
 
 #include <cstddef>
@@ -161,6 +162,94 @@ double criticalTimestep(const double nodes[kDof], const StructuralMaterial& mate
 // Smallest Jacobian determinant over the eight corners. Non-positive means the
 // element is inverted or degenerate and nothing computed from it means anything.
 double smallestJacobian(const double nodes[kDof]);
+
+// --- Plasticity and tearing ---------------------------------------------------
+//
+// `plasticity.{hpp,cpp}` is the point law; this is the element that feeds it. The
+// two things the element has to supply that a point law cannot are its **own
+// size** -- because the failure strain is not a material constant, it depends on
+// how much of a neck one element averages over -- and an **equilibrium condition
+// for the enhanced strains**, because the seven EAS parameters are no longer given
+// by a closed form once the material stops being linear.
+
+// The element's characteristic in-plane length and its thickness, which
+// `plasticity::regularisedFailureStrain` resolves the failure strain against.
+// In-plane is sqrt(mid-surface area) and thickness is volume/area -- the
+// perpendicular distance between the faces, so a *sheared* element reports the
+// thickness it actually has rather than the length of its slanted edge.
+void elementSize(const double nodes[kDof], double* inPlane, double* thickness);
+
+// Everything one element remembers. Eight integration points, each with its own
+// plastic history, plus the enhanced parameters kept as a warm start for the
+// Newton below -- they are a function of the displacement and the history, not
+// independent state, and starting from zero reaches the same answer at the cost of
+// a few more iterations, which the tests check.
+struct ElementPlasticState {
+    plasticity::State point[kGauss];
+    double enhanced[kEas] = {};
+    double failureStrain = 0.0;  // resolved from this element's own geometry
+    bool torn = false;           // every integration point has failed
+};
+
+// Sets `failureStrain` from the element's geometry and clears the history.
+void initialisePlasticState(const double nodes[kDof], const plasticity::Material& material,
+                            ElementPlasticState& state);
+
+struct PlasticUpdate {
+    bool converged = false;
+    int iterations = 0;     // enhanced-parameter Newton iterations
+    int yieldedPoints = 0;  // of kGauss
+    int failedPoints = 0;
+    double dissipation = 0.0;  // J over the element volume, this increment
+
+    // ||int G^T sigma dV||. A diagnostic, **not** the convergence measure: the
+    // enhanced thickness modes are scaled by 1/t^2, so for 20 mm plate a residual
+    // of 1e-3 already means alpha is right to twelve digits. See the note in
+    // `elementPlasticUpdate`.
+    double enhancedResidual = 0.0;
+    // |delta . r| of the last Newton correction, in joules -- the scale-free
+    // measure that actually decides convergence, against the element's yield
+    // energy sigma_y * V.
+    double enhancedWork = 0.0;
+};
+
+// Elastoplastic internal force, and the history advanced to `current`.
+//
+// The enhanced strains are what makes this more than a loop over eight points. In
+// the elastic element `alpha = -Kaa^-1 Kua^T u` closes in one line because
+// everything is linear. Once the material yields, alpha is whatever satisfies
+//
+//     r(alpha) = integral G^T sigma(B u + G alpha) dV = 0
+//
+// -- the statement that the enhanced modes carry no stress -- and that is seven
+// nonlinear equations solved here by Newton on the **algorithmic** tangent, which
+// is why `plasticity::update` returns one. Skipping the solve and holding alpha at
+// its elastic value would not be a small error: the enhanced thickness modes are
+// the entire reason sigma_zz relaxes to zero through a bent plate, and a plate that
+// cannot thin does not yield where a real one does.
+//
+// `force` is what the element applies **to its nodes**, the same sign convention
+// as `internalForce` and `fem::tetForces`. With a material that never yields this
+// returns exactly what `internalForce` returns for the condensed elastic
+// stiffness, to rounding -- which is the tie between this path and the validated
+// one.
+//
+// **An element that has lost an integration point drops its enhanced strains and
+// finishes its life as the ANS hex**, and `state.enhanced` comes back zeroed to say
+// so. `r(alpha) = 0` is a statement about a continuum, and an element with a dead
+// point in it is not one: Kaa loses rank, and the measured consequence was not a
+// wobble but an element that *stopped tearing* -- its surviving points driven below
+// the damage cutoff, damage frozen at 0.78 while plastic strain ran on from 0.49 to
+// 0.89. The step in which the point dies is re-run without the enhanced modes, so
+// nothing computed on a rank-deficient system is ever committed.
+//
+// The history is committed even when the Newton did not converge, because a caller
+// that has to keep stepping is better served by a slightly wrong state it is told
+// about than by a state that silently stopped advancing. Check `converged`.
+PlasticUpdate elementPlasticUpdate(const double rest[kDof], const double current[kDof],
+                                  const plasticity::Material& material, Formulation form,
+                                  ElementPlasticState& state, double force[kDof],
+                                  double stress[kGauss * 6] = nullptr);
 
 // --- Meshes -------------------------------------------------------------------
 

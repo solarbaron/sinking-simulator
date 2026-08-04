@@ -1692,6 +1692,83 @@ minimum section modulus, so a rule-minimum ship in the same condition would run 
 designed to. The moment and the section were computed by completely separate
 routes, neither aimed at that number.
 
+### Progressive collapse — **implemented**
+
+`engine/sim/collapse.{hpp,cpp}`. First yield is not strength. A hull girder does
+not fail when its worst panel reaches its limit: that panel sheds load onto its
+neighbours, the neutral axis migrates towards the side still carrying, and the
+section goes on taking moment until enough of it has gone that the total starts
+to fall. **Smith's method** — impose a curvature, let every element answer with
+its own load-shortening curve, move the neutral axis until axial forces balance,
+sum moments, step and repeat — is what classification societies use, and the peak
+of the resulting curve is the ultimate strength.
+
+It is testable because it sits between two exact answers. At zero curvature the
+slope must be `E·Σ(A d²)` about the elastic neutral axis. With buckling switched
+off, a large curvature must give the fully plastic moment about the **plastic**
+neutral axis — the one that balances *area*, not first moment, which on an
+asymmetric section is a different height and using the elastic one understates
+the answer.
+
+The elements' own second moments are deliberately absent from that slope. Smith's
+method carries axial stress alone — a strip of plating resists by stretching, not
+by bending about its own mid-thickness — so the initial stiffness is slightly
+below `E·I` as `hullGirderSection()` reports it. Measured on the ferry: 90–100%
+of it, the gap being the plating's own inertia.
+
+**What it says about the ferry** (369 elements at midship, A = 1.80 m², I = 46.2 m⁴):
+
+| | moment | as a fraction of first yield |
+|---|---|---|
+| first yield (deck governs both ways) | 1.978 × 10⁹ N·m | 1.00 |
+| fully plastic | 2.573 × 10⁹ N·m | 1.30 |
+| **ultimate hogging** | 1.987 × 10⁹ N·m | **1.00** |
+| **ultimate sagging** | 1.288 × 10⁹ N·m | **0.65** |
+
+**In sagging she fails at 65% of first yield.** The deck buckles in compression
+long before any fibre reaches yield stress, so a first-yield check overstates her
+sagging strength by a factor of **1.54** — it would clear a moment half again
+larger than the one that actually collapses her. Hogging shows no such gap,
+because it compresses the keel, which is heavy, closely framed structure that
+yields rather than buckles.
+
+That asymmetry — sagging ultimate at 65% of hogging ultimate — is the standard
+finding for a ship with a light, widely stiffened deck, and it is emergent here:
+nothing in the method knows which fibre is which, only which one is in
+compression.
+
+Against the standard wave of her own length the margins are 4.2× hogging and 7.8×
+sagging, which is comfortable and consistent with her carrying 1.7× the rule
+minimum section modulus.
+
+**Where does she break?** `longitudinalStrength()` runs the collapse calculation at
+every station of a bending moment curve and reports the ratio, because "how
+strong is midship" and "where does she fail" are different questions and the
+ferry separates them.
+
+Her scantlings already taper — `side_forward` and `side_aft` drop the side plating
+from 12 mm to 10 mm beyond ±44 m, and the element count falls at the ends as decks
+and bulkheads run out. Measured, her ultimate moment runs from 1.18 × 10⁹ N·m
+amidships down to 6.8 × 10⁸ at the ends, **a factor of 1.74**. So her weakest
+sections are her ends. Her worst *margin* is nonetheless amidships, because the
+ends carry almost no bending moment. A calculation reporting either number alone
+would be answering the other question.
+
+Sweeping the whole ship costs 142 ms hogging and 239 ms sagging over 41 stations.
+Getting there needed one fix: the neutral-axis bisection ran a fixed 200
+iterations, and a double carries 53 bits, so a bracket nine section-depths wide is
+exhausted in about sixty halvings. Two thirds of the solve was refining digits
+that do not exist. Stopping on bracket width instead is **4× faster** — 70.7 ms to
+17.3 ms for a 300-step curve — with identical answers to every figure.
+
+**The load-shortening curve is the model, and it is one number.** Past the
+compressive cap, `σ = σ_c (ε_c/ε)ⁿ`, continuous at the cap by construction, with
+`n ≈ 0.45` for plating and zero for stiffeners. The published curves are per
+failure mode and far more elaborate; this family is chosen so the *shape* is
+right and the assumption is visible rather than buried. `n = 0` gives a perfect
+plateau and an upper bound on strength — the curve then never turns over, and
+`ultimateMoment` is the plateau rather than a peak.
+
 ### Buckling — **implemented**
 
 `engine/sim/buckling.{hpp,cpp}`. Dividing a moment by a section modulus is the
@@ -1807,6 +1884,177 @@ model is local.
 - **Welds and joints**: modelled as cohesive-zone interface elements with their
   own (lower) strength. Structures fail at connections far more often than in the
   middle of a plate.
+
+### Plasticity and ductile failure — **implemented**
+
+`engine/sim/plasticity.{hpp,cpp}`, checked by `tests/test_plasticity.cpp`, hooked
+into the element by `solidshell::elementPlasticUpdate`. This is the half of the
+list above that makes the solid-shell element do more than spring back.
+
+**J2 flow, backward Euler, solved rather than stepped.** The return map is exact
+for radial loading: the consistency condition `2μ(E − P) = √(2/3)·σ_y(√(2/3)·P)`
+determines the plastic flow from the total deviatoric strain and from nothing
+else, so **one step and ten thousand steps to the same final strain give the same
+stress to 10⁻¹²** — asserted for both hardening curves, with a deliberately
+non-proportional path as the negative control, because that property is what
+separates a return map from a forward-Euler update and a test that cannot see the
+difference is measuring nothing.
+
+**Hardening is isotropic, with linear kinematic available and defaulted off.**
+Forward, the two are indistinguishable — growing the yield surface and moving it
+give the same monotonic curve, which is exactly why a suite that only pulls
+cannot tell them apart. They part on a reversal, by closed form: the elastic span
+is `2σ_y(ε_p)` for isotropic hardening and **exactly `2σ_y0` for kinematic**,
+whatever the prestrain. Kinematic is off by default because nothing measures it —
+`StructuralMaterial` carries E, ν, ρ and a yield strength and no hardening curve
+at all — and because it costs six doubles per integration point, 380 MB at the
+Tier-2 budget, to buy a Bauschinger effect a monotonic ram does not exercise.
+**Rate dependence is deliberately absent**: it would make the map viscoplastic and
+destroy the step-size independence above, which is the best instrument this file
+has. Until it exists the flow stress is quasi-static, so the model under-predicts
+the resisting force and over-predicts the penetration.
+
+**The hardening curve is fitted, not tabulated.** Swift, `σ_y = K(ε₀+ε_p)ⁿ`, from
+the three numbers a tensile test reports — yield strength, true stress at the
+ultimate load, true uniform strain — with the fit exact at both points and its
+Considère necking strain equal to the uniform strain that went in. The
+construction that looks natural is wrong and is kept as a guard: taking `ε₀ =
+σ_y/E`, the elastic strain at yield, puts the curve **21% high at 0.2 plastic
+strain**, because a power law forced through the yield point of a steel that has a
+plateau is far too steep.
+
+#### Element size is the failure criterion, not a detail
+
+An element does not tear at a material constant. Everything after Considère
+happens inside a neck whose width is set by the plate thickness, so an element of
+in-plane size *l* containing that neck reads an average — the uniform part, plus
+the necking part diluted by *t/l*:
+
+```
+eps_f(l) = eps_uniform + (eps_fracture - eps_uniform) * min(t/l, 1)
+```
+
+Both constants are measurable and neither is fitted. `eps_uniform` is Considère's
+necking strain, computed from the hardening curve — so the failure model and the
+flow curve cannot drift apart, and a test asserts they have not. `eps_fracture` is
+the local true strain at fracture, `ln(A₀/A_f)` from the reduction of area. The
+clamp at `l = t` is not a fudge either: an element no larger than the plate is
+thick resolves the neck itself and should see the local fracture strain, which is
+what the expression returns there. **So it interpolates between two measured end
+points rather than between two fitted ones.** What is mesh-invariant is the
+necking elongation `(eps_f(l) − eps_g)·l = eps_e·t`, asserted as an identity; and
+the formula is checked against its own derivation by averaging a rectangular neck
+of width *t* over an element of length *l* and demanding the answer back.
+
+Triaxiality is the other half of "depending on the strain state": Rice–Tracey void
+growth gives `eps_f ∝ exp(−3η/2)`, referred to η = 1/3 where a tensile test
+measures the constants, so in-plane biaxial tension (η = 2/3) fails at exp(−1/2) =
+0.607 of uniaxial. Below a cutoff at η = −1/3 voids close and no damage
+accumulates at all, which also bounds the multiplier by *e*. Damage is
+**accumulated** — `D += Δε_p/ε_f(η)`, failing at D = 1 — not compared, so a path
+that wanders through several stress states spends the right fraction of its life
+in each.
+
+For AH36 on 20 mm plating that gives:
+
+| element | l/t | ε_f uniaxial | ε_f biaxial |
+|---|---|---|---|
+| 20 mm | 1.0 | 0.799 | 0.484 |
+| 50 mm | 2.5 | 0.408 | 0.248 |
+| 100 mm | 5.0 | 0.278 | 0.169 |
+| 200 mm | 10 | 0.213 | 0.129 |
+| 400 mm | 20 | 0.181 | 0.110 |
+
+which brackets the 0.15–0.35 that ship-collision practice uses at the mesh
+densities it uses. The element measures its own size — `elementSize()` returns
+`sqrt(mid-surface area)` and `volume/area`, so a *sheared* element reports the
+perpendicular distance between its faces rather than the length of its slanted
+edge — and `initialisePlasticState` resolves the failure strain from it. **The
+failure strain is a property of the element, not of the material.**
+
+**The limit, measured rather than asserted away.** This regularises the strain one
+element must reach to tear. It does *not* make the elongation of a uniformly
+strained gauge length mesh-independent, and nothing without a softening mechanism
+could: with hardening and no softening the plastic strain in a bar never
+localises, so every element reaches its own failure strain at nearly the same
+load. Measured on a 200 mm bar with a 5% thinned point, elongation before the
+first tear: **43.3 mm as one element, 65.9 mm as four** — a factor of 1.52. What
+the criterion does deliver, and what a structural tear needs, is that the tear
+starts at the right place and at the right strain for the mesh: the thinned point
+is the one that tears in both meshes, each at its own ε_f (0.213 and 0.408).
+
+#### Plasticity inside an EAS element
+
+The seven enhanced parameters stop having a closed form the moment the material
+is nonlinear. `α = −K_aa⁻¹K_ua^T u` is a statement about a linear element; with
+plasticity, α is whatever satisfies `r(α) = ∫Gᵀσ(Bu + Gα) dV = 0`, seven nonlinear
+equations solved by Newton on the **algorithmic** tangent — which is why the
+return map returns one, and why that tangent is checked against a central finite
+difference of the return map itself rather than transcribed and hoped for.
+Skipping the solve is not a small error: the enhanced thickness modes are the
+entire reason σ_zz relaxes through a bent plate, and a plate that cannot thin does
+not yield where a real one does.
+
+Two things had to be got right that are easy to get wrong:
+
+- **‖r‖ is not a scale-free convergence measure here.** The enhanced thickness
+  modes carry `E_ζζ`, so their columns of G are scaled by the Voigt transform's
+  1/t² and K_aa inherits its square. Measured on a bent element, a residual of
+  10⁻³ corresponds to an error in α of 6 × 10⁻¹⁸ against an α of 2.7 × 10⁻⁶ —
+  twelve significant digits. Chasing ‖r‖ below its own floor costs forty
+  iterations and moves nothing; the forty-iteration answer and the four-iteration
+  answer agree to every digit printed. Convergence is taken on `|δ·r|`, the work
+  the correction would do, against the element's yield energy `σ_y·V`.
+- **A dead integration point makes the enhanced problem ill-posed**, and the
+  consequence is not a wobble. K_aa loses rank as the tangent at the dead points
+  goes to zero; measured on a plate torn under an in-plane strain gradient, with
+  four of eight points gone the survivors were driven to a triaxiality below the
+  damage cutoff, their damage froze at 0.78 while their plastic strain ran on from
+  0.49 to 0.89, and **the element never finished tearing**. So an element drops its
+  enhanced modes the moment any point fails and finishes its life as the ANS hex,
+  re-running the step in which the point died so nothing ill-posed is committed.
+
+#### Cost, one core, measured
+
+| | |
+|---|---|
+| Return map, elastic point | **35 ns** |
+| Return map, plastic point (Swift, Newton on the consistency condition) | **180 ns**, 5.2× |
+| The algorithmic tangent on top of that | +9% |
+| Enhanced-strain Newton, warm start | 4 iterations (5 cold) |
+| Solid-shell elastic internal force, the reference | 273 ns |
+| Solid-shell elastoplastic update, nothing yielding | 5.4 µs, **19.6×** |
+| Solid-shell elastoplastic update, marching and yielding | 7.3 µs, **26.9×** |
+| Per-point state | 120 B; 10⁶ elements × 8 points = **916 MB** |
+
+**35% of that 7.3 µs is re-forming B on the rest geometry, which never changes.**
+It is loop-invariant and hoistable, at 12 kB per element — against the 4.6 kB per
+element the elastic path already spends on a condensed stiffness. That is the
+first optimisation to reach for and it is a memory decision, so it belongs with
+the Tier-2 solver rather than here.
+
+The consequence for the budget in `07-fem-spike-findings.md` §6 is real and should
+not be glossed: a 200 m² collision zone at 50 mm elements costs ~7 400 core-seconds
+per simulated second elastic, and **~2 × 10⁵ core-seconds elastoplastic** — five
+minutes of wall time on the 24-thread CPU against about two hours. Plasticity is
+what makes the crush zone expensive, not the element.
+
+#### What it cannot do yet
+
+1. **Small strain in a co-rotational frame.** The strain measure is additive, so
+   at 0.2 it differs from the logarithmic one by about 10%, and the failure
+   strains above are quoted as true strains. Large rotations are exact; large
+   *strains* are not.
+2. **Element deletion, not splitting.** A failed point carries no stress at all,
+   discontinuously, which an explicit scheme feels as a small shock. The maximum
+   principal direction at the moment of failure is returned — it is the plane a
+   tear would open on — but nothing consumes it yet.
+3. **No rate dependence, no temperature, no Gurson.** See above for why the first
+   is deferred deliberately rather than forgotten.
+4. **No `StructuralMesh` consumer.** `plasticity::shipSteel()` exists because the
+   material database this section plans does not; its elastic constants are
+   asserted against `ah36Steel()` so the two cannot drift, but the hardening curve
+   and the fracture strain cannot yet come out of a ship file.
 
 ### Element technology — revised after measurement, then built
 
