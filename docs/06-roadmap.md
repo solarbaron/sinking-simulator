@@ -182,6 +182,33 @@ worth trusting.
   a powerplant for a real hull and sourcing the benchmark data are the two tasks
   left, and neither is a physics gap.
 
+  `tools/seaway_view` is the visible form of the half that works: a named ship
+  built from principal particulars, under power at a chosen Froude number, in a
+  directional spectral sea, drawn in the water it is responding to. **Fn 0.275 is
+  reachable** — measured, the S-175 form settles at Fn 0.081 at 1.4 rev/s, 0.241
+  at 4.0 and 0.277 at 4.6 — so the benchmark *condition* is no longer the
+  obstacle either. It runs in `verify.sh full`, because it is the only thing that
+  exercises hull generation, radiation, propulsion, the wave field and both
+  renderers against each other rather than one at a time.
+
+  Three things a look at its output showed that no unit test would have:
+
+  - **The ocean patch edge is visible against the sky.** A finite grid ends, and
+    at 1050 m it ends inside the frame. The fix is the planned cascade in
+    `03-renderer-audio.md`, not a bigger uniform grid — resolution is set by the
+    *shortest* component, so widening the patch squares the cost.
+  - **The area curve has no parallel middle body.** `f(u) = 1 − (1−e)|u|ⁿ` is
+    smooth everywhere, so a fine hull comes out canoe-like where a real
+    containership has a long constant midship. It matters for appearance and for
+    sectional-area-driven quantities; it does not much affect Cb, Cp or LCB,
+    which is why the coefficient tests are all green. A three-parameter curve with
+    an explicit parallel middle body is the fix.
+  - **Irregular frequencies get worse as hulls get fuller.** The S-175 needs 8 of
+    600 station-frequency solves repaired; the KVLCC2, with a nearly rectangular
+    midship at Cm 0.998, needs 76 of 600. That is 12.7%, which is the region
+    `radiation.hpp` warns about, and it is an argument for the extended integral
+    equation rather than the interpolation currently standing in for it.
+
 **Performance, now measured rather than projected.** The wave-field query is
 essentially 100% of a wavy tick. Evaluating the surface once per hull *vertex*
 rather than once per triangle *corner* removed a 6× redundancy for no change in

@@ -137,6 +137,13 @@ if(Vulkan_FOUND AND GLSLC)
   target_compile_definitions(ferry_view PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}")
   target_compile_options(ferry_view PRIVATE -Wall -Wextra)
 
+  add_executable(seaway_view tools/seaway_view/main.cpp)
+  add_dependencies(seaway_view shipsim_shaders)
+  target_link_libraries(seaway_view PRIVATE shipsim_engine)
+  target_compile_definitions(seaway_view PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}"
+    SHIPSIM_MATERIAL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/engine/gpu/materials")
+  target_compile_options(seaway_view PRIVATE -Wall -Wextra)
+
   add_executable(fem_spike tools/fem_spike/main.cpp engine/gpu/fem_gpu.cpp)
   add_dependencies(fem_spike shipsim_shaders)
   target_link_libraries(fem_spike PRIVATE shipsim_engine Vulkan::Vulkan)

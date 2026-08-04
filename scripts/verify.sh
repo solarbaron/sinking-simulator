@@ -109,6 +109,15 @@ if [ -x ./build/ferry_view ]; then
 else
   skip "ferry_view not built"
 fi
+# The integration case: hull from particulars, radiation, propulsion, spectral
+# sea, ocean and hull rendering, all in one run. Unit tests cover each of those
+# alone; this is the only thing that runs them against each other.
+if [ -x ./build/seaway_view ]; then
+  expect_ok "seaway_view" '^ok$|no usable GPU' \
+            ./build/seaway_view --out=/tmp --frames=2
+else
+  skip "seaway_view not built"
+fi
 
 section "flooding scenarios still behave"
 for scenario in none doors full; do
