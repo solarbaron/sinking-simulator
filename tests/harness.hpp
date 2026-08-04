@@ -31,6 +31,7 @@ void runCameraTests();
 void runCoreTests();
 void runJobTests();
 void runArenaTests();
+void runBreachTests();
 void runEcsTests();
 void runDeviceTests();
 void runOffscreenTests();

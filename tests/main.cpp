@@ -43,6 +43,7 @@ int main() {
     runRadiationTests();
     runRollDampingTests();
     runScantlingTests();
+    runBreachTests();
     runSchedulerTests();
     runSerialiseTests();
     runShipFileTests();
