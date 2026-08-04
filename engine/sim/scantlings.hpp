@@ -390,6 +390,27 @@ struct HullGirderSection {
     double modulusDeck = 0;     // m^3
     double modulusKeel = 0;     // m^3
 };
+// One longitudinally-effective piece of a transverse cut: a strip of plating, or
+// a stiffener. `hullGirderSection()` is the sum of these, and progressive
+// collapse (`collapse.hpp`) needs them individually, because the whole method is
+// that each one goes non-linear at its own strain.
+struct SectionElement {
+    double area = 0;             // m^2
+    double height = 0;           // m above the baseline, of its own centroid
+    double ownSecondMoment = 0;  // m^4 about its own horizontal centroidal axis
+    double zLo = 0, zHi = 0;     // m, its extreme fibres
+    double thickness = 0;        // m, plating thickness or stiffener web thickness
+    double width = 0;            // m, girth spanned; zero for a stiffener
+    int material = 0;
+    bool stiffener = false;
+};
+
+// Decompose a transverse cut into its elements. The extent is half-open,
+// [xLo, xHi), so a cut landing on a frame seam is served by the bay forward of it
+// and not by both -- counting both doubles area and second moment while leaving
+// the neutral axis, a ratio, looking perfectly correct.
+std::vector<SectionElement> sectionElements(const StructuralMesh& mesh, double x);
+
 HullGirderSection hullGirderSection(const StructuralMesh& mesh, double x);
 
 // The midship section modulus a classification society will not go below, from

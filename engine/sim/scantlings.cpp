@@ -935,12 +935,8 @@ StructuralMesh makeStructuralMesh(const TriMesh& hull, const Scantlings& scantli
 
 // --- Hull girder ---------------------------------------------------------------
 
-HullGirderSection hullGirderSection(const StructuralMesh& mesh, double x) {
-    HullGirderSection s;
-    s.x = x;
-
-    double area = 0, moment = 0, second = 0;
-    double zLo = 1e300, zHi = -1e300;
+std::vector<SectionElement> sectionElements(const StructuralMesh& mesh, double x) {
+    std::vector<SectionElement> out;
     constexpr double kFlat = 1e-9;
 
     // A cut that lands exactly on a frame station sits on the seam between two
@@ -1012,12 +1008,17 @@ HullGirderSection hullGirderSection(const StructuralMesh& mesh, double x) {
         const double own =
             a * (dz * dz + p.thickness * p.thickness * (dy / cut) * (dy / cut)) / 12.0;
 
-        area += a;
-        moment += a * zc;
-        second += own + a * zc * zc;
         const double halfThickness = 0.5 * p.thickness * std::abs(dy) / cut;
-        zLo = std::min(zLo, std::min(q0.z, q1.z) - halfThickness);
-        zHi = std::max(zHi, std::max(q0.z, q1.z) + halfThickness);
+        SectionElement e;
+        e.area = a;
+        e.height = zc;
+        e.ownSecondMoment = own;
+        e.zLo = std::min(q0.z, q1.z) - halfThickness;
+        e.zHi = std::max(q0.z, q1.z) + halfThickness;
+        e.thickness = p.thickness;
+        e.width = cut;
+        e.material = p.material;
+        out.push_back(e);
     }
 
     for (const StructuralMember& m : mesh.members) {
@@ -1038,12 +1039,34 @@ HullGirderSection hullGirderSection(const StructuralMesh& mesh, double x) {
         const double own = m.rise.z * m.rise.z * ps.secondMoment +
                            m.rise.y * m.rise.y * ps.secondMomentWeak;
 
-        area += ps.area;
-        moment += ps.area * centre.z;
-        second += own + ps.area * centre.z * centre.z;
         const Vec3 tip = root + m.rise * (0.5 * m.attachedPlateThickness + ps.height);
-        zLo = std::min(zLo, std::min(root.z, tip.z));
-        zHi = std::max(zHi, std::max(root.z, tip.z));
+        SectionElement e;
+        e.area = ps.area;
+        e.height = centre.z;
+        e.ownSecondMoment = own;
+        e.zLo = std::min(root.z, tip.z);
+        e.zHi = std::max(root.z, tip.z);
+        e.thickness = m.profile.webThickness;
+        e.width = 0.0;
+        e.material = m.material;
+        e.stiffener = true;
+        out.push_back(e);
+    }
+    return out;
+}
+
+HullGirderSection hullGirderSection(const StructuralMesh& mesh, double x) {
+    HullGirderSection s;
+    s.x = x;
+
+    double area = 0, moment = 0, second = 0;
+    double zLo = 1e300, zHi = -1e300;
+    for (const SectionElement& e : sectionElements(mesh, x)) {
+        area += e.area;
+        moment += e.area * e.height;
+        second += e.ownSecondMoment + e.area * e.height * e.height;
+        zLo = std::min(zLo, e.zLo);
+        zHi = std::max(zHi, e.zHi);
     }
 
     if (area <= 0) return s;

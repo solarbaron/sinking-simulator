@@ -49,6 +49,7 @@ void runShipFileTests();
 void runWorldIoTests();
 void runWaveTests();
 void runBucklingTests();
+void runCollapseTests();
 void runGirderTests();
 void runHullFormTests();
 void runRaoTests();

@@ -1464,6 +1464,63 @@ minimum section modulus, so a rule-minimum ship in the same condition would run 
 designed to. The moment and the section were computed by completely separate
 routes, neither aimed at that number.
 
+### Progressive collapse — **implemented**
+
+`engine/sim/collapse.{hpp,cpp}`. First yield is not strength. A hull girder does
+not fail when its worst panel reaches its limit: that panel sheds load onto its
+neighbours, the neutral axis migrates towards the side still carrying, and the
+section goes on taking moment until enough of it has gone that the total starts
+to fall. **Smith's method** — impose a curvature, let every element answer with
+its own load-shortening curve, move the neutral axis until axial forces balance,
+sum moments, step and repeat — is what classification societies use, and the peak
+of the resulting curve is the ultimate strength.
+
+It is testable because it sits between two exact answers. At zero curvature the
+slope must be `E·Σ(A d²)` about the elastic neutral axis. With buckling switched
+off, a large curvature must give the fully plastic moment about the **plastic**
+neutral axis — the one that balances *area*, not first moment, which on an
+asymmetric section is a different height and using the elastic one understates
+the answer.
+
+The elements' own second moments are deliberately absent from that slope. Smith's
+method carries axial stress alone — a strip of plating resists by stretching, not
+by bending about its own mid-thickness — so the initial stiffness is slightly
+below `E·I` as `hullGirderSection()` reports it. Measured on the ferry: 90–100%
+of it, the gap being the plating's own inertia.
+
+**What it says about the ferry** (369 elements at midship, A = 1.80 m², I = 46.2 m⁴):
+
+| | moment | as a fraction of first yield |
+|---|---|---|
+| first yield (deck governs both ways) | 1.978 × 10⁹ N·m | 1.00 |
+| fully plastic | 2.573 × 10⁹ N·m | 1.30 |
+| **ultimate hogging** | 1.987 × 10⁹ N·m | **1.00** |
+| **ultimate sagging** | 1.288 × 10⁹ N·m | **0.65** |
+
+**In sagging she fails at 65% of first yield.** The deck buckles in compression
+long before any fibre reaches yield stress, so a first-yield check overstates her
+sagging strength by a factor of **1.54** — it would clear a moment half again
+larger than the one that actually collapses her. Hogging shows no such gap,
+because it compresses the keel, which is heavy, closely framed structure that
+yields rather than buckles.
+
+That asymmetry — sagging ultimate at 65% of hogging ultimate — is the standard
+finding for a ship with a light, widely stiffened deck, and it is emergent here:
+nothing in the method knows which fibre is which, only which one is in
+compression.
+
+Against the standard wave of her own length the margins are 4.2× hogging and 7.8×
+sagging, which is comfortable and consistent with her carrying 1.7× the rule
+minimum section modulus.
+
+**The load-shortening curve is the model, and it is one number.** Past the
+compressive cap, `σ = σ_c (ε_c/ε)ⁿ`, continuous at the cap by construction, with
+`n ≈ 0.45` for plating and zero for stiffeners. The published curves are per
+failure mode and far more elaborate; this family is chosen so the *shape* is
+right and the assumption is visible rather than buried. `n = 0` gives a perfect
+plateau and an upper bound on strength — the curve then never turns over, and
+`ultimateMoment` is the plateau rather than a peak.
+
 ### Buckling — **implemented**
 
 `engine/sim/buckling.{hpp,cpp}`. Dividing a moment by a section modulus is the
