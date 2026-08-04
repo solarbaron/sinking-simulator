@@ -44,6 +44,7 @@ add_library(shipsim_engine
   engine/sim/rao.cpp
   engine/sim/scantlings.cpp
   engine/sim/fem.cpp
+  engine/sim/solid_shell.cpp
   engine/sim/radiation.cpp
   engine/sim/roll_damping.cpp
   engine/sim/waves.cpp
@@ -84,6 +85,7 @@ add_executable(shipsim_tests
   tests/test_scantlings.cpp
   tests/test_scheduler.cpp
   tests/test_serialise.cpp
+  tests/test_solid_shell.cpp
   tests/test_shipfile.cpp
   tests/test_worldio.cpp
   tests/test_jobs.cpp
