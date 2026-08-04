@@ -320,9 +320,20 @@ The longest and highest-risk phase.
   tool, and it runs in `verify.sh full` because it is the only thing that
   exercises collision, indentation, breach and flooding *against each other*.
 
-  At 6 m/s: 1.14 s in contact, 149 MN peak, 74 MJ absorbed, 66 bays torn,
-  112.8 m² of hole, 66.75 m² of it reaching a compartment, 2210 t of water and
-  she is lost with GM −1.62 m.
+  At 6 m/s: 1.14 s in contact, 149 MN peak, 74 MJ absorbed, 0.205 m into her,
+  63 bays torn, 107.7 m² of hole, 2210 t of water, and she is lost with
+  GM −1.62 m.
+
+  Those figures were first published with the indentation model spanning the
+  frames at 2.40 m where the plating actually spans the longitudinals at 0.70 m.
+  The zone FEM found it, having no span in it at all. Worth being exact about what
+  it cost, because the natural reading of that finding is too broad: the energy to
+  tear a bay is `σ_y·t·area·ε_f`, in which **the span cancels**, reaching the
+  answer only through the failure-strain regularisation — and that is nearly flat
+  here, 0.1517 against 0.1596. So the torn count moved from 66 to 63 and the 3 m/s
+  case did not move at all. What was wrong by 3.4× was **force and penetration**:
+  2.96 MN against 10.35, and 0.686 m of denting against 0.205, both in the
+  direction of reporting the hull as far softer than it is.
 
   Two things fall out of it rather than being put in. **Beyond a threshold the
   outcome stops caring how big the hole is** — from 1.5 to 6 m/s the hole grows
