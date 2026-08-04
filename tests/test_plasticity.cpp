@@ -1823,8 +1823,22 @@ void testCost() {
     std::printf("     per-point state: %zu bytes; 10^6 elements x 8 points = %.0f MB\n",
                 sizeof(State), static_cast<double>(sizeof(State)) * 8.0e6 / (1024.0 * 1024.0));
 
-    expectTrue("the plastic path costs more than the elastic one", plasticPath > elasticPath);
-    expectTrue("the cost measurement did not optimise itself away", sink != 0.0);
+    expectTrue("the cost measurement did work that could not be optimised away",
+               std::isfinite(sink) && sink != 0.0);
+    // **Deliberately loose, and the loose version replaced a tight one that was a
+    // real flaky test.** This asserted `plasticPath > elasticPath` -- true by 35% on
+    // an idle machine and measured here at 25 failures in 48 runs with sixteen
+    // copies of this suite running at once, because under contention the two
+    // converge and the inequality becomes noise. It cost the gate a repeat run, and
+    // it had already reported one mutant killed that was not. `test_solid_shell.cpp`
+    // says the same thing in its own cost test and says it first: a timing
+    // assertion tight enough to be interesting is a flaky test on a shared machine.
+    // Two orders of headroom each, so these fire only if something has gone
+    // structurally wrong; the numbers themselves are printed, which is what they
+    // are for.
+    expectTrue("a return-map evaluation is under 10 microseconds", plasticPoint < 1.0e4);
+    expectTrue("an elastoplastic element update is under a millisecond",
+               plasticPath < 1.0e6 && elasticPath < 1.0e6);
 }
 
 }  // namespace

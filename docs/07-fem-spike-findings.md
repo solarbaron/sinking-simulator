@@ -441,6 +441,27 @@ already-degraded element is output-identical to letting the in-step retry catch
 it — it saves a wasted Newton pass per step for the rest of a torn element's life,
 which is a cost difference and not a behaviour one.
 
+### A flaky test, caught by the gate and not by any run of the suite
+
+The cost test asserted that the elastoplastic element path costs more than the
+elastic one. True by 35% on an idle machine, and 60 sequential runs never saw it
+fail — but **25 of 48 runs fail with sixteen copies of the suite running at once**,
+because under contention the two measurements converge and the inequality becomes
+noise. It cost `verify.sh sanitize` one of its six repeat runs, which is the only
+instrument that would have found it; it had also, earlier, reported one mutant
+killed that was not.
+
+`test_solid_shell.cpp` had already written the rule down in its own cost test —
+*a timing assertion tight enough to be interesting is a flaky test on a shared
+machine* — and this is what ignoring it looks like. Replaced with bounds two orders
+loose, which fire only if something has gone structurally wrong. **The numbers are
+for printing, not for asserting.**
+
+That the failure needed *contention* to appear is the reusable part: a suite with
+no threads, no GPU and no file I/O in it still had a nondeterminism, and the
+operating point that exposed it was load. It is the same lesson as the auto-grain
+clamp that only ThreadSanitizer's slowness reached.
+
 ### Two test-harness defects, both of the same shape
 
 Both were bisections walking off a function that stops being monotone at failure,
