@@ -274,6 +274,39 @@ The longest and highest-risk phase.
 - **Milestone:** ram the ferry. The hull deforms, tears where the stress says it
   should, and the resulting hole floods at a rate the hole's own area determines.
 
+  **Met, and `tools/ram_view` is it.** A 5175 t hull strikes the 8984 t ferry
+  abeam; the penetration volume gives a force and the energy that went into the
+  meeting; that energy is spent outward through her plating until bays tear; the
+  torn bays become openings in the flooding network; and she floods at
+  `Cd·A·√(2Δp/ρ)` through them. Not a step of that chain is reimplemented in the
+  tool, and it runs in `verify.sh full` because it is the only thing that
+  exercises collision, indentation, breach and flooding *against each other*.
+
+  At 6 m/s: 1.14 s in contact, 149 MN peak, 74 MJ absorbed, 66 bays torn,
+  112.8 m² of hole, 66.75 m² of it reaching a compartment, 2210 t of water and
+  she is lost with GM −1.62 m.
+
+  Two things fall out of it rather than being put in. **Beyond a threshold the
+  outcome stops caring how big the hole is** — from 1.5 to 6 m/s the hole grows
+  from 3.4 to 113 m² and the floodwater barely moves, because a small breach fills
+  the compartment behind it inside 900 s just as a large one does. Damage
+  stability is decided by *which* compartments open, which is what the subdivision
+  rules are written around. And **where she is struck decides how she dies**:
+  amidships she takes 2100 t and lolls 6°, at the quarter she takes 8100 t and goes
+  over 26° the other way.
+
+  She is lost in every case tried, and that is consistent rather than suspicious:
+  `ram_view` applies no damage control at all, which is Phase 0's `none` scenario,
+  and `none` loses her too. The scenarios that let her live are the ones where
+  somebody acts.
+
+  **What the milestone does not yet include.** The striking ship is rigid, so
+  every joule goes into tearing the struck plating — `indentation.hpp` records that
+  this is tight at low energy and loose above a few tens of megajoules. The
+  deformation is computed by a membrane model rather than by the solid-shell
+  elements and plasticity that now exist; wiring those in is the Tier-2 zone
+  solver, and it is the largest thing still outstanding in Phase 3.
+
 This is the phase the whole concept is named for. If it works, everything after
 it is addition; if it does not, the project is a very good flooding simulator and
 should be honest about that.

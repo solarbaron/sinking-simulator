@@ -112,6 +112,14 @@ fi
 # The integration case: hull from particulars, radiation, propulsion, spectral
 # sea, ocean and hull rendering, all in one run. Unit tests cover each of those
 # alone; this is the only thing that runs them against each other.
+# The Phase 3 milestone as one act: collision, indentation, breach and flooding
+# in a single run. Every one of those is unit-tested alone; this is the only thing
+# that runs them against each other.
+if [ -x ./build/ram_view ]; then
+  expect_ok "ram_view" '^ok$' ./build/ram_view --speed=4.0 --duration=120
+else
+  skip "ram_view not built"
+fi
 if [ -x ./build/seaway_view ]; then
   expect_ok "seaway_view" '^ok$|no usable GPU' \
             ./build/seaway_view --out=/tmp --frames=2

@@ -171,6 +171,10 @@ if(Vulkan_FOUND AND GLSLC)
     SHIPSIM_MATERIAL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/engine/gpu/materials")
   target_compile_options(seaway_view PRIVATE -Wall -Wextra)
 
+  add_executable(ram_view tools/ram_view/main.cpp game/prototype/ferry.cpp)
+  target_link_libraries(ram_view PRIVATE shipsim_engine)
+  target_compile_options(ram_view PRIVATE -Wall -Wextra)
+
   add_executable(fem_spike tools/fem_spike/main.cpp engine/gpu/fem_gpu.cpp)
   add_dependencies(fem_spike shipsim_shaders)
   target_link_libraries(fem_spike PRIVATE shipsim_engine Vulkan::Vulkan)
