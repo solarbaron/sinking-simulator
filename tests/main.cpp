@@ -51,6 +51,7 @@ int main() {
     runWorldIoTests();
     runWaveTests();
     runBucklingTests();
+    runCollisionTests();
     runGirderTests();
     runHullFormTests();
     runRaoTests();

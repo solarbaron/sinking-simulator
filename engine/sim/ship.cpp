@@ -669,6 +669,21 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
         }
     }
 
+    // Contact with another hull, and anything else outside this ship's own
+    // physics. Added after the damping loop because a contact force is not
+    // something the sea damps, and cleared once consumed.
+    //
+    // It is divided by the *effective* mass below, added mass included, which is
+    // right -- a struck ship accelerates with the water it has to shove aside --
+    // and which means the two ships in a collision do not conserve momentum
+    // between themselves alone. The difference is in the water. See
+    // collision.hpp; the conservation laws are asserted against the bare rigid
+    // bodies, where they hold exactly.
+    fBody += R.transposed() * externalForce;
+    tBody += R.transposed() * externalMoment;
+    externalForce = {};
+    externalMoment = {};
+
     const Vec3 aBody{fBody.x / mEff.x, fBody.y / mEff.y, fBody.z / mEff.z};
     const Vec3 alphaBody = inverse(Ieff) * (tBody - cross(wBody, Ieff * wBody));
 

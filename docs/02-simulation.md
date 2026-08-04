@@ -1086,6 +1086,234 @@ belong to the coupling rather than to the method:
 
 All three are refinements with a clear route, not gaps in the coupling.
 
+### Hull-to-hull contact — **implemented**
+
+`engine/sim/collision.hpp` / `.cpp`. Everything downstream of an impact existed
+before this — a structural mesh, buckling, a solid-shell element, failed panels
+that become flooding openings — and everything upstream did too. Two `sim::Ship`s
+passed through each other without noticing. This is the middle: whether two hulls
+interfere, *where* and *how much*, and what force that puts on both of them. It is
+the rigid-body half only; there is no fracture and no deformation here.
+
+#### Detection: a penetration volume, not a contact manifold
+
+The usual answer is a list of contact points with normals and depths. It is the
+wrong one here for three reasons. A ship hull is **not convex** — bulbous bow,
+transom tuck, flare above the knuckle — and a convex decomposition that gets one
+of those wrong invents contact where there is none. The point *count* is a
+tessellation artefact, so a penalty force summed over it scales with how finely
+the shell was wound rather than with the ship. And the consumer is a structural
+model that asks which panels failed: "42 MN over 18 m² centred here" is a load
+case, "nine points with depths" is not.
+
+So detection computes the **interpenetration solid** A ∩ B — volume, centroid,
+principal extents, and the two surface patches that bound it — exactly, for
+arbitrary closed meshes, using only machinery the engine already had.
+
+The device is the signed-cone identity that already makes `integrate()` correct
+for any apex, stated for the *indicator* rather than for the volume: for a closed,
+outward-wound mesh and any apex `o`,
+
+    1_B(x) = Σ_j sign_j · 1_{tet_j}(x),   tet_j = (o, a_j, b_j, c_j)
+
+pointwise almost everywhere. That turns "is this point inside a general closed
+mesh" into a sum over **convex** pieces, and a tetrahedron is an intersection of
+four half-spaces — the one thing this engine's geometry is built to clip against.
+Applied to a triangle T of ∂A it gives `area(T ∩ B) = Σ_j sign_j area(T ∩ tet_j)`,
+and every term is a convex polygon clip: no welding, no cap stitching, no ear
+clipping, no mesh boolean anywhere. Summing the divergence-theorem flux of those
+polygons over ∂A ∩ B and ∂B ∩ A gives the overlap's volume, centroid and second
+moments, because ∂(A ∩ B) is precisely those two pieces — and the same sweep hands
+back each patch's area, centroid and area-weighted normal for free.
+
+Cost is O(triangles of A × triangles of B), so both meshes are first cut to the
+overlap region with `clipToBox` — legitimate because A ∩ B ⊆ box implies
+A ∩ B = (A ∩ box) ∩ (B ∩ box) — and the box is tightened against the clipped
+meshes' own bounds a couple of times. The box is then padded outward, which costs
+nothing and buys something worth having: A ∩ B is then *strictly* inside it, so the
+cut faces `clipToBox` introduces lie outside the overlap and contribute exactly
+zero to both the volume and the patches. No provenance tracking is needed.
+
+**Depth and patch come from the overlap's own second moments.** A uniform box of
+side lengths (d₁, d₂, d₃) has covariance eigenvalues dᵢ²/12, so the
+eigen-decomposition of the overlap's covariance inverts to an *equivalent box*:
+exactly for a box, and sensibly for anything lens-shaped. The smallest extent is
+the penetration depth, volume over it is the projected patch area, and the
+corresponding eigenvector is a contact normal that owes nothing to any
+tessellation. The normal actually reported is the better-conditioned one — the
+area-weighted mean of the two patches' *surface* normals — with the principal axis
+as fallback and cross-check.
+
+**Measured.** Two boxes: volume, centroid, extents, both patch areas, both patch
+centroids and both patch normals exact to 1e-9. A square and the same square at
+45° intersect in the regular octagon of area 2(√2−1)s², to 1e-9. Two tessellated
+spheres reach the analytic lens volume at **second order** — measured error ratios
+3.73, 3.92 and 3.98 per halving of facet size, against the 4 that owes. A box
+inside a hull returns the box's own volume and the box's whole surface as patch.
+Detection costs **5.4 ms** on a bow-into-side contact between two 464-triangle
+hulls and **11 ms** at 3272 triangles; two hulls that are not touching cost
+nothing at all, because the bounding boxes reject first. That is not cheap against
+a 100 Hz budget, but a collision lasts of order a second, and the O(n·m) sweep is
+the obvious thing to index if it ever needs to be faster.
+
+#### Two defects the closed forms found
+
+Both shipped green on everything else and both are worth recording.
+
+**`Mat3{}` is the identity, not zero.** `Mat3` carries a default member
+initialiser of `{1,0,0,0,1,0,0,0,1}`, so a value-initialised accumulator starts at
+I. The second-moment integral then reported every solid's second moment one too
+large on the diagonal — for a 2 × 4 × 6 box, a 6% error in the shortest extent,
+which reads as a slightly fat box rather than as a broken integral. Found by
+asserting the closed-form covariance d²/12, not by any volume test: the volume was
+right throughout.
+
+**Coincident faces were counted twice.** ∂(A ∩ B) is (∂A inside B) plus (∂B inside
+A), and those two sets are disjoint *except* where a face of one hull lies exactly
+in a face of the other — which both sweeps then claim, doubling that face's flux.
+It is not an exotic case: two boxes meeting face to face share four side planes,
+and the overlap volume comes out **5/3 too large** with no other symptom. Two
+squares at 45° share their end planes and come out 4/3 too large — larger than the
+whole of one of the solids, which is how it was caught. Shared faces now take half
+weight in *both* sweeps, which counts them once and keeps the routine symmetric in
+its arguments; faces coincident with *opposing* normals are two hulls touching
+from outside, bound no overlap, and take weight zero. A cheap standing guard was
+added with it — the overlap can never exceed either solid — and it is what would
+have caught this on the first run instead of on a closed form aimed at something
+else.
+
+#### Response: a compliant force, not an impulse
+
+At 6 m/s closing, two 20,000 t ships are **not** an impulsive problem. Take a
+contact stiffness that puts the peak force where ship-collision measurements put
+it and the contact half-period is π√(m_red/K) ≈ 0.5 s — fifty to a hundred
+simulation steps. An impulse collapses all of that into one step and hands the
+structural model a velocity change, when what it needs is a force history: a rise
+time, a peak, a patch that grows and moves, and an energy that accumulates. So the
+primary model is a **penalty** contact,
+
+    F = stiffness · volume · (1 + dissipation · approachRate),  clamped ≥ 0
+
+with Coulomb friction, regularised, on the tangential component. Force
+proportional to the overlap *volume* rather than to a depth is the hydroelastic
+form and the one that is mesh-independent: no contact count appears in it, it is
+continuous as the patch grows, and `stiffness` is an honest physical quantity — a
+contact pressure per metre of penetration, in Pa/m. The dissipation term is
+Hunt–Crossley, proportional to the penetration, so the force is zero at first
+touch and at separation and never goes tensile, which a linear dashpot does at
+both ends.
+
+The resultant acts at the **overlap solid's centroid**, which for a pressure
+proportional to local penetration is the centre of pressure — the depth-weighted
+centroid of the patch, and not the patch's area centroid. On the box fixture the
+two are 0.3 m apart; on a ship-length lever that is a moment error of the same
+order as the moment the contact is trying to produce.
+
+The impulsive solver is still there. It is the closed form the penalty model's
+conservation is checked against, it is the right model for a low-speed nudge that
+would otherwise be resolved in one step, and its energy figure
+`(1 − e²)/2 · m_eff · u²` is the *target* the penalty force's work integral has to
+reach. Both apply equal and opposite loads at one shared point, so both conserve
+linear and angular momentum identically.
+
+**Hunt–Crossley's small-dissipation law is asymptotic, and reading it as a
+calibration is how a default gets chosen twice as elastic as intended.** The law
+says e = 1 − (2/3)·dissipation·u. Measured on the flat-block fixture at 6 m/s the
+slope is 3.92 against the predicted 4.00 at 0.005 s/m — and has fallen to 2.05 by
+0.25 s/m, where the linear extrapolation says e = 0 and the truth is e = 0.49. The
+default was set from the extrapolation first and is now set from the measurement:
+**0.8 s/m**, delivering e = 0.20 at 6 m/s and absorbing 96% of the closing energy,
+which is where ship-collision energy ratios sit. It is speed dependent by
+construction — 0.65 at 1 m/s, 0.12 at 10 m/s — and that is the right direction,
+since a gentle touch does less plastic damage than a ram.
+
+#### Coupling: nothing here replaces a lumped stand-in
+
+Three times in `ship.cpp` — radiation, Ikeda, the MMG polynomial — coupling a real
+model in has meant *deleting* a fraction-of-critical damper that was secretly
+doing the same job, because adding the real thing alongside its own stand-in damps
+the ship twice. **Contact does not have that problem**, and the reason is worth
+stating rather than leaving to be rediscovered: every damping, added-mass and drag
+term in `integrateRigidBody()` is a *fluid* mechanism. Radiation, viscous roll,
+cross-flow drag, hull resistance — all of them act on a ship that is nowhere near
+another ship, none of them was ever a proxy for hull-to-hull contact, and none of
+them switches off while contact is happening. `Ship` therefore loses nothing and
+gains one thing: an `externalForce` / `externalMoment` accumulator in the world
+frame, taken about the centre of gravity, applied after the damping loop and
+**cleared** once consumed.
+
+It is divided by the *effective* mass, added mass included, which is right — a
+struck ship accelerates with the water it has to shove aside — and which means the
+two ships in a collision do not conserve momentum between themselves alone. The
+difference is in the water. The conservation laws are asserted against bare rigid
+bodies, where they hold exactly.
+
+The one double count that does exist is small and in the other direction: while
+the hulls overlap, both ships claim buoyancy from the same displaced water. A ram
+deep enough to matter — 10 m³ of overlap — credits 10 t of extra buoyancy against
+20,000 t of ship, below the noise of everything else, and removing it would mean
+subtracting the overlap from each hull's own hydrostatic integral for no
+observable change.
+
+#### What a ram looks like in numbers
+
+Two S-175-like hulls, one at rest, the other striking her port side 30 m forward
+of midship at 6 m/s, both floating free with hydrostatics, damping and drag:
+
+| | |
+|---|---|
+| closing speed | 6.0 m/s |
+| contact duration | 1.62 s (162 steps at dt = 10 ms) |
+| peak normal force | 323 MN |
+| penetration at peak | 0.398 m |
+| projected patch at peak | 11.4 m² |
+| mean contact pressure at peak | 28.3 MPa |
+| energy absorbed | 233 MJ |
+| patch location, struck ship's frame | x = +30.0 m, y = +9.3 m, z = +8.3 m |
+
+The patch lands within 5 cm of the station aimed at, on the port side, inside the
+hull's depth — which is the number the structural model consumes.
+
+#### What this cannot represent
+
+- **Two contact regions at once.** A bow and a quarter touching simultaneously
+  produce one volume, one centroid and one force, applied *between* them, where
+  nothing is touching. The volume is right and the moment is wrong. This is the one
+  thing a contact-point list does better. `normalAgreement` and `patchSeparation`
+  are published so the case announces itself: two regions a ship's length apart put
+  the two patch centroids a ship's length apart, where a single region puts them
+  within its own penetration depth.
+- **Deep or engulfing penetration.** Once the overlap stops being a thin lens the
+  equivalent box is no longer flat and its smallest extent stops being a depth. In
+  a real ship that state arrives long after the shell has failed, but nothing here
+  detects it.
+- **The structure.** The contact is rigid. A real 6 m/s ram spends most of its
+  energy crushing bow and side at roughly constant force over metres of
+  penetration; a rigid contact reaches a much higher peak force over a much smaller
+  penetration for the same absorbed energy. **Peak force is an over-estimate and
+  penetration an under-estimate**; only the energy and the patch location survive
+  the approximation intact.
+- **Hydrodynamic interaction.** The water squeezed out from between two closing
+  hulls resists, and the added mass of a hull alongside another is not that of a
+  hull alone. Neither is modelled; both make a real collision slightly softer.
+- **Coincident surfaces**, in one direction. Faces coincident with the *same*
+  outward normal are exact — that is the fix above, and a shared face is split
+  evenly between the two reported patches, which is a choice rather than a
+  measurement. Faces coincident with *opposing* normals are exact whenever the
+  coincident tetrahedron is the only one claiming them, which covers two convex
+  hulls laid flush; on a non-convex solid a face on its own skin can also be
+  claimed by a tetrahedron it is not coplanar with, and no per-face rule undoes
+  that. Measured on a box wedged flush into an L-prism's notch while overlapping
+  its other arm: 2.10 m³ reported against 1.60 m³. Deciding membership per point
+  on a coincident face is the coincident-face problem every mesh boolean has and
+  it is not solved here, so **that case is reported in `problems`** instead of
+  being presented as a measurement. It needs exact coplanarity, to a part in 10⁹
+  of the contact region, which two independently placed hulls do not produce.
+- **`ContactHistory::work`** is a rectangle rule on the contact power at the start
+  of each step, so it is **first order in dt** — 1.5% of the closing energy at
+  dt = 1 ms, halving exactly with the step. It is a diagnostic; nothing in the
+  dynamics reads it back.
+
 ### The hard cases
 
 - **Green water on deck**: waves over the bulwark, water loose on deck. Handled by
@@ -1941,7 +2169,10 @@ module has something to be tested against, not because a ferry is a VLCC.
 - **Grounding**: seabed contact with soil mechanics for the reaction, hull raking
   damage as a moving FEM load, and the stability problem of being partly supported
   by the ground.
-- **Collision**: two deformable ships, both FEM-active in the contact zone.
+- **Collision**: two *deformable* ships, both FEM-active in the contact zone. The
+  rigid-body half is done — §2 "Hull-to-hull contact" — so what is left here is
+  the deformation: the contact patch and force history it reports are already the
+  load case a FEM-active zone would be driven by.
 - **Submarines**: pressure hull with depth-dependent loading and collapse depth,
   main ballast and trim tanks, the fact that submerged stability is a different
   problem (no waterplane, so BM = 0 and only BG matters).
