@@ -2444,6 +2444,44 @@ reach, which is exactly what that change was for.
 
 ### Adaptive zone promotion — **implemented**
 
+**End to end on the ferry, which nothing had run.** The pieces were unit-tested
+separately; this is the whole path — a real ship, a real seaway, Tier-0, the
+criterion, and a zone:
+
+| condition | worst yield | worst buckling | worst collapse | promoted |
+|---|---|---|---|---|
+| still water | 0.079 | 0.088 | 0.079 | none |
+| crest, hogging | 0.237 | 0.264 | 0.236 | none |
+| trough, sagging | 0.083 | **0.298** | 0.128 | none |
+
+Nothing promotes, and that is the right answer rather than a broken one: her worst
+utilisation anywhere is 0.298 against a buckling threshold of 0.80. An intact
+ro-pax in a standard wave does not need a finite-element model of her side, and a
+criterion that said otherwise would be promoting for the sake of it.
+
+The contact trigger fires exactly where the plating says it should. Over a bay of
+12 mm plating spanning 0.713 m, `platingCollapsePressure` gives **402 kPa**, and:
+
+| contact force | pressure | promotes |
+|---|---|---|
+| 1.0 MN | 221 kPa | no |
+| **2.0 MN** | **442 kPa** | **yes, 464 elements** |
+| 20.0 MN | 4421 kPa | yes, 464 elements |
+
+Cost separates as designed: Tier-0 is 180–530 ms (the Smith sweep dominating) and
+the decision that reads it is **4–5 µs**, five orders apart, which is why the
+criterion is cheap to run often and the Tier-0 answer it consumes is not. A
+promoted zone at 464 elements sits comfortably inside the ~8000-element ceiling
+the cache cliff imposes.
+
+**Two ways to drive this API wrongly, both found by doing it.** A contact patch
+whose centre is *inboard of the plating* finds no panels — the ferry's shell at
+midship is at y ≈ 9.16 m, and aiming at 8.5 m with a 1.2 m radius reaches nothing.
+And a single `review()` on a fresh `Promoter` never promotes anything, because the
+dwell requires a candidate to qualify on consecutive reviews; promotion lands on
+review 2. Both look like refusals and neither is.
+
+
 `engine/sim/promotion.{hpp,cpp}`, checked by `tests/test_promotion.cpp`, run at
 ship scale by `tools/zone_probe` in `verify.sh full`. The piece that makes the
 tiers one system: **which patches deserve Tier 2, what a solved zone hands back to
