@@ -1097,6 +1097,65 @@ All three are refinements with a clear route, not gaps in the coupling.
 
 ## 3. Structure — adaptive tetrahedral FEM
 
+### Tier-0: the hull girder — **implemented**
+
+`engine/sim/girder.{hpp,cpp}`. The ship as a free beam, which is the cheapest
+structural answer worth having and the one naval architecture has computed by
+hand for a century. Weight and buoyancy cancel in total and in moment — she
+floats, and floats level — but not station by station, and what is left over
+bends the hull.
+
+```
+q(x) = w(x) − b(x)     V(x) = ∫q     M(x) = ∫V      hogging positive
+```
+
+Weight *minus* buoyancy, and that ordering is the whole sign convention: with the
+other one a hogging ship comes out negative. Getting it backwards produces a
+plausible curve of the right magnitude that names every failure as its opposite.
+
+**The free ends are the instrument.** Nothing holds a floating ship up at the
+perpendiculars, so V and M must both be zero there — guaranteed by the two
+equilibrium conditions and by nothing else. A residual is therefore a direct
+measure of every error upstream. Measured on the ferry: shear closes to 4 × 10⁻⁵
+of W/2 and moment to 1.8 × 10⁻³ of WL/8.
+
+**Balancing on the wave is not optional.** The first version computed the girder
+with the ship left at her still-water attitude, and the result was not merely
+inaccurate — the shear and moment curves grew monotonically to the forward
+perpendicular and never closed, because an unbalanced ship carries a net force
+and a net moment that swamp the wave-induced bending. `balanceOnWave()` solves
+for the sinkage and trim that make buoyancy equal weight *and* put B under G:
+two residuals, two unknowns, Newton with a numerical Jacobian, one whole-hull
+integral per residual rather than one per station.
+
+**Measured on the 120 m ferry**, 8984 t, under a standard wave of her own length
+and L/20 height:
+
+| condition | bending moment | |
+|---|---|---|
+| still water | +1.57 × 10⁸ N·m | hogging |
+| crest amidships | +4.70 × 10⁸ N·m | hogging |
+| trough amidships | −1.65 × 10⁸ N·m | sagging |
+
+The wave-induced component is therefore about ±3.2 × 10⁸ N·m, against an
+IACS-style rule-of-thumb sagging moment `0.11 C L² B (Cb + 0.7)` of
+3.59 × 10⁸ N·m — **agreement within 12% with an independent industry estimate**.
+That is a sanity check rather than a validation: the rule is written for a
+specific design wave and load case, so what it establishes is the right order of
+magnitude arrived at down a completely different road.
+
+**What this tier cannot do.** It is a beam: it knows nothing about where stress
+goes within a section, nothing about buckling, nothing about shear lag, nothing
+about local loads. It answers "is the hull girder overloaded", which is the
+question that decides whether a long ship in a seaway survives being long. Turning
+the moment into a stress needs a section modulus, which needs scantlings.
+
+The lightship weight curve is a trapezoidal fit matched to total weight and LCG —
+the Prohaska/Biles construction, and an *assumption*. Floodwater is not assumed:
+each compartment's water is spread over that compartment's own extent, because
+the flooding solver already knows where it is. A flooded hold amidships sags the
+hull, and that coupling is asserted.
+
 The chosen fidelity target is full 3D tetrahedral finite elements. The physical
 obstacle is arithmetic: a 300 m hull with 20 mm plating needs ~10 mm elements to
 resolve bending through the plate thickness, which is on the order of 10¹¹

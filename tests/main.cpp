@@ -47,6 +47,7 @@ int main() {
     runShipFileTests();
     runWorldIoTests();
     runWaveTests();
+    runGirderTests();
     runHullFormTests();
     runRaoTests();
     std::printf("%d checks, %d failures\n", testing::checkCount(), testing::failureCount());
