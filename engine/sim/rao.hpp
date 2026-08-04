@@ -38,6 +38,7 @@ HarmonicFit fitHarmonic(const std::vector<double>& samples, double dt, double om
 struct RaoPoint {
     double omega = 0;           // wave frequency, rad/s
     double encounterOmega = 0;  // what the ship actually feels, rad/s
+    double forwardSpeed = 0;    // m/s, measured over the record if under power
     double waveLength = 0;      // m
     double waveAmplitude = 0;   // m, as driven
 
@@ -63,13 +64,26 @@ struct RaoSettings {
     double waveAmplitude = 0.5;
     double timestep = 0.02;      // s
     double heading = 0.0;        // rad; 0 = following, pi = head seas
-    // Used *only* to work out the frequency the response is fitted at. It does
-    // not propel the ship: the caller is responsible for the hull actually making
-    // way. Zero-speed RAOs are the validated case; leave it at zero unless the
-    // ship is genuinely under power.
+
+    // Still-water running before the wave is switched on, so a ship with
+    // propulsion reaches its own speed rather than being told one.
+    double accelerateSeconds = 0.0;
+
+    // Speed to *assume* when the ship has no propulsion attached -- a towed
+    // model, or a hull whose machinery is not modelled. When `prototype` does
+    // carry propulsion this is ignored and the speed the ship actually achieves
+    // is measured instead, because a requested speed the hull cannot reach would
+    // put the fit at a frequency the ship never met.
     double forwardSpeed = 0.0;   // m/s
     int settleCycles = 15;       // transient discarded before recording
     int recordCycles = 10;       // fitted window
+
+    // Autopilot gains, used only when the ship has propulsion. A hull with real
+    // manoeuvring derivatives is frequently directionally unstable, and one that
+    // has wandered out of the heading it was given is no longer measuring the
+    // RAO that was asked for.
+    double headingGain = 3.0;    // rad of rudder per rad of heading error
+    double rateGain = 30.0;      // rad of rudder per rad/s of yaw rate
 };
 
 // Encounter frequency for a ship making way. omega_e = omega - omega^2 U cos(mu) / g,

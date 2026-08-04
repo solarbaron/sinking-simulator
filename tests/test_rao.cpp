@@ -425,6 +425,193 @@ void testFreeDecayAgreesWithTheFrequencyDomainTable() {
                std::abs(implied - fromTable) < std::abs(implied - aInf));
 }
 
+
+// --- Propulsion coupling -----------------------------------------------------
+
+// A manoeuvring set scaled to the barge. The non-dimensional derivatives stay
+// KVLCC2's: wrong in detail for a box, right in order of magnitude, and not what
+// is under test here -- these tests ask whether the coupling moves the ship and
+// whether the sea it meets is the right one, not whether a barge has a tanker's
+// hydrodynamics.
+Ship poweredBarge(double revsPerSecond) {
+    Ship s = makeBarge(32);
+    Manoeuvring m = kvlcc2();
+    m.hull.length = 60.0;
+    m.hull.beam = 16.0;
+    m.hull.draft = 4.0;
+    m.hull.blockCoefficient = 1.0;
+    m.hull.xCog = 0.0;
+    m.propeller.diameter = 2.5;
+    m.rudder.area = 3.0;
+    m.rudder.span = 2.2;
+    m.rudder.x = -28.0;
+    m.rudder.flowStraighteningLever = -42.6;   // scaled from -227.2 by 60/320
+    m.rudder.hullLiftLever = -27.8;            // scaled from -148.5
+    m.revsPerSecond = revsPerSecond;
+    s.propulsion = m;
+    s.initialise(0.0);
+    return s;
+}
+
+// Speed along the ship's own bow. RigidState::velocity is a *world* vector, so
+// its x component is the ship's speed only while the ship still points that way.
+// Reading it directly made a perfectly steady turn look like a chaotic speed
+// trace, because the world-frame component oscillates with heading while the
+// real surge speed is dead constant.
+double surgeOf(const Ship& ship) {
+    const Mat3 R = ship.state.orientation.toMat3();
+    return dot(ship.state.velocity, R * Vec3{1, 0, 0});
+}
+
+double runToSpeed(Ship& ship, double seconds, double dt = 0.02) {
+    const Sea still(0.0);
+    const auto steps = static_cast<long long>(seconds / dt);
+    for (long long i = 0; i < steps; ++i) ship.step(dt, still);
+    return surgeOf(ship);
+}
+
+void testPropulsionDrivesTheShip() {
+    double previous = 0;
+    for (double revs : {0.5, 1.0, 1.5}) {
+        Ship ship = poweredBarge(revs);
+        const double speed = runToSpeed(ship, 400.0);
+        expectTrue("the ship makes way ahead", speed > previous + 0.05);
+        previous = speed;
+    }
+    expectTrue("and reaches a useful speed, not a crawl", previous > 0.5);
+
+    // Steady state means thrust balances resistance, so the speed stops changing.
+    //
+    // The window matters and was got wrong first time: a 3.9e6 kg hull has an
+    // acceleration time constant of *minutes*. Measured, this one is at 61% of
+    // its final speed after 300 s and within 0.3% after 1200 s, so asking
+    // whether it had converged at 400 s was asking the wrong question of correct
+    // behaviour.
+    Ship steady = poweredBarge(1.5);
+    const double first = runToSpeed(steady, 1200.0);
+    const double second = runToSpeed(steady, 300.0);
+    expectTrue("speed settles rather than climbing without limit",
+               std::abs(second - first) < 0.02 * first);
+
+    // Astern rotation must drive the ship astern, not merely slow it. This is the
+    // case a crash stop needs and the one a first-quadrant propeller model gets
+    // wrong while looking entirely plausible ahead.
+    Ship astern = poweredBarge(-1.5);
+    expectTrue("astern revolutions drive the ship astern", runToSpeed(astern, 400.0) < -0.1);
+}
+
+// The rudder convention is stated in propulsion.hpp: positive delta swings the
+// bow to port, which is positive yaw about +z. A sign error here turns the ship
+// the wrong way, which looks like steering and is not.
+void testRudderTurnsTowardsTheCommandedSide() {
+    Ship port = poweredBarge(1.5);
+    runToSpeed(port, 300.0);
+    Ship starboard = port;
+    port.propulsion->rudderAngle = 20.0 * kPi / 180.0;
+    starboard.propulsion->rudderAngle = -20.0 * kPi / 180.0;
+
+    const Sea still(0.0);
+    for (int i = 0; i < 3000; ++i) {         // 60 s of helm
+        port.step(0.02, still);
+        starboard.step(0.02, still);
+    }
+    expectTrue("positive rudder swings the bow to port", port.state.angularVelocity.z > 1e-4);
+    expectTrue("negative rudder swings it to starboard",
+               starboard.state.angularVelocity.z < -1e-4);
+    // Port/starboard symmetry: a symmetric hull must turn equally hard each way.
+    expectNear("the two turns are mirror images", port.state.angularVelocity.z,
+               -starboard.state.angularVelocity.z,
+               0.05 * std::abs(port.state.angularVelocity.z));
+}
+
+// The milestone check, and the reason forward speed had to exist at all.
+//
+// Nothing imposes the encounter frequency. The surface is cos(k x - omega t + phi)
+// and the ship's x is moving, so a hull under way meets waves at |omega - k U|
+// purely because it translates through a spatially varying field. If that does
+// not fall out, comparing against published RAOs -- which are all tabulated
+// against encounter frequency at a Froude number -- would be meaningless.
+//
+// The response frequency is measured *independently*, by scanning the harmonic
+// fit for the frequency that leaves least unexplained. Reading encounterOmega
+// back out of measureRaoAt() would only confirm that a formula was evaluated.
+void testEncounterFrequencyEmergesFromMovingThroughTheWave() {
+    Ship ship = poweredBarge(2.0);
+    runToSpeed(ship, 400.0);
+
+    const double omega = 0.7;
+    const double dt = 0.02;
+    const WaveField field = WaveField::regular(0.3, omega, kPi);   // head seas
+    Sea sea;
+    sea.waves = &field;
+
+    std::vector<double> heave;
+    double speedSum = 0;
+    int samples = 0;
+    for (int i = 1; i <= 15000; ++i) {       // 300 s, first third discarded
+        sea.time = i * dt;
+        ship.step(dt, sea);
+        if (i > 5000) {
+            heave.push_back(ship.state.position.z);
+            speedSum += surgeOf(ship);
+            ++samples;
+        }
+    }
+    const double speed = speedSum / samples;
+    expectTrue("the ship was genuinely under way", speed > 0.5);
+
+    double bestOmega = 0, bestResidual = 1e30;
+    for (double w = 0.3; w <= 1.6; w += 0.001) {
+        const HarmonicFit fit = fitHarmonic(heave, dt, w);
+        if (fit.residual < bestResidual) {
+            bestResidual = fit.residual;
+            bestOmega = w;
+        }
+    }
+
+    const double predicted = encounterFrequency(omega, speed, kPi);
+
+    // Vacuity guard, and the whole point: at rest omega_e is omega, so a test
+    // that merely found "some frequency near omega" would pass on a ship that
+    // never moved. The shift has to be far larger than the search resolution.
+    expectTrue("the Doppler shift is large enough to be the thing measured",
+               predicted - omega > 0.05);
+    expectNear("a moving ship meets waves at the encounter frequency", bestOmega, predicted,
+               0.02 * predicted);
+    expectTrue("and not at the wave's own frequency",
+               std::abs(bestOmega - omega) > 0.5 * (predicted - omega));
+}
+
+// measureRaoAt must run the ship up to speed rather than take one on trust,
+// report what it actually achieved, and keep it pointed where it was aimed.
+//
+// The acceleration window is deliberately past the point where this hull departs
+// into a turn unsteered -- measured at about 1900 s. That makes the check
+// discriminating rather than decorative: without the autopilot the ship ends up
+// in a steady turn at 1.05 m/s of surge instead of running straight at 1.99, and
+// every RAO measured from it would be at the wrong speed, the wrong heading, and
+// entirely plausible-looking.
+void testRaoMeasuresTheSpeedItActuallyReached() {
+    const Ship driven = poweredBarge(1.5);
+    RaoSettings settings;
+    settings.waveAmplitude = 0.3;
+    settings.heading = kPi;
+    settings.accelerateSeconds = 2200.0;
+    settings.forwardSpeed = 99.0;   // absurd, and must be ignored
+    settings.settleCycles = 8;
+    settings.recordCycles = 6;
+
+    const RaoPoint point = measureRaoAt(driven, 0.7, settings);
+    expectTrue("the measured speed is the ship's own, not the requested one",
+               point.forwardSpeed > 0.5 && point.forwardSpeed < 20.0);
+    expectTrue("the ship was held straight rather than left to fall into a turn",
+               point.forwardSpeed > 1.7);
+    expectTrue("head seas raise the encounter frequency", point.encounterOmega > 0.7);
+    expectNear("and it follows from the speed that was measured", point.encounterOmega,
+               encounterFrequency(0.7, point.forwardSpeed, kPi), 1e-9);
+    expectTrue("the response is still a usable RAO", point.heave > 0.05 && point.heave < 3.0);
+}
+
 }  // namespace
 
 void runRaoTests() {
@@ -441,4 +628,8 @@ void runRaoTests() {
     testStationsFromAMeshAreExactForABox();
     testRadiationMemoryDampsRatherThanDiverges();
     testFreeDecayAgreesWithTheFrequencyDomainTable();
+    testPropulsionDrivesTheShip();
+    testRudderTurnsTowardsTheCommandedSide();
+    testEncounterFrequencyEmergesFromMovingThroughTheWave();
+    testRaoMeasuresTheSpeedItActuallyReached();
 }

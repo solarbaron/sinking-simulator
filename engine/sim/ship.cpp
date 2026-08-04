@@ -434,6 +434,16 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
         Ieff(2, 2) = mp.inertiaAboutCog(2, 2) + aInf[5][5];
     }
 
+    // Surge added mass, the one entry strip theory structurally cannot supply,
+    // comes from the manoeuvring set when there is one: m_x' non-dimensionalised
+    // on 0.5 rho L^2 d. This is exactly the hole documented above being filled by
+    // the only model here that has an answer for it.
+    if (propulsion.has_value()) {
+        const HullParams& mmg = propulsion->hull;
+        const double reference = 0.5 * seaDensity * mmg.length * mmg.length * mmg.draft;
+        mEff.x = mp.mass + mmg.addedMassSurge * reference;
+    }
+
     const Vec3 vBody = R.transposed() * state.velocity;
     const Vec3 wBody = R.transposed() * state.angularVelocity;
 
@@ -472,7 +482,22 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
     const Vec3 ext = hullHi - hullLo;
     const double draft = std::max(0.1, sea.level - (state.position.z + hullLo.z));
     const Vec3 projArea{ext.y * draft, ext.x * draft, ext.x * ext.y};
-    const Vec3 dragCoeff{0.10, 1.00, 1.50};
+    Vec3 dragCoeff{0.10, 1.00, 1.50};
+
+    // The same argument as radiation, one deck down. A drag coefficient of 0.10
+    // on the bow's projected area is a stand-in for hull resistance, and 1.00 on
+    // the side is a stand-in for cross-flow drag. The MMG polynomial computes
+    // both properly -- R_0' for resistance, Y_v and its higher terms for the
+    // lateral force -- so with a manoeuvring set attached the stand-ins go, and
+    // the yaw damper with them, since N_r is what that was standing in for.
+    // Heave keeps its drag: nothing in a horizontal-plane model speaks to it.
+    if (propulsion.has_value()) {
+        dragCoeff.x = 0.0;
+        dragCoeff.y = 0.0;
+        cLin.x = 0.0;
+        cLin.y = 0.0;
+        cAng.z = 0.0;
+    }
 
     Vec3 fBody = R.transposed() * force;
     Vec3 tBody = R.transposed() * torque;
@@ -481,6 +506,28 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
         fBody[i] -= cLin[i] * v
                   + 0.5 * seaDensity * dragCoeff[i] * projArea[i] * std::abs(v) * v;
         tBody[i] -= cAng[i] * wBody[i];
+    }
+
+    // Propeller, rudder and the MMG hull polynomial, in the horizontal plane.
+    //
+    // Ship owns the motion: the manoeuvring state is overwritten from the rigid
+    // body here and only read back as forces, so the two cannot disagree about
+    // where the ship is or how fast it is going.
+    if (propulsion.has_value()) {
+        propulsion->density = seaDensity;
+        propulsion->state.surgeSpeed = vBody.x;
+        propulsion->state.swaySpeed = vBody.y;
+        propulsion->state.yawRate = wBody.z;
+
+        const PlanarForces planar = propulsion->forces();
+        const Vec3 horizontal{planar.surge, planar.sway, 0.0};
+        fBody += horizontal;
+        // X and Y act at midship -- the body origin -- while this integrator
+        // takes moments about the centre of gravity, so the offset contributes a
+        // yaw moment of its own. On a hull with x_G forward of midship that term
+        // is not small, and dropping it would make the ship turn about the wrong
+        // point in a way that still looks like turning.
+        tBody.z += planar.yawMoment + cross(Vec3{} - mp.cog, horizontal).z;
     }
 
     // The wave-memory force: waves this ship radiated earlier, still nearby and

@@ -657,6 +657,88 @@ must be resolved when Ikeda damping is wired in and roll is validated properly.
 Heave is unaffected (translation-invariant) and pitch is unaffected given strip
 theory's zero surge added mass.
 
+### Propulsion coupled into the ship — **implemented, opt-in**
+
+`Ship::propulsion` holds an optional `Manoeuvring`. Ship owns the motion: the
+manoeuvring state is overwritten from the rigid body every tick and only ever
+read back as forces, so the two cannot disagree about where the ship is. The
+horizontal-plane forces `X`, `Y` and the yaw moment `N` are applied in the body
+frame; `X` and `Y` act at midship while the integrator takes moments about the
+centre of gravity, so the offset contributes a yaw moment of its own — dropping
+it would make the ship turn about the wrong point in a way that still looks like
+turning.
+
+**Stand-ins removed, for the third time in this file.** A drag coefficient of
+0.10 on the bow's projected area was standing in for hull resistance, and 1.00 on
+the side for cross-flow drag. The MMG polynomial computes both properly (`R_0'`,
+`Y_v` and its higher terms), so with a manoeuvring set attached those go, and the
+yaw damper with them since `N_r` is what *it* was standing in for. Heave keeps its
+drag: nothing in a horizontal-plane model speaks to it. Conversely, surge added
+mass now comes from `m_x'` — filling exactly the hole strip theory leaves, since
+`A_inf[0][0]` is a structural zero.
+
+**One overlap is not resolved and is not hidden.** With both radiation and
+propulsion attached, sway is damped by radiation (wave-making) *and* by `Y_v`
+(lifting and cross-flow). These are different physical mechanisms that dominate
+in different frequency bands — radiation at wave frequencies, `Y_v` at
+manoeuvring frequencies — so adding them double-counts in the middle. At zero
+speed there is no overlap at all, because `evaluateHull()` returns only
+resistance when the speed is zero. The proper treatment is a frequency crossover
+between the seakeeping and manoeuvring models, which is a research topic rather
+than an oversight to be tidied away.
+
+**The encounter frequency is emergent, and this is the point of the whole
+exercise.** Nothing imposes it. The surface is `A cos(kx − ωt + φ)` and the ship's
+x is moving, so a hull under way meets waves at `|ω − kU|` purely because it
+translates through a spatially varying field. Measured on the barge at three
+frequencies, against `encounterFrequency()` at the speed the ship actually
+achieved:
+
+| ω | U, m/s | predicted ω_e | measured ω_e | error |
+|---|---|---|---|---|
+| 0.55 | 2.02 | 0.6123 | 0.6125 | 0.0% |
+| 0.70 | 2.31 | 0.8152 | 0.8160 | 0.1% |
+| 0.85 | 2.13 | 1.0068 | 1.0075 | 0.1% |
+
+The response frequency there is measured *independently*, by scanning the
+harmonic fit for the frequency leaving least unexplained; reading
+`encounterOmega` back out of `measureRaoAt()` would only confirm that a formula
+had been evaluated. A first attempt reported 3–6% error and that was entirely the
+measurement: an exponential drift filter with a 10 s time constant sitting on a
+9 s wave is a high-pass filter on the signal.
+
+**Two things this turned up about running a ship at all.**
+
+*Acceleration takes minutes.* A 3.9 × 10⁶ kg hull reaches 61% of its final speed
+after 300 s and settles by about 1800 s. A test asking whether it had converged
+at 400 s was asking the wrong question of correct behaviour.
+
+*The hull is directionally unstable*, which is unsurprising with KVLCC2
+derivatives — that hull is the standard unstable example. Left alone it runs dead
+straight for about 1900 s and then departs into a *steady* turn: surge 1.0515,
+sway 0.4969, both constant, heading rotating uniformly. `measureRaoAt()` therefore
+steers, with proportional-on-heading and derivative-on-yaw-rate gains in
+`RaoSettings`. A ship that has quietly turned out of head seas is no longer
+measuring the RAO that was asked for, while still producing a number.
+
+That departure was first read as chaos, because the speed trace was oscillating
+between +1.6 and −1.2 m/s. It was not: `RigidState::velocity` is a **world**
+vector, and its x component is the ship's speed only while the ship still points
+along world x. The surge speed was constant the whole time. `rao.cpp` and the
+tests now both take speed along the ship's own bow.
+
+**Forward speed in `RaoSettings` is now measured, not asserted.**
+`accelerateSeconds` runs the ship up in still water first, and the encounter
+frequency is re-derived from the mean surge over the recording window, because
+added resistance in waves means the speed under way is not the speed it settled
+at in flat water. `forwardSpeed` survives only for hulls with no machinery
+modelled — a towed model — and is ignored outright when propulsion is attached.
+
+One consequence worth stating: the reference wave is sampled **at the ship**, not
+at the origin. A moving hull meets the wave at ω_e while the surface at a fixed
+point still oscillates at ω, so fitting the origin's history at ω_e would return
+a small meaningless amplitude and every RAO would be normalised by it.
+
 ### Viscous roll damping — **implemented**
 
 Potential flow gives no roll damping at all — it is entirely viscous and it is the

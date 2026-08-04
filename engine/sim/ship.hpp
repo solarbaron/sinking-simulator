@@ -18,6 +18,7 @@
 #pragma once
 
 #include "../core/geometry.hpp"
+#include "propulsion.hpp"
 #include "radiation.hpp"
 #include "waves.hpp"
 
@@ -166,6 +167,16 @@ public:
     // value, not shared: the memory states are part of *this* ship's history, and
     // two copies riding the same states would be two ships pretending to be one.
     std::optional<RadiationForce> radiation;
+
+    // Propulsion, steering and horizontal-plane hydrodynamics. Optional, like
+    // radiation: a drifting casualty has none, and that is the case Phase 0 was
+    // built around.
+    //
+    // `Manoeuvring` carries its own ManoeuvringState, and this ship does *not*
+    // let it integrate. Ship owns the motion; the state is overwritten from the
+    // rigid body every tick and only ever read back as forces. Anything else
+    // would be two integrators disagreeing about where the ship is.
+    std::optional<Manoeuvring> propulsion;
 
     RigidState state;
 

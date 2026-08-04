@@ -35,6 +35,34 @@ bool solve3x3(const double a[3][3], const double b[3], double x[3]) {
     return true;
 }
 
+// Speed along the ship's own bow, not along world +x. RigidState::velocity is a
+// world vector, so its x component is the ship's speed only while the ship
+// happens to point that way -- and a hull that has turned reports a surge speed
+// that oscillates with its heading while the real one is dead constant. That
+// mistake produced a "chaotic" speed trace that was a perfectly steady turn.
+double surgeSpeed(const Ship& ship) {
+    const Mat3 R = ship.state.orientation.toMat3();
+    return dot(ship.state.velocity, R * Vec3{1, 0, 0});
+}
+
+// Hold the initial heading with the rudder.
+//
+// Not a convenience. Real manoeuvring derivatives often describe a
+// directionally *unstable* hull -- the reference set here runs straight for
+// about 1900 s and then departs into a steady turn -- and a ship that has turned
+// out of head seas has stopped measuring the thing that was asked for, quietly
+// and while still producing a plausible number. Proportional on heading error,
+// derivative on yaw rate; positive rudder swings the bow to port, so correcting
+// a bow-to-port error needs negative rudder.
+void holdHeading(Ship& ship, double headingGain, double rateGain) {
+    if (!ship.propulsion.has_value()) return;
+    const Mat3 R = ship.state.orientation.toMat3();
+    const Vec3 forward = R * Vec3{1, 0, 0};
+    const double heading = std::atan2(forward.y, forward.x);
+    const double demand = -headingGain * heading - rateGain * ship.state.angularVelocity.z;
+    ship.propulsion->rudderAngle = std::clamp(demand, -35.0 * kPi / 180.0, 35.0 * kPi / 180.0);
+}
+
 }  // namespace
 
 HarmonicFit fitHarmonic(const std::vector<double>& samples, double dt, double omega) {
@@ -94,18 +122,34 @@ RaoPoint measureRaoAt(const Ship& prototype, double omega, const RaoSettings& se
 
     const double k = deepWaterWavenumber(omega);
     point.waveLength = 2.0 * kPi / k;
-    point.encounterOmega = encounterFrequency(omega, settings.forwardSpeed, settings.heading);
-    const double omegaResponse = std::abs(point.encounterOmega);
-    if (omegaResponse <= 0.0) return point;
-
-    const WaveField field = WaveField::regular(settings.waveAmplitude, omega, settings.heading);
-    Sea sea;
-    sea.waves = &field;
 
     Ship ship = prototype;
     ship.initialise(0.0);
 
     const double dt = settings.timestep;
+
+    // Let a powered ship reach its own speed in still water before the wave
+    // arrives. A speed the hull cannot actually hold would put the fit at a
+    // frequency the ship never met, which is why this is run rather than asked
+    // for: with propulsion attached, settings.forwardSpeed is ignored entirely.
+    double speed = settings.forwardSpeed;
+    if (ship.propulsion.has_value() && settings.accelerateSeconds > 0.0) {
+        const Sea still(0.0);
+        const auto steps = static_cast<long long>(settings.accelerateSeconds / dt);
+        for (long long i = 0; i < steps; ++i) {
+            holdHeading(ship, settings.headingGain, settings.rateGain);
+            ship.step(dt, still);
+        }
+        speed = surgeSpeed(ship);
+    }
+
+    point.encounterOmega = encounterFrequency(omega, speed, settings.heading);
+    double omegaResponse = std::abs(point.encounterOmega);
+    if (omegaResponse <= 0.0) return point;
+
+    const WaveField field = WaveField::regular(settings.waveAmplitude, omega, settings.heading);
+    Sea sea;
+    sea.waves = &field;
     const double responsePeriod = 2.0 * kPi / omegaResponse;
     const auto settleSteps =
         static_cast<long long>(settings.settleCycles * responsePeriod / dt);
@@ -118,9 +162,11 @@ RaoPoint measureRaoAt(const Ship& prototype, double omega, const RaoSettings& se
     pitch.reserve(static_cast<std::size_t>(recordSteps));
     roll.reserve(static_cast<std::size_t>(recordSteps));
     wave.reserve(static_cast<std::size_t>(recordSteps));
+    double speedSum = 0;
 
     for (long long i = 0; i < settleSteps + recordSteps; ++i) {
         sea.time = static_cast<double>(i) * dt;
+        holdHeading(ship, settings.headingGain, settings.rateGain);
         ship.step(dt, sea);
         if (i < settleSteps) continue;
 
@@ -135,11 +181,28 @@ RaoPoint measureRaoAt(const Ship& prototype, double omega, const RaoSettings& se
         heave.push_back(ship.state.position.z);
         pitch.push_back(trimRad);
         roll.push_back(heelRad);
-        // The driving wave, sampled at the origin over the very same window.
+        speedSum += surgeSpeed(ship);
+        // The driving wave, sampled **at the ship** over the very same window.
         // Fitting it rather than deriving its phase analytically means the
         // reported motion phases cannot pick up a sign error from the
         // book-keeping of when the window started.
-        wave.push_back(field.elevation(0.0, 0.0, sea.time));
+        //
+        // At the ship, not at the origin: a moving hull meets the wave at the
+        // encounter frequency, while the surface at a fixed point still
+        // oscillates at omega. Fitting the origin's history at omega_e would
+        // return a small, meaningless amplitude and every RAO would be
+        // normalised by it. For a ship at rest the two are the same sample.
+        wave.push_back(field.elevation(ship.state.position.x, ship.state.position.y, sea.time));
+    }
+
+    // Added resistance in waves slows a ship, so the speed over the record is not
+    // the speed it settled at in flat water. Re-derive the encounter frequency
+    // from what actually happened and fit at that.
+    point.forwardSpeed = recordSteps > 0 ? speedSum / static_cast<double>(recordSteps) : speed;
+    if (ship.propulsion.has_value()) {
+        point.encounterOmega = encounterFrequency(omega, point.forwardSpeed, settings.heading);
+        omegaResponse = std::abs(point.encounterOmega);
+        if (omegaResponse <= 0.0) return point;
     }
 
     const HarmonicFit waveFit = fitHarmonic(wave, dt, omegaResponse);

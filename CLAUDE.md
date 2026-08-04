@@ -87,6 +87,7 @@ most useful thing to know about this codebase:
 | Radiation solver returning **negative** damping at four frequencies in the seakeeping band | a near-field/far-field **energy balance**, not any coefficient test |
 | Retardation fitted over 1.3 s of a 20 s decay, turning a damper into an integrator | a free-decay test, after the ship reached NaN in five steps |
 | Radiation damping added *on top of* the modal damping standing in for it | comparing an RAO sweep before and after, not any single run |
+| Reading `state.velocity.x` as "speed" — it is a *world* vector | a steady turn that looked like chaos until surge was taken along the bow |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct.
