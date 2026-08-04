@@ -371,16 +371,36 @@ void testSpaceLocation() {
     expectTrue("but nowhere near a half", defective > 0.8);
     expectEqual("so it still locates", spaceAt(holed, {-25, 0, 3}), barge.aftHold);
 
-    // On the real ship the same situation arises from the *subdivision*, not from
-    // a deck: amidships the engine-room boxes stop at |y| = 8 m while the shell
-    // is out past 8.6 m, so the plating over the engine room mostly faces a void.
+    // The same three-way answer on the real ship, where the subdivision rather
+    // than a missing face decides it.
+    //
+    // This assertion used to read the other way round: outboard of the engine
+    // room *was* an unmodelled void, because the mid wing tanks had never been
+    // authored and the band from y = 8 m to the shell belonged to nothing over
+    // the 28 m of machinery space. The test pinned that down as though it were
+    // the design. It was a defect -- ramming her amidships tore 63 bays of which
+    // 26 opened onto nothing -- and the ship now carries the tanks the forward
+    // and after ends always had. Asserting the fix here is what stops it coming
+    // back, and the deliberate void above the barge's holds is what keeps the
+    // three-way answer honest, rather than a hole in a ship that should not have
+    // one.
     Ship ferry = game::buildFerry();
     ferry.initialise(0.0);
     expectEqual("the ferry's starboard engine room locates by name",
                 spaceAt(ferry, {6, -4, 4}), ferry.findCompartment("engine_room_s"));
-    expectEqual("outboard of the ferry's engine room is an unmodelled void",
-                spaceAt(ferry, {6, -8.3, 4}), kEnclosedVoid);
+    expectEqual("outboard of it is the wing tank, not a void",
+                spaceAt(ferry, {6, -8.3, 4}), ferry.findCompartment("wing_tank_mid_s"));
     expectEqual("outboard of the ferry's shell is the sea", spaceAt(ferry, {6, -12, 4}), kSea);
+
+    // The gap ran the length of the machinery space, so check both ends of it and
+    // not just the middle: a tank carved 4 m short at either end would satisfy the
+    // single probe above and leave most of the defect in place.
+    expectEqual("and at the forward end of the machinery space",
+                spaceAt(ferry, {19, -8.6, 4}), ferry.findCompartment("wing_tank_mid_s"));
+    expectEqual("and at the after end", spaceAt(ferry, {-7, -8.6, 4}),
+                ferry.findCompartment("wing_tank_mid_s"));
+    expectEqual("and on the port side", spaceAt(ferry, {6, 8.3, 4}),
+                ferry.findCompartment("wing_tank_mid_p"));
 }
 
 // --- Connectivity -------------------------------------------------------------
@@ -1087,27 +1107,38 @@ void testFerryConnectivity() {
                        wing.problems[0].find("from itself") != std::string::npos);
     }
 
-    // Amidships the engine-room boxes stop short of the shell, so most of the
-    // plating over them faces a void. That must open nothing and say so -- the
-    // dangerous alternative is calling the void "sea" and flooding a compartment
-    // that the tear does not actually reach.
-    int voidPanel = -1;
-    for (std::size_t i = 0; i < damage.mesh.panels.size() && voidPanel < 0; ++i) {
+    // Side plating amidships, which is the piece the whole mid wing tank fix is
+    // about. It used to face nothing -- the engine-room boxes stopped at |y| = 8
+    // and the shell is out past 8.6 -- so tearing it opened nothing and this test
+    // asserted exactly that, treating a hole in the subdivision as the design.
+    //
+    // It must now open the sea into the wing tank, and specifically into the *wing
+    // tank* rather than the engine room: putting the sea straight into machinery
+    // is the failure the tank exists to prevent, and a probe that marched too far
+    // inboard would do it while still producing one plausible-looking opening.
+    int sidePanel = -1;
+    for (std::size_t i = 0; i < damage.mesh.panels.size() && sidePanel < 0; ++i) {
         const PlatePanel& panel = damage.mesh.panels[i];
         if (panel.role != PanelRole::Shell) continue;
         const Vec3 c = panel.centroid();
         if (c.x > 0 && c.x < 12 && c.y < -8.2 && c.z > 3.5 && c.z < 5.0)
-            voidPanel = static_cast<int>(i);
+            sidePanel = static_cast<int>(i);
     }
     expectTrue("the ferry has side plating amidships outboard of the engine room",
-               voidPanel >= 0);
-    if (voidPanel >= 0) {
-        const BreachSet gap = breachesFromFailedPanels(ship, damage.mesh, {voidPanel});
-        expectEqual("plating over an unmodelled void opens nothing",
-                    static_cast<long long>(gap.breaches.size()), 0);
-        expectTrue("and names the void",
-                   gap.problems.size() == 1 &&
-                       gap.problems[0].find("no compartment describes") != std::string::npos);
+               sidePanel >= 0);
+    if (sidePanel >= 0) {
+        const BreachSet gap = breachesFromFailedPanels(ship, damage.mesh, {sidePanel});
+        expectEqual("plating amidships now opens into the ship rather than nothing",
+                    static_cast<long long>(gap.breaches.size()), 1);
+        if (gap.breaches.size() == 1) {
+            const Opening& o = gap.breaches[0].opening;
+            expectEqual("from the sea", o.a, kSea);
+            expectEqual("into the starboard mid wing tank", o.b,
+                        ship.findCompartment("wing_tank_mid_s"));
+            expectTrue("and not into the machinery space behind it",
+                       o.b != ship.findCompartment("engine_room_s"));
+        }
+        expectTrue("with nothing left unexplained", gap.problems.empty());
     }
 
     // The reason the probe marches, on the geometry that forced it. A shell panel

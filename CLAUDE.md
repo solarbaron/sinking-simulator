@@ -99,6 +99,8 @@ most useful thing to know about this codebase:
 | A published damage table whose energy column was ½·v²·the **struck** ship's mass — the wrong ship, and as if all of it reached the plating | re-running the tool that generated the table instead of quoting the table |
 | Three documents claiming a fix was still unapplied, above code that applied it | the same re-run; nothing tests a comment |
 | "The hole is 10× too big" inferred from a **force** ratio, when the hole is set by energy per unit area and moves 5% | measuring the two effects separately instead of propagating one number |
+| The ferry's **mid wing tanks were never authored**, so 41% of a ram amidships tore open onto no compartment and could not flood | reading a warning `ram_view` had printed on every run for months |
+| A published "hole size stops mattering" finding that was an **artefact of that gap** — the extra hole opened onto nothing by construction | re-deriving the finding after the defect was fixed, not just the figures |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct. **Nothing at all tests a comment** — three documents here repeated a

@@ -376,8 +376,9 @@ The longest and highest-risk phase.
   exercises collision, indentation, breach and flooding *against each other*.
 
   At 6 m/s: 1.14 s in contact, 149 MN peak, 74 MJ absorbed, 0.205 m into her,
-  63 bays torn, 107.7 m² of hole, 2210 t of water, and she is lost with
-  GM −1.62 m.
+  63 bays torn, 107.7 m² of hole reaching four compartments, and she capsizes —
+  19° of heel by 150 s, through 90° before 300 s, and lying at 165° with 16 613 t
+  in her at 900 s.
 
   Those figures were first published with the indentation model spanning the
   frames at 2.40 m where the plating actually spans the longitudinals at 0.70 m.
@@ -390,21 +391,44 @@ The longest and highest-risk phase.
   2.96 MN against 10.35, and 0.686 m of denting against 0.205, both in the
   direction of reporting the hull as far softer than it is.
 
-  Two things fall out of it rather than being put in. **Beyond a threshold the
-  outcome stops caring how big the hole is** — from 1.5 to 6 m/s the hole grows
-  from 3.4 to 107.7 m², thirty-two times over, and the floodwater moves 2%: 2254 t
-  against 2210 t. A small breach fills the compartment behind it inside 900 s just
-  as a large one does. Damage stability is decided by *which* compartments open,
-  which is what the subdivision rules are written around. And **where she is
-  struck decides how she dies**: amidships she takes 2210 t and lolls 8.1° to
-  starboard, at the quarter she takes 7102 t and goes over to 45° the other way.
+  Two things fall out of it rather than being put in.
+
+  **There is a saturation regime, and it is narrower than this section used to
+  claim.** From 3 to 5.5 m/s the hole grows from 24 to about 95 m², four times
+  over, and the floodwater moves 3%: 7182 t against 7415 t. A breach past a
+  certain size fills the compartments behind it inside 900 s no faster than a
+  smaller one does, so damage stability is decided by *which* compartments open —
+  which is what the subdivision rules are written around.
+
+  It is bounded on both sides, and the earlier draft of this paragraph had the
+  lower bound wrong for a reason worth recording. It claimed saturation all the
+  way down to 1.5 m/s, over a 32× range of hole size. That was an artefact of a
+  defect: the mid wing tanks did not exist, so the extra hole area amidships
+  opened onto no compartment at all and could not flood anything by construction.
+  With the tanks in place, a strike at 1.5 m/s opens 3.4 m² and takes 2254 t,
+  lolling her 9.4°, while 3 m/s takes 7182 t and puts her at 60.6° — the low end
+  does not saturate, it simply had nowhere to put the water.
+
+  **And she goes over.** Above 5.75 m/s the amidships strike stops being a loll
+  and becomes a capsize: at 5.5 m/s she lolls to 63° with 7415 t, at 5.75 she
+  rolls through to 167° with 16 425 t, and beyond that the inverted result is
+  steady to four figures (16 613 t at 6 m/s, 16 627 at 6.5). The threshold is
+  sharp, and 6 m/s — the speed this section publishes — sits about 4% above it.
+  What carries her past the loll is the ram's own angular impulse: driven from
+  rest with identical damage she settles at 44°, and the difference is roll energy
+  the collision put in, not flooding.
+
+  So **where she is struck decides how she dies**: amidships she goes over
+  entirely, at the quarter she takes 7323 t and lolls to 48° the other way without
+  inverting.
 
   Those figures are checked rather than quoted. `scripts/check-figures.sh` re-runs
-  `ram_view` at each operating point this section publishes and fails naming the
-  line to update, because the previous set went stale without anyone noticing when
-  a wing tank authored *inside* a hold was fixed: that removed 217 m³ which had
-  been flooding twice, and moved the quarter case from the 8100 t printed here for
-  months to 7102 t. Nothing tests a comment, so the numbers in this one are tested
+  `ram_view` at each operating point and fails naming the line to update. It
+  brackets the capsize rather than trusting a tonnage, because either side of that
+  threshold a single number looks plausible on its own while describing a
+  different casualty. The previous set went stale unnoticed twice — once when a
+  wing tank authored *inside* a hold stopped flooding twice over, and once when
+  the mid wing tanks were added — so the numbers in this section are now tested
   from outside it.
 
   She is lost in every case tried, and that is consistent rather than suspicious:

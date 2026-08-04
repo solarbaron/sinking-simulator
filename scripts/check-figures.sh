@@ -19,10 +19,19 @@
 # comment**. This does, and it is why it belongs in `verify.sh full` rather than
 # in a notebook somewhere.
 #
-# Kept cheap deliberately: the damage figures need no flooding at all, so they run
-# with `--duration=1` in about a second each, and only the one headline outcome
-# pays for the full 900 s of flooding. About 40 s in total against the ~400 s the
-# `full` gate already costs.
+# **What it learned about itself.** The first version checked figures alone, and
+# the amidships strike turned out to sit about 4% above a capsize threshold: at
+# 5.5 m/s she lolls, at 5.75 she goes over, and the tonnage jumps 7415 -> 16425 t
+# across that gap. A tonnage on its own is nearly meaningless there, so the two
+# speeds are checked as a *pair* and what is asserted is which side of 90 degrees
+# she ends on. A change that moved the threshold outside the bracket would leave
+# both tonnages looking individually plausible and still have altered what the
+# ship does.
+#
+# Cost: the damage figures need no flooding at all and run with `--duration=1` in
+# about a second each; three runs pay for the full 900 s. Around 105 s against the
+# ~580 s the `full` gate already costs, and the same budget the first version
+# spent on figures that said less.
 set -u
 
 RAM=${RAM:-./build/ram_view}
@@ -76,8 +85,8 @@ if [ ! -x "$RAM" ]; then
   exit 0
 fi
 
-for h in "from 3.4 to" "63 bays torn, 107.7" "amidships she takes" \
-         "at the quarter she takes" "GM −1.62 m"; do
+for h in "opens 3.4 m" "63 bays torn, 107.7" "amidships she goes over" \
+         "at the quarter she takes" "she lolls to 63"; do
   hint "$h"
 done
 
@@ -96,46 +105,56 @@ quick15=$("$RAM" --speed=1.5 --duration=1 2>&1)
 area6=$(damage_line "$quick6" | sed -n 's/.*torn, \([0-9.]*\) m2 of hole.*/\1/p')
 area15=$(damage_line "$quick15" | sed -n 's/.*torn, \([0-9.]*\) m2 of hole.*/\1/p')
 torn=$(damage_line "$quick6" | sed -n 's/.*over [0-9]* bays, \([0-9]*\) torn.*/\1/p')
-check "hole at 1.5 m/s (m2)" 3.4 0.3 "$area15" "from 3.4 to"
-check "hole at 6 m/s (m2)" 107.7 0.6 "$area6" "from 3.4 to"
+check "hole at 1.5 m/s (m2)" 3.4 0.3 "$area15" "opens 3.4 m"
+check "hole at 6 m/s (m2)" 107.7 0.6 "$area6" "107.7 m² of hole"
 check "bays torn at 6 m/s" 63 1 "$torn" "63 bays torn, 107.7"
 
 # --- the headline outcome, which needs the full 900 s ---------------------------
+#
+# Three full runs, which is the same budget the first version of this script
+# spent, but aimed at the thing that turned out to matter: the amidships strike
+# sits just above a capsize threshold, so a figure alone says very little. 5.5 m/s
+# and 6 m/s straddle it, and asserting both is what makes the pair a finding
+# rather than two numbers.
 out=$("$RAM" --speed=6 2>&1)
 water=$(outcome_line "$out" | sed -n 's/.*-- \([0-9]*\) t of water.*/\1/p')
 heel=$(outcome_line "$out" | sed -n 's/.*heel \(-\{0,1\}[0-9.]*\) deg.*/\1/p')
-gm=$(outcome_line "$out" | sed -n 's/.*GM \(-\{0,1\}[0-9.]*\) m.*/\1/p')
-check "floodwater amidships (t)" 2210 45 "$water" "amidships she takes"
-check "heel amidships (deg)"     8.1  0.5 "$heel" "amidships she takes"
-check "GM at loss (m)"          -1.62 0.05 "$gm"  "GM −1.62 m"
+check "floodwater amidships at 6 m/s (t)" 16613 400 "$water" "amidships she goes over"
+checks=$((checks + 1))
+if [ -n "$heel" ] && awk -v h="$heel" 'BEGIN { if (h < 0) h = -h; exit !(h > 90) }'; then
+  printf '  %s✓%s and she goes right over: heel %s deg, past 90\n' "$green" "$off" "$heel"
+else
+  printf '  %s✗%s she no longer capsizes at 6 m/s: heel %s deg\n' "$red" "$off" "$heel"
+  printf '      %s%s describes this as a capsize under "amidships she goes over"%s\n' \
+         "$dim" "$DOC" "$off"
+  fails=$((fails + 1))
+fi
+
+# Below the threshold, where she lolls instead. The pair is the point: a change
+# that moved the threshold past 6 m/s, or below 5.5, would leave both tonnages
+# looking reasonable on their own and still have altered what the ship does.
+lo=$("$RAM" --speed=5.5 2>&1)
+lowater=$(outcome_line "$lo" | sed -n 's/.*-- \([0-9]*\) t of water.*/\1/p')
+loheel=$(outcome_line "$lo" | sed -n 's/.*heel \(-\{0,1\}[0-9.]*\) deg.*/\1/p')
+check "floodwater amidships at 5.5 m/s (t)" 7415 300 "$lowater" "she lolls to 63"
+checks=$((checks + 1))
+if [ -n "$loheel" ] && awk -v h="$loheel" 'BEGIN { if (h < 0) h = -h; exit !(h < 90) }'; then
+  printf '  %s✓%s and at 5.5 m/s she lolls instead: heel %s deg, short of 90\n' \
+         "$green" "$off" "$loheel"
+else
+  printf '  %s✗%s the capsize threshold has moved below 5.5 m/s: heel %s deg\n' \
+         "$red" "$off" "$loheel"
+  printf '      %sthe threshold between 5.5 and 5.75 m/s is a finding in %s%s\n' \
+         "$dim" "$DOC" "$off"
+  fails=$((fails + 1))
+fi
 
 # --- and that being struck at the quarter is worse, and the other way -----------
 out=$("$RAM" --speed=6 --aim=-30 2>&1)
 qwater=$(outcome_line "$out" | sed -n 's/.*-- \([0-9]*\) t of water.*/\1/p')
 qheel=$(outcome_line "$out" | sed -n 's/.*heel \(-\{0,1\}[0-9.]*\) deg.*/\1/p')
-check "floodwater at the quarter (t)" 7102 150 "$qwater" "at the quarter she takes"
-check "heel at the quarter (deg)"    -45.0 1.0 "$qheel" "at the quarter she takes"
-
-# The claim that survives all of it, and the only one that is a *finding* rather
-# than a figure: a 32x range of hole size barely moves the floodwater, because a
-# small breach fills the compartment behind it inside 900 s just as a large one
-# does. Asserted as a spread rather than as values, so it keeps meaning something
-# when the ship is re-tuned.
-lo=$(outcome_line "$("$RAM" --speed=1.5 2>&1)" | sed -n 's/.*-- \([0-9]*\) t of water.*/\1/p')
-if [ -n "$lo" ] && [ -n "$water" ]; then
-  checks=$((checks + 1))
-  if awk -v a="$lo" -v b="$water" \
-        'BEGIN { r = a / b; if (r < 1) r = 1 / r; exit !(r < 1.15) }'; then
-    printf '  %s✓%s a 32x range of hole size moves the floodwater under 15%% (%s t vs %s t)\n' \
-           "$green" "$off" "$lo" "$water"
-  else
-    printf '  %s✗%s the threshold finding no longer holds: %s t at 1.5 m/s against %s t at 6 m/s\n' \
-           "$red" "$off" "$lo" "$water"
-    printf '      %sthis is a finding, not a figure -- %s explains it under "Beyond a threshold"%s\n' \
-           "$dim" "$DOC" "$off"
-    fails=$((fails + 1))
-  fi
-fi
+check "floodwater at the quarter (t)" 7323 150 "$qwater" "at the quarter she takes"
+check "heel at the quarter (deg)"    -47.8 1.0 "$qheel" "at the quarter she takes"
 
 if [ "$fails" -eq 0 ]; then
   echo "ok — $checks published figures still match the tool"

@@ -139,6 +139,20 @@ compartment wing_tank_fwd_s
     permeability 0.98
     vented false
 
+# The mid pair, flanking the machinery space. Missing until a ram amidships was
+# found to tear 63 bays of which 26 opened onto no compartment at all -- 41% of
+# the hole leading nowhere, because the band between y = 8 and the shell had
+# nothing describing it over the 28 m of engine room.
+compartment wing_tank_mid_p
+    box  -8   8 1.8   20 20 7.0
+    permeability 0.98
+    vented false
+
+compartment wing_tank_mid_s
+    box  -8 -20 1.8   20 -8 7.0
+    permeability 0.98
+    vented false
+
 compartment wing_tank_aft_p
     box -38   8 1.8   -8 20 7.0
     permeability 0.98
@@ -332,6 +346,22 @@ opening airpipe_wfp
 opening airpipe_wfs
     between wing_tank_fwd_s sea
     at 32 -9.0 12.5
+    area 0.02
+    discharge 0.70
+    kind vent
+    open true
+
+opening airpipe_wmp
+    between wing_tank_mid_p sea
+    at 6 9.0 12.5
+    area 0.02
+    discharge 0.70
+    kind vent
+    open true
+
+opening airpipe_wms
+    between wing_tank_mid_s sea
+    at 6 -9.0 12.5
     area 0.02
     discharge 0.70
     kind vent

@@ -115,6 +115,24 @@ Ship buildFerry() {
         // hanging outside the shell, which is what they are on a real ship.
         carve(h, "wing_tank_fwd_p",   {  20,   8, 1.8}, {  44,  20,  7.0}, 0.98),
         carve(h, "wing_tank_fwd_s",   {  20, -20, 1.8}, {  44,  -8,  7.0}, 0.98),
+        // The mid pair, flanking the machinery space, and they were missing.
+        //
+        // Forward and aft wing tanks were authored; these were not, so over the
+        // 28 m of engine room the band between y = 8 and the shell at ~9.2 m
+        // belonged to no compartment at all. Ramming her amidships tore 63 bays
+        // of which **26 opened onto nothing** -- 41% of the hole led nowhere and
+        // the ship simply did not flood through it. `breachesFromFailedPanels`
+        // reported it every run ("open sea onto a part of the hull that no
+        // compartment describes"); nothing was reading the warning.
+        //
+        // The sharp evidence that it was an omission rather than a design: a
+        // strike at either quarter, where the fwd and aft tanks do reach the
+        // shell, leaves **zero** panels unmatched. Machinery spaces on a real
+        // ro-pax are flanked this way precisely so that side damage floods a void
+        // instead of the engine room, which is what the subdivision rules are
+        // written around and what the fwd and aft pairs already do here.
+        carve(h, "wing_tank_mid_p",   {  -8,   8, 1.8}, {  20,  20,  7.0}, 0.98),
+        carve(h, "wing_tank_mid_s",   {  -8, -20, 1.8}, {  20,  -8,  7.0}, 0.98),
         carve(h, "wing_tank_aft_p",   { -38,   8, 1.8}, {  -8,  20,  7.0}, 0.98),
         carve(h, "wing_tank_aft_s",   { -38, -20, 1.8}, {  -8,  -8,  7.0}, 0.98),
         carve(h, "double_bottom_fwd", {   4, -20, 0.0}, {  44,  20,  1.8}, 0.98),
@@ -136,6 +154,8 @@ Ship buildFerry() {
     const int steering   = ship.findCompartment("steering_gear");
     const int wingFwdP   = ship.findCompartment("wing_tank_fwd_p");
     const int wingFwdS   = ship.findCompartment("wing_tank_fwd_s");
+    const int wingMidP   = ship.findCompartment("wing_tank_mid_p");
+    const int wingMidS   = ship.findCompartment("wing_tank_mid_s");
     const int wingAftP   = ship.findCompartment("wing_tank_aft_p");
     const int wingAftS   = ship.findCompartment("wing_tank_aft_s");
     const int dbFwd      = ship.findCompartment("double_bottom_fwd");
@@ -145,7 +165,15 @@ Ship buildFerry() {
     // --- Flow network ------------------------------------------------------
     ship.openings = {
         // The casualty: a 2.4 m^2 tear in the starboard shell, 2.5 m below the
-        // waterline, opening straight into the starboard engine room.
+        // waterline, opening into the starboard engine room.
+        //
+        // It reaches the machinery space by going *through* the mid wing tank,
+        // whose inboard bulkhead it opens as well -- the tank is only about 1.2 m
+        // deep here, so anything that tears 2.4 m2 of shell has gone through both.
+        // That is the scenario this ship was built to pose and it is deliberately
+        // the bad case: a shallower strike would flood the wing tank alone, which
+        // is what the tank is for and what makes the difference between a ship
+        // that lolls and one that does not.
         orifice("breach_er_s", kSea, erS, {6, -9.0, 3.0}, 2.4, 0.62,
                 OpeningKind::Breach, true),
 
@@ -191,6 +219,8 @@ Ship buildFerry() {
         orifice("vent_fpk",     forepeak, kSea, { 50,  0.0, 12.5}, 0.10, 0.80, OpeningKind::Vent, true),
         orifice("airpipe_wfp",  wingFwdP, kSea, { 32,  9.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),
         orifice("airpipe_wfs",  wingFwdS, kSea, { 32, -9.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),
+        orifice("airpipe_wmp",  wingMidP, kSea, {  6,  9.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),
+        orifice("airpipe_wms",  wingMidS, kSea, {  6, -9.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),
         orifice("airpipe_wap",  wingAftP, kSea, {-24,  9.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),
         orifice("airpipe_was",  wingAftS, kSea, {-24, -9.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),
         orifice("airpipe_dbf",  dbFwd,    kSea, { 24,  0.0, 12.5}, 0.02, 0.70, OpeningKind::Vent, true),

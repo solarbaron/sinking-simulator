@@ -377,10 +377,10 @@ void testFerryFileMatchesTheCompiledFerry() {
     loaded.ship.initialise(0.0);
 
     // Guard against a vacuous comparison. Two empty ships agree perfectly.
-    expectEqual("the ferry has its sixteen compartments",
-                static_cast<long long>(loaded.ship.compartments.size()), 16);
-    expectEqual("and its twenty-five openings",
-                static_cast<long long>(loaded.ship.openings.size()), 25);
+    expectEqual("the ferry has its eighteen compartments",
+                static_cast<long long>(loaded.ship.compartments.size()), 18);
+    expectEqual("and its twenty-seven openings",
+                static_cast<long long>(loaded.ship.openings.size()), 27);
     expectEqual("and its four pumps", static_cast<long long>(loaded.ship.pumps.size()), 4);
     const Diagnostics intact = loaded.ship.diagnostics(0.0);
     expectNear("intact displacement is the ferry's, near 8984 t",
