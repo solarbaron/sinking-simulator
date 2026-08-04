@@ -197,10 +197,17 @@ bool SceneMesh::appendShip(const sim::Ship& ship, const HullPaint& paint,
 }
 
 void SceneMesh::appendOcean(const OceanSurface& surface, std::uint32_t material) {
-    const auto started = std::chrono::steady_clock::now();
-    const std::vector<OceanVertex>& source = surface.vertices();
-    const std::vector<std::uint32_t>& sourceIndices = surface.indices();
+    appendOceanGeometry(surface.vertices(), surface.indices(), material);
+}
 
+void SceneMesh::appendOcean(const OceanCascadeSurface& surface, std::uint32_t material) {
+    appendOceanGeometry(surface.vertices(), surface.indices(), material);
+}
+
+void SceneMesh::appendOceanGeometry(const std::vector<OceanVertex>& source,
+                                    const std::vector<std::uint32_t>& sourceIndices,
+                                    std::uint32_t material) {
+    const auto started = std::chrono::steady_clock::now();
     const auto base = static_cast<std::uint32_t>(vertices_.size());
     vertices_.reserve(vertices_.size() + source.size());
     for (const OceanVertex& v : source) {

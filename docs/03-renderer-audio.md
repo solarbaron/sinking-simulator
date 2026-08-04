@@ -50,7 +50,9 @@ screen-space GI for interiors, analytic sky model outdoors.
   scales to cover chop through swell without tiling artefacts. Generated on the
   compute queue at 30 Hz.
 - **Adaptive projected grid** for the surface, so screen-space triangle density is
-  roughly uniform and the horizon does not cost anything.
+  roughly uniform and the horizon does not cost anything. The geometric cascade
+  below is the first half of this: it makes the horizon nearly free, but the
+  triangle density is uniform in *world* space rather than in screen space.
 - **The physics and the visuals read the same spectrum.** Non-negotiable. If the
   wave the ship responds to is not the wave under the bow, the entire premise
   collapses.
@@ -68,7 +70,8 @@ screen-space GI for interiors, analytic sky model outdoors.
 `engine/gpu/ocean.{hpp,cpp}`, `engine/gpu/shaders/ocean.{vert,frag}`,
 `tests/test_ocean.cpp`. A displaced grid patch with a vertex/fragment pipeline
 beside `OffscreenRenderer` — no mesh shaders, no ray tracing, nothing Pascal
-cannot run.
+cannot run — and, over it, a **cascade of concentric rings** that carries the same
+patch out to the horizon for a cost that grows with the *logarithm* of the reach.
 
 **It is driven by `sim::WaveField` itself.** Not a visual copy, not a re-seeded
 spectrum: `OceanSurface::build` walks the same `WaveComponent` array
@@ -126,10 +129,154 @@ height: 1.4 m spacing for that sea, 80 000 vertices over a 400 m patch, and
 **92 ms per frame on one core**. `shortestWavelength()` exists so callers compute
 that rather than guess it.
 
-Which is the argument for the FFT cascade above, now with a number on it. Note
-that evaluating the spectrum in a *vertex shader* is not the fix: it is the same
-sum with the same components, and it re-does the per-vertex `sincos` the row
-recurrence just removed. The FFT is the fix, and it still reads this spectrum.
+Which is why a *uniform* patch cannot reach the horizon, and why the sea's edge
+was visible against the sky in `seaway_view`: applying that criterion out to the
+horizon costs the square of the distance, so the patch stopped at 525 m and the
+frame showed it. Note that evaluating the spectrum in a *vertex shader* is not
+the fix either: it is the same sum with the same components, and it re-does the
+per-vertex `sincos` the row recurrence just removed.
+
+### The cascade
+
+`OceanCascade` / `OceanCascadeSurface` in `engine/gpu/ocean.{hpp,cpp}`.
+Concentric square rings: level 0 is a full grid of `resolution` cells, and each
+level out **doubles both the cell size and the extent**. A ring is therefore the
+same cell count minus the quarter its predecessor already covers — three quarters
+of level 0's cost for four times the area — and
+
+> **reach is exponential in the number of levels while cost is linear in it.**
+
+That is the whole of the idea. Ten levels reach 512 times as far as one. The
+criterion above then applies where it means something and stops applying where it
+does not.
+
+**How far is far enough is a fact about the camera, not a number.** A flat sea's
+horizon *is* the eye's own horizontal plane, so a surface point at horizontal
+distance `D` sits `atan(h / D)` below it, and a patch that stops at `D` leaves
+exactly that much sky between its edge and the water that should still be there.
+One pixel at the centre of the frame subtends `2 tan(fov / 2) / pixelHeight`, so
+
+```
+oceanHorizonReach(h, fov, pixels) = h * pixels / (2 tan(fov / 2))
+```
+
+is where the edge disappears into the horizon line. Doubling the eye height
+doubles the reach required and so does doubling the vertical resolution; nothing
+about the sea state enters it, because a crest is below the eye whatever it is
+doing. `tests/test_ocean.cpp` asserts the *consequence* through a real camera
+matrix rather than the formula against itself: at that reach the edge projects
+**exactly one pixel** below the vanishing point of the sea plane, and at a quarter
+of it exactly four. Both are identities, so both are asserted as equalities.
+
+**Cracking is prevented by construction, not by tolerance.** Two levels meeting
+at a boundary is the whole difficulty of the technique, and there are two ways for
+it to go wrong:
+
+- A **T-junction**: the fine level has a vertex halfway along each of the coarse
+  level's boundary edges, and a coarse triangle that interpolates straight past it
+  leaves a wedge of background showing through.
+- A **step**: two levels evaluating the same point and disagreeing, because they
+  carry different components or simply because two floating-point sums of the same
+  numbers in a different order are not the same number.
+
+Both are removed by the same decision: **a ring's inner boundary vertices are the
+previous level's outer boundary vertices** — the same entries in the same array,
+addressed rather than re-evaluated — and every coarse cell meeting the seam is
+split into *three* triangles so that it uses the fine level's midpoint too. It
+falls out that at most one edge of any coarse cell can be on the seam: the four
+cells at the corners of the hole touch it at a point, so there is no corner case.
+The seam is then a set of shared edges with shared endpoints, and there is nothing
+left for two evaluations to disagree about.
+
+**A level drops what it cannot resolve.** Keeping a component the grid samples
+below its Nyquist does not draw the wave, it draws an artefact with the wave's
+amplitude — and the closed form is already in this document: the mesh's own error
+at a cell centre is `a (1 - cos(pi / n))` for `n` cells per wavelength, which at
+`n = 2` is exactly `a`. **At two cells per wavelength carrying the component is
+precisely as wrong as dropping it, and worse to look at, because the artefact has
+structure.** Two is therefore the floor and not the answer; the default
+`minimumCellsPerWavelength` is **four**, where the residual is 29%. Components are
+sorted by wavenumber once per build so each level's set is a prefix, which makes
+the sets nested: a component a ring carries is carried by every finer level.
+
+The same `sim::WaveField` still drives every level. A band-limited level is this
+spectrum with its unresolvable tail removed, not a second one.
+
+### Cascade — measured cost
+
+At **equal near-field cell size and equal reach** — 2.48 m cells out to 525 m,
+128 components (Hs 4 m, Tp 9 s, 16 × 8), one core, `-O2`:
+
+| | cells / levels | vertices | displacement |
+|---|---|---|---|
+| uniform patch | 424 cells | 180 625 | **55.0 ms** |
+| cascade | 2 levels | 79 289 | **25.4 ms** |
+
+Cheaper twice over: three quarters of the outer area at a quarter of the vertex
+density, and an outer ring that drops what it cannot carry. Then the interesting
+number — the same cascade taken to the horizon:
+
+| | levels | reach | vertices | displacement |
+|---|---|---|---|---|
+| cascade, matched reach | 2 | 525 m | 79 289 | 25.4 ms |
+| cascade, horizon reach | 10 | 134 km | 350 649 | 45.9 ms |
+
+**256 times the reach for 1.8 times the cost.** The uniform grid that reached
+134 km at 2.48 m cells would be 1.2 × 10¹⁰ vertices — 33 600 times the cascade,
+and about four hours a frame.
+
+`tools/seaway_view` (S-175, Hs 4 m, camera 69 m up at 1280 × 720, GTX 1070 Ti):
+
+| | reach | vertices | displacement | upload | GPU |
+|---|---|---|---|---|---|
+| uniform patch (before) | 525 m | 180 625 | 55 ms | 1.4 ms | 0.2 ms |
+| cascade (now) | 67 km | 316 729 | **46 ms** | 2.5 ms | 0.24 ms |
+
+Nine levels of 212 cells, and what each of them carries is the point:
+
+| level cell size | 2.5 m | 5 m | 10 m | 20 m | 40 m | 79 m and out |
+|---|---|---|---|---|---|---|
+| components carried | 128 | 128 | 120 | 96 | 16 | **0** |
+| vertices | 45 369 | 33 920 | 33 920 | 33 920 | 33 920 | 33 920 each |
+
+The four outermost rings resolve nothing, skip the recurrence entirely and are
+dead flat, which is what makes 60 km of sea nearly free — and is correct as well
+as cheap, since a 20 m wave at 20 km is a thousandth of a pixel.
+
+**What the cascade did *not* buy.** The near field still costs what it always did:
+level 0 and level 1 carry every component and are 79 000 of the 317 000 vertices
+but most of the 46 ms. Reaching the horizon is now cheap; resolving the water
+under the bow is not, and the FFT above is still the answer to that one. The
+vertex buffer also grew 1.75×, and it is re-uploaded whole every frame — 2.5 ms,
+which is more than the GPU spends drawing it. The index buffer never changes
+between frames and has no business being re-uploaded at all; that is the first
+thing to fix if this path stays on the CPU.
+
+### Cascade — limits
+
+- **The rings are squares, so reach is not isotropic.** The corners are √2 further
+  out than the sides, and `reach()` reports the side. A camera looking along a
+  diagonal has 41% more sea than it needs; the criterion is stated for the worst
+  case, which is the axis.
+- **The cascade is centred on the ship, not on the camera.** `seaway_view`'s eye
+  rides 1.42 Lpp out on the quarter, so level 0 is sized to contain both. A camera
+  taken further out than `innerHalfExtent` would find the water directly beneath
+  it drawn at level 1's resolution.
+- **The sea seen at the horizon is seen edge-on, and a linear facet can then
+  present its underside.** Where a far facet tilts away from the eye more steeply
+  than the view ray, `gl_FrontFacing` is false, the shared fragment shader flips
+  the normal as it must for a hull seen from inside, and the pixel comes out
+  black. Measured on `seaway_view`: **9 pixels in 8 frames of 1280 × 720** — about
+  one in a million — all within 60 rows below the horizon, which is the far tenth
+  of the sea. The same 9 at Hs 4 m and at Hs 5.5 m, so it is not a steepness
+  effect waiting to grow. It is a grazing-incidence artefact of a heightfield
+  rather than a hole — the elevation channel shows the fragments are drawn, and
+  the crack test finds no background there — and the fix belongs with the
+  reflection work, where the sea stops going through a hull's BRDF.
+- **A far plane has to be moved to match.** Geometry beyond it is clipped, and a
+  clip plane makes exactly the edge the cascade exists to remove. `seaway_view`
+  now sets far to 1.5 × the reach and near to 0.02 Lpp, which keeps depth
+  resolution at the waterline near a millimetre in float32.
 
 Deliberately absent: **specular and Fresnel.** The shading is Lambert against a
 directional sun plus a hemispheric sky term and is view-independent, which is what
@@ -169,6 +316,73 @@ Three of them earned their place:
   measuring position quantisation times local slope, and failed at 1.6e-6 m against
   a 1e-6 m expectation. The expectation was right and the comparison was wrong;
   position is now asserted separately, against its own float32 bound.
+
+### Cascade — what the tests are pointed at
+
+A cracked sea and a whole one look identical everywhere except at the crack, and a
+crack is a few pixels. So the primary instrument is not a picture at all:
+
+- **An edge census over the whole cascade.** Every directed edge of the triangle
+  soup is counted. An interior edge of a watertight surface appears exactly twice
+  in opposite directions; an edge on the outer boundary appears once. **A
+  T-junction is exactly an interior edge that appears once**, so the crack question
+  becomes combinatorial — no camera, no pixels, no tolerance — and the answer is an
+  integer: `4n` unmatched edges, all of them on the outer square, and zero
+  malformed. Same instrument as the manifold check that caught the hull wound
+  inconsistently. It is also the *only* thing that catches a reversed winding in a
+  transition cell, which renders as a dark patch and nothing else notices.
+  Unstitched, the same census predicts and finds `4n + 6n(levels − 1)`: three
+  edges go unmatched at each of the `2n` coarse cells along each seam.
+- **The vertex and triangle counts are closed forms** —
+  `(n+1)² + (levels−1)(3n²/4 + n)` and `2n² + (levels−1)(3n²/2 + 2n)` — so a
+  topology change is an arithmetic disagreement rather than a slightly wrong
+  picture, and no vertex may be displaced and then never drawn.
+- **The seam is sampled from both sides.** At the midpoint of every coarse cell
+  along a seam, the mesh's own elevation a tenth of a millimetre inside and a tenth
+  outside must agree to within `2ε` times the field's steepest slope — derived, not
+  chosen. The guard is that the same probes on an unstitched cascade report a
+  **0.36 m** step, which is the sagitta the stitch is closing: the comparison
+  demonstrably can fail. Points standing *exactly* on a level boundary are asserted
+  separately, because a level chosen with `<` rather than `<=` sends them one level
+  out and the ε probes step right over it.
+- **No background pixel below the horizon, over four azimuths.** The elevation
+  channel tags every drawn sea fragment with blue 255 and the frame is cleared to
+  blue 0, so "is this pixel sea" is an integer question rather than a colour
+  comparison. The horizon row is computed from the camera as the vanishing point of
+  the sea plane. Four azimuths because a seam is a square and one camera sees two
+  of its four sides — a mutation that removed the transition cells on the other two
+  went straight through a single view.
+- **Two negative controls on that frame**: the uniform patch it replaces, at the
+  same cell size and with *more* vertices than the whole cascade, leaves 61 680
+  background pixels below the horizon; the same cascade unstitched leaks 480
+  through its seams.
+- **The near field still passes the load-bearing check**, unchanged: the cascade's
+  level 0 renders to 0.6 mm rms and 2.2 mm worst against `WaveField::elevation()`,
+  which are the same figures the uniform patch produces, because it is the same
+  grid. The comparison and its tolerance construction are now one shared routine so
+  there is one place for them to be right.
+
+### What mutation testing changed, second time
+
+Twenty-five deliberate defects in the cascade. Most were caught loudly — the
+delegation from a ring to the level inside it made one index tighter trips 11
+assertions, a seam midpoint replaced by the coarse corner trips 4, an elevation
+scaled by 1.02 trips 4 and is rejected by 374 of 400 samples. **Five escaped
+entirely**, and each is now a test that did not exist:
+
+| escaped | now caught by |
+|---|---|
+| the flat fast path reusing the previous row's accumulator | a level that resolves nothing being **bit-exactly** flat — `z == 0.0f`, normal `(0,0,1)`. It shares the row buffers with every other level, so the stale values are a plausible sea and every other assertion was about levels that do displace |
+| `sampleElevation` choosing its level with `<` instead of `<=` | sampling *exactly on* each boundary, including the outer edge. Every other probe was deliberately a hair to one side |
+| the index cache key forgetting `stitchSeams` | building two configurations into the *same* surface and holding the result against one built from nothing. Every other test used a fresh object per configuration, so the cache was never asked to notice a change |
+| `cellsPerSide` rounding *down* to a multiple of four | a sweep of every resolution from 1 to 40, asserting the rounding is up and that each one is still one watertight sheet. Rounding down is silent and hands back a coarser grid than the resolution criterion asked for |
+| the rings' normals replaced by a flat `+z` | a ring's normals checked against the analytic slope of **what that ring carries** — with a guard that it is measurably not the full field's slope. `docs` already records this exact defect escaping once on the uniform patch; the cascade reintroduced the hole by having its own displacement loop |
+
+A sixth was a partial escape worth recording on its own: removing the transition
+cells on two sides of every seam was invisible to the rendered frame (the camera
+was looking the other way) and obvious to the edge census. That is the general
+lesson again — the configuration that makes an assertion exact is often the
+configuration that makes it blind — and it is why the frame now asks four times.
 
 ## Hull rendering and materials
 

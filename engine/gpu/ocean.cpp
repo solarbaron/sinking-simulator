@@ -32,6 +32,69 @@ struct Push {
 };
 static_assert(sizeof(Push) == 112, "the push block must match the shaders");
 
+// One grid row's elevation and slope, accumulated over `count` components.
+//
+// **The row recurrence lives here and nowhere else.** Along a row only x moves, so
+// the phase advances by a constant and (cos psi, sin psi) can be stepped by a
+// fixed rotation instead of re-evaluated: one sincos per row per component rather
+// than one per vertex, and the sine that falls out is exactly what the slope
+// needs, so the normal is free. It is an algebraic rearrangement of the same sum,
+// not an approximation -- worst measured disagreement against direct evaluation
+// over a 257-wide row is 2e-14 m -- and it is an eighth of the cost. Restarted
+// from a real sincos on every row and every segment, so drift is bounded by the
+// run length rather than by the whole grid.
+void accumulateRow(const sim::WaveComponent* components, std::size_t count, double x0, double y,
+                   double h, int points, double time, double* elevation, double* slopeX,
+                   double* slopeY) {
+    std::fill(elevation, elevation + points, 0.0);
+    std::fill(slopeX, slopeX + points, 0.0);
+    std::fill(slopeY, slopeY + points, 0.0);
+
+    for (std::size_t c = 0; c < count; ++c) {
+        const sim::WaveComponent& component = components[c];
+        const double kx = component.wavenumber * component.dirX;
+        const double ky = component.wavenumber * component.dirY;
+        // eta = a cos(psi), so d eta/dx = -a kx sin(psi) and likewise in y.
+        const double a = component.amplitude;
+        const double slopeGainX = -a * kx;
+        const double slopeGainY = -a * ky;
+
+        const double psi = kx * x0 + ky * y - component.omega * time + component.phase;
+        double cosPsi = std::cos(psi);
+        double sinPsi = std::sin(psi);
+        const double stepCos = std::cos(kx * h);
+        const double stepSin = std::sin(kx * h);
+
+        for (int i = 0; i < points; ++i) {
+            const auto index = static_cast<std::size_t>(i);
+            elevation[index] += a * cosPsi;
+            slopeX[index] += slopeGainX * sinPsi;
+            slopeY[index] += slopeGainY * sinPsi;
+            const double nextCos = cosPsi * stepCos - sinPsi * stepSin;
+            sinPsi = sinPsi * stepCos + cosPsi * stepSin;
+            cosPsi = nextCos;
+        }
+    }
+}
+
+// n = normalize(-d eta/dx, -d eta/dy, 1), written into a vertex at (x, y).
+void writeVertex(OceanVertex& vertex, double x, double y, double z, double slopeX, double slopeY) {
+    const double nx = -slopeX;
+    const double ny = -slopeY;
+    const double inverse = 1.0 / std::sqrt(nx * nx + ny * ny + 1.0);
+    vertex.position[0] = static_cast<float>(x);
+    vertex.position[1] = static_cast<float>(y);
+    vertex.position[2] = static_cast<float>(z);
+    vertex.normal[0] = static_cast<float>(nx * inverse);
+    vertex.normal[1] = static_cast<float>(ny * inverse);
+    vertex.normal[2] = static_cast<float>(inverse);
+}
+
+// A cascade level's ring has a hole a quarter of its extent across, and its
+// boundary vertices have to land on even lattice indices of the finer level
+// inside it. Both need the cell count to be a multiple of four.
+constexpr int kMaxCascadeLevels = 24;
+
 }  // namespace
 
 // --- Resolution ---------------------------------------------------------------
@@ -137,55 +200,12 @@ void OceanSurface::build(const sim::WaveField& field, const OceanGrid& grid, dou
     // caught paying (CLAUDE.md, "Sea surface queried 6x more than necessary").
     for (int j = 0; j < side; ++j) {
         const double y = y0 + h * j;
-        std::fill(rowElevation_.begin(), rowElevation_.end(), 0.0);
-        std::fill(rowSlopeX_.begin(), rowSlopeX_.end(), 0.0);
-        std::fill(rowSlopeY_.begin(), rowSlopeY_.end(), 0.0);
-
-        for (const sim::WaveComponent& c : components) {
-            const double kx = c.wavenumber * c.dirX;
-            const double ky = c.wavenumber * c.dirY;
-            // eta = a cos(psi), so d eta/dx = -a kx sin(psi) and likewise in y.
-            // The recurrence produces sin(psi) as a by-product, so the slope --
-            // and therefore the normal -- is free.
-            const double a = c.amplitude;
-            const double slopeGainX = -a * kx;
-            const double slopeGainY = -a * ky;
-
-            const double psi = kx * x0 + ky * y - c.omega * time + c.phase;
-            double cosPsi = std::cos(psi);
-            double sinPsi = std::sin(psi);
-            // Along a row only x moves, so psi advances by a constant and
-            // (cos, sin) can be stepped by a fixed rotation. Restarted from a
-            // real sincos on every row, so drift is bounded by the row length
-            // rather than by the whole grid; measured worst error against direct
-            // evaluation over a 257-wide row is 2e-14 m.
-            const double stepCos = std::cos(kx * h);
-            const double stepSin = std::sin(kx * h);
-
-            for (int i = 0; i < side; ++i) {
-                const auto index = static_cast<std::size_t>(i);
-                rowElevation_[index] += a * cosPsi;
-                rowSlopeX_[index] += slopeGainX * sinPsi;
-                rowSlopeY_[index] += slopeGainY * sinPsi;
-                const double nextCos = cosPsi * stepCos - sinPsi * stepSin;
-                sinPsi = sinPsi * stepCos + cosPsi * stepSin;
-                cosPsi = nextCos;
-            }
-        }
-
+        accumulateRow(components.data(), components.size(), x0, y, h, side, time,
+                      rowElevation_.data(), rowSlopeX_.data(), rowSlopeY_.data());
         for (int i = 0; i < side; ++i) {
             const auto index = static_cast<std::size_t>(i);
-            // n = normalize(-d eta/dx, -d eta/dy, 1).
-            const double nx = -rowSlopeX_[index];
-            const double ny = -rowSlopeY_[index];
-            const double inverse = 1.0 / std::sqrt(nx * nx + ny * ny + 1.0);
-            OceanVertex& vertex = vertices_[vertexIndex(i, j)];
-            vertex.position[0] = static_cast<float>(x0 + h * i);
-            vertex.position[1] = static_cast<float>(y);
-            vertex.position[2] = static_cast<float>(rowElevation_[index]);
-            vertex.normal[0] = static_cast<float>(nx * inverse);
-            vertex.normal[1] = static_cast<float>(ny * inverse);
-            vertex.normal[2] = static_cast<float>(inverse);
+            writeVertex(vertices_[vertexIndex(i, j)], x0 + h * i, y, rowElevation_[index],
+                        rowSlopeX_[index], rowSlopeY_[index]);
         }
     }
 
@@ -219,6 +239,370 @@ bool OceanSurface::sampleElevation(double x, double y, double& elevation) const 
     elevation = v <= u ? z00 + u * (height(i + 1, j) - z00) + v * (z11 - height(i + 1, j))
                        : z00 + v * (height(i, j + 1) - z00) + u * (z11 - height(i, j + 1));
     return true;
+}
+
+// --- The cascade --------------------------------------------------------------
+
+namespace {
+
+// Which edge of cell (i, j) of `level` lies on the seam with the finer level
+// inside it. **At most one can**, and that is what makes the whole construction
+// tractable: the four cells at the corners of the hole touch it at a single point
+// rather than along an edge, so there is no corner case to get wrong.
+enum class SeamEdge { None, Bottom, Top, Left, Right };
+
+SeamEdge seamEdgeOf(int cells, int level, int i, int j, bool stitch) {
+    if (level < 1 || !stitch) return SeamEdge::None;
+    const int hole = cells / 4;
+    if (j == hole && i >= -hole && i <= hole - 1) return SeamEdge::Bottom;
+    if (j == -hole - 1 && i >= -hole && i <= hole - 1) return SeamEdge::Top;
+    if (i == hole && j >= -hole && j <= hole - 1) return SeamEdge::Left;
+    if (i == -hole - 1 && j >= -hole && j <= hole - 1) return SeamEdge::Right;
+    return SeamEdge::None;
+}
+
+// True when cell (i, j) of `level` is inside the hole the finer level fills.
+bool cellIsInHole(int cells, int level, int i, int j) {
+    if (level < 1) return false;
+    const int hole = cells / 4;
+    return i >= -hole && i <= hole - 1 && j >= -hole && j <= hole - 1;
+}
+
+}  // namespace
+
+int OceanCascade::cellsPerSide() const {
+    const int atLeast = std::max(resolution, 4);
+    return std::min((atLeast + 3) / 4 * 4, kMaxResolution);
+}
+
+double OceanCascade::halfExtent(int level) const {
+    const int clamped = std::clamp(level, 0, kMaxCascadeLevels - 1);
+    return innerHalfExtent * static_cast<double>(1u << static_cast<unsigned>(clamped));
+}
+
+double OceanCascade::cellSize(int level) const {
+    return 2.0 * halfExtent(level) / cellsPerSide();
+}
+
+int oceanCascadeLevelsFor(double innerHalfExtent, double reach) {
+    if (!(innerHalfExtent > 0.0) || !(reach > innerHalfExtent)) return 1;
+    // The tolerance is there so an exact power of two asks for the level that
+    // reaches it, not for one more.
+    const int doublings = static_cast<int>(std::ceil(std::log2(reach / innerHalfExtent) - 1e-9));
+    return std::clamp(1 + doublings, 1, kMaxCascadeLevels);
+}
+
+double oceanHorizonReach(double eyeHeight, double verticalFov, int pixelHeight) {
+    if (!(eyeHeight > 0.0) || !(verticalFov > 0.0) || !(verticalFov < sim::kPi) || pixelHeight < 1)
+        return 0.0;
+    return eyeHeight * pixelHeight / (2.0 * std::tan(0.5 * verticalFov));
+}
+
+std::size_t OceanCascadeSurface::vertexIndexAt(int level, int i, int j) const {
+    const int half = cells_ / 2, hole = cells_ / 4;
+    // A lattice point on or inside the hole belongs to the finer level, at twice
+    // the index. This is the whole of the anti-cracking scheme: there is no second
+    // copy of a seam vertex to disagree with the first.
+    while (level > 0 && std::max(std::abs(i), std::abs(j)) <= hole) {
+        i *= 2;
+        j *= 2;
+        --level;
+    }
+    const std::size_t row =
+        rowStart_[static_cast<std::size_t>(level) * static_cast<std::size_t>(cells_ + 1) +
+                  static_cast<std::size_t>(j + half)];
+    if (level == 0 || std::abs(j) > hole) return row + static_cast<std::size_t>(i + half);
+    // A row crossing the hole is stored as two segments, left then right.
+    return i < 0 ? row + static_cast<std::size_t>(i + half)
+                 : row + static_cast<std::size_t>(cells_ / 4) +
+                       static_cast<std::size_t>(i - (hole + 1));
+}
+
+void OceanCascadeSurface::layOutVertices() {
+    const int half = cells_ / 2, hole = cells_ / 4;
+    rowStart_.assign(static_cast<std::size_t>(cascade_.levels) *
+                         static_cast<std::size_t>(cells_ + 1),
+                     0);
+    std::size_t offset = 0;
+    for (int level = 0; level < cascade_.levels; ++level) {
+        const std::size_t levelBase = offset;
+        for (int r = 0; r <= cells_; ++r) {
+            rowStart_[static_cast<std::size_t>(level) * static_cast<std::size_t>(cells_ + 1) +
+                      static_cast<std::size_t>(r)] = offset;
+            const int j = r - half;
+            const bool full = level == 0 || std::abs(j) > hole;
+            offset += full ? static_cast<std::size_t>(cells_ + 1)
+                           : static_cast<std::size_t>(cells_ / 2);
+        }
+        levels_[static_cast<std::size_t>(level)].vertices = offset - levelBase;
+    }
+    vertices_.resize(offset);
+}
+
+void OceanCascadeSurface::buildIndices() {
+    if (indexCells_ == cells_ && indexLevels_ == cascade_.levels &&
+        indexStitched_ == cascade_.stitchSeams)
+        return;
+
+    const int half = cells_ / 2;
+    indices_.clear();
+    levelTriangles_.assign(static_cast<std::size_t>(cascade_.levels), 0);
+    for (int level = 0; level < cascade_.levels; ++level) {
+        const std::size_t before = indices_.size();
+        const auto index = [&](int i, int j) {
+            return static_cast<std::uint32_t>(vertexIndexAt(level, i, j));
+        };
+        const auto finer = [&](int i, int j) {
+            return static_cast<std::uint32_t>(vertexIndexAt(level - 1, i, j));
+        };
+        const auto triangle = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+            indices_.push_back(a);
+            indices_.push_back(b);
+            indices_.push_back(c);
+        };
+
+        for (int j = -half; j < half; ++j)
+            for (int i = -half; i < half; ++i) {
+                if (cellIsInHole(cells_, level, i, j)) continue;
+                const std::uint32_t v00 = index(i, j);
+                const std::uint32_t v10 = index(i + 1, j);
+                const std::uint32_t v11 = index(i + 1, j + 1);
+                const std::uint32_t v01 = index(i, j + 1);
+                // Counter-clockwise seen from above in every case, and the
+                // no-seam split is the v00-v11 diagonal OceanSurface uses, so a
+                // cell centre still lands on the shared edge.
+                switch (seamEdgeOf(cells_, level, i, j, cascade_.stitchSeams)) {
+                    case SeamEdge::None:
+                        triangle(v00, v10, v11);
+                        triangle(v00, v11, v01);
+                        break;
+                    case SeamEdge::Bottom: {
+                        const std::uint32_t m = finer(2 * i + 1, 2 * j);
+                        triangle(v00, m, v01);
+                        triangle(m, v11, v01);
+                        triangle(m, v10, v11);
+                        break;
+                    }
+                    case SeamEdge::Top: {
+                        const std::uint32_t m = finer(2 * i + 1, 2 * (j + 1));
+                        triangle(v00, v10, m);
+                        triangle(v00, m, v01);
+                        triangle(v10, v11, m);
+                        break;
+                    }
+                    case SeamEdge::Left: {
+                        const std::uint32_t m = finer(2 * i, 2 * j + 1);
+                        triangle(v00, v10, m);
+                        triangle(m, v10, v11);
+                        triangle(m, v11, v01);
+                        break;
+                    }
+                    case SeamEdge::Right: {
+                        const std::uint32_t m = finer(2 * (i + 1), 2 * j + 1);
+                        triangle(v00, v10, m);
+                        triangle(v00, m, v11);
+                        triangle(v00, v11, v01);
+                        break;
+                    }
+                }
+            }
+        levelTriangles_[static_cast<std::size_t>(level)] = (indices_.size() - before) / 3;
+    }
+    indexCells_ = cells_;
+    indexLevels_ = cascade_.levels;
+    indexStitched_ = cascade_.stitchSeams;
+}
+
+void OceanCascadeSurface::build(const sim::WaveField& field, const OceanCascade& cascade,
+                                double time) {
+    const auto started = std::chrono::steady_clock::now();
+
+    cascade_ = cascade;
+    cascade_.levels = std::clamp(cascade.levels, 1, kMaxCascadeLevels);
+    cells_ = cascade_.cellsPerSide();
+    cascade_.resolution = cells_;  // report what was used, not what was asked for
+    time_ = time;
+
+    const int half = cells_ / 2, hole = cells_ / 4;
+
+    // Sorted by wavenumber, so "the components this level resolves" is a prefix
+    // and the level sets nest: a component a ring carries is carried by every
+    // finer level too, which is what stops a seam from being a step in the
+    // spectrum as well as in the mesh.
+    byWavenumber_ = field.components();
+    std::sort(byWavenumber_.begin(), byWavenumber_.end(),
+              [](const sim::WaveComponent& a, const sim::WaveComponent& b) {
+                  return a.wavenumber < b.wavenumber;
+              });
+
+    levels_.assign(static_cast<std::size_t>(cascade_.levels), Level{});
+    const double cellsPerWavelength = std::max(cascade_.minimumCellsPerWavelength, 1e-9);
+    for (int level = 0; level < cascade_.levels; ++level) {
+        Level& info = levels_[static_cast<std::size_t>(level)];
+        info.cellSize = cascade_.cellSize(level);
+        info.halfExtent = cascade_.halfExtent(level);
+        // wavelength >= cellsPerWavelength * h  <=>  k <= 2 pi / (cellsPerWavelength * h)
+        const double maxWavenumber = 2.0 * sim::kPi / (cellsPerWavelength * info.cellSize);
+        const auto end = std::upper_bound(byWavenumber_.begin(), byWavenumber_.end(), maxWavenumber,
+                                          [](double bound, const sim::WaveComponent& c) {
+                                              return bound < c.wavenumber;
+                                          });
+        info.components = static_cast<std::size_t>(end - byWavenumber_.begin());
+    }
+
+    layOutVertices();
+    buildIndices();
+    // Counted while the indices were written, not predicted from the shape: a
+    // reported figure that comes from a second derivation of the same thing is a
+    // figure that can disagree with the geometry. The closed forms live in
+    // tests/test_ocean.cpp, where disagreeing with them is the point.
+    for (int level = 0; level < cascade_.levels; ++level)
+        levels_[static_cast<std::size_t>(level)].triangles =
+            levelTriangles_[static_cast<std::size_t>(level)];
+
+    rowElevation_.resize(static_cast<std::size_t>(cells_ + 1));
+    rowSlopeX_.resize(static_cast<std::size_t>(cells_ + 1));
+    rowSlopeY_.resize(static_cast<std::size_t>(cells_ + 1));
+
+    // One segment of one row: the recurrence, then the vertices it produced.
+    const auto segment = [&](std::size_t out, int i0, int points, double h, double y,
+                             std::size_t componentCount) {
+        const double x0 = cascade_.centreX + static_cast<double>(i0) * h;
+        if (componentCount == 0) {
+            // A level that resolves nothing is dead flat, and skipping the
+            // recurrence entirely is what makes the far rings almost free.
+            for (int p = 0; p < points; ++p)
+                writeVertex(vertices_[out + static_cast<std::size_t>(p)], x0 + h * p, y, 0.0, 0.0,
+                            0.0);
+            return;
+        }
+        accumulateRow(byWavenumber_.data(), componentCount, x0, y, h, points, time,
+                      rowElevation_.data(), rowSlopeX_.data(), rowSlopeY_.data());
+        for (int p = 0; p < points; ++p) {
+            const auto index = static_cast<std::size_t>(p);
+            writeVertex(vertices_[out + index], x0 + h * p, y, rowElevation_[index],
+                        rowSlopeX_[index], rowSlopeY_[index]);
+        }
+    };
+
+    for (int level = 0; level < cascade_.levels; ++level) {
+        const double h = levels_[static_cast<std::size_t>(level)].cellSize;
+        const std::size_t componentCount = levels_[static_cast<std::size_t>(level)].components;
+        for (int r = 0; r <= cells_; ++r) {
+            const int j = r - half;
+            const double y = cascade_.centreY + static_cast<double>(j) * h;
+            const std::size_t rowBase =
+                rowStart_[static_cast<std::size_t>(level) * static_cast<std::size_t>(cells_ + 1) +
+                          static_cast<std::size_t>(r)];
+            if (level == 0 || std::abs(j) > hole) {
+                segment(rowBase, -half, cells_ + 1, h, y, componentCount);
+            } else {
+                // The hole and its boundary belong to the finer level, so this row
+                // is two runs with the middle missing.
+                segment(rowBase, -half, cells_ / 4, h, y, componentCount);
+                segment(rowBase + static_cast<std::size_t>(cells_ / 4), hole + 1, cells_ / 4, h, y,
+                        componentCount);
+            }
+        }
+    }
+
+    buildSeconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+}
+
+int OceanCascadeSurface::levelAt(double x, double y) const {
+    if (levels_.empty()) return -1;
+    const double radius = std::max(std::abs(x - cascade_.centreX), std::abs(y - cascade_.centreY));
+    // Written so a NaN falls out of the cascade rather than into a level.
+    if (!(radius >= 0.0)) return -1;
+    for (int level = 0; level < cascade_.levels; ++level)
+        if (radius <= levels_[static_cast<std::size_t>(level)].halfExtent) return level;
+    return -1;
+}
+
+bool OceanCascadeSurface::sampleElevation(double x, double y, double& elevation) const {
+    const int level = levelAt(x, y);
+    if (level < 0 || vertices_.empty()) return false;
+
+    const int half = cells_ / 2;
+    const double h = levels_[static_cast<std::size_t>(level)].cellSize;
+    const double fi = (x - cascade_.centreX) / h;
+    const double fj = (y - cascade_.centreY) / h;
+    const int i = std::clamp(static_cast<int>(std::floor(fi)), -half, half - 1);
+    const int j = std::clamp(static_cast<int>(std::floor(fj)), -half, half - 1);
+    const double u = fi - i, v = fj - j;
+
+    const auto height = [&](int a, int b) {
+        return static_cast<double>(vertices_[vertexIndexAt(level, a, b)].position[2]);
+    };
+    const double z00 = height(i, j), z10 = height(i + 1, j);
+    const double z11 = height(i + 1, j + 1), z01 = height(i, j + 1);
+
+    const SeamEdge seam = seamEdgeOf(cells_, level, i, j, cascade_.stitchSeams);
+    if (seam == SeamEdge::None) {
+        elevation = v <= u ? z00 + u * (z10 - z00) + v * (z11 - z10)
+                           : z00 + v * (z01 - z00) + u * (z11 - z01);
+        return true;
+    }
+
+    // A transition cell is three triangles, so the containing one has to be found
+    // rather than chosen by a diagonal test. The midpoint comes from the finer
+    // level, which is the point of the whole arrangement.
+    const auto midpoint = [&](int a, int b) {
+        return static_cast<double>(vertices_[vertexIndexAt(level - 1, a, b)].position[2]);
+    };
+    double soup[9][3];  // three triangles, nine corners, each (u, v, z)
+    const auto put = [&](int slot, double cu, double cv, double cz) {
+        soup[slot][0] = cu;
+        soup[slot][1] = cv;
+        soup[slot][2] = cz;
+    };
+    switch (seam) {
+        case SeamEdge::Bottom: {
+            const double zm = midpoint(2 * i + 1, 2 * j);
+            put(0, 0, 0, z00); put(1, 0.5, 0, zm);  put(2, 0, 1, z01);
+            put(3, 0.5, 0, zm); put(4, 1, 1, z11);  put(5, 0, 1, z01);
+            put(6, 0.5, 0, zm); put(7, 1, 0, z10);  put(8, 1, 1, z11);
+            break;
+        }
+        case SeamEdge::Top: {
+            const double zm = midpoint(2 * i + 1, 2 * (j + 1));
+            put(0, 0, 0, z00); put(1, 1, 0, z10);   put(2, 0.5, 1, zm);
+            put(3, 0, 0, z00); put(4, 0.5, 1, zm);  put(5, 0, 1, z01);
+            put(6, 1, 0, z10); put(7, 1, 1, z11);   put(8, 0.5, 1, zm);
+            break;
+        }
+        case SeamEdge::Left: {
+            const double zm = midpoint(2 * i, 2 * j + 1);
+            put(0, 0, 0, z00); put(1, 1, 0, z10);   put(2, 0, 0.5, zm);
+            put(3, 0, 0.5, zm); put(4, 1, 0, z10);  put(5, 1, 1, z11);
+            put(6, 0, 0.5, zm); put(7, 1, 1, z11);  put(8, 0, 1, z01);
+            break;
+        }
+        case SeamEdge::Right: {
+            const double zm = midpoint(2 * (i + 1), 2 * j + 1);
+            put(0, 0, 0, z00); put(1, 1, 0, z10);   put(2, 1, 0.5, zm);
+            put(3, 0, 0, z00); put(4, 1, 0.5, zm);  put(5, 1, 1, z11);
+            put(6, 0, 0, z00); put(7, 1, 1, z11);   put(8, 0, 1, z01);
+            break;
+        }
+        case SeamEdge::None:
+            break;
+    }
+
+    for (int t = 0; t < 3; ++t) {
+        const double* a = soup[3 * t];
+        const double* b = soup[3 * t + 1];
+        const double* c = soup[3 * t + 2];
+        const double area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        if (std::abs(area) < 1e-12) continue;
+        const double wa = ((b[0] - u) * (c[1] - v) - (b[1] - v) * (c[0] - u)) / area;
+        const double wb = ((c[0] - u) * (a[1] - v) - (c[1] - v) * (a[0] - u)) / area;
+        const double wc = 1.0 - wa - wb;
+        if (wa < -1e-9 || wb < -1e-9 || wc < -1e-9) continue;
+        elevation = wa * a[2] + wb * b[2] + wc * c[2];
+        return true;
+    }
+    return false;
 }
 
 // --- The elevation channel ----------------------------------------------------
@@ -491,17 +875,28 @@ bool OceanRenderer::ensureGeometryCapacity(std::size_t vertexBytes, std::size_t 
 
 bool OceanRenderer::render(const float mvp[16], const OceanSurface& surface, const OceanView& view,
                            const float clearColour[4], core::Image& out) {
+    return render(mvp, surface.vertices(), surface.indices(), view, clearColour, out);
+}
+
+bool OceanRenderer::render(const float mvp[16], const OceanCascadeSurface& surface,
+                           const OceanView& view, const float clearColour[4], core::Image& out) {
+    return render(mvp, surface.vertices(), surface.indices(), view, clearColour, out);
+}
+
+bool OceanRenderer::render(const float mvp[16], const std::vector<OceanVertex>& surfaceVertices,
+                           const std::vector<std::uint32_t>& surfaceIndices, const OceanView& view,
+                           const float clearColour[4], core::Image& out) {
     if (!valid()) return false;
 
-    const std::size_t vertexCount = surface.vertices().size();
-    const std::size_t indexCount = surface.indices().size();
+    const std::size_t vertexCount = surfaceVertices.size();
+    const std::size_t indexCount = surfaceIndices.size();
     const bool hasGeometry = vertexCount > 0 && indexCount > 0;
     if (hasGeometry) {
         const std::size_t vertexBytes = vertexCount * sizeof(OceanVertex);
         const std::size_t indexBytes = indexCount * sizeof(std::uint32_t);
         if (!ensureGeometryCapacity(vertexBytes, indexBytes)) return false;
-        if (!device_->upload(vertexBuffer_, surface.vertices().data(), vertexBytes)) return false;
-        if (!device_->upload(indexBuffer_, surface.indices().data(), indexBytes)) return false;
+        if (!device_->upload(vertexBuffer_, surfaceVertices.data(), vertexBytes)) return false;
+        if (!device_->upload(indexBuffer_, surfaceIndices.data(), indexBytes)) return false;
     }
 
     Push push{};

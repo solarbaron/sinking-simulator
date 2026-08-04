@@ -199,14 +199,32 @@ int main(int argc, char** argv) {
     // Resolve the *shortest* component, not the dominant one: sixteen cells
     // across the dominant wavelength still invents a quarter of Hs, because the
     // spectrum carries waves an order of magnitude shorter than its peak.
-    const double patch = 3.0 * particulars.lengthPp;
-    gpu::OceanGrid grid;
-    grid.halfExtent = patch;
-    grid.resolution =
-        std::min(512, gpu::oceanResolutionFor(patch, gpu::shortestWavelength(field), 8.0));
-    std::printf("  ocean grid: %d cells over %.0f m\n", grid.resolution, 2 * patch);
+    //
+    // A *uniform* patch at that resolution cannot then reach the horizon -- it
+    // costs the square of the distance, so it stopped half a kilometre out and its
+    // edge was in the frame. The cascade halves the resolution every time it
+    // doubles the extent, so reach costs levels rather than area. How far is far
+    // enough is a fact about the camera: `oceanHorizonReach` is the distance at
+    // which the sea's edge is one pixel from the horizon.
+    const double fov = 50.0 * sim::kDegToRad;
+    const double eyeHeight = ship.state.position.z + 0.45 * particulars.lengthPp;
+    const double reach = gpu::oceanHorizonReach(eyeHeight, fov, kHeight);
 
-    gpu::OceanSurface surface;
+    gpu::OceanCascade cascade;
+    // Level 0 has to hold the ship *and* the camera: the eye rides
+    // sqrt(0.9^2 + 1.1^2) = 1.42 Lpp out on the quarter, and the water directly
+    // under it is the nearest water in the frame.
+    cascade.innerHalfExtent = 1.5 * particulars.lengthPp;
+    cascade.resolution =
+        gpu::oceanResolutionFor(cascade.innerHalfExtent, gpu::shortestWavelength(field), 8.0);
+    cascade.levels = gpu::oceanCascadeLevelsFor(cascade.innerHalfExtent, reach);
+    std::printf("  ocean cascade: %d levels, %d cells of %.2f m over the inner %.0f m,"
+                " reaching %.0f km (horizon for an eye %.0f m up at %u px is %.0f km)\n",
+                cascade.levels, cascade.cellsPerSide(), cascade.cellSize(0),
+                2.0 * cascade.innerHalfExtent, cascade.reach() * 1e-3, eyeHeight, kHeight,
+                reach * 1e-3);
+
+    gpu::OceanCascadeSurface surface;
     gpu::SceneMesh scene;
     gpu::HullPaint paint;
     paint.waterlineZ = particulars.draft;
@@ -214,6 +232,7 @@ int main(int argc, char** argv) {
 
     const int stepsPerFrame = static_cast<int>(0.25 / dt);
     double worstHeel = 0, worstTrim = 0;
+    double bestDisplace = 1e30, bestUpload = 1e30, bestGpu = 1e30;
     for (int frame = 0; frame < options.frames; ++frame) {
         for (int i = 0; i < stepsPerFrame; ++i) {
             sea.time += dt;
@@ -229,11 +248,11 @@ int main(int argc, char** argv) {
 
         if (!device.valid()) continue;
 
-        // The ocean patch follows the ship, so the sea is always drawn where the
+        // The cascade follows the ship, so the finest water is always where the
         // ship is rather than where it started.
-        grid.centreX = ship.state.position.x;
-        grid.centreY = ship.state.position.y;
-        surface.build(field, grid, sea.time);
+        cascade.centreX = ship.state.position.x;
+        cascade.centreY = ship.state.position.y;
+        surface.build(field, cascade, sea.time);
 
         scene.clear();
         if (!scene.appendShip(ship, paint, library, gpu::HullShading{}, error)) {
@@ -247,9 +266,13 @@ int main(int argc, char** argv) {
                                                1.1 * particulars.lengthPp,
                                                0.45 * particulars.lengthPp};
         const sim::Vec3 eye = ship.state.position + offset;
+        // The far plane has to clear the cascade's own corners or the clip plane
+        // becomes the edge the cascade was built to remove. The near plane moves
+        // out with it to keep the depth resolution at the waterline in
+        // millimetres: nothing here is closer than the water under the camera.
         const sim::Mat4 mvp =
-            sim::perspective(50.0 * sim::kDegToRad, double(kWidth) / kHeight, 1.0,
-                             12.0 * particulars.lengthPp) *
+            sim::perspective(fov, double(kWidth) / kHeight, 0.02 * particulars.lengthPp,
+                             1.5 * cascade.reach()) *
             sim::lookAt(eye, ship.state.position, {0, 0, 1});
         view.eye[0] = float(eye.x);
         view.eye[1] = float(eye.y);
@@ -264,6 +287,16 @@ int main(int argc, char** argv) {
             std::printf("render failed on frame %d\n", frame);
             return 1;
         }
+        if (frame == 0) {
+            std::printf("  cascade levels (cell size, components carried, vertices):");
+            for (const gpu::OceanCascadeSurface::Level& level : surface.levels())
+                std::printf(" [%.0fm %zu %zu]", level.cellSize, level.components, level.vertices);
+            std::printf("\n");
+        }
+        bestDisplace = std::min(bestDisplace, surface.buildSeconds());
+        bestUpload = std::min(bestUpload, renderer.lastFrame().uploadSeconds);
+        bestGpu = std::min(bestGpu, renderer.lastFrame().gpuSeconds);
+
         char path[512];
         std::snprintf(path, sizeof(path), "%s/seaway_%03d.png", options.out.c_str(), frame);
         if (!core::writePng(path, image)) {
@@ -276,6 +309,11 @@ int main(int argc, char** argv) {
     std::printf("  %d frames, worst heel %.2f deg, worst trim %.2f deg, speed %.2f m/s\n",
                 options.frames, worstHeel, worstTrim,
                 dot(ship.state.velocity, R * sim::Vec3{1, 0, 0}));
+    if (device.valid())
+        std::printf("  best frame: %zu ocean vertices, displacement %.1f ms, upload %.2f ms,"
+                    " GPU %.2f ms\n",
+                    surface.vertices().size(), bestDisplace * 1e3, bestUpload * 1e3,
+                    bestGpu * 1e3);
     std::printf("ok\n");
     return 0;
 }
