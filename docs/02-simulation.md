@@ -2171,10 +2171,17 @@ gave 1.8× and 4.0×. And the probe is a synthetic matvec with the right footpri
 not the elastoplastic kernel, so it settles the *bandwidth* question and only
 bounds the barrier one.
 
-The actionable consequence: the per-element stiffness store is what puts the
-ceiling there. Recomputing it instead of storing it trades compute for bandwidth
-and moves the knee out by roughly the ratio of the two, which is the first thing
-to try if zones ever need to be larger.
+The per-element stiffness store is what puts the ceiling there, so the question is
+what to do about it — and the obvious answer is wrong. **Recomputing instead of
+storing costs 133× the bandwidth it saves**: forming an element stiffness is
+21.1 µs (`07-fem-spike-findings.md`) while streaming its 4.6 kB at the saturated
+29 GB/s is 0.16 µs. This paragraph first suggested exactly that trade without
+costing it, which is the error this file keeps recording other people making.
+
+What *is* available is that the matrix is **symmetric** — 300 independent entries
+of 576 — so storing a triangle halves the working set and moves the knee from
+~6500 elements to ~13 000 for no arithmetic at all. Beyond that, the honest answer
+is to keep zones under the line rather than to make the line move.
 
 
 `engine/sim/zone.{hpp,cpp}`, checked by `tests/test_zone.cpp`, run at ship scale by
