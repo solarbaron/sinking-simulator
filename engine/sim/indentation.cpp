@@ -82,6 +82,8 @@ ImpactDamage impactDamage(const StructuralMesh& structure, const Vec3& impact, d
 
     const double frameSpacing =
         structure.frameSpacing > 0 ? structure.frameSpacing : scantlings.frameSpacing;
+    const double stiffenerSpacing =
+        scantlings.longitudinalSpacing > 0 ? scantlings.longitudinalSpacing : frameSpacing;
 
     // Panels the strike can reach, nearest first.
     //
@@ -112,20 +114,37 @@ ImpactDamage impactDamage(const StructuralMesh& structure, const Vec3& impact, d
         (void)distance;
         const PlatePanel& panel = structure.panels[static_cast<std::size_t>(index)];
 
+        // A plate spans the *short* way between its supports, so the span is the
+        // smaller of the two spacings and not the frame spacing by convention.
+        // This was authored as the frame spacing and it is wrong: on the ferry the
+        // plating is bounded by longitudinals at 0.70 m, not by frames at 2.40 m.
+        //
+        // Found by the zone FEM, which has no span in it at all -- only plating
+        // and where it is held -- so it settles the question from outside the
+        // model. What it costs is worth being exact about, because the headline
+        // reading of that finding is too broad: the energy to tear a bay moves
+        // only 5%, because the failure strain is nearly flat over this range of
+        // element size, so the *number* of bays torn barely changes. What moves is
+        // penetration, 0.686 m to 0.205 m, and resisting force, 2.96 MN to
+        // 10.35 MN -- both by a factor of 3.4, and both in the direction of the
+        // hull being far stiffer and far less deeply dented than reported.
+        const double span = std::min(frameSpacing, stiffenerSpacing);
         IndentedPanel model;
-        model.span = frameSpacing;
+        model.span = span;
         model.thickness = panel.thickness;
-        // The struck width is the panel's own extent along the frame direction,
-        // which for a roughly square bay is its area over the span.
-        model.contactWidth = std::max(panel.area() / std::max(frameSpacing, 1e-6), 1e-6);
+        // The struck width is the panel's extent along the *other* direction,
+        // which for a bay of known area is its area over the span.
+        model.contactWidth = std::max(panel.area() / std::max(span, 1e-6), 1e-6);
         model.yieldStrength =
             panel.material >= 0 && panel.material < static_cast<int>(structure.materials.size())
                 ? structure.materials[static_cast<std::size_t>(panel.material)].yieldStrength
                 : ah36Steel().yieldStrength;
         // Regularised on this panel's own geometry, not taken as one number: the
         // failure strain is a property of the length the strain is smeared over.
+        // Regularised on the span, which is the length the membrane strain is
+        // smeared over -- not on the frame spacing, which is now the other side.
         model.failureStrain =
-            plasticity::regularisedFailureStrain(material.failure, frameSpacing, panel.thickness);
+            plasticity::regularisedFailureStrain(material.failure, span, panel.thickness);
 
         const double toTear = energyToTear(model);
         damage.panels.push_back(index);
