@@ -11,7 +11,7 @@ of truth.
 ```sh
 ./scripts/verify.sh            # quick    build + tests             ~35 s
 ./scripts/verify.sh full       # + clean rebuild, GPU, scenarios   ~400 s
-./scripts/verify.sh sanitize   # + ASan and TSan                   ~670 s
+./scripts/verify.sh sanitize   # + ASan and TSan                   ~820 s
 ```
 
 Run `quick` constantly and `sanitize` **before every commit** — the extra
