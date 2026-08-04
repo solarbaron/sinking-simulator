@@ -142,6 +142,44 @@ CollapseCurve progressiveCollapse(const std::vector<CollapseElement>& elements,
     return curve;
 }
 
+CollapseCurve collapseCurve(const std::vector<CollapseElement>& elements, double direction,
+                            int steps) {
+    const double sign = direction >= 0 ? 1.0 : -1.0;
+    const double yieldCurvature = firstYieldCurvature(elements);
+    if (!(yieldCurvature > 0)) return CollapseCurve{};
+
+    // Collapse arrives at a small multiple of first yield; six is comfortable and
+    // still cheap.
+    double reach = 6.0 * yieldCurvature;
+    CollapseCurve curve = progressiveCollapse(elements, sign * reach, steps);
+
+    // **The peak landing on the last point means the curve was still rising**, and
+    // a maximum found at the edge of a sweep is not a maximum. It happens whenever
+    // one element is far weaker than the section it sits in -- a wasted strake, or
+    // a bay a Tier-2 zone has just reported as damaged -- because first yield is
+    // set by the weakest element and collapse is not. Jump straight to the
+    // curvature the *extreme fibre* would yield at, which no single weak element
+    // can move, then extend geometrically if even that was short. A section whose
+    // peak was already inside its sweep never enters this branch and is unchanged
+    // to the last bit.
+    const auto peakAtTheEnd = [](const CollapseCurve& c) {
+        return !c.points.empty() &&
+               std::abs(c.ultimateCurvature) >= 0.999 * std::abs(c.points.back().curvature);
+    };
+    if (peakAtTheEnd(curve)) {
+        const double robust = extremeFibreYieldCurvature(elements);
+        if (robust > yieldCurvature) {
+            reach = 6.0 * robust;
+            curve = progressiveCollapse(elements, sign * reach, steps);
+        }
+        for (int attempt = 0; attempt < 6 && peakAtTheEnd(curve); ++attempt) {
+            reach *= 3.0;
+            curve = progressiveCollapse(elements, sign * reach, steps);
+        }
+    }
+    return curve;
+}
+
 double firstYieldCurvature(const std::vector<CollapseElement>& elements) {
     if (elements.empty()) return 0.0;
     double area = 0, moment = 0;
@@ -167,6 +205,28 @@ double firstYieldCurvature(const std::vector<CollapseElement>& elements) {
     return smallest;
 }
 
+double extremeFibreYieldCurvature(const std::vector<CollapseElement>& elements) {
+    if (elements.empty()) return 0.0;
+    double area = 0, moment = 0;
+    for (const CollapseElement& e : elements) {
+        area += e.area;
+        moment += e.area * e.height;
+    }
+    if (area <= 0) return 0.0;
+    const double axis = moment / area;
+
+    // Yield only. Buckling is deliberately absent: it is the term that a single
+    // damaged panel drives to nothing, and this exists to be immune to that.
+    double smallest = 0;
+    for (const CollapseElement& e : elements) {
+        const double lever = std::abs(e.height - axis);
+        if (lever <= 0 || e.curve.youngsModulus <= 0 || e.curve.yieldStrength <= 0) continue;
+        const double k = e.curve.yieldStrength / (e.curve.youngsModulus * lever);
+        if (smallest == 0.0 || k < smallest) smallest = k;
+    }
+    return smallest;
+}
+
 std::vector<StrengthStation> longitudinalStrength(const HullGirder& girder,
                                                   const StructuralMesh& structure,
                                                   const Scantlings& scantlings,
@@ -183,15 +243,11 @@ std::vector<StrengthStation> longitudinalStrength(const HullGirder& girder,
         s.x = g.x;
         s.appliedMoment = g.moment;
 
-        // Sweep far enough to be certain the peak is inside. Collapse arrives at
-        // a small multiple of first yield; six is comfortable and still cheap.
-        const double yieldCurvature = firstYieldCurvature(elements);
-        if (!(yieldCurvature > 0)) continue;
+        if (!(firstYieldCurvature(elements) > 0)) continue;
         // In the direction the moment actually acts. A hull is not equally strong
         // both ways and evaluating the wrong branch would report the stronger one.
-        const double sign = g.moment >= 0 ? 1.0 : -1.0;
         const CollapseCurve curve =
-            progressiveCollapse(elements, sign * 6.0 * yieldCurvature, curvatureSteps);
+            collapseCurve(elements, g.moment >= 0 ? 1.0 : -1.0, curvatureSteps);
 
         s.ultimateMoment = curve.ultimateMoment;
         s.fullyPlastic = curve.fullyPlasticMoment;

@@ -273,13 +273,36 @@ The longest and highest-risk phase.
   and `engine/sim/plasticity.hpp`, measured in `02-simulation.md` §3. Radial return
   with isotropic hardening (kinematic available, defaulted off for want of a
   measurement); rate dependence deliberately deferred, with the reason recorded
-- Adaptive zone promotion/demotion and interface coupling — **the largest thing
-  outstanding.** `zone.hpp` builds and solves a zone; nothing decides when to
-  promote one, nothing couples its reaction back to the hull girder, and nothing
-  gives it the girder's stress as a pre-load. It is a cost problem as much as an
-  engineering one: measured, an elastoplastic solid-shell element costs 7.3 µs
-  against 273 ns elastic and the stable step is thickness-governed, so cost is
-  `4.0 × elementCount` core-seconds per simulated second on 12 mm plating.
+- ~~Adaptive zone promotion/demotion and interface coupling~~ — **done for
+  Tier 0 ↔ Tier 2**: `engine/sim/promotion.{hpp,cpp}`, measured in
+  `02-simulation.md` §3. Three things that were three separate holes: a criterion
+  that decides which patches deserve Tier 2 under an element budget, a
+  `SectionReduction` that turns what tore back into a `StructuralMesh` Tier-0
+  already knows how to read, and a `zone::Preload` that hands the zone the
+  girder's own `M (z − z_na) / I` on the way in.
+
+  It is a cost problem as much as an engineering one, and the cost is **linear in
+  the number of zones** — measured, two zones take 2.00× one. So the criterion is
+  built around *not* firing: a station qualifies only when it is past an absolute
+  threshold **and** standing above the ship's own **median** for that trigger, so
+  a hull at 0.9 of capacity everywhere promotes nothing (0 candidates with the
+  guard, 31 without). A contact patch is the other trigger and is absolute,
+  against the struck bay's own `4 σ_y (t/span)²` — 402 kPa on her side, bracketed
+  at ±20%. Chatter is held off by hysteresis *and* a dwell, each tested against
+  its own negative control: 1 promotion against 5 without the band, 0 against 20
+  without the dwell.
+
+  Two costs, three orders apart: the **decision** is 7 µs over 8900 panels and the
+  **Tier-0 answer it reads** is 167 ms, of which 137 ms is the Smith sweep — so it
+  is reviewed at a cadence and explicitly not every tick.
+
+  What is still missing is **Tier 1**, so the coupling goes to a *section* rather
+  than to retained interface DOF, and it is one way per solve: the patch's edge
+  stays clamped and nothing outside it responds. The reduction also carries
+  plating only, because the zone meshes plating only — a collision that opens
+  fourteen bays leaves their longitudinals at full strength, which is the
+  un-conservative direction and needs the same multi-point constraint the zone
+  needs to mesh a web at all
 
   **The "200 m² is two core-hours per simulated second" figure needs its element
   size beside it or it says nothing.** It assumes 50 mm elements; the same 200 m²
@@ -287,6 +310,18 @@ The longest and highest-risk phase.
   bounded is the element *count*, and area and resolution trade as `area / h²` —
   the step does not care how big an element is in plane. The event is short too: a
   6 m/s bow reaching 0.22 m into her side is 0.037 s, not one second
+
+- **A Tier-0 defect the coupling found, and fixed.** `longitudinalStrength` sized
+  its progressive-collapse sweep from `firstYieldCurvature`, which is set by the
+  *weakest* element in a section — safe only while none is anomalously weak, which
+  stops being true exactly when it matters, because a damaged bay's critical
+  stress falls as `t²`. Thinning forty of the ferry's side panels to an eighth
+  dropped first yield 25× and the reported ultimate moment to 1.26e8 N m against a
+  true 1.89e9; taking the same plating away *entirely* reported 1.87e9, so the
+  hull girder got fifteen times stronger when material was removed.
+  `collapseCurve()` now extends the sweep only when the peak lands on its last
+  point, so an intact section's answer is **bit-identical** to before — her worst
+  strength margin is 4.2366 either way
 - Ductile damage — done, `engine/sim/plasticity.hpp`: equivalent plastic strain to
   failure, regularised against the element's own size and against triaxiality.
   **Mesh-splitting fracture is not**: a failed integration point is deleted, and the
@@ -401,8 +436,19 @@ The longest and highest-risk phase.
   every joule goes into tearing the struck plating — `indentation.hpp` records that
   this is tight at low energy and loose above a few tens of megajoules. The
   deformation is computed by a membrane model rather than by the solid-shell
-  elements and plasticity that now exist; wiring those in is the Tier-2 zone
-  solver, and it is the largest thing still outstanding in Phase 3.
+  elements and plasticity that now exist. Every piece needed to replace it is now
+  here — `promotion.hpp` sites a zone from the contact patch, hands it the
+  girder's stress, and takes its damage back — and `tools/zone_probe` runs that
+  chain end to end on her side. What `ram_view` still lacks is the *energy*
+  bookkeeping: the zone takes a prescribed punch travel where a collision delivers
+  a number of joules, and closing that needs the striking body's mass, which is
+  `collision.hpp`'s to supply.
+
+  With the zone solver and the coupling done, **the largest thing outstanding in
+  Phase 3 is Tier 1** — Craig–Bampton reduction. Without it a promoted zone is
+  clamped on a boundary that cannot move, and a hull girder that has lost a bay
+  learns about it through a section rather than through the interface DOF where
+  the load actually redistributes.
 
 This is the phase the whole concept is named for. If it works, everything after
 it is addition; if it does not, the project is a very good flooding simulator and

@@ -95,8 +95,22 @@ struct CollapseCurve {
 
 // Sweep a curvature range and return the curve. `maxCurvature` is signed: give it
 // a negative value for the sagging branch. Steps are uniform.
+//
+// It sweeps exactly as far as it is told and nothing checks that the peak is
+// inside -- use `collapseCurve()` below unless the range is the point of the
+// call, because **sizing the sweep is the part that is easy to get wrong.**
 CollapseCurve progressiveCollapse(const std::vector<CollapseElement>& elements,
                                   double maxCurvature, int steps = 200);
+
+// The collapse curve, swept far enough that its peak is genuinely a peak.
+// `direction` is the sign of the moment the section has to carry.
+//
+// Starts at six times `firstYieldCurvature`, exactly as before, and extends only
+// when the peak lands on the last point of the sweep -- which is the signature of
+// a curve that was still rising. See `extremeFibreYieldCurvature` for the case
+// that makes that happen and for what it cost when nothing checked.
+CollapseCurve collapseCurve(const std::vector<CollapseElement>& elements, double direction,
+                            int steps = 150);
 
 // The neutral axis that balances axial force at a given curvature, and the moment
 // there. Exposed because the migration of the neutral axis is the mechanism, and
@@ -114,10 +128,33 @@ std::vector<CollapseElement> collapseElementsAt(const StructuralMesh& structure,
                                                 const Scantlings& scantlings, double x,
                                                 double shedExponent = 0.45);
 
-// Curvature at which the extreme fibre first reaches yield. Used to size a sweep
-// that is certain to contain the peak: collapse arrives at a small multiple of
-// it, so sweeping to several times this is safe without being wasteful.
+// Curvature at which the first element reaches its own limit -- yield, or
+// buckling if that comes first. This is *first yield of the section*, and it is
+// set by the **weakest** element in it.
 double firstYieldCurvature(const std::vector<CollapseElement>& elements);
+
+// Curvature at which the extreme fibre would reach **yield**, ignoring buckling
+// entirely. The classical first-yield curvature, and the one no single weak
+// element can move: yield strengths across a ship vary by a factor of one and a
+// half where a plate's critical stress varies as `t^2`.
+//
+// It exists because sizing a collapse sweep from `firstYieldCurvature` is only
+// safe when no element is anomalously weak, and **that assumption breaks exactly
+// when it matters**. A wasted strake -- or a bay a Tier-2 zone has just reported
+// as damaged, which is what `promotion.hpp` does -- buckles at a couple of MPa,
+// which puts first yield five orders of magnitude below the curvature at which
+// the section actually collapses. A sweep sized from it never reaches the peak
+// and reports a ship that has lost one bay as having lost nearly all her
+// strength. Measured on the reference ferry: thinning forty side panels to an
+// eighth took the reported ultimate moment from 1.85e9 to 8.4e7 N m, and taking
+// them away *entirely* put it back to 1.7e9 -- a strength that improves when
+// material is removed, which is the signature of a truncated sweep and not of
+// any physics.
+//
+// `longitudinalStrength` now sizes from `firstYieldCurvature` as before and
+// extends only if the peak lands on the last point of the sweep, so a section
+// whose peak was already inside is unaffected to the last bit.
+double extremeFibreYieldCurvature(const std::vector<CollapseElement>& elements);
 
 // --- Along the length ---------------------------------------------------------
 
