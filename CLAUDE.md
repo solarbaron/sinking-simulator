@@ -96,9 +96,14 @@ most useful thing to know about this codebase:
 | `Mat3{}` is the **identity**, so an accumulator started at I | a second moment measured two ways: every volume right, every diagonal one too large |
 | Two coincident faces counted twice, overlap 5/3 too large | an overlap coming out *larger than one of the solids* |
 | Roll stiffness finite-differenced about the **body origin** while the moment was taken about the cog, so `zetaRoll = 0.08` delivered 0.144 | timing a free decay's log decrement against the ζ the label claims |
+| A published damage table whose energy column was ½·v²·the **struck** ship's mass — the wrong ship, and as if all of it reached the plating | re-running the tool that generated the table instead of quoting the table |
+| Three documents claiming a fix was still unapplied, above code that applied it | the same re-run; nothing tests a comment |
+| "The hole is 10× too big" inferred from a **force** ratio, when the hole is set by energy per unit area and moves 5% | measuring the two effects separately instead of propagating one number |
 
 A green functional test is evidence the code does what you thought of, not that
-it is correct.
+it is correct. **Nothing at all tests a comment** — three documents here repeated a
+wrong factor of ten because each quoted the previous one rather than the
+measurement, and the code beneath them had been right for weeks.
 
 ## Settled decisions — do not reopen
 

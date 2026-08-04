@@ -67,13 +67,23 @@ struct RaoSettings {
 
     // Still-water running before the wave is switched on, so a ship with
     // propulsion reaches its own speed rather than being told one.
+    //
+    // **Set this when the prototype carries propulsion.** It defaults to zero, and
+    // at zero a powered ship accelerates *through* her own measurement window: the
+    // reported RAO is still fitted at the speed she averaged over the record, so
+    // the answer is not wrong, but the window was sized from a speed she never
+    // held and the surge is not steady across it.
     double accelerateSeconds = 0.0;
 
     // Speed to *assume* when the ship has no propulsion attached -- a towed
-    // model, or a hull whose machinery is not modelled. When `prototype` does
-    // carry propulsion this is ignored and the speed the ship actually achieves
-    // is measured instead, because a requested speed the hull cannot reach would
-    // put the fit at a frequency the ship never met.
+    // model, or a hull whose machinery is not modelled.
+    //
+    // When `prototype` does carry propulsion this does not reach the reported
+    // answer: the encounter frequency is re-derived from the mean surge over the
+    // record, because a requested speed the hull cannot reach would put the fit at
+    // a frequency the ship never met. It is not quite unused, though -- it sizes
+    // the settle and record windows, which are counted in response periods, so a
+    // badly wrong value still costs accuracy through the fit's window length.
     double forwardSpeed = 0.0;   // m/s
     int settleCycles = 15;       // transient discarded before recording
     int recordCycles = 10;       // fitted window

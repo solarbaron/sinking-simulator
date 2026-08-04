@@ -37,34 +37,41 @@
 // for a survivability question, and either way it is the number to replace when
 // the zone FEM can be driven over a real patch.
 //
-// **How badly, measured.** Struck amidships by a sister ship, the ferry opens:
+// **How badly, measured.** `tools/ram_view` drives a 5175 t hull into the 8984 t
+// ferry abeam and reports the energy the contact model actually delivered, which
+// is well short of the striker's kinetic energy because both ships keep moving:
 //
-//     2 m/s,  18 MJ  ->   16 bays,   27 m2
-//     4 m/s,  72 MJ  ->   63 bays,  107 m2
-//     6 m/s, 162 MJ  ->  139 bays,  234 m2
-//     8 m/s, 287 MJ  ->  245 bays,  415 m2
+//     2 m/s,   7 MJ  ->    5 bays,    8.6 m2
+//     4 m/s,  31 MJ  ->   26 bays,   44.4 m2
+//     6 m/s,  74 MJ  ->   63 bays,  107.7 m2
+//     8 m/s, 135 MJ  ->  114 bays,  196.5 m2
 //
-// **A correction the zone FEM found, recorded rather than applied.**
-// `impactDamage()` below hands this model `span = frameSpacing` -- 2.4 m on the
-// reference ferry -- and takes the struck width as the longitudinal spacing. For a
-// longitudinally framed side that is the wrong way round: the plating spans between
-// *longitudinals*, 0.70 m, and the frames are the long direction. The sentence
-// above about `span` has the two swapped for the same reason.
+// An earlier table here read 27 / 107 / 234 / 415 m2 and **both** of its columns
+// were wrong. The energy was `0.5 m v^2` over the *struck* ship's 8984 t -- the
+// wrong ship, and as though all of it reached the plating -- overstating what is
+// delivered by 2.1 to 2.6 times. Nearly all of the difference is that.
 //
-// `zone.{hpp,cpp}` is the instrument that settles it, because it has no span in it
-// at all -- only plating and supports. Driving a 2 m punch into the ferry's own
-// side, it resists at **18.9 MN at 0.078 m**, against 10.6 MN for this model on the
-// 0.70 m span and **1.10 MN** on the 2.4 m one. The short span is right, and the
-// long one under-predicts what a bay absorbs by an order of magnitude -- so the
-// table below, and `ram_view`'s hole, are about ten times too large again on top of
-// everything else here.
+// **The span, and what correcting it actually cost.** `impactDamage()` once took
+// `span = frameSpacing`, 2.4 m, where a longitudinally framed side spans between
+// *longitudinals* at 0.70 m. `zone.{hpp,cpp}` settled it from outside, having no
+// span in it at all -- only plating and where it is held: a 2 m punch into the
+// ferry's side resists at **18.9 MN at 0.078 m**, against 10.6 MN for this model
+// on the short span and **1.10 MN** on the long one.
 //
-// It is one line to change and it moves every number the Phase 3 milestone
-// publishes, including the three quoted in `06-roadmap.md`, so it is left for a
-// session that can re-validate them rather than folded in beside unrelated work.
+// It is fixed, and the natural reading of that finding is far too broad, so it is
+// worth being exact. The energy to tear a bay is `sigma_y t A eps_f`, in which
+// **the span cancels** -- it reaches the answer only through the failure-strain
+// regularisation, which is nearly flat here. Per unit struck area a bay absorbs
+// 0.646 MJ/m2 on the long span against 0.680 on the short, so the hole moves 5%:
+// the old energies through the corrected span give 25.6 / 102.0 / 222.4 / 392.8 m2
+// against the old 27 / 107 / 234 / 415. Not the order of magnitude an earlier
+// draft of this comment claimed -- that reasoned from force to area, and they do
+// not scale together. What *was* wrong by 3.4x is force and penetration: 0.686 m
+// of denting against 0.205, in the direction of reporting the hull far softer than
+// it is.
 //
-// The low end is credible. **The high end is not** -- 415 m2 is most of her side,
-// and a real 287 MJ collision does not open that, because the striking bow crushes
+// The low end is credible. **The high end is not** -- 196 m2 is a seventh of her
+// side, and a real 135 MJ collision does not open that, because the striking bow crushes
 // too, the longitudinals resist in their own right, and friction takes a share.
 // None of those are here, so every joule goes into tearing the struck plating and
 // the hole grows linearly with energy when it should saturate. Treat the answer as
@@ -80,9 +87,11 @@
 
 namespace sim {
 
-// The panel being struck. `span` is between supports -- frame spacing for a
-// longitudinally framed side, longitudinal spacing for a transversely framed one
-// -- and `contactWidth` is how much of it the striking body actually touches.
+// The panel being struck. `span` is between supports -- *longitudinal* spacing for
+// a longitudinally framed side, frame spacing for a transversely framed one -- and
+// `contactWidth` is how much of it the striking body actually touches. Plating
+// spans the short way, between whichever stiffeners are closer together; getting
+// these two round the wrong way is the defect recorded above.
 struct IndentedPanel {
     double span = 2.40;          // m, L
     double thickness = 0.012;    // m, t

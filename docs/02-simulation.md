@@ -841,7 +841,13 @@ tests now both take speed along the ship's own bow.
 frequency is re-derived from the mean surge over the recording window, because
 added resistance in waves means the speed under way is not the speed it settled
 at in flat water. `forwardSpeed` survives only for hulls with no machinery
-modelled — a towed model — and is ignored outright when propulsion is attached.
+modelled — a towed model — and does not reach the reported answer when propulsion
+is attached. It is not entirely unused there, which an earlier draft of this
+paragraph claimed: it seeds the encounter frequency that sizes the settle and
+record windows, and those are counted in response periods. Since
+`accelerateSeconds` defaults to **zero**, the default powered sweep accelerates
+through its own recording window with that window sized from a speed the ship
+never held. Set `accelerateSeconds` whenever the prototype has machinery.
 
 One consequence worth stating: the reference wave is sampled **at the ship**, not
 at the origin. A moving hull meets the wave at ω_e while the surface at a fixed
@@ -2341,18 +2347,28 @@ membrane model says 0.092 m, earlier by the predictable direction, because the
 membrane model spreads one strain over the whole leg where the FEM has the punch
 edge and the clamped support concentrating it.
 
-> **What this settles, and it is a correction to `indentation.hpp`.** `impactDamage()`
-> takes the membrane span as the **frame** spacing — 2.4 m on this ship — and the
+> **What this settles, and it was a correction to `indentation.hpp`.** `impactDamage()`
+> took the membrane span as the **frame** spacing — 2.4 m on this ship — and the
 > struck width as the longitudinal spacing. For a longitudinally framed side that is
 > the wrong way round: the plating spans between *longitudinals*, 0.70 m. The FEM has
 > no span in it at all, only plating and supports, so it is the instrument that can
 > say. On the ferry's own side at 0.078 m of penetration it resists at **18.9 MN**,
 > against 10.6 MN for a membrane on the 0.70 m span and **1.10 MN** for one on the
-> 2.4 m span. The short span is right, and the long one under-predicts the energy a
-> bay absorbs by a factor of ten — which means `ram_view` currently tears roughly ten
-> times too many bays. The line to change is one line in `indentation.cpp`; it moves
-> every number the Phase 3 milestone publishes, so it is recorded here and left for
-> a session that can re-validate them rather than folded in here.
+> 2.4 m span. The short span is right, and it is now what the code uses.
+>
+> **But "a factor of ten" was the wrong thing to conclude from it,** and this draft
+> said so before the fix was measured. Force differs by ten; the *hole* does not,
+> because the hole is set by energy per unit struck area and the span very nearly
+> cancels out of it. The energy to tear a bay is `σ_y·t·A·ε_f`, reaching the span
+> only through the failure-strain regularisation, which is flat here: **0.646 MJ/m²
+> on the long span against 0.680 on the short, 5%.** Running the pre-fix energies
+> through the corrected span moves the published holes from 27 / 107 / 234 / 415 m²
+> to 25.6 / 102.0 / 222.4 / 392.8 — five per cent, not ten times. What *was* wrong
+> by 3.4× is force and penetration, 0.686 m of denting against 0.205, in the
+> direction of reporting the hull far softer than it is.
+>
+> Reasoning from a force ratio to an area ratio is the mistake, and it survived
+> three documents because each copy quoted the last rather than the measurement.
 
 #### The energy account, and where it stops closing
 

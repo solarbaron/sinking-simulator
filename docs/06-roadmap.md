@@ -404,18 +404,6 @@ The longest and highest-risk phase.
   and `none` loses her too. The scenarios that let her live are the ones where
   somebody acts.
 
-  **A correction the FEM found in it.** `impactDamage()` takes the membrane span as
-  the *frame* spacing, 2.4 m, and the struck width as the longitudinal spacing. For
-  a longitudinally framed side that is the wrong way round — the plating spans
-  between longitudinals, 0.70 m — and `indentation.hpp`'s own header states the rule
-  with the two swapped. The zone FEM has no span in it, only plating and supports,
-  so it is the instrument that settles it: on the ferry's side at 0.078 m of
-  penetration it resists at 18.9 MN against 10.6 MN for a membrane on the 0.70 m
-  span and 1.10 MN on the 2.4 m one. **The long span under-predicts what a bay
-  absorbs by a factor of ten, so the figures above tear roughly ten times too many
-  bays.** The fix is one line; it moves every number this milestone publishes, so it
-  is recorded rather than folded in, and it needs a session that re-validates them.
-
   **And it draws.** `ram_view --frames=N --out=DIR` writes the flooding sequence
   with the damage in it: plating dished in, the torn bays cut out as holes with the
   ferry's own compartment meshes visible through them, and exposed metal round

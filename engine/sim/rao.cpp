@@ -131,7 +131,14 @@ RaoPoint measureRaoAt(const Ship& prototype, double omega, const RaoSettings& se
     // Let a powered ship reach its own speed in still water before the wave
     // arrives. A speed the hull cannot actually hold would put the fit at a
     // frequency the ship never met, which is why this is run rather than asked
-    // for: with propulsion attached, settings.forwardSpeed is ignored entirely.
+    // for.
+    //
+    // What `settings.forwardSpeed` still does when propulsion is attached: it
+    // seeds the encounter frequency that sizes the settle and record windows
+    // below. The *reported* frequency is re-derived from the mean surge over the
+    // record further down, so the answer does not depend on it -- but the window
+    // length does, and with `accelerateSeconds` left at its default of zero this
+    // branch does not run at all and the seed is whatever was asked for.
     double speed = settings.forwardSpeed;
     if (ship.propulsion.has_value() && settings.accelerateSeconds > 0.0) {
         const Sea still(0.0);
