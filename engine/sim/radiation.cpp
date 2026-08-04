@@ -619,6 +619,37 @@ std::vector<double> radiationFrequencyGrid(double omegaMin, double omegaMax, int
     return grid;
 }
 
+Matrix6 transferAddedMass(const Matrix6& matrix, const Vec3& offset) {
+    // T = [[I, d~], [0, I]]; see the derivation in the header. Written out rather
+    // than looped over as a general 6x6 product only in the sense that the two
+    // multiplications are kept separate -- the fully expanded quadruple loop is
+    // 1296 products for a matrix that is mostly identity, and this runs once a
+    // tick inside the rigid-body integrator.
+    double t[6][6] = {};
+    for (int i = 0; i < 6; ++i) t[i][i] = 1.0;
+    t[0][4] = -offset.z; t[0][5] =  offset.y;
+    t[1][3] =  offset.z; t[1][5] = -offset.x;
+    t[2][3] = -offset.y; t[2][4] =  offset.x;
+
+    double half[6][6] = {};   // A * T
+    for (int i = 0; i < 6; ++i)
+        for (int j = 0; j < 6; ++j) {
+            double sum = 0;
+            for (int k = 0; k < 6; ++k) sum += matrix[static_cast<std::size_t>(i)]
+                                                     [static_cast<std::size_t>(k)] * t[k][j];
+            half[i][j] = sum;
+        }
+
+    Matrix6 out{};
+    for (int i = 0; i < 6; ++i)
+        for (int j = 0; j < 6; ++j) {
+            double sum = 0;
+            for (int k = 0; k < 6; ++k) sum += t[k][i] * half[k][j];
+            out[static_cast<std::size_t>(i)][static_cast<std::size_t>(j)] = sum;
+        }
+    return out;
+}
+
 double RadiationTable::dampingAt(int i, int j, double omegaQuery) const {
     const int n = size();
     if (n == 0 || omegaQuery <= omega.front() || omegaQuery >= omega.back()) return 0.0;

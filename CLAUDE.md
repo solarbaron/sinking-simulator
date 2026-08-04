@@ -88,6 +88,7 @@ most useful thing to know about this codebase:
 | Retardation fitted over 1.3 s of a 20 s decay, turning a damper into an integrator | a free-decay test, after the ship reached NaN in five steps |
 | Radiation damping added *on top of* the modal damping standing in for it | comparing an RAO sweep before and after, not any single run |
 | Reading `state.velocity.x` as "speed" — it is a *world* vector | a steady turn that looked like chaos until surge was taken along the bow |
+| Roll stiffness finite-differenced about the **body origin** while the moment was taken about the cog, so `zetaRoll = 0.08` delivered 0.144 | timing a free decay's log decrement against the ζ the label claims |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct.

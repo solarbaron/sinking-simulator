@@ -17,8 +17,10 @@
 #include "engine/sim/rao.hpp"
 #include "harness.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 using namespace sim;
@@ -612,6 +614,537 @@ void testRaoMeasuresTheSpeedItActuallyReached() {
     expectTrue("the response is still a usable RAO", point.heave > 0.05 && point.heave < 3.0);
 }
 
+// =============================================================================
+// --- Viscous roll damping, and the frame the roll added inertia lives in ------
+//
+// Two things are under test here and they fail in different ways.
+//
+// The *frame transfer* is arithmetic with exact answers, so it is asserted
+// exactly: strip theory assembles A_inf about the body-frame origin -- midship
+// on the baseline -- while the integrator adds it to an inertia about the centre
+// of gravity, and the two differ by the sway-roll coupling twice over. The sign
+// of that transfer is the whole question, and it is pinned by a section whose
+// roll added mass is analytically zero rather than by a convention read out of a
+// textbook.
+//
+// The *damping* is Ikeda's empirical method driving the real integrator, so it is
+// asserted against the closed form that says what a linear damping coefficient
+// means: log decrement 2 pi zeta / sqrt(1 - zeta^2). What makes that a test and
+// not a tautology is that B44 is strongly amplitude-dependent, so the decrement
+// has to change through a single decay in the way the coefficient says it will --
+// and a linear damper, run through the same code, has to hold it constant.
+// =============================================================================
+
+// A ship-shaped hull for the roll work: 120 x 22 m at 6 m draft, with rise of
+// floor and fine ends.
+//
+// The box barge above cannot be used. Ikeda's regressions are fitted over
+// 0.5 <= Cb <= 0.85 and 0.9 <= Cm <= 0.99 and a box is 1.0 on both, so its eddy
+// coefficient would be pure extrapolation and its default bilge radius exactly
+// zero. This hull comes out at Cb 0.742, Cm 0.910, B/d 3.67 and OG/d -0.20,
+// inside every published bound -- which testRollDampingFormComesOffTheHull
+// asserts rather than assumes.
+constexpr double kRollWaterline = 6.0;
+constexpr double kRollKeelLength = 40.0;
+constexpr double kRollKeelBreadth = 1.0;
+constexpr double kRollKg = 7.2;          // puts the roll axis 1.2 m above the waterline
+
+Ship rollShip() {
+    const std::vector<double> waterlines{0.0, 0.8, 1.6, 2.6, 3.6, 4.8, 6.0, 8.0, 11.0, 14.0};
+    std::vector<Station> stations;
+    for (int i = 0; i <= 40; ++i) {
+        Station s;
+        s.x = -60.0 + 120.0 * i / 40.0;
+        const double u = std::abs(s.x) / 60.0;
+        const double fx = u <= 0.35 ? 1.0 : 1.0 - 0.85 * std::pow((u - 0.35) / 0.65, 2.0);
+        for (double z : waterlines) {
+            const double fz = z >= 3.0 ? 1.0 : 0.55 + 0.45 * std::pow(z / 3.0, 0.6);
+            s.halfBeam.push_back(11.0 * fx * fz);
+        }
+        stations.push_back(s);
+    }
+    Ship ship;
+    ship.hull = makeHullFromStations(stations, waterlines);
+    ship.deckEdgeZ = 11.0;
+    const RollDampingHull form = rollDampingHullFromMesh(ship.hull, kRollWaterline);
+    ship.lightshipMass = form.blockCoeff * form.lengthPp * form.beam * form.draft * kRhoSeawater;
+    ship.lightshipCog = {0, 0, kRollKg};
+    ship.gyradii = {0.35 * form.beam, 0.25 * form.lengthPp, 0.26 * form.lengthPp};
+    ship.initialise(0.0);
+    return ship;
+}
+
+struct RollDecay {
+    std::vector<double> peaks;   // rad, successive maxima of the heel angle
+    std::vector<double> times;   // s
+
+    double period() const {
+        return times.size() >= 2 ? (times.back() - times.front()) /
+                                       static_cast<double>(times.size() - 1)
+                                 : 0.0;
+    }
+    double decrement(std::size_t i) const { return std::log(peaks[i - 1] / peaks[i]); }
+};
+
+// Release the ship at a heel angle and record the successive maxima.
+//
+// dt is 0.02 s -- 600 steps per roll period. Checked against 0.01 and 0.005: the
+// measured decrement moves in the fourth decimal place, so nothing below is a
+// statement about the integrator's step size.
+RollDecay rollDecay(Ship& ship, double heelDeg, double seconds, double dt = 0.02) {
+    const Sea still(0.0);
+    ship.state.orientation = Quat::fromAxisAngle(Vec3{1, 0, 0}, heelDeg * kDegToRad);
+    RollDecay out;
+    double y0 = 0, y1 = 0;
+    const auto steps = static_cast<int>(seconds / dt);
+    for (int i = 0; i < steps; ++i) {
+        ship.step(dt, still);
+        double heel = 0, trim = 0;
+        heelTrimFromRotation(ship.state.orientation.toMat3(), heel, trim);
+        // Parabolic interpolation through three samples, as in
+        // test_roll_damping.cpp: taking the nearest step instead biases every
+        // peak downward and quietly inflates the decrement.
+        if (i >= 2 && y1 > y0 && y1 > heel) {
+            const double denom = y0 - 2.0 * y1 + heel;
+            const double shift = denom != 0 ? 0.5 * (y0 - heel) / denom : 0.0;
+            out.peaks.push_back(y1 - 0.25 * (y0 - heel) * shift);
+            out.times.push_back((i - 1 + shift) * dt);
+        }
+        y0 = y1;
+        y1 = heel;
+    }
+    return out;
+}
+
+// --- The frame transfer ------------------------------------------------------
+
+// transferAddedMass() is the parallel-axis theorem wearing a 6x6, so a rigid
+// body's own mass matrix must come back out of it obeying the theorem exactly.
+// Nothing hydrodynamic is involved; this is the arithmetic, checked before the
+// physics leans on it.
+void testAddedMassTransferObeysTheParallelAxisTheorem() {
+    const double m = 1234.5;
+    const Vec3 offset{2.0, -3.0, 5.0};
+    const double ixx = 700.0, iyy = 900.0, izz = 1100.0;
+
+    Matrix6 aboutCentre{};
+    for (std::size_t i = 0; i < 3; ++i) aboutCentre[i][i] = m;
+    aboutCentre[3][3] = ixx;
+    aboutCentre[4][4] = iyy;
+    aboutCentre[5][5] = izz;
+
+    const Matrix6 moved = transferAddedMass(aboutCentre, offset);
+    const double d2 = dot(offset, offset);
+    expectNear("Ixx picks up m (dy^2 + dz^2)", moved[3][3], ixx + m * (d2 - offset.x * offset.x),
+               1e-9);
+    expectNear("Iyy likewise", moved[4][4], iyy + m * (d2 - offset.y * offset.y), 1e-9);
+    expectNear("Izz likewise", moved[5][5], izz + m * (d2 - offset.z * offset.z), 1e-9);
+    expectNear("and the products of inertia appear", moved[3][4], -m * offset.x * offset.y, 1e-9);
+
+    // Translational added mass is reference-point independent. This is why heave
+    // was never affected by the mismatch the transfer exists to fix.
+    for (std::size_t i = 0; i < 3; ++i)
+        for (std::size_t j = 0; j < 3; ++j)
+            expectTrue("the translational block is untouched by the transfer",
+                       std::abs(moved[i][j] - aboutCentre[i][j]) < 1e-9);
+
+    // Moving back must land where it started, or the transform is not a group
+    // action and one of the two directions is wrong.
+    const Matrix6 back = transferAddedMass(moved, Vec3{0, 0, 0} - offset);
+    double worst = 0;
+    for (std::size_t i = 0; i < 6; ++i)
+        for (std::size_t j = 0; j < 6; ++j)
+            worst = std::max(worst, std::abs(back[i][j] - aboutCentre[i][j]));
+    expectTrue("transferring there and back is the identity", worst < 1e-9);
+}
+
+// **The check that pins the sign**, and the reason no textbook convention had to
+// be trusted.
+//
+// Rotate a semicircle about the centre of its own circle and no point of the
+// contour moves normal to itself: the radiation potential is identically zero, so
+// a44 and a24 about that centre are exactly zero at every frequency. Put the
+// centre on the waterline and everything strip theory then reports for the roll
+// mode about the baseline is *pure transfer* -- a44 = T^2 a22 and a24 = -T a22 --
+// and transferring it back up by the draft has to annihilate it.
+//
+// The opposite sign does not give a small error there. It gives 4 T^2 a22.
+void testSemicircularSectionsPinTheTransferSign() {
+    const double radius = 3.0;
+    RadiationHull hull;
+    hull.draft = radius;
+    hull.panelsPerHalfSection = 64;
+    const double length = 30.0;
+    for (int i = 0; i < 9; ++i) {
+        RadiationStation st;
+        st.x = -0.5 * length + length * i / 8.0;
+        st.beam = 2.0 * radius;
+        st.draft = radius;
+        st.areaCoefficient = kPi / 4.0;   // exactly a semicircle
+        hull.stations.push_back(st);
+    }
+    const RadiationTable table = stripTheoryTable(hull, {0.8});
+    const Matrix6& baseline = table.addedMass[0];
+
+    expectTrue("the semicircular hull has real sway added mass", baseline[1][1] > 0);
+    expectNear("roll about the baseline is the sway added mass on a draft lever",
+               baseline[3][3], radius * radius * baseline[1][1], 1e-6 * baseline[3][3]);
+    expectNear("and the coupling is that lever once", baseline[1][3], -radius * baseline[1][1],
+               1e-6 * std::abs(baseline[1][3]));
+
+    // Vacuity guard: if the roll block were already small there would be nothing
+    // for the transfer to annihilate.
+    const double scale = baseline[3][3];
+    expectTrue("there is a substantial roll block to cancel",
+               scale > 0.5 * radius * radius * baseline[1][1]);
+
+    const Matrix6 aboutCentre = transferAddedMass(baseline, Vec3{0, 0, radius});
+    expectTrue("transferring to the circle's centre annihilates the roll added mass",
+               std::abs(aboutCentre[3][3]) < 1e-6 * scale);
+    expectTrue("and the sway-roll coupling with it",
+               std::abs(aboutCentre[1][3]) < 1e-6 * radius * baseline[1][1]);
+
+    // The wrong sign, spelled out, so the tolerance above is known to be
+    // discriminating rather than merely tight.
+    const double wrongSign =
+        baseline[3][3] - 2.0 * radius * baseline[1][3] + radius * radius * baseline[1][1];
+    expectTrue("the opposite sign would leave four drafts' worth of it behind",
+               wrongSign > 3.5 * scale);
+}
+
+// What the transfer is worth on a real hull, and why only roll cares.
+void testRollAddedInertiaIsReferredToTheCentreOfGravity() {
+    const Ship& ship = radiatingBarge();
+    const Vec3 cog = ship.diagnostics(Sea(0.0)).centreOfGravity;
+    expectTrue("the barge's centre of gravity is well above the baseline", cog.z > 3.0);
+    expectTrue("the barge is carrying a radiation model", ship.radiation.has_value());
+
+    // Straight off the attached model, which is the matrix the integrator is
+    // actually adding to the inertia -- no need to rebuild the table to ask what
+    // A_inf is, and this way there is no second table to disagree with the first.
+    const Matrix6& origin = ship.radiation->addedMassInfinite();
+    const Matrix6 aboutCog = transferAddedMass(origin, cog);
+
+    expectTrue("the transfer is not a rounding correction in roll",
+               aboutCog[3][3] < 0.7 * origin[3][3]);
+    expectTrue("but it is still positive, as an added inertia must be", aboutCog[3][3] > 0);
+    expectNear("heave added mass does not move with the reference point", aboutCog[2][2],
+               origin[2][2], 1e-9 * origin[2][2]);
+    // Pitch moves only through the *longitudinal* offset of the cog, because
+    // strip theory's surge added mass is a structural zero; this barge's cog is
+    // on the midship section, so it does not move at all.
+    expectNear("pitch is untouched for a cog on the midship section", aboutCog[4][4],
+               origin[4][4], 1e-9 * origin[4][4]);
+
+    // Referring the matrix to the cog also shrinks the coupling the integrator
+    // has no way to carry, because the cog sits near the height at which sway and
+    // roll decouple. That is a real improvement in the approximation, not a
+    // cosmetic one.
+    expectTrue("the sway-roll coupling the integrator must drop shrinks with the transfer",
+               std::abs(aboutCog[1][3]) < 0.5 * std::abs(origin[1][3]));
+
+    // The height at which sway and roll decouple is a property of the sections,
+    // and it has to land on the ship rather than under her keel. This is the same
+    // statement the semicircle makes, on a hull with no closed form.
+    const double rollCentre = -origin[1][3] / origin[1][1];
+    expectTrue("the added-mass roll centre sits near the waterline, not below the keel",
+               rollCentre > 0.0 && rollCentre < 12.0);
+}
+
+// The dynamic statement, and the roll counterpart of
+// testFreeDecayAgreesWithTheFrequencyDomainTable: a roll free decay settling at
+// omega_d must behave as though its added roll inertia were A44(omega_d) *about
+// the centre of gravity*. About the baseline origin that number is three times
+// larger, so this discriminates between the two frames rather than merely
+// confirming that some added inertia is present.
+void testRollDecaySeesAddedInertiaAboutTheCentreOfGravity() {
+    Ship ship = radiatingBarge();
+    // The comparison table only has to answer "what is A44 near the decay
+    // frequency", so it is built on a grid bracketing it rather than over the
+    // whole seakeeping band -- same hull, same panel count, eight frequencies
+    // instead of forty, and finer where it is read. A 2D panel solve is seconds
+    // of work at full width and this suite runs eight times in the gate.
+    const RadiationHull sections = radiationHullFromMesh(ship.hull, 4.0, 9);
+    const RadiationTable table = stripTheoryTable(sections, radiationFrequencyGrid(0.55, 1.2, 8));
+
+    const Diagnostics diag = ship.diagnostics(Sea(0.0));
+    const double mass = 60.0 * 16.0 * 4.0 * kRhoSeawater;
+    const double stiffness = mass * kGravity * diag.gmTransverse;
+    const double dryInertia = mass * 5.0 * 5.0;   // gyradius kxx = 5 m
+    expectTrue("the barge is stable enough to roll about", diag.gmTransverse > 1.0);
+
+    const Sea still(0.0);
+    ship.state.orientation = Quat::fromAxisAngle(Vec3{1, 0, 0}, 4.0 * kDegToRad);
+    std::vector<double> crossings;
+    double previous = 4.0 * kDegToRad;
+    const double dt = 0.01;
+    for (int i = 1; i <= 12000; ++i) {
+        ship.step(dt, still);
+        double heel = 0, trim = 0;
+        heelTrimFromRotation(ship.state.orientation.toMat3(), heel, trim);
+        if (previous < 0 && heel >= 0)
+            crossings.push_back(i * dt - dt * heel / (heel - previous));
+        previous = heel;
+    }
+    expectTrue("the roll decay produced enough cycles to time", crossings.size() >= 4);
+    if (crossings.size() < 4) return;
+
+    double total = 0;
+    for (std::size_t i = 2; i < crossings.size(); ++i) total += crossings[i] - crossings[i - 1];
+    const double omegaDamped =
+        2.0 * kPi * static_cast<double>(crossings.size() - 2) / total;
+    const double implied = stiffness / (omegaDamped * omegaDamped) - dryInertia;
+
+    double aboutCog = 0, aboutOrigin = 0;
+    for (int i = 0; i + 1 < table.size(); ++i) {
+        const auto lo = static_cast<std::size_t>(i);
+        if (table.omega[lo] > omegaDamped || omegaDamped > table.omega[lo + 1]) continue;
+        const double f = (omegaDamped - table.omega[lo]) / (table.omega[lo + 1] - table.omega[lo]);
+        aboutOrigin = table.addedMass[lo][3][3] * (1 - f) + table.addedMass[lo + 1][3][3] * f;
+        aboutCog = transferAddedMass(table.addedMass[lo], diag.centreOfGravity)[3][3] * (1 - f) +
+                   transferAddedMass(table.addedMass[lo + 1], diag.centreOfGravity)[3][3] * f;
+    }
+    expectTrue("the roll decay frequency lies inside the table", aboutCog > 0);
+
+    expectNear("the decay sees A44(omega_d) referred to the centre of gravity", implied, aboutCog,
+               0.15 * aboutCog);
+    // The guard that makes the tolerance mean something.
+    expectTrue("the two frames are far enough apart for this to discriminate",
+               std::abs(aboutOrigin - aboutCog) > 0.5 * aboutCog);
+    expectTrue("and the decay follows the centre-of-gravity value, not the baseline one",
+               std::abs(implied - aboutCog) < std::abs(implied - aboutOrigin));
+}
+
+// --- Ikeda in the integrator -------------------------------------------------
+
+// The hull form Ikeda is evaluated on is read off the mesh, so it must agree with
+// the mesh. A box barge already checks the exact case in
+// testStationsFromAMeshAreExactForABox; what is checked here is that a real hull
+// form lands inside the domain the regressions were fitted over, because outside
+// it the eddy polynomial returns whatever it returns.
+void testRollDampingFormComesOffTheHull() {
+    Ship ship = rollShip();
+    const RollDampingHull form =
+        ship.attachRollDamping(kRollWaterline, kRollKeelLength, kRollKeelBreadth);
+
+    expectNear("length is the wetted length of the mesh", form.lengthPp, 120.0, 1e-9);
+    expectNear("beam is the widest the wetted body gets", form.beam, 22.0, 1e-9);
+    expectNear("draft is the waterline down to the keel", form.draft, kRollWaterline, 1e-12);
+    expectTrue("the block coefficient is a real hull's, not a box's",
+               form.blockCoeff > 0.5 && form.blockCoeff < 0.85);
+    expectTrue("and so is the midship coefficient",
+               form.midshipCoeff > 0.9 && form.midshipCoeff < 0.99);
+    // Cb <= Cm always: the midship section is the largest, so the prismatic
+    // coefficient Cb/Cm cannot exceed 1.
+    expectTrue("the block coefficient does not exceed the midship coefficient",
+               form.blockCoeff <= form.midshipCoeff);
+
+    // Displacement, derived two ways: from the coefficients the form reports, and
+    // from the hydrostatic integral the ship actually floats on.
+    const double fromForm =
+        form.blockCoeff * form.lengthPp * form.beam * form.draft * kRhoSeawater;
+    expectNear("the form's displacement is the hull's displacement", fromForm,
+               ship.diagnostics(Sea(0.0)).displacementMass, 1e-6 * fromForm);
+
+    // The roll axis is loading, not form, and comes from the live centre of
+    // gravity rather than from anything in the mesh.
+    expectNear("the roll axis is the centre of gravity above the keel", form.rollAxisAboveKeel,
+               ship.diagnostics(Sea(0.0)).centreOfGravity.z, 1e-9);
+
+    // Everything the method complains about, other than the wave component it
+    // deliberately does not compute. A hull outside the regression domain would
+    // make every coefficient below an extrapolation.
+    RollDampingCondition at;
+    at.rollAmplitude = 10.0 * kDegToRad;
+    at.rollFrequency = 0.53;
+    int unexpected = 0;
+    for (const std::string& problem : validateRollDamping(form, at))
+        if (problem.find("wave") == std::string::npos) ++unexpected;
+    expectEqual("the test hull sits inside every published bound of the method",
+                static_cast<long long>(unexpected), 0LL);
+
+    // waveDamping is left at zero on purpose: with a radiation model attached the
+    // memory convolution already applies it, and supplying both is the double
+    // count that cost 27% of mid-frequency heave when radiation first landed.
+    expectTrue("the wave component is left to the radiation model", form.waveDamping == 0.0);
+}
+
+// **The headline check.** Feed Ikeda's B44 to the real rigid-body integrator,
+// release the ship at a heel, and require the logarithmic decrement of every
+// cycle to be the 2 pi zeta / sqrt(1 - zeta^2) implied by the coefficient at that
+// cycle's amplitude.
+//
+// Every ingredient comes from a different place, which is what stops this being a
+// restatement of the integrator's own arithmetic:
+//
+//   * the restoring stiffness from GM, which diagnostics() gets from a forced-heel
+//     GZ sweep and not from the finite difference the damper is scaled by;
+//   * the effective roll inertia from the period of a decay with the damping
+//     switched off entirely;
+//   * B44 from roll_damping.cpp, called directly;
+//   * the decrement from the simulation.
+//
+// The release is deliberately small. At 20 degrees this hull's restoring is
+// visibly nonlinear -- the roll period runs 1.3% short -- and the closed form is
+// a linear-restoring statement, so a large release would be testing GZ curvature
+// under the name of damping.
+void testRollFreeDecayMatchesTheIkedaCoefficient() {
+    Ship undamped = rollShip();
+    undamped.zetaRoll = 0.0;   // no modal stand-in, and no Ikeda attached
+    const RollDecay natural = rollDecay(undamped, 3.0, 180.0);
+    expectTrue("the undamped decay produced enough peaks to time", natural.peaks.size() >= 8);
+    if (natural.peaks.size() < 8) return;
+
+    // Vacuity guard, and the control for everything below: a ship with no roll
+    // damping of any kind must not decay. Measured drift is +0.2% over fourteen
+    // cycles, which is the ceiling on what the integrator itself contributes.
+    expectTrue("with no roll damping at all the ship does not decay",
+               std::abs(natural.peaks.back() / natural.peaks.front() - 1.0) < 0.02);
+
+    const Diagnostics diag = undamped.diagnostics(Sea(0.0));
+    const double stiffness = diag.displacementMass * kGravity * diag.gmTransverse;
+    const double omegaNatural = 2.0 * kPi / natural.period();
+    const double inertia = stiffness / (omegaNatural * omegaNatural);
+    expectTrue("the stiffness and inertia are ship-sized", stiffness > 0 && inertia > 0);
+
+    Ship ship = rollShip();
+    const RollDampingHull form =
+        ship.attachRollDamping(kRollWaterline, kRollKeelLength, kRollKeelBreadth);
+    const RollDecay decay = rollDecay(ship, 3.0, 180.0);
+    expectTrue("the damped decay produced enough peaks", decay.peaks.size() >= 8);
+    if (decay.peaks.size() < 8) return;
+
+    // The integrator picks its own operating point. Roll being sharply resonant
+    // is the argument for using the natural frequency, and this is the check on
+    // it: the frequency Ikeda was asked at has to be the frequency the ship
+    // actually rolled at.
+    expectNear("Ikeda was evaluated at the frequency the ship rolls at",
+               ship.rollCondition.rollFrequency, omegaNatural, 0.01 * omegaNatural);
+    expectTrue("and at an amplitude that followed the decay down",
+               ship.rollCondition.rollAmplitude > 0 &&
+                   ship.rollCondition.rollAmplitude < 0.5 * decay.peaks.front());
+
+    double smallest = 1e30, largest = 0;
+    for (std::size_t i = 1; i < decay.peaks.size(); ++i) {
+        RollDampingCondition at;
+        // The amplitude over the cycle, which for a slowly decaying envelope is
+        // the mean of its endpoints. B44 is affine in amplitude, so the mean of
+        // the amplitude is the amplitude of the mean.
+        at.rollAmplitude = 0.5 * (decay.peaks[i - 1] + decay.peaks[i]);
+        at.rollFrequency = omegaNatural;
+        const double zeta =
+            rollDamping(form, at).total / (2.0 * std::sqrt(inertia * stiffness));
+        const double wanted = 2.0 * kPi * zeta / std::sqrt(1.0 - zeta * zeta);
+        smallest = std::min(smallest, wanted);
+        largest = std::max(largest, wanted);
+        expectTrue("the damping ratio is light, as roll always is", zeta > 0.005 && zeta < 0.2);
+        expectNear("logarithmic decrement matches 2 pi zeta / sqrt(1 - zeta^2)",
+                   decay.decrement(i), wanted, 0.02 * wanted);
+    }
+
+    // Guard against the whole comparison being a constant against a constant. If
+    // B44 did not move with amplitude, a linear damper would pass this test and
+    // the amplitude handling would be untested.
+    expectTrue("the predicted decrement genuinely varies across the record",
+               largest > 1.2 * smallest);
+}
+
+// Bilge keels are the strongest check available on the coupling because the
+// statement is monotone, physical and untunable: adding them can only take energy
+// out faster. Nothing about their size or the fitted constants is asserted.
+void testBilgeKeelsShortenTheRollDecay() {
+    Ship keeled = rollShip();
+    const RollDampingHull withKeels =
+        keeled.attachRollDamping(kRollWaterline, kRollKeelLength, kRollKeelBreadth);
+    Ship bare = rollShip();
+    const RollDampingHull withoutKeels = bare.attachRollDamping(kRollWaterline);
+    Ship none = rollShip();
+    none.zetaRoll = 0.0;
+
+    // At the coefficient level first, so a failure downstream can be told apart
+    // from a failure here.
+    RollDampingCondition at;
+    at.rollAmplitude = 5.0 * kDegToRad;
+    at.rollFrequency = 0.53;
+    const RollDamping keeledB = rollDamping(withKeels, at);
+    const RollDamping bareB = rollDamping(withoutKeels, at);
+    expectTrue("bilge keels add damping", keeledB.total > bareB.total);
+    expectTrue("and they are the dominant contribution once fitted",
+               keeledB.bilgeKeel() > 0.5 * keeledB.total);
+    expectTrue("a hull without them reports exactly none", bareB.bilgeKeel() == 0.0);
+
+    const RollDecay withDecay = rollDecay(keeled, 8.0, 180.0);
+    const RollDecay withoutDecay = rollDecay(bare, 8.0, 180.0);
+    const RollDecay noneDecay = rollDecay(none, 8.0, 180.0);
+    const std::size_t cycles =
+        std::min({withDecay.peaks.size(), withoutDecay.peaks.size(), noneDecay.peaks.size()});
+    expectTrue("all three decays ran long enough to compare", cycles >= 8);
+    if (cycles < 8) return;
+
+    const double kept = withDecay.peaks[cycles - 1] / withDecay.peaks.front();
+    const double bareKept = withoutDecay.peaks[cycles - 1] / withoutDecay.peaks.front();
+    const double noneKept = noneDecay.peaks[cycles - 1] / noneDecay.peaks.front();
+
+    // Vacuity guard: the bare hull must itself be damped by Ikeda rather than by
+    // the integrator, or "keels beat bare" would be a comparison against noise.
+    expectTrue("the bare hull's decay is Ikeda's and not the integrator's",
+               bareKept < 0.9 * noneKept);
+    expectTrue("bilge keels shorten the decay a great deal", kept < 0.25 * bareKept);
+    expectTrue("and every cycle of the keeled decay is shorter than the bare one's",
+               withDecay.decrement(1) > withoutDecay.decrement(1) &&
+                   withDecay.decrement(cycles - 1) > withoutDecay.decrement(cycles - 1));
+}
+
+// Roll damping is strongly amplitude-dependent, which is the one property that
+// cannot survive being replaced by any constant coefficient. A large decay must
+// therefore show its decrement *falling* as the amplitude falls -- and the same
+// ship run on the fraction-of-critical stand-in, through the same integrator and
+// the same peak finder, must hold it constant.
+//
+// That pairing is what makes this a test of the physics rather than of the
+// measurement: both runs share every source of error except the damper.
+void testLargeRollDecayHasAnAmplitudeDependentDecrement() {
+    Ship ikeda = rollShip();
+    ikeda.attachRollDamping(kRollWaterline, kRollKeelLength, kRollKeelBreadth);
+    Ship linear = rollShip();   // zetaRoll = 0.08, the lumped stand-in
+
+    const RollDecay nonlinearDecay = rollDecay(ikeda, 20.0, 180.0);
+    const RollDecay linearDecay = rollDecay(linear, 20.0, 180.0);
+    expectTrue("both decays produced enough cycles",
+               nonlinearDecay.peaks.size() >= 8 && linearDecay.peaks.size() >= 8);
+    if (nonlinearDecay.peaks.size() < 8 || linearDecay.peaks.size() < 8) return;
+
+    // The release really was large, and really did decay a long way -- otherwise
+    // "the decrement changed" would be a statement about a narrow amplitude band.
+    expectTrue("the decay spans a wide range of amplitudes",
+               nonlinearDecay.peaks.front() > 8.0 * nonlinearDecay.peaks.back());
+
+    const std::size_t last = nonlinearDecay.peaks.size() - 1;
+    expectTrue("the decrement falls as the roll decays",
+               nonlinearDecay.decrement(1) > 1.5 * nonlinearDecay.decrement(last));
+    for (std::size_t i = 2; i <= last; ++i)
+        expectTrue("and falls monotonically, as B44 does with amplitude",
+                   nonlinearDecay.decrement(i) < nonlinearDecay.decrement(i - 1));
+
+    // The control. A constant fraction of critical gives a constant decrement, so
+    // whatever the nonlinear run is showing is the damper and not the hull, the
+    // peak finder or the restoring curve.
+    const std::size_t lastLinear = linearDecay.peaks.size() - 1;
+    const double spread =
+        std::abs(linearDecay.decrement(1) / linearDecay.decrement(lastLinear) - 1.0);
+    expectTrue("a linear damper holds its decrement constant through the same decay",
+               spread < 0.03);
+
+    // And the stand-in means what its name says: zetaRoll = 0.08 delivers 0.08 of
+    // critical. That is a statement about the *stiffness* the damper is scaled by,
+    // and it did not hold until the finite difference was made to rotate the ship
+    // about her centre of gravity rather than about the body origin.
+    const double zeta = 0.08;
+    expectNear("zetaRoll delivers the fraction of critical it claims",
+               linearDecay.decrement(lastLinear), 2.0 * kPi * zeta / std::sqrt(1.0 - zeta * zeta),
+               0.02);
+}
+
 }  // namespace
 
 void runRaoTests() {
@@ -632,4 +1165,15 @@ void runRaoTests() {
     testRudderTurnsTowardsTheCommandedSide();
     testEncounterFrequencyEmergesFromMovingThroughTheWave();
     testRaoMeasuresTheSpeedItActuallyReached();
+
+    // --- viscous roll damping and the roll added-inertia frame ---
+    std::printf("\n--- roll damping and added inertia coupled into the ship ---\n");
+    testAddedMassTransferObeysTheParallelAxisTheorem();
+    testSemicircularSectionsPinTheTransferSign();
+    testRollAddedInertiaIsReferredToTheCentreOfGravity();
+    testRollDecaySeesAddedInertiaAboutTheCentreOfGravity();
+    testRollDampingFormComesOffTheHull();
+    testRollFreeDecayMatchesTheIkedaCoefficient();
+    testBilgeKeelsShortenTheRollDecay();
+    testLargeRollDecayHasAnAmplitudeDependentDecrement();
 }

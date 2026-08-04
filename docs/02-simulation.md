@@ -617,11 +617,12 @@ be separated.
 *Damping counted twice.* The modal damping coefficients **were** radiation — a
 lumped stand-in for it. Adding the real thing alongside them cost 27% of
 mid-frequency heave. With radiation attached, the sway, heave and pitch modal
-dampers are switched off. Roll keeps its stand-in, because roll radiation damping
-is genuinely small and the mechanism that matters is viscous; deleting it before
-Ikeda is wired into this integrator would leave the mode that most needs damping
-with almost none. Surge keeps its damper too, since strip theory contributes no
-surge radiation at all. Quadratic drag is untouched: it is viscous and separate.
+dampers are switched off. Roll keeps its stand-in *unless Ikeda is also attached*,
+which is now the case that closes the loop: roll radiation damping is genuinely
+small and the mechanism that matters is viscous, so deleting roll's stand-in
+before Ikeda landed would have left the mode that most needs damping with almost
+none. Surge keeps its damper too, since strip theory contributes no surge
+radiation at all. Quadratic drag is untouched: it is viscous and separate.
 
 That last point generalises. `A_inf[0][0]` is a **structural zero, not a measured
 zero** — a strip has no longitudinal radiation problem, and surge added mass is
@@ -647,15 +648,83 @@ below the noise floor of a tick measurement. That is the intended shape: an
 expensive coefficient table computed once, and a convolution cheap enough to run
 at 100 Hz.
 
-**Limits, beyond the ones the radiation module already lists.** Only the
-*diagonal* of `A_inf` is used: the integrator inverts a 3×3 inertia and divides by
-a per-axis mass, so there is nowhere for the sway–roll coupling `A_24` to go. That
-coupling is real and matters for roll. And `A_inf`'s rotational block is
-referenced to the body-frame origin on the baseline, while the inertia it is
-added to is about the centre of gravity — a frame mismatch that affects roll and
-must be resolved when Ikeda damping is wired in and roll is validated properly.
-Heave is unaffected (translation-invariant) and pitch is unaffected given strip
-theory's zero surge added mass.
+**The reference-point transfer — was a documented gap, now closed.** Strip theory
+assembles `A_inf` about the body-frame origin, midship on the baseline, because
+that is where `stripTheoryTable()` puts it. The inertia it is added to is about
+the **centre of gravity**, and rotational added mass is no more origin-independent
+than a moment of inertia is. `transferAddedMass()` moves a 6×6 by the congruence
+`A' = TᵀAT` with
+
+```
+T = [ I  d~ ]     d~ a = d x a,   d = new reference point - old
+    [ 0  I  ]
+```
+
+which is the parallel-axis theorem in 6×6 clothing — feed a rigid body's own mass
+matrix in and the rotational block comes out as `I + m(d dᵀ − |d|² I)`. Written
+out for roll:
+
+```
+A44' = A44 + 2 dz A24 + dz^2 A22 + dy^2 A33
+```
+
+**It is not a correction, it is the difference between two different numbers.** On
+the 60 × 16 × 4 m barge with KG 5 m, `A_inf` roll falls from 5.70 × 10⁷ to
+3.48 × 10⁷ kg m² — 39% — and on a 120 × 22 × 6 m ferry-like hull with KG 7.2 m
+from 3.82 × 10⁸ to 1.10 × 10⁸, a factor of **3.5**. Against that ship's own dry
+roll inertia of 7.0 × 10⁸ that is the difference between adding 54% and adding
+16%.
+
+*Establishing the sign, rather than assuming it.* The literature convention was
+not trusted; the code's own was measured, using a section whose answer is
+analytic. **Rotate a semicircle about the centre of its own circle and no point of
+the contour moves normal to itself**, so the radiation potential is identically
+zero and `a44 = a24 = 0` exactly, at every frequency. Put that centre on the
+waterline and everything strip theory reports for the roll mode about the baseline
+is *pure transfer*: measured at `a44 = T² a22` and `a24 = −T a22` to six figures,
+with the raw sectional values coming back at 4 × 10⁻²⁶ and 6 × 10⁻¹³ against an
+`a22` of 1.5 × 10⁴ — machine zero. Transferring back up by the draft has to
+annihilate the roll block, and does. **The opposite sign does not give a small
+error there; it gives `4 T² a22`**, so the check discriminates by a factor of
+four rather than by a tolerance. Independently, the height at which sway and roll
+decouple, `−A24/A22`, comes out at 5.7 m above the baseline on the barge and
+10.8 m on the ferry-like hull — near the waterline in both cases, where a
+section's added-mass roll centre belongs. The other sign would put it under
+the keel.
+
+A second, corroborating measurement: `A44` about the baseline swings by a factor
+of 2.7 across the seakeeping band on the barge (1.03 × 10⁸ down to 3.8 × 10⁷),
+while `A44` about the centre of gravity at 5 m — close to that decoupling height —
+is flat to 4% over the same band. Almost all of the apparent frequency dependence
+of roll added inertia about an arbitrary point is the sway added mass riding a
+lever. That is a measurement, not a proof of sign on its own: it fixes the
+*distance* to the decoupling point and the semicircle fixes which side of the
+baseline it lies on.
+
+**Two things the earlier note got wrong**, both found while doing this:
+
+- *Pitch is not unaffected.* Zero surge added mass kills the **vertical** part of
+  the pitch transfer, which is what that note was reaching for, but not the
+  **longitudinal** part: `A55' = A55 + 2 dx A35 + dx² A33`, which is exactly
+  `∫(x − dx)² a33 dx` and is the same identity strip theory assembles `A55` from
+  in the first place. Measured on the 120 m hull with the cog 6 m aft of midship,
+  `A55` moves 4.9% and `A66` 3.7%. Heave really is unaffected: the translational
+  block is reference-point independent, full stop, which is why the heave
+  validation above never noticed any of this.
+- *The memory force had the same mismatch, in the damping rather than the
+  inertia.* `RadiationForce::memoryForce()` returns its moment about the origin
+  the table was assembled about; `integrateRigidBody` was applying it as a moment
+  about the centre of gravity. The correction is `M_G = M_O − d × F`, the same one
+  the propulsion forces already carried. Removing it again shifts the measured
+  roll added inertia by 17%.
+
+**What is still approximated.** Only the *diagonal* of the transferred `A_inf` is
+used: the integrator inverts a 3×3 inertia and divides by a per-axis mass, so
+there is nowhere for the sway–roll coupling `A_24` to go. That is a limitation of
+this integrator's shape, not of the physics. Doing the transfer first shrinks the
+term being dropped by **8×** on the barge (−3.96 × 10⁶ to −4.80 × 10⁵), because
+the centre of gravity sits close to the height at which sway and roll decouple —
+so the transfer improves the approximation twice over.
 
 ### Propulsion coupled into the ship — **implemented, opt-in**
 
@@ -809,8 +878,173 @@ and are recorded here because that is the only place they can live.
 **Next**: per-ship tuning against roll decay tests — a per-component scale factor
 identified from a measured decay curve, which is how this is done in practice and
 what turns a ±25% method into a ±10% one for a specific ship. Then the skeg and
-rudder components, and feeding B44 into the rigid-body roll equation in place of
-`Ship::zetaRoll`.
+rudder components.
+
+### Viscous roll damping coupled into the ship — **implemented, opt-in**
+
+`Ship::attachRollDamping(waterlineZ, bilgeKeelLength, bilgeKeelBreadth)` reads the
+hull form off the mesh and puts B44 into the rigid-body roll equation **in place
+of** `Ship::zetaRoll`.
+
+**Stand-ins removed, for the fourth time in this file**, and this one had a trap
+in it: `zetaRoll = 0.08` was picked to sit where Ikeda puts a ro-pax with bilge
+keels — 6.3% of critical, measured above — so leaving both in would not have
+looked wrong anywhere. It would simply have doubled the damping of the mode that
+decides whether a damaged ship capsizes. The test that catches it is the log
+decrement, and it catches it by a factor of four.
+
+Opt-in, like radiation and propulsion: the flooding scenarios predate all of it
+and attach neither this nor radiation, so they keep the scalar coefficients.
+
+They are not, however, *untouched* — and the difference between "the outcome line
+is the same" and "nothing changed" is worth being precise about. The stiffness
+correction below applies to every ship, so their roll damping moved by
+`sqrt(KM/GM)` ≈ 1.8×. All three outcome lines are identical; the traces are not
+bit-identical, and comparing them properly rather than grepping the verdict is
+what says whether that matters. On the `doors` capsize the two runs track to
+**0.1° of heel out of 52°** at t = 780 s and 7 t of floodwater out of 4894 — and
+the numbers that decide survival, the damaged GZ curve and the per-compartment
+final state, agree to the last printed digit. A slow loll driven by flooding is
+not sensitive to how hard roll is damped, which is the reassuring answer rather
+than the assumed one.
+
+**Where the hull form comes from — derived, not authored.**
+`rollDampingHullFromMesh()` reads Lpp, beam and draft off the wetted body, Cb from
+the volume the hydrostatics already integrate, and Cm from the largest sectional
+area found by clipping the hull into slabs — the same route
+`radiationHullFromMesh()` takes to its stations, and for the same reason: a hull
+that displaces what it should then also has a block coefficient that says so, and
+there is no second set of main dimensions to drift out of step with the shape.
+
+Three inputs are deliberately *not* derived, and the boundary is the point:
+
+| Input | Where it comes from | Why |
+|---|---|---|
+| Lpp, B, d, Cb, Cm | the mesh | they are properties of the shape, and the shape is the mesh |
+| bilge keels | the caller | a watertight envelope has no appendages in it — there is nothing to measure |
+| bilge radius | left at the "estimate from Cm and B/d" sentinel | Ikeda's keel model idealises the section as vertical side, flat bottom, quarter-circle bilge; a radius measured off a shape that is not that is not the radius the formulae want |
+| roll axis | the live centre of gravity, every tick | it is *loading*, not form, and a flooding ship's loading moves |
+
+**The operating point — evaluated every tick, and why that is the cheap answer.**
+B44 is an equivalent *linear* coefficient, valid only at the amplitude, frequency
+and speed it was asked for, all three of which move. Measured, one `rollDamping()`
+call is **52 ns against a 16 µs tick — 0.33%**, so caching it buys nothing but a
+stale answer and the question settles itself. The three inputs come from
+quantities the integrator already holds:
+
+- **Frequency: the natural roll frequency** `sqrt(C44 / (I44 + A44))`, from the
+  measured hydrostatic stiffness and the effective inertia. Roll is lightly damped
+  and sharply resonant, so a ship's roll sits at its own frequency whatever drives
+  it; and Ikeda's frequency dependence is only `sqrt(omega)` for friction and
+  linear for everything else, so a frequency wrong by a fifth is a B44 wrong by
+  less than the method's own ±25%. **Measured against the frequency the ship
+  actually rolled at in a free decay: 0.098% apart.** An estimator fitted to
+  recent motion would need filter state, would lag every change of loading, and
+  would have nothing to say at all about a ship that is not currently rolling.
+- **Amplitude: the phase-plane radius** `sqrt(phi² + (phidot/omega_n)²)`, which for
+  a lightly damped oscillator *is* the envelope of the roll being executed —
+  exactly the amplitude equivalent linearisation is defined at, instantaneous, and
+  with no history to keep. Using the heel alone instead reports zero damping every
+  time the ship passes through upright, which is where it is rolling fastest;
+  substituted deliberately, it breaks the log decrement by 12%.
+- **Speed: surge along the ship's own bow**, not `state.velocity.x`, which is a
+  world vector — the mistake recorded further up this file.
+
+**`waveDamping` stays zero when radiation is attached.** B44W is the radiation
+share of roll damping, and the Cummins memory convolution is already applying it;
+supplying both is the same double count that cost 27% of mid-frequency heave.
+`attachRollDamping()` therefore sets it to zero explicitly rather than by
+omission, and `validateRollDamping()` still reports it as missing for the
+no-radiation case, which is the honest thing for it to say.
+
+**Validation.** The reference hull for this is a 120 × 22 m ferry-like form at 6 m
+draft — Cb 0.742, Cm 0.910, B/d 3.67, KG 7.2 m (OG/d −0.20), GM 2.09 m, roll
+period 11.94 s, bilge keels 40 × 1.0 m. It is not the box barge the rest of the
+seakeeping suite uses, deliberately: Ikeda's regressions are fitted over
+0.5 ≤ Cb ≤ 0.85 and 0.9 ≤ Cm ≤ 0.99 and **a box is 1.0 on both**, so a barge's
+eddy coefficient is pure extrapolation and its default bilge radius is exactly
+zero. The tests assert the hull is inside every published bound rather than
+assuming it.
+
+| Check | Measured |
+|---|---|
+| Log decrement against `2πζ/√(1−ζ²)` from B44, per cycle, 3° release | worst **0.25%** over 14 cycles |
+| Same, at dt = 0.02 / 0.01 / 0.005 s | 0.24% / 0.25% / 0.25% — not a timestep artefact |
+| Frequency Ikeda was asked at vs the frequency the ship rolled at | 0.098% |
+| 8° release, 15 cycles: bilge keels / bare hull / no damping at all | 6.30° → 0.58° / 7.92° → 6.99° / 8.00° → **8.13°** |
+| 20° release: decrement, first cycle to last | 0.316 → 0.139, monotone |
+| Same decay on the `zetaRoll` stand-in | 0.4996 → 0.5043 against the closed form's 0.50427 |
+
+Damping ratio at the natural roll frequency, straight from the coefficient:
+
+| roll amplitude | ζ with bilge keels | ζ bare | bilge-keel share |
+|---|---|---|---|
+| 2.5° | 0.0259 | 0.00062 | 97.6% |
+| 5° | 0.0323 | 0.00105 | 96.7% |
+| 10° | 0.0470 | 0.00193 | 95.9% |
+| 20° | 0.0810 | 0.00368 | 95.5% |
+
+Between 2.6% and 8.1% of critical with keels, against 0.06–0.37% bare: a factor of
+**22 to 42**, which is why the bilge-keel test needs no tolerance to be
+convincing. The keels dominate more here than the 50–80% Kawahara reports,
+because this hull's roll axis sits close to the waterline and the eddy component
+nearly vanishes there; the ro-pax in `test_roll_damping.cpp`, with OG/d = −0.69,
+is the fixture that checks the component split against ITTC's bands.
+
+Every ingredient of the first row comes from somewhere else: the stiffness from
+GM (a forced-heel GZ sweep, not the finite difference the damper is scaled by),
+the effective inertia from the period of a decay with damping switched off
+entirely, B44 from `roll_damping.cpp` called directly, and the decrement from the
+simulation. The last two rows of the first table are the pair that matters — **a
+linear damper run through the same integrator, the same hull and the same peak
+finder holds its decrement constant to 0.9%**, so the factor of 2.3 the nonlinear
+run shows over the same amplitudes is the damper and not the measurement.
+
+The "no damping at all" column is the control, and it *grows* by 0.2% over
+fourteen cycles rather than decaying. That is the ceiling on what the integrator
+itself contributes, and it is what makes the bare-hull decay — 12% over the same
+record — a measurement of Ikeda rather than of numerical dissipation.
+
+**A defect this turned up, which every functional test had passed.** The measured
+angular stiffnesses that scale the modal dampers were being finite-differenced by
+rotating the ship about the **body origin** while taking the moment about the
+**centre of gravity**. That leaves the weight with a moment arm, so the stiffness
+came out as `ρg∇·KM` instead of `ρg∇·GM`: too large by `ρg∇·KG`. Against a
+longitudinal metacentric height of a couple of hundred metres that is nothing, and
+pitch never noticed — against a transverse GM of a couple of metres and a KG of
+5–7 m it is larger than the quantity being measured. The inflation factor is
+`sqrt(KM/GM)`: measured on a 120 × 18 m hull at GM 2.28 m and KG 5.0 m, a nominal
+`zetaRoll = 0.08` was delivering a log decrement of 0.90825, i.e. **0.1436 of
+critical** against the 0.0800 on the label, where `0.08·sqrt((2.28+5.0)/2.28)`
+predicts 0.1430. The fix is to rotate about the centre of gravity, after which the
+same run gives 0.50433 against the closed form's 0.50427 — four decimal places on
+a quantity that was 80% out.
+
+It shipped green because `zetaRoll` is a dimensionless fudge factor: an inflated
+stiffness only means the damper is stronger than its label, and nothing checked
+the label. It was found by **timing a free decay and comparing the logarithmic
+decrement against the ζ the coefficient claims** — the same instrument that
+validates Ikeda, pointed at the thing Ikeda replaces. It matters here beyond the
+label, because the natural roll frequency Ikeda is evaluated at is built from that
+same stiffness and would have been 2.1× too high.
+
+**Limits.** Everything in the validity list above still applies, plus three that
+belong to the coupling rather than to the method:
+
+1. *The operating-point frequency is the natural one*, so a ship driven hard well
+   off resonance — a following sea overtaking slowly — is evaluated at the wrong
+   frequency by whatever the detuning is. Ikeda is at worst linear in ω, so the
+   error is bounded by the detuning and is not sharp.
+2. *The natural frequency itself uses `A_inf`, not `A(ω_n)`*, because that is what
+   the mass matrix carries; the self-consistent value would need an iteration. On
+   the barge the two added masses are 0.4% apart and it does not matter at all; on
+   the ferry-like hull `A_inf` is 21% below `A(ω_d)`, which is dry inertia plus
+   16% against dry plus 20% — a 1.7% error in ω and so in B44.
+3. *Hull form is snapshotted at `attachRollDamping()`* and only the roll axis
+   tracks the ship afterwards, so a hull that floods until its draft and Cb have
+   visibly changed is being damped on its intact form.
+
+All three are refinements with a clear route, not gaps in the coupling.
 
 ### The hard cases
 
