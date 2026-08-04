@@ -48,6 +48,7 @@
 // roll axis, positive downward) is derived as draft - KR internally.
 #pragma once
 
+#include "../core/geometry.hpp"
 #include "../core/math.hpp"
 
 #include <string>
@@ -117,6 +118,28 @@ struct RollDamping {
 };
 
 RollDamping rollDamping(const RollDampingHull& hull, const RollDampingCondition& condition);
+
+// Derive the hull-form half of a RollDampingHull from an actual hull mesh, so a
+// ship asset does not have to carry a second, separately-authored set of main
+// dimensions that can drift away from the shape it actually has. Lpp and beam
+// are read off the wetted body, draft from the waterline down to the keel, Cb
+// from the volume the same integrator gives the hydrostatics, and Cm from the
+// largest sectional area found by clipping the hull into slabs -- the same route
+// radiationHullFromMesh() takes to its stations, and for the same reason: a hull
+// that displaces what it should then also has a block coefficient that says so.
+//
+// **What is deliberately not derived.** Bilge keels are appendages, and a
+// watertight envelope has no appendages in it -- there is nothing in the mesh to
+// measure, so they are arguments. The bilge radius is left at its "estimate from
+// Cm and B/d" sentinel rather than fitted to the mesh, because Ikeda's bilge-keel
+// model idealises the section as a vertical side, a horizontal bottom and a
+// quarter-circle bilge, and a radius measured off a shape that is not that is not
+// the radius the formulae want. The roll axis is left at zero: it is a property
+// of loading rather than of form, it moves as a ship floods, and Ship sets it
+// from the live centre of gravity every tick.
+RollDampingHull rollDampingHullFromMesh(const TriMesh& hull, double waterlineZ,
+                                        double bilgeKeelLength = 0, double bilgeKeelBreadth = 0,
+                                        double density = kRhoSeawater);
 
 // Ikeda's method is a fit, and a fit has a domain. This reports, in plain words,
 // every way the given hull and operating point sit outside the range over which

@@ -386,13 +386,28 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
         cachedWaterplaneArea_ = (hullSweep.below(planeOffset + h).volume -
                                  hullSweep.below(planeOffset - h).volume) / (2 * h);
 
+        // **The perturbation has to rotate the ship about its centre of gravity.**
+        // The damping this feeds is applied to a torque about the cog, so the
+        // stiffness paired with it must be about the cog too. Rotating about the
+        // body origin instead -- which is what leaving `state.position` alone
+        // does -- moves the centre of gravity out from under the point the moment
+        // is taken about, and the weight then contributes a moment of rho g V
+        // times KG that no righting arm has in it.
+        //
+        // That term is nothing next to the longitudinal metacentric height, so
+        // pitch never noticed; against a transverse GM of 2.3 m and a KG of 5 m
+        // it was larger than the quantity being measured, and a nominal
+        // zetaRoll of 0.08 was delivering 0.144 of critical -- found by timing a
+        // free decay's logarithmic decrement, not by any check on the stiffness.
         auto angularStiffness = [&](const Vec3& axisWorld) {
             const double eps = 2e-3;
             const Quat q2 = Quat::fromAxisAngle(axisWorld, eps) * state.orientation;
             const Mat3 R2 = q2.toMat3();
-            const VolumeIntegral s2 = PlaneSweep(hull, bodyFrameUp(R2)).below(planeOffset);
+            const Vec3 position2 = cogWorld - R2 * mp.cog;
+            const double planeOffset2 = sea.level - position2.z;
+            const VolumeIntegral s2 = PlaneSweep(hull, bodyFrameUp(R2)).below(planeOffset2);
             const Vec3 fb2{0, 0, seaDensity * kGravity * s2.volume};
-            const Vec3 cb2 = R2 * s2.centroid + state.position;
+            const Vec3 cb2 = R2 * s2.centroid + position2;
             const Vec3 t2 = cross(cb2 - cogWorld, fb2);
             return std::max(0.0, -(dot(t2, axisWorld) - dot(torque, axisWorld)) / eps);
         };
@@ -414,14 +429,28 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
     Ieff(2, 2) *= (1.0 + addedInertiaYaw);
 
     // With a radiation model, the guessed coefficients give way to this hull's
-    // own infinite-frequency added mass. Only the diagonal is taken: the
-    // integrator below inverts a 3x3 inertia and divides by a per-axis mass, so
-    // there is nowhere for the sway-roll coupling A_24 to go. That coupling is
-    // real and matters for roll, and taking the diagonal is an approximation this
-    // integrator's shape forces rather than one the physics justifies -- see
-    // docs/02-simulation.md.
+    // own infinite-frequency added mass.
+    //
+    // **The transfer is not optional.** stripTheoryTable() assembles A_inf about
+    // the body-frame origin -- midship on the baseline -- while everything below
+    // takes moments about the centre of gravity, and rotational added mass is no
+    // more origin-independent than a moment of inertia is. Referring it to the
+    // cog costs one congruence, A' = T^T A T, and it is not a small correction:
+    // on the reference barge A_44 falls by 39%, because a section's added-mass
+    // roll centre sits near the waterline and the baseline is a long lever away
+    // from it. Heave comes through untouched (translational added mass is
+    // reference-point independent) and pitch moves only through the longitudinal
+    // offset of the cog, since strip theory's surge added mass is zero.
+    //
+    // Only the diagonal of the result is taken: the integrator below inverts a
+    // 3x3 inertia and divides by a per-axis mass, so there is nowhere for the
+    // sway-roll coupling A_24 to go. That is an approximation this integrator's
+    // shape forces rather than one the physics justifies -- but referring the
+    // matrix to the cog first shrinks the term being dropped by roughly eight
+    // times on the barge, because the cog sits near the point where sway and roll
+    // decouple. See docs/02-simulation.md.
     if (radiation.has_value()) {
-        const Matrix6& aInf = radiation->addedMassInfinite();
+        const Matrix6 aInf = transferAddedMass(radiation->addedMassInfinite(), mp.cog);
         // Surge keeps its coefficient. Strip theory does not decline to answer
         // for surge by oversight -- a strip has no longitudinal radiation problem
         // at all, and surge added mass is entirely a three-dimensional end
@@ -465,17 +494,75 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
     // entirely reasonable, since a ship that moves too little in waves reads as
     // stiff rather than as broken.
     //
-    // Roll and yaw keep theirs. Roll radiation damping is genuinely small and the
-    // mechanism that matters is viscous -- eddies and bilge keels, which
-    // roll_damping.{hpp,cpp} computes by Ikeda's method and which is not yet
-    // wired into this integrator; deleting roll's stand-in before that lands
-    // would leave the one mode that most needs damping with almost none. Surge
-    // keeps its damper too, since strip theory contributes no surge radiation at
-    // all. Quadratic drag is untouched throughout: it is viscous and separate.
+    // Yaw keeps its damper, and so does surge -- strip theory contributes no
+    // surge radiation at all. Roll keeps this one only until Ikeda is attached
+    // below: roll radiation damping is genuinely small and the mechanism that
+    // matters is viscous, so a ship with radiation but no viscous roll model
+    // would otherwise have the one mode that most needs damping running on almost
+    // none. Quadratic drag is untouched throughout: it is viscous and separate.
     if (radiation.has_value()) {
         cLin.y = 0.0;
         cLin.z = 0.0;
         cAng.y = 0.0;
+    }
+
+    // Viscous roll damping, Ikeda's method, in place of roll's fraction-of-
+    // critical stand-in -- the fourth time in this file that coupling a real
+    // model in has meant deleting a lumped one that was secretly doing its job.
+    // zetaRoll was fitted to sit where Ikeda puts a ro-pax with bilge keels (8%
+    // of critical against a measured 6.3%), so leaving both in would not look
+    // wrong; it would just double the damping of the mode that decides whether a
+    // damaged ship capsizes.
+    //
+    // **The operating point.** B44 is an equivalent *linear* coefficient and is
+    // only valid at the amplitude, frequency and speed it was asked for, all
+    // three of which move every tick. Evaluated per tick rather than cached,
+    // because one call is 52 ns against a 16 us tick -- 0.3%, so a cache would
+    // buy nothing but a stale answer. The three inputs come from quantities this
+    // integrator already has in hand:
+    //
+    //   * frequency: the natural roll frequency sqrt(C44 / (I44 + A44)), from the
+    //     measured hydrostatic stiffness and the effective inertia two lines up.
+    //     Roll is lightly damped and sharply resonant, so a ship's roll sits at
+    //     its natural frequency whatever is driving it; and Ikeda's frequency
+    //     dependence is only sqrt(omega) for friction and linear for the rest, so
+    //     a frequency wrong by a fifth is a B44 wrong by less than the method's
+    //     own +/-25%. Estimating it from recent motion instead would need filter
+    //     state, would lag every change of loading, and would have nothing to say
+    //     at all about a ship that is not currently rolling.
+    //   * amplitude: the phase-plane radius sqrt(phi^2 + (phidot/omega_n)^2),
+    //     which for a lightly damped oscillator *is* the envelope of the roll it
+    //     is presently executing -- exactly the amplitude equivalent
+    //     linearisation is defined at, available instantaneously and with no
+    //     history to keep. Reading the heel alone would report zero damping every
+    //     time the ship passed through upright, which is where it is rolling
+    //     fastest.
+    //   * speed: surge along the ship's own bow. state.velocity is a *world*
+    //     vector and its x component is the ship's speed only while the ship
+    //     still points along world x.
+    if (rollDampingForm.has_value()) {
+        // The roll axis is loading, not form: it moves as the ship floods, so it
+        // is taken from the live centre of gravity rather than snapshotted.
+        rollDampingForm->rollAxisAboveKeel = mp.cog.z - hullLo.z;
+        rollDampingForm->seaDensity = seaDensity;
+
+        const double omegaRoll = std::sqrt(cachedKRoll_ / std::max(Ieff(0, 0), 1e-9));
+        double heel = 0, trim = 0;
+        heelTrimFromRotation(R, heel, trim);
+
+        rollCondition.rollFrequency = omegaRoll;
+        rollCondition.rollAmplitude =
+            omegaRoll > 0 ? std::hypot(heel, wBody.x / omegaRoll) : std::abs(heel);
+        rollCondition.forwardSpeed = vBody.x;
+        rollDampingApplied = rollDamping(*rollDampingForm, rollCondition);
+
+        // Zero means the form is not usable -- rollDamping() reports every
+        // component as zero for a hull it cannot make sense of -- and the stand-in
+        // stays. It is not a guard against a capsizing ship: when the
+        // finite-difference roll stiffness clamps to zero the stand-in is
+        // 2 zeta sqrt(0 * I), which is also zero, so there is nothing to fall back
+        // *to*. What the ship keeps in that state is its quadratic drag.
+        if (rollDampingApplied.total > 0) cAng.x = rollDampingApplied.total;
     }
 
     // Quadratic drag on the projected areas of the box around the hull.
@@ -533,12 +620,22 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
     // The wave-memory force: waves this ship radiated earlier, still nearby and
     // still pushing back. Advanced with the body-frame velocity and subtracted,
     // per the sign convention in radiation.hpp.
+    //
+    // The velocity handed over is the body origin's, which is the point the
+    // table is referenced to, so no transfer is owed on the way in. The moment
+    // that comes back is about that same origin, and tBody is about the centre of
+    // gravity -- so the memory *force* contributes a moment of its own through
+    // the offset, exactly as the propulsion forces do above. Dropping it would
+    // put the whole radiation memory on the wrong lever in roll.
     if (radiation.has_value()) {
         radiation->step({vBody.x, vBody.y, vBody.z, wBody.x, wBody.y, wBody.z}, dt);
         const std::array<double, 6> memory = radiation->memoryForce();
+        const Vec3 memoryForce{memory[0], memory[1], memory[2]};
+        const Vec3 memoryMoment = Vec3{memory[3], memory[4], memory[5]} -
+                                  cross(mp.cog, memoryForce);
         for (int i = 0; i < 3; ++i) {
-            fBody[i] -= memory[i];
-            tBody[i] -= memory[i + 3];
+            fBody[i] -= memoryForce[i];
+            tBody[i] -= memoryMoment[i];
         }
     }
 
@@ -574,6 +671,28 @@ RadiationTable Ship::attachRadiation(double waterlineZ, int stationCount, int st
 
     radiation.emplace(table, kFitStep, samples, stateOrder);
     return table;
+}
+
+RollDampingHull Ship::attachRollDamping(double waterlineZ, double bilgeKeelLength,
+                                        double bilgeKeelBreadth) {
+    RollDampingHull form = rollDampingHullFromMesh(hull, waterlineZ, bilgeKeelLength,
+                                                   bilgeKeelBreadth, seaDensity);
+    // The roll axis is loading rather than form; seed it from the ship as it
+    // stands so a caller who never steps still gets a usable coefficient.
+    // integrateRigidBody() refreshes it every tick thereafter.
+    form.rollAxisAboveKeel = massProperties().cog.z - hullLo.z;
+
+    // Left at zero deliberately, and not because it is unknown. B44W is the
+    // radiation share of roll damping; when a RadiationForce is attached the
+    // memory convolution is already applying it, so adding it here would be the
+    // same double count that cost 27% of mid-frequency heave the first time
+    // radiation was wired in. A caller with no radiation model who wants the
+    // 5-30% ITTC puts on the wave component can set it themselves -- and
+    // validateRollDamping() says so when it is missing.
+    form.waveDamping = 0.0;
+
+    rollDampingForm = form;
+    return form;
 }
 
 void Ship::step(double dt, const Sea& sea) {

@@ -167,6 +167,19 @@ worth trusting.
   runs the ship up to its own speed and steers to hold heading, because the
   reference hull is directionally unstable and departs into a turn after about
   1900 s of straight running (`02-simulation.md` §2)
+- ~~**Ikeda coupled into the seakeeping path, and the roll added-mass frame**~~
+  **done** — `Ship::attachRollDamping()` replaces `zetaRoll` with B44 re-evaluated
+  every tick at the amplitude, frequency and speed the ship is actually at (52 ns
+  a call against a 16 µs tick, so caching it would only buy a stale answer). The
+  free-decay log decrement matches `2πζ/√(1−ζ²)` to 0.25% cycle by cycle, and the
+  decrement *changes* through a decay exactly as an amplitude-dependent
+  coefficient says it must, where the stand-in it replaced held it constant.
+  `A_inf`'s rotational block is now referred from the baseline origin to the
+  centre of gravity — a factor of 3.5 in roll on a ferry-like hull, with the sign
+  pinned by a semicircular section whose roll added mass is analytically zero.
+  Along the way: the angular stiffness scaling every modal damper was being
+  measured about the wrong point, so `zetaRoll = 0.08` was delivering 0.144
+  (`02-simulation.md` §2)
 - **Milestone:** drive a ship in a real seaway. Validated against published RAOs.
   **Half met.** *Drive a ship in a real seaway* — yes: a hull under power, in a
   directional spectral sea, responding through nonlinear Froude–Krylov with

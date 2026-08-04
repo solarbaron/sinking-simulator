@@ -219,6 +219,39 @@ RadiationTable stripTheoryTable(const RadiationHull& hull, const std::vector<dou
 // instead of spending them on a flat tail.
 std::vector<double> radiationFrequencyGrid(double omegaMin, double omegaMax, int count);
 
+// Re-reference a 6x6 radiation matrix -- added mass, damping, or a retardation
+// sample -- from the point it was assembled about to another point `offset`
+// metres away in the same body frame. stripTheoryTable() produces everything
+// about the body-frame origin (midship on the baseline); an equation of motion
+// written about the centre of gravity needs it about the centre of gravity, and
+// rotational added mass is no more origin-independent than a moment of inertia
+// is.
+//
+// The velocity about the old point in terms of the velocity about the new one is
+// v_old = v_new + d x omega with omega unchanged, i.e. the 6x6
+//
+//     T = [ I  d~ ]        d~ a = d x a,   d = new point - old point
+//         [ 0  I  ]
+//
+// and a quadratic form transfers by congruence: A_new = T^T A_old T. That is the
+// parallel-axis theorem in disguise -- feed a rigid body's own mass matrix in and
+// the rotational block comes out as I + m(d d^T - |d|^2 I).
+//
+// Two consequences worth stating, because both are easy to get wrong by sign:
+//
+//   * the translational block is unchanged (added mass in surge, sway and heave
+//     does not care where you measure it from), and
+//   * the roll entry picks up the sway-roll coupling twice over,
+//     A44' = A44 + 2 dz A24 + dz^2 A22 + dy^2 A33, so dropping A24 -- as an
+//     integrator with a diagonal mass matrix must -- is not the same as
+//     dropping the transfer.
+//
+// The generalised *force* conjugate to those coordinates transfers by T^T alone:
+// the moment about the new point is M - d x F. RadiationForce::memoryForce()
+// returns its moment about the same origin the table was assembled about, so a
+// caller taking moments elsewhere owes it that correction.
+Matrix6 transferAddedMass(const Matrix6& matrix, const Vec3& offset);
+
 // --- Cummins / Ogilvie -------------------------------------------------------
 
 // The retardation function K_ij(t) = (2/pi) int_0^inf B_ij(omega) cos(omega t)

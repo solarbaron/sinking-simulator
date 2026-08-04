@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "roll_damping.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 
@@ -272,6 +273,64 @@ RollDamping rollDamping(const RollDampingHull& hull, const RollDampingCondition&
                 out.wave;
     const double scale = hull.nondimensionalScale();
     out.totalHat = scale > 0 ? out.total / scale : 0.0;
+    return out;
+}
+
+RollDampingHull rollDampingHullFromMesh(const TriMesh& hull, double waterlineZ,
+                                        double bilgeKeelLength, double bilgeKeelBreadth,
+                                        double density) {
+    RollDampingHull out;
+    out.seaDensity = density;
+    out.bilgeKeelLength = bilgeKeelLength;
+    out.bilgeKeelBreadth = bilgeKeelBreadth;
+    if (hull.verts.empty()) return out;
+
+    Vec3 lo = hull.verts[0], hi = hull.verts[0];
+    for (const Vec3& v : hull.verts) {
+        lo = {std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+        hi = {std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
+    }
+    if (!(waterlineZ > lo.z)) return out;
+
+    // Clip generously wide in the directions that are not being cut, so the box
+    // trims the hull only at the waterline and the shell does the rest.
+    const double wide = (hi.x - lo.x) + (hi.y - lo.y) + (hi.z - lo.z) + 1.0;
+    const Vec3 boxLo{lo.x - wide, lo.y - wide, lo.z - wide};
+    const TriMesh wetted = clipToBox(hull, boxLo, {hi.x + wide, hi.y + wide, waterlineZ});
+    if (wetted.verts.empty()) return out;
+
+    Vec3 wlo = wetted.verts[0], whi = wetted.verts[0];
+    for (const Vec3& v : wetted.verts) {
+        wlo = {std::min(wlo.x, v.x), std::min(wlo.y, v.y), std::min(wlo.z, v.z)};
+        whi = {std::max(whi.x, v.x), std::max(whi.y, v.y), std::max(whi.z, v.z)};
+    }
+    // Beam is taken over the whole wetted body rather than at the waterline
+    // exactly. For any hull without tumblehome those are the same number, and for
+    // one with it the wider figure is what the bilge-keel lever arms are built on.
+    out.lengthPp = whi.x - wlo.x;
+    out.beam = whi.y - wlo.y;
+    out.draft = waterlineZ - wlo.z;
+    if (out.lengthPp <= 0 || out.beam <= 0 || out.draft <= 0) return out;
+
+    const double volume = integrate(wetted).volume;
+    if (volume <= 0) return out;
+    out.blockCoeff = volume / (out.lengthPp * out.beam * out.draft);
+
+    // Cm is the *midship* section coefficient, and midship on a real hull is
+    // wherever the section is largest -- not necessarily x = 0, and certainly not
+    // the mean of the stations. Scanning for the maximum is what makes this right
+    // for a hull with its parallel midbody off centre.
+    constexpr int kSlabs = 41;
+    const double thickness = out.lengthPp / kSlabs;
+    double largestArea = 0;
+    for (int i = 0; i < kSlabs; ++i) {
+        const double x = wlo.x + out.lengthPp * (i + 0.5) / kSlabs;
+        const TriMesh slab = clipToBox(hull, {x - 0.5 * thickness, boxLo.y, boxLo.z},
+                                       {x + 0.5 * thickness, hi.y + wide, waterlineZ});
+        if (slab.verts.empty()) continue;
+        largestArea = std::max(largestArea, integrate(slab).volume / thickness);
+    }
+    out.midshipCoeff = largestArea / (out.beam * out.draft);
     return out;
 }
 

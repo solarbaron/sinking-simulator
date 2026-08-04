@@ -20,6 +20,7 @@
 #include "../core/geometry.hpp"
 #include "propulsion.hpp"
 #include "radiation.hpp"
+#include "roll_damping.hpp"
 #include "waves.hpp"
 
 #include <optional>
@@ -149,6 +150,14 @@ public:
 
     // Damping as a fraction of critical, per mode. Roll is the lightly damped one
     // and is what makes a flooding ship feel alive rather than syrupy.
+    //
+    // Every one of these is a lumped stand-in for a mechanism that is now
+    // modelled somewhere: heave/sway/pitch for radiation, yaw for N_r, roll for
+    // Ikeda's viscous components. They are the default because the flooding
+    // scenarios predate all of it and are validated against their own behaviour;
+    // each is switched off in integrateRigidBody() the moment the real model
+    // arrives, which is not a tidy-up but the entire point -- adding the real
+    // thing alongside its own stand-in damps the ship twice.
     double zetaHeave = 0.35;
     double zetaRoll  = 0.08;
     double zetaPitch = 0.30;
@@ -178,6 +187,35 @@ public:
     // would be two integrators disagreeing about where the ship is.
     std::optional<Manoeuvring> propulsion;
 
+    // Viscous roll damping by Ikeda's method, when the ship has been given it.
+    // Potential flow gives roll almost no damping at all, so this is where roll
+    // damping actually comes from, and it replaces zetaRoll outright rather than
+    // adding to it.
+    //
+    // Held as the hull-form parameters rather than as a coefficient, because
+    // Ikeda's B44 is a function of the operating point -- roll amplitude, roll
+    // frequency, forward speed -- and the operating point changes every tick.
+    // integrateRigidBody() evaluates it per tick at 52 ns against a 16 us tick,
+    // which is cheap enough that caching it would only buy a stale answer.
+    //
+    // `rollAxisAboveKeel` is overwritten from the live centre of gravity each
+    // tick, on the same terms as the manoeuvring state: hull *form* is fixed and
+    // is snapshotted by attachRollDamping(), but the roll axis is a property of
+    // loading and a flooding ship's loading moves.
+    //
+    // **waveDamping must stay zero while `radiation` is attached.** It is the
+    // radiation share of B44, and with a radiation model the memory convolution
+    // is already applying it; supplying both is the same double count that cost
+    // 27% of mid-frequency heave when radiation first landed.
+    std::optional<RollDampingHull> rollDampingForm;
+
+    // Diagnostic, filled each tick when rollDampingForm is set: the operating
+    // point Ikeda was asked at and every component of the answer. Which mechanism
+    // is doing the work is the whole diagnostic value of the method, so it is
+    // published rather than consumed silently.
+    RollDampingCondition rollCondition{};
+    RollDamping rollDampingApplied{};
+
     RigidState state;
 
     // --- Lifecycle ---
@@ -206,6 +244,18 @@ public:
     // are the numbers that say whether to trust it, and swallowing them here
     // would be the wrong kind of convenience.
     RadiationTable attachRadiation(double waterlineZ, int stationCount = 21, int stateOrder = 6);
+
+    // Read this hull's form off its own mesh and attach Ikeda's viscous roll
+    // damping, so the roll mode stops running on a guessed fraction of critical.
+    // `waterlineZ` is the still-water plane in body coordinates; call after
+    // initialise(). Bilge keels are arguments because a watertight envelope has
+    // no appendages in it -- see rollDampingHullFromMesh().
+    //
+    // Returns the form it derived, because validateRollDamping() against it is
+    // what says whether this hull is inside the domain the regressions were
+    // fitted over, and swallowing that would be the wrong kind of convenience.
+    RollDampingHull attachRollDamping(double waterlineZ, double bilgeKeelLength = 0,
+                                      double bilgeKeelBreadth = 0);
 
     Diagnostics diagnostics(const Sea& sea) const;
 
