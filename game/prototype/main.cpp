@@ -119,6 +119,10 @@ int main(int argc, char** argv) {
     double dt = 0.02;
     std::string csvPath;
     std::string shipPath;
+    // Bilge keel length, m. Zero leaves the ship on the linear stand-in; any
+    // positive value attaches Ikeda's viscous roll damping instead. A ro-pax of
+    // this size carries keels around a third of her length.
+    double bilgeKeelLength = 0.0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view a = argv[i];
@@ -127,6 +131,7 @@ int main(int argc, char** argv) {
         else if (a.starts_with("--dt=")) dt = std::atof(argv[i] + 5);
         else if (a.starts_with("--csv=")) csvPath = std::string(a.substr(6));
         else if (a.starts_with("--ship=")) shipPath = std::string(a.substr(7));
+        else if (a.starts_with("--bilge-keels=")) bilgeKeelLength = std::atof(argv[i] + 14);
         else { std::fprintf(stderr, "unknown argument: %s\n", argv[i]); return 2; }
     }
 
@@ -147,6 +152,16 @@ int main(int argc, char** argv) {
     }
     const double seaLevel = 0.0;
     ship.initialise(seaLevel);
+
+    // Real viscous roll damping, on request. Roll is the mode that decides
+    // whether a damaged ship lolls or lies over, and Ikeda's B44 is strongly
+    // amplitude-dependent where the linear stand-in is not -- so the two differ
+    // most exactly where this scenario spends its time.
+    if (bilgeKeelLength > 0.0) {
+        const RollDampingHull form = ship.attachRollDamping(5.5, bilgeKeelLength, 0.9);
+        for (const std::string& problem : validateRollDamping(form, {}))
+            std::fprintf(stderr, "  roll damping: %s\n", problem.c_str());
+    }
 
     for (const std::string& problem : ship.validate())
         std::fprintf(stderr, "  ship definition: %s\n", problem.c_str());

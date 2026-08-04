@@ -294,6 +294,41 @@ The honest way to do wave loads on a large ship is potential flow.
   seakeeping result. Two panels along the length already gave the exact answer in
   that case, but the rule to build to is several panels per wavelength.
 
+### Does any of it change the damage-control answer? — **measured**
+
+Worth asking directly, because Phase 0's ferry scenarios are the project's
+centrepiece and everything since has moved the physics under them. Two changes in
+particular: the roll stiffness defect meant every ship had been rolling at 1.8×
+its configured damping since Phase 0, and Ikeda's B44 is strongly
+amplitude-dependent where the linear stand-in is not — so the two differ most at
+exactly the heel angles a lolling ship lives at.
+
+`shipsim --bilge-keels=40` attaches Ikeda instead of the stand-in. Comparing the
+`doors` capsize trajectory over 900 s:
+
+| | worst difference | as % of that column's range |
+|---|---|---|
+| heel | 0.076° | 0.13% |
+| GM | 0.007 m | 0.13% |
+| floodwater | 1.13 t | 0.02% |
+| displacement | 1.2 t | 0.02% |
+| draft | 0.0006 m | 0.03% |
+
+All three verdicts are unchanged. (GZ moves 35% of *its* range, which sounds
+alarming and is not: GZ is near zero throughout a loll, so its whole range here is
+7 mm and the difference is 2.4 mm.)
+
+**The conclusion is that the damage-control outcome is governed by statics, not by
+roll damping**, and that is what it should be. A loll is a *static* instability —
+GM goes negative and the ship settles at a new equilibrium — so how fast it gets
+there barely matters. Which of the two damping models is used, and the 1.8× error
+that was in both of them, move the answer by about a tenth of a per cent.
+
+That is a reassuring result rather than a boring one. It says the Phase 0
+conclusions survived having their dynamics substantially rewritten underneath
+them, and it says where roll damping *will* matter: a ship rolling in a seaway
+near resonance, not a ship lolling in flat water.
+
 ### Response amplitude operators — **implemented**
 
 `engine/sim/rao.{hpp,cpp}`. An RAO is the transfer function between a regular
