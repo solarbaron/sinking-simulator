@@ -253,7 +253,10 @@ The longest and highest-risk phase.
 - Adaptive zone promotion/demotion and interface coupling
 - Ductile damage and mesh-splitting fracture
 - GPU element solver
-- FEM → flooding coupling (a tear becomes an orifice)
+- ~~FEM → flooding coupling (a tear becomes an orifice)~~ — done:
+  `engine/sim/breach.hpp`, measured in `02-simulation.md` §3. Failed panels become
+  merged `Opening`s whose area, position and connectivity come from the structure;
+  what supplies the failed panels is still to come
 - Deformation and tear rendering
 - **Milestone:** ram the ferry. The hull deforms, tears where the stress says it
   should, and the resulting hole floods at a rate the hole's own area determines.

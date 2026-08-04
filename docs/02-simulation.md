@@ -39,8 +39,13 @@ floodwater free to re-level.
 4. **Downflooding angle bookkeeping.** Track the heel at which each opening
    immerses, and surface it — this is the number that decides survival and it is
    currently only implicit.
-5. **Progressive flooding through the structure.** Requires §3: once elements
-   tear, new orifices appear automatically.
+5. **Progressive flooding through the structure.** ~~Requires §3: once elements
+   tear, new orifices appear automatically.~~ **The coupling is done** —
+   `engine/sim/breach.{hpp,cpp}`, written up in §3 below: given a structural mesh
+   and the panels that failed, it returns `Opening`s that drop into
+   `Ship::openings` and are indistinguishable to the solver from authored ones.
+   What is still missing is the other half — a fracture model to decide *which*
+   panels fail. Today the failure set is supplied by the caller.
 
 ---
 
@@ -1232,6 +1237,158 @@ girder built outside the hull; and longitudinals shifted onto the wrong strake
 seam, which leaves one on the centreline keel while weight and count say nothing.
 The single survivor is genuinely equivalent: a station-and-waterline hull mesh has
 a single-valued half-breadth, so nearest and outermost hit are the same ray.
+
+### Failed structure → flooding openings — **implemented**
+
+`engine/sim/breach.{hpp,cpp}`. The half of the Phase 3 milestone that is not the
+FEM: given a `StructuralMesh` and the panels that failed, produce the holes that
+failure implies in the flooding network. It contains no fracture model and does
+not pretend to — the failure set is the caller's answer, eventually the FEM's.
+
+```cpp
+BreachSet breachesFromFailedPanels(const Ship&, const StructuralMesh&,
+                                   const std::vector<int>& failedPanels,
+                                   const BreachParams& = {});
+std::size_t applyBreaches(Ship&, const BreachSet&);   // straight into Ship::openings
+int    spaceAt(const Ship&, const Vec3& bodyPoint);   // compartment / kSea / kEnclosedVoid
+double meshWindingNumber(const TriMesh&, const Vec3&);
+```
+
+**Connectivity is read off the geometry, never off the label.** Which two spaces
+a hole joins is the one thing that must not be wrong — a shell panel opens a
+compartment to the sea, a bulkhead panel opens one compartment to another, and
+confusing them is the difference between a breach and a door. `PanelRole` looks
+like the answer and is not, and the reference ferry breaks it three ways: her
+wing bulkhead runs at |y| = 6 m *inside* the holds, so tearing it opens a space
+to itself; her weather deck is `PanelRole::Deck` with the sky above it, so a hole
+there is open to the sea; and amidships her engine-room boxes stop at |y| = 8 m
+while the shell is out past 8.6 m, so most of the plating over the engine room
+faces nothing the subdivision describes. Each failed panel is therefore probed
+either side of its own plane, and the probe returns three answers — a
+compartment, `kSea`, or `kEnclosedVoid` for inside the hull but inside no
+compartment. The third is not an error: it is a hole into a space the ship
+definition does not model, and it opens nothing and says so.
+
+Point location is a **summed solid angle** (Van Oosterom–Strackee), not a ray
+cast. Compartments are carved from the hull on axis-aligned bulkhead and deck
+planes, so their edges lie along exactly the axes a ray would be written along,
+and a ray through an edge is counted twice or not at all. The solid angle sum has
+no ray to place. On a *surface* its answer is decided by the sign of a
+floating-point zero — a coplanar triangle cancels the triple product to ±0 and
+`atan2` reads ±π off it, giving 1 on the +x, +y and +z faces of a box and 0 on
+the other three — which is why probes are kept off surfaces and why the overlap
+check below asks twice.
+
+**The probe marches.** A flat panel chords across a curved shell, so its centroid
+is not on the surface it stands for: **measured at 0.15 m** on this ferry, where
+a girth band spans the crease at the turn of the bilge. A single fixed probe
+cannot serve — one small enough to stay inside a 1.8 m double bottom is smaller
+than that and reads the same space on both sides, which drops the breach. So the
+probe doubles outward until the two sides disagree and stops at the first
+disagreement, which is the nearest boundary and therefore this panel's own
+surface, giving up at the distance from the centroid to the furthest corner.
+Measured stability against the starting step, over all 8 900 panels of the ferry:
+
+| first step | openings | torn area |
+|---|---|---|
+| 20 mm | 55 | 10 136 m² |
+| **50 mm** (default) | **61** | **10 179 m²** |
+| 100 mm | 65 | 10 182 m² |
+
+**A torn plate is one hole, not forty.** Failed panels that share an *edge* and
+join the same pair of spaces merge into one opening whose area is the sum of
+theirs and whose position is the region's area-weighted centroid. Both qualifiers
+carry weight. *Same pair*: a shell panel and the bulkhead panel it lands against
+share an edge and are not the same hole, because an `Opening` has exactly two
+ends. *An edge, not a corner*: two panels touching only at a corner stay two
+openings, because the pinch between them has zero width and the merged centroid
+would sit at the one point in the region where there is no hole. It costs nothing
+in total flow — `Cd·A·√(2Δp/ρ)` is linear in area — and it keeps the head right
+where the pieces sit at different depths, which is the case where splitting is
+the better quadrature of `∫√h dA` and merging is the approximation.
+
+**Discharge coefficient: 0.60.** A clean sharp-edged orifice runs 0.61–0.62 (the
+ferry's authored breach uses 0.62) and a rounded or ducted entry 0.8–0.95, so the
+only question is which side of the sharp-edged value a tear sits. It sits at or
+below it: fractured plating petals, and an edge protruding into the flow is
+re-entrant, whose contraction coefficient is 0.5 in the Borda limit.
+Damage-stability practice takes 0.6 for a damage opening. 0.60 is therefore the
+top of the honest range rather than the middle, so the error is towards flooding
+too slowly. It is a constant because nothing upstream can refine it: what would
+is the tear's aspect ratio and which way the plating folded, and a set of failed
+panels records neither.
+
+**Does the water follow the area?** That is the milestone's actual claim, so it
+is measured rather than asserted. A barge with 200 × 40 m of waterplane, a hold
+20 m long and a hole 2 m under, against `Cd·A·√(2gh)·t` over 30 s:
+
+| failed plating | water taken | orifice law | ratio |
+|---|---|---|---|
+| 0.5 m² | 56.416 m³ | 56.368 m³ | 1.00084 |
+| 1.0 m² | 112.926 m³ | 112.736 m³ | 1.00168 |
+| 2.0 m² | 226.231 m³ | 225.472 m³ | 1.00337 |
+
+**Doubling the failed plating multiplies the water by 2.0017.** The excess is not
+noise and is not a discrepancy: the wider hole sinks the ship faster and so
+raises its own head, and the residual scales exactly linearly with area, as a
+first-order sinkage term must. Handing the flooding solver an opening this file
+produced and one written out by hand with the same numbers gives water volumes
+that agree to the last bit.
+
+**What it found in the ship it was pointed at.** The probe reports the reference
+ferry's forward wing tanks as lying *entirely inside* her forward holds —
+`fwd_hold_p` is authored y = 0…20 m where `wing_tank_fwd_p` is 8…20 m over the
+same length and height — so 217 m³ of her is described twice and a tear out there
+is attributed to whichever compartment was declared first. `Ship::validate()`
+does not catch it, because the subdivision still totals 25 259 m³ against a
+28 273 m³ hull and its overlap test only fires past 100.1%. The aft wing tanks,
+authored on the same plan, are correct. Reported rather than fixed: the flooding
+scenarios are validated against the ship as it stands.
+
+Distinguishing a real overlap from two compartments that merely *abut* needs care
+for the signed-zero reason above — both claim a point on the bulkhead between
+them, and the ferry's bulkhead deck lays a panel whose probe lands exactly on the
+forepeak boundary at x = 44 m. So the claim is only made when it survives a
+millimetre's displacement in all six directions: a region with volume in it does,
+a face does not. The check therefore fails towards missing a real overlap rather
+than towards inventing one.
+
+**What this cannot yet express:**
+
+- **Which panels fail.** The whole fracture half. Everything here is consequence.
+- **Partial failure.** A panel is torn or intact; there is no fraction of a plate
+  gone, and no separate treatment of a stiffener failing without its plating.
+- **A tear's shape.** The opening is an area at a point. A long vertical slit and
+  a compact hole of the same area are the same orifice here, though the slit's
+  flow should be the height integral of `√h` rather than `√h` at the centroid —
+  which is exactly the error the merge introduces and the reason corner-touching
+  pieces are deliberately left separate.
+- **Deformation.** The panels are read where the scantlings put them. A crushed
+  bow's plating has moved, and neither the structural mesh nor the compartment
+  meshes follow it yet.
+- **Air paths.** A tear vents air as readily as it admits water and the network
+  already handles that, but structure between compartments that fails *without*
+  becoming a flooding path — a buckled but unsplit bulkhead — has no
+  representation.
+- **Progressive failure.** One call, one failure set. A hole that grows is a new
+  call, and nothing dedupes it against the openings already added.
+
+**How it is checked** (`tests/test_breach.cpp`). A rectangular barge where every
+area, centroid and head is an exact rational; the reference ferry, whose hull is
+curved and whose compartments do not reach the shell everywhere; and an authored
+twin flooded alongside a produced opening and required to agree bit for bit.
+**Mutation testing killed 47 of 49 mutants.** Five of the survivors on the first
+pass were real holes and are now closed: the marching probe was never exercised
+at all (no test had a panel whose centroid was off its own surface); a collapsed
+quad side was treated as an edge, which fuses two triangles meeting at a point;
+the weld's neighbourhood search could be reduced to a single cell; an inside-out
+compartment mesh read as empty sea; and an out-of-range panel index survived
+because reading past the end of the array produced a *different* complaint that
+kept the problem count right. The two remaining survivors are equivalent: the
+bounding box is a pure pre-filter that the winding number overrules, and taking
+the probe's reach from one corner instead of the furthest agrees on every quad
+whose corners are equidistant from its centroid, which is every one the generator
+makes.
 
 ### Adaptive tetrahedral FEM
 

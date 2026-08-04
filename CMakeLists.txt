@@ -38,6 +38,7 @@ add_library(shipsim_engine
   engine/gpu/material.cpp
   engine/sim/ship.cpp
   engine/sim/shipfile.cpp
+  engine/sim/breach.cpp
   engine/sim/propulsion.cpp
   engine/sim/buckling.cpp
   engine/sim/girder.cpp
@@ -73,6 +74,7 @@ add_executable(shipsim_tests
   tests/main.cpp
   tests/harness.cpp
   tests/test_arena.cpp
+  tests/test_breach.cpp
   tests/test_camera.cpp
   tests/test_core.cpp
   tests/test_ecs.cpp

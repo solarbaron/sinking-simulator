@@ -83,6 +83,36 @@ std::vector<std::string> Ship::validate() const {
         note("compartments total " + std::to_string(subdivided) + " m3, more than the hull's " +
              std::to_string(hullVolume) + " m3 -- the subdivision overlaps");
 
+    // The total is a weak instrument, and it missed a real one. A ship is
+    // typically 85-90% subdivided, so one compartment can sit *wholly inside*
+    // another and the sum still comes nowhere near the hull -- which is exactly
+    // what the reference ferry did with a wing tank inside a hold, 217 m3 of
+    // floodwater with nowhere physical to go. Pairwise is what catches it.
+    //
+    // Bounding boxes, not meshes: abutting compartments share a face and
+    // intersect in zero volume, while a nested one intersects in its own. That
+    // distinction is the whole check, and it is exact for the box-carved
+    // compartments this engine builds. Advisory, because an L-shaped space could
+    // overlap in box and not in fact.
+    for (std::size_t i = 0; i < compartments.size(); ++i)
+        for (std::size_t j = i + 1; j < compartments.size(); ++j) {
+            const Compartment& a = compartments[i];
+            const Compartment& b = compartments[j];
+            Vec3 lo{std::max(a.bboxLo.x, b.bboxLo.x), std::max(a.bboxLo.y, b.bboxLo.y),
+                    std::max(a.bboxLo.z, b.bboxLo.z)};
+            Vec3 hi{std::min(a.bboxHi.x, b.bboxHi.x), std::min(a.bboxHi.y, b.bboxHi.y),
+                    std::min(a.bboxHi.z, b.bboxHi.z)};
+            const Vec3 e{hi.x - lo.x, hi.y - lo.y, hi.z - lo.z};
+            if (e.x <= 0 || e.y <= 0 || e.z <= 0) continue;
+            const double shared = e.x * e.y * e.z;
+            const double smaller = std::min(a.grossVolume, b.grossVolume);
+            if (smaller > 0 && shared > 0.01 * smaller)
+                note("compartments '" + a.name + "' and '" + b.name + "' overlap by about " +
+                     std::to_string(shared) + " m3 (" +
+                     std::to_string(100.0 * shared / smaller) + "% of the smaller) -- that volume "
+                     "would flood twice");
+        }
+
     for (const Opening& o : openings) {
         const int n = static_cast<int>(compartments.size());
         if (o.a != kSea && (o.a < 0 || o.a >= n))

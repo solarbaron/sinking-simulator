@@ -99,8 +99,13 @@ Ship buildFerry() {
     ship.compartments = {
         // Stops at the bulkhead deck: above 7 m the space forward is vehicle deck.
         carve(h, "forepeak",          {  44, -20, 1.8}, {  70,  20,  7.0}, 0.97),
-        carve(h, "fwd_hold_p",        {  20,   0, 1.8}, {  44,  20,  7.0}, 0.95),
-        carve(h, "fwd_hold_s",        {  20, -20, 1.8}, {  44,   0,  7.0}, 0.95),
+        // Outboard limit 8 m, where the wing tanks start -- exactly as the aft
+        // holds are drawn below. Authored at 20 m until the breach work found it:
+        // that put the whole wing tank *inside* the hold, so 217 m3 of the ship
+        // could flood twice. Ship::validate() could not see it, because a ship is
+        // only ~89% subdivided and the total never came near the hull.
+        carve(h, "fwd_hold_p",        {  20,   0, 1.8}, {  44,   8,  7.0}, 0.95),
+        carve(h, "fwd_hold_s",        {  20,  -8, 1.8}, {  44,   0,  7.0}, 0.95),
         carve(h, "engine_room_p",     {  -8,   0, 1.8}, {  20,   8,  7.0}, 0.85),
         carve(h, "engine_room_s",     {  -8,  -8, 1.8}, {  20,   0,  7.0}, 0.85),
         carve(h, "aft_hold_p",        { -38,   0, 1.8}, {  -8,   8,  7.0}, 0.95),
