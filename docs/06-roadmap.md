@@ -246,20 +246,35 @@ The longest and highest-risk phase.
   measured in `02-simulation.md` §3. Stiffeners are discrete rather than smeared,
   and the structural mesh is independent of the hydrodynamic hull mesh; both
   decisions are recorded there with what they rule out.
-- Craig–Bampton offline reduction; Tier-0 beam and Tier-1 reduced models
-- Solid-shell elements for plating; explicit tet FEM for genuinely 3D regions
+- ~~**Tier-0 beam**~~ **done** — `engine/sim/girder.{hpp,cpp}` and
+  `collapse.{hpp,cpp}`: the hull girder as a free beam balanced on the wave, first
+  yield, buckling, and Smith's-method progressive collapse swept along the length
+  (`02-simulation.md` §3). Craig–Bampton reduction and the Tier-1 reduced model are
+  **not** done, and are the piece between this and Tier-2
+- ~~**Solid-shell elements for plating**~~ **done** —
+  `engine/sim/solid_shell.{hpp,cpp}`. Explicit tet FEM for genuinely 3D regions
+  already existed from the Phase 0 spike (`engine/sim/fem.{hpp,cpp}`). **What does
+  not exist is a consumer**: nothing builds elements over a `StructuralMesh` and
+  solves, so the elements are validated and unused
   (see `07-fem-spike-findings.md` §4 for why this split is not optional)
 - ~~Co-rotational elasticity and J2 plasticity~~ — done: `engine/sim/solid_shell.hpp`
   and `engine/sim/plasticity.hpp`, measured in `02-simulation.md` §3. Radial return
   with isotropic hardening (kinematic available, defaulted off for want of a
   measurement); rate dependence deliberately deferred, with the reason recorded
-- Adaptive zone promotion/demotion and interface coupling
+- Adaptive zone promotion/demotion and interface coupling — **the largest thing
+  outstanding.** It is a cost problem as much as an engineering one: measured, an
+  elastoplastic solid-shell element costs 7.3 µs against 273 ns elastic, so a
+  200 m² collision zone is ~2 hours of wall time per simulated second on 24
+  threads. Promotion has to be rare and small, which is the whole reason the tier
+  structure exists
 - Ductile damage — done, `engine/sim/plasticity.hpp`: equivalent plastic strain to
   failure, regularised against the element's own size and against triaxiality.
   **Mesh-splitting fracture is not**: a failed integration point is deleted, and the
   maximum principal direction it returns — the plane a tear would open on — has no
   consumer yet
-- GPU element solver
+- GPU element solver — not started for solid-shell. The Phase 0 spike has a
+  Vulkan compute back-end for tets (`07-fem-spike-findings.md`), which is the
+  pattern to follow
 - ~~FEM → flooding coupling (a tear becomes an orifice)~~ — done:
   `engine/sim/breach.hpp`, measured in `02-simulation.md` §3. Failed panels become
   merged `Opening`s whose area, position and connectivity come from the structure;
@@ -270,7 +285,8 @@ The longest and highest-risk phase.
   reported as a patch, a pressure and an energy rather than as a velocity change,
   which is the load case the FEM-active zone needs. The rigid half of the
   milestone; what it does *not* do is deform or tear
-- Deformation and tear rendering
+- Deformation and tear rendering — not started. `engine/gpu/hull.{hpp,cpp}` draws
+  an undeformed hull from `sim::Ship`; nothing feeds it a deformed one
 - **Milestone:** ram the ferry. The hull deforms, tears where the stress says it
   should, and the resulting hole floods at a rate the hole's own area determines.
 
