@@ -392,12 +392,20 @@ The longest and highest-risk phase.
 
   Two things fall out of it rather than being put in. **Beyond a threshold the
   outcome stops caring how big the hole is** — from 1.5 to 6 m/s the hole grows
-  from 3.4 to 113 m² and the floodwater barely moves, because a small breach fills
-  the compartment behind it inside 900 s just as a large one does. Damage
-  stability is decided by *which* compartments open, which is what the subdivision
-  rules are written around. And **where she is struck decides how she dies**:
-  amidships she takes 2100 t and lolls 6°, at the quarter she takes 8100 t and goes
-  over 26° the other way.
+  from 3.4 to 107.7 m², thirty-two times over, and the floodwater moves 2%: 2254 t
+  against 2210 t. A small breach fills the compartment behind it inside 900 s just
+  as a large one does. Damage stability is decided by *which* compartments open,
+  which is what the subdivision rules are written around. And **where she is
+  struck decides how she dies**: amidships she takes 2210 t and lolls 8.1° to
+  starboard, at the quarter she takes 7102 t and goes over to 45° the other way.
+
+  Those figures are checked rather than quoted. `scripts/check-figures.sh` re-runs
+  `ram_view` at each operating point this section publishes and fails naming the
+  line to update, because the previous set went stale without anyone noticing when
+  a wing tank authored *inside* a hold was fixed: that removed 217 m³ which had
+  been flooding twice, and moved the quarter case from the 8100 t printed here for
+  months to 7102 t. Nothing tests a comment, so the numbers in this one are tested
+  from outside it.
 
   She is lost in every case tried, and that is consistent rather than suspicious:
   `ram_view` applies no damage control at all, which is Phase 0's `none` scenario,

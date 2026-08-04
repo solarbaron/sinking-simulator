@@ -117,6 +117,12 @@ fi
 # that runs them against each other.
 if [ -x ./build/ram_view ]; then
   expect_ok "ram_view" '^ok$' ./build/ram_view --speed=4.0 --duration=120
+  # And that the numbers docs/06-roadmap.md publishes about this milestone are
+  # still the numbers the tool produces. Docs are the source of truth here and
+  # nothing enforced it: the previous set went stale when a wing tank authored
+  # inside a hold stopped flooding twice, and a claim in indentation.hpp outlived
+  # the code that contradicted it by weeks. ~100 s, and it names the line to fix.
+  expect_ok "published figures" '^ok — ' ./scripts/check-figures.sh
 else
   skip "ram_view not built"
 fi
