@@ -54,6 +54,7 @@ int main() {
     runBucklingTests();
     runCollapseTests();
     runGirderTests();
+    runIndentationTests();
     runHullFormTests();
     runRaoTests();
     std::printf("%d checks, %d failures\n", testing::checkCount(), testing::failureCount());

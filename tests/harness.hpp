@@ -52,5 +52,6 @@ void runWaveTests();
 void runBucklingTests();
 void runCollapseTests();
 void runGirderTests();
+void runIndentationTests();
 void runHullFormTests();
 void runRaoTests();
