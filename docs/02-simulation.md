@@ -2138,6 +2138,45 @@ the surface normal and change plate thickness at a seam, not across an element.
 
 ### The Tier-2 zone — **implemented**
 
+**How big a zone can usefully be, measured — and it is a cliff, not a slope.**
+A zone stores a 24 × 24 stiffness matrix per element: **4.6 kB each**. This machine
+has 30 MB of L3, so the working set crosses it at about 6500 elements, and the
+parallel speedup does not degrade gracefully across that line — it falls off it:
+
+| elements | working set | speedup on 27 lanes | effective bandwidth |
+|---|---|---|---|
+| 2 000 | 9 MB | 13.5× | 275 GB/s |
+| 6 000 | 28 MB | 13.4× | 260 GB/s |
+| 8 000 | 37 MB | 10.5× | 193 GB/s |
+| **12 000** | **55 MB** | **2.7×** | **53 GB/s** |
+| 20 000 | 92 MB | 1.6× | 29 GB/s |
+
+Below the line the matrices stay resident and the solve scales. Above it every
+element streams from DRAM and the bandwidth saturates at ~29 GB/s however many
+threads are pointed at it. **So a big zone does not merely cost more, it scales
+worse**, and the practical ceiling is 8000–10 000 elements rather than anything
+the element count alone would suggest.
+
+That also corrects the diagnosis this section was first written with. The zone's
+own measurement — 3.4× on a 224-element patch — was attributed to the
+synchronisation barrier, and "the barrier is what to attack, not the kernel".
+Measured separately, `JobSystem::parallelFor` delivers **7.8× at 224 elements with
+47 µs of overhead** for compute-bound work, so the barrier is not what is holding
+it down. A kernel with the *same memory footprint* as a real element update gives
+about 4× at that size, which is what is actually being seen.
+
+Two caveats on that, both real. The 224-element point is small enough that a
+single step is tens of microseconds and the measurement is noisy — repeated runs
+gave 1.8× and 4.0×. And the probe is a synthetic matvec with the right footprint,
+not the elastoplastic kernel, so it settles the *bandwidth* question and only
+bounds the barrier one.
+
+The actionable consequence: the per-element stiffness store is what puts the
+ceiling there. Recomputing it instead of storing it trades compute for bandwidth
+and moves the knee out by roughly the ratio of the two, which is the first thing
+to try if zones ever need to be larger.
+
+
 `engine/sim/zone.{hpp,cpp}`, checked by `tests/test_zone.cpp`, run at ship scale by
 `tools/zone_probe` in `verify.sh full`. The consumer the element and the return map
 did not have: **`StructuralMesh` + a load → solid-shell elements → an explicit
