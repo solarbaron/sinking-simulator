@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "geometry.hpp"
 
+#include <string>
+
 #include <limits>
 #include <unordered_map>
 #include <utility>
@@ -563,7 +565,8 @@ TriMesh makeBox(const Vec3& lo, const Vec3& hi) {
 }
 
 TriMesh makeHullFromStations(const std::vector<Station>& stations,
-                             const std::vector<double>& waterlines) {
+                             const std::vector<double>& waterlines,
+                             std::vector<std::string>* problems) {
     TriMesh m;
     const auto ns = stations.size();
     const auto nw = waterlines.size();
@@ -578,9 +581,21 @@ TriMesh makeHullFromStations(const std::vector<Station>& stations,
     };
 
     m.verts.resize(2 * ns * nw);
+    if (problems)
+        for (std::size_t i = 0; i < ns; ++i) {
+            if (stations[i].halfBeam.size() == nw) continue;
+            problems->push_back("station at x = " + std::to_string(stations[i].x) + " has " +
+                                std::to_string(stations[i].halfBeam.size()) +
+                                " half-breadths for " + std::to_string(nw) + " waterlines");
+        }
     for (std::size_t i = 0; i < ns; ++i)
         for (std::size_t k = 0; k < nw; ++k) {
-            const double hb = k < stations[i].halfBeam.size() ? stations[i].halfBeam[k] : 0.0;
+            // Carry the last supplied half-breadth upward rather than dropping to
+            // zero. A missing column is an authoring error either way, but a
+            // wall-sided extension is a visible one and a knife edge is not.
+            double hb = 0.0;
+            if (!stations[i].halfBeam.empty())
+                hb = stations[i].halfBeam[std::min(k, stations[i].halfBeam.size() - 1)];
             m.verts[port(i, k)] = {stations[i].x, hb, waterlines[k]};
             m.verts[stbd(i, k)] = {stations[i].x, -hb, waterlines[k]};
         }

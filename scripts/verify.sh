@@ -120,11 +120,22 @@ else
 fi
 
 section "flooding scenarios still behave"
+# Run twice: once from the compiled reference ferry, once from ships/ferry.ship.
+# The outcomes must be identical strings, which is the check that the ship
+# definition format captured what actually matters rather than what was easy to
+# serialise. The unit suite compares the two ships in lockstep too, but only for
+# the first 150 s -- these are the 900 s runs the outcomes are quoted from, and
+# 'none' does not reach its verdict until t+880.
 for scenario in none doors full; do
   out="$(timeout 900 ./build/shipsim --scenario="$scenario" --duration=900 2>/dev/null \
          | grep -E '^=== Outcome' || true)"
-  if [ -n "$out" ]; then pass "$scenario: ${out#=== Outcome }"
-  else fail "$scenario produced no outcome"; fi
+  from_file="$(timeout 900 ./build/shipsim --ship=ships/ferry.ship --scenario="$scenario" \
+               --duration=900 2>/dev/null | grep -E '^=== Outcome' || true)"
+  if [ -z "$out" ]; then fail "$scenario produced no outcome"
+  elif [ "$out" != "$from_file" ]; then
+    fail "$scenario: ships/ferry.ship diverges from the compiled ferry"
+    printf '      compiled: %s\n      file:     %s\n' "$out" "$from_file"
+  else pass "$scenario (compiled and from file): ${out#=== Outcome }"; fi
 done
 
 section "repeat runs (concurrency must not be flaky)"

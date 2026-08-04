@@ -17,7 +17,136 @@ a real ship.
 
 ## 1. Ship definition format
 
-Declarative, text, version-controlled, human-diffable. Reference structure:
+Declarative, text, version-controlled, human-diffable.
+
+### What exists now
+
+`engine/sim/shipfile.{hpp,cpp}` reads a **single text file** that builds a whole
+`sim::Ship`, and `ships/ferry.ship` is the prototype ferry expressed in it.
+`game/prototype/ferry.cpp` stays in the tree as the reference the file is checked
+against, not as the way ships are authored.
+
+The grammar is whitespace-separated tokens, one directive per line, `#` to end of
+line for comments — deliberately the same lexical idiom as
+`engine/gpu/materials/*.materials`, because this repo already has one text format
+and a second style would be a second thing to learn. Blocks are `ship`, `hull`,
+`compartment`, `opening` and `pump`; the header of `shipfile.hpp` is the grammar
+reference. Abridged:
+
+```
+ship_format 1
+
+ship ferry_120m
+    deck_edge_z 7.0
+    lightship_draft 5.5            # or lightship_mass, in kg
+    lightship_cog -1.5 0.0 7.80
+    gyradii        7.0 28.0 29.0
+
+hull
+    waterlines  0.000  1.000  1.800 ...     # ascending, m
+    station -60.0  1.350000  2.463693 ...   # x, then one half-breadth per waterline
+
+compartment engine_room_s
+    box  -8 -8 1.8   20 0 7.0      # six bulkhead and deck planes
+    permeability 0.85
+    vented false
+
+opening breach_er_s
+    between sea engine_room_s
+    at 6 -9.0 3.0
+    area 2.4
+    discharge 0.62
+    kind breach
+    open true
+
+pump bilge_er_s
+    drains engine_room_s
+    capacity 0.060
+    max_head 25.0
+    on false
+```
+
+SI throughout. No third-party parser: this repo has a hand-written PNG codec
+rather than take libpng, and a ship file does not justify a JSON or TOML
+dependency either.
+
+**It is the same ship, and that is measured rather than asserted.**
+`tests/test_shipfile.cpp` loads
+`ships/ferry.ship` and holds it against `game::buildFerry()` — hull triangle by
+hull triangle, every compartment volume, every opening field, then both floated
+and their displacement, draft, GM, KB, waterplane area, freeboard and the whole
+0–60° GZ curve compared. The file's six-decimal offsets table is the only
+difference between the two ships and it costs **3.3e-9 relative on displacement,
+2.7e-8 relative on compartment volume, 4.1e-8 m on GM and the GZ curve**. The
+format itself is lossless — seventeen significant figures round-trip bit for bit;
+six decimals is a micron, and an authoring choice about what a human can diff.
+Both ships are then run through the damage-control scenario in lockstep, and
+`scripts/verify.sh full` runs all three 900 s flooding scenarios from the file and
+requires the same verdicts as the compiled ferry.
+
+**It fails closed, and says why.** Everything parses into a scratch definition and
+is committed only when the whole file has parsed, every name has resolved and
+every compartment has come back from the clip with geometry in it. Diagnostics
+carry `<origin>:<line>: <reason>`. CLAUDE.md records a `World::load` that failed
+open and left a half-built world; the instrument that caught it — every truncation
+of a valid file — is pointed at this loader too, at both line and byte
+granularity.
+
+**Unknown keys are rejected, not ignored,** which is the opposite of the usual mod
+advice and is deliberate. `permeabilty 0.85` on a machinery space is a typo that
+leaves the space at a *plausible* default and nothing downstream looks wrong; the
+ship just floods more than the author wrote. Forward compatibility is bought
+instead with the `ship_format` stamp: a file from a newer build is refused **by
+name** rather than silently missing the field that changed the ship's meaning.
+Data a mod carries that the simulation does not read belongs in a sibling file —
+a ship is a directory, and `art/`, `systems/` and `loading/` are where that goes.
+
+Everything a key can get wrong is caught at load: a value out of range, a
+non-finite number, a unit suffix on a number, a number where a name should be, a
+name that never resolves, a station list out of order, the wrong count of
+half-breadths, a duplicate name, a key set twice, a box that clips to nothing, a
+hull that does not close, and a deck edge or a lightship draft outside the hull
+the offsets describe — the last two because they show up only as a freeboard or a
+displacement nobody has anything to check against.
+
+Every key is required unless the format documents a default, and the only
+documented defaults are `sea_density`, `damping`, `added_mass` and
+`added_inertia` — engine-wide physics placeholders rather than statements about
+this ship. Permeability and the vented flag in particular are *not* optional: the
+defaults for both are plausible, and a plausible wrong number is the failure mode
+this repo keeps finding.
+
+### What the format cannot yet express
+
+Named so that nobody discovers them by finding a field silently missing:
+
+- **Compartments are authored, not derived.** Each one is six axis-aligned planes
+  clipped against the hull. That is `ferry.cpp`'s model as data — it is *not* the
+  derived subdivision described below, and it carries the same weakness: nothing
+  guarantees the spaces tile the hull. `Ship::validate()` catches overlap; gaps
+  are indistinguishable from unmodelled structure. Raked and curved bulkheads,
+  L-shaped spaces, and any union or subtraction are simply not sayable.
+- **The hull is an offsets table and nothing else.** No STEP/IGES, no DXF, no
+  point cloud, and no reference to an external offsets file — the table is inline.
+- **One file, not a directory.** No scantlings, no systems graphs, no machinery or
+  propulsion (`Ship::propulsion` is reachable only from code), no loading
+  conditions, no precomputed hydrodynamics, no art. Radiation is attached by
+  calling `Ship::attachRadiation`, not by a key.
+- **No initial condition.** Every ship loads intact and upright. Water already in
+  a compartment, an initial list, a starting draft other than equilibrium: none of
+  them can be stated.
+- **No scenarios.** Damage events, sea state and the damage-control schedule are
+  still C++ in `game/prototype/main.cpp`.
+- **No exporter.** The engine reads the format and does not write it, so the
+  editor of §3 has half its round trip. This is the next thing to build, and the
+  bit-exact round-trip test exists so that it can be.
+- Names are single tokens with no spaces, and a ship has no human-readable title.
+- Permeability is one scalar per space; there is no distribution and no
+  distinction between a space full of machinery and a space full of cars.
+
+### Where it is going
+
+The reference structure below is still the target:
 
 ```
 ships/mv-example/
@@ -33,12 +162,24 @@ ships/mv-example/
   art/                 meshes, materials, sounds
 ```
 
+Whether it becomes a directory of TOML files or a directory of files in the
+format above is not settled. What the shipped loader has already shown is that a
+whole `sim::Ship` fits in one file readably, and that a parser worth trusting is a
+few hundred lines — so the argument for a dependency is weaker than it looked.
+
 **Compartments are derived, not authored.** You place bulkheads and decks as
 planes or surfaces; the toolchain intersects them with the hull interior and
 produces the compartment polyhedra. This is the fix for the prototype's biggest
 data problem, it guarantees the compartments tile the hull without gaps or
 overlaps, and it means changing the hull form does not silently invalidate every
 compartment volume.
+
+`ships/ferry.ship` does **not** do this yet — it states one box per compartment,
+which is the prototype's model written down rather than fixed. The half-step it
+does take is that a box is clipped to the hull rather than trusted, so the wing
+tanks taper into the turn of the bilge and a box that misses the hull is refused
+at load instead of becoming a space that never floods. The remaining half is a
+shared plane set and a partition of the interior between them.
 
 **Everything derived is cached and content-hashed.** BEM coefficient solves take
 hours; windage sweeps take longer; FEM Craig–Bampton reduction takes minutes.
@@ -145,12 +286,21 @@ In-engine, because a ship editor that cannot run the ship is only half a tool.
   free-form.
 - Hot reload throughout — edit a bulkhead, see the ship's fate change.
 
+The reader half of this landed with the ship definition format; the writer has
+not. An editor needs to emit the format as faithfully as it consumes it, which is
+why `tests/test_shipfile.cpp` establishes that full-precision offsets survive the
+round trip bit for bit — the exporter has a target to hit before it is written.
+
 ## 4. Scripting and mods
 
 - **WASM** for behavioural mods (systems logic, scenario scripts, AI, UI). Chosen
   over Lua for sandboxing, performance, and language choice. Mods cannot corrupt
   the sim state; they interact through a declared API.
-- **Data mods** need no code at all — a new ship is a directory.
+- **Data mods** need no code at all — a new ship is a directory. The first half of
+  this is real: `./shipsim --ship=path/to/ship` runs any file the format can
+  describe, and nothing recompiles. A bad file stops the program with a line
+  number rather than falling back to a built-in ship, because a mod that silently
+  does not load is worse than one that refuses to.
 - Deterministic constraint: mods that touch simulation state run inside the
   deterministic boundary and are subject to the same rules (no wall clock, no
   unordered iteration, engine RNG only).
@@ -176,6 +326,23 @@ right" — a number, compared against a number someone else measured.
 | Free-surface loss of GM | ρ·i/Δ, matched within 15% |
 | Trapped air arresting flooding | Boyle's law, pV conserved within 2% |
 | Water mass conservation across a network | flow through the breach = water held |
+
+`tests/test_shipfile.cpp`, on the ship definition format, against the compiled
+ferry it has to reproduce:
+
+| Check | Reference |
+|---|---|
+| Hull mesh from `ships/ferry.ship` | `game::buildFerry()`, vertex and index for index, to 1e-6 m |
+| Displacement, compartment volumes, waterplane | the same ship, to 1e-8 relative |
+| Draft, GM, KB, freeboard, GZ at 13 heel angles | the same ship, to 1e-6 m |
+| 150 s of the 'full' damage-control scenario | the same ship, tracks to 4e-7 |
+| 900 s outcomes for all three scenarios | `scripts/verify.sh full`, identical verdicts |
+| Full-precision offsets round trip | bit-exact against `makeHullFromStations` |
+| Every line and byte truncation of a valid file | accepted exactly when it ends after a complete ship; nothing half built |
+
+Each of the first four carries a negative control: a station offset moved by a
+centimetre must break the static tolerances, and a breach 4% larger must break the
+trajectory one. A comparison that cannot fail is not a measurement.
 
 ### Planned, by subsystem
 

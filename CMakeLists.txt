@@ -37,6 +37,7 @@ add_library(shipsim_engine
   # is checkable on a machine that has no GPU at all.
   engine/gpu/material.cpp
   engine/sim/ship.cpp
+  engine/sim/shipfile.cpp
   engine/sim/propulsion.cpp
   engine/sim/hullform.cpp
   engine/sim/rao.cpp
@@ -79,11 +80,19 @@ add_executable(shipsim_tests
   tests/test_roll_damping.cpp
   tests/test_scheduler.cpp
   tests/test_serialise.cpp
+  tests/test_shipfile.cpp
   tests/test_worldio.cpp
   tests/test_jobs.cpp
   tests/test_waves.cpp
+  # The ship file is validated against the ship it describes, so the reference
+  # ferry is compiled into the tests as well as into the game.
+  game/prototype/ferry.cpp
 )
 target_include_directories(shipsim_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+# Ships are data, read at runtime rather than compiled in, so the tests need to
+# be told where the shipped ones live. Source directory, not build: an input.
+target_compile_definitions(shipsim_tests PRIVATE
+  SHIPSIM_SHIP_DIR="${CMAKE_CURRENT_SOURCE_DIR}/ships")
 target_link_libraries(shipsim_tests PRIVATE shipsim_engine)
 target_compile_options(shipsim_tests PRIVATE -Wall -Wextra)
 add_test(NAME core COMMAND shipsim_tests)

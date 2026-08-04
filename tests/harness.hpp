@@ -42,6 +42,7 @@ void runRadiationTests();
 void runRollDampingTests();
 void runSchedulerTests();
 void runSerialiseTests();
+void runShipFileTests();
 void runWorldIoTests();
 void runWaveTests();
 void runHullFormTests();

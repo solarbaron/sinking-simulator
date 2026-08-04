@@ -340,6 +340,56 @@ void testSurfaceIsQueriedOncePerVertex() {
                integrateBelowSurface(hull, wave).volume, 1e-9);
 }
 
+// A station short of a half-breadth column used to be padded with zeros, which
+// turns the missing levels into a knife edge. The mesh still closes, still passes
+// the manifold check, and still integrates -- to a displacement that is simply
+// wrong. That is the exact shape of every defect in CLAUDE.md's table: a wrong
+// answer that survives every check aimed at something else.
+void testShortStationsAreRepairedAndReported() {
+    const std::vector<double> waterlines{0.0, 2.0, 4.0, 6.0};
+    const auto build = [&](std::size_t columnsOnOne, std::vector<std::string>* problems) {
+        std::vector<Station> stations;
+        for (int i = 0; i <= 8; ++i) {
+            Station s;
+            s.x = -20.0 + 40.0 * i / 8.0;
+            s.halfBeam = {5.0, 5.0, 5.0, 5.0};
+            if (i == 4) s.halfBeam.resize(columnsOnOne);
+            stations.push_back(s);
+        }
+        return makeHullFromStations(stations, waterlines, problems);
+    };
+
+    std::vector<std::string> problems;
+    const TriMesh whole = build(4, &problems);
+    expectTrue("a complete station list raises nothing", problems.empty());
+
+    problems.clear();
+    const TriMesh short2 = build(2, &problems);
+    expectTrue("a short station is reported", problems.size() == 1);
+
+    // The dangerous part, asserted directly: the damaged mesh is still closed, so
+    // isClosedManifold() -- which caught a 40% displacement error once -- cannot
+    // see this one at all.
+    expectTrue("and the damaged hull is still a closed manifold", isClosedManifold(short2));
+
+    // With the repair carrying the last breadth upward, a station missing its top
+    // columns is wall-sided there, so the volume is unchanged for this prismatic
+    // hull. Zero padding would have cut a notch out of it.
+    expectNear("carrying the last breadth upward preserves a prismatic hull's volume",
+               integrate(short2).volume, integrate(whole).volume, 1e-9 * integrate(whole).volume);
+
+    // Guard the guard: the hull has to be big enough that a notch would have
+    // shown, or "unchanged" says nothing.
+    expectTrue("the hull has a volume worth comparing", integrate(whole).volume > 1000.0);
+
+    // An empty station is still zero-width, and still reported rather than
+    // producing a silently smaller ship.
+    problems.clear();
+    const TriMesh empty = build(0, &problems);
+    expectTrue("a station with no half-breadths at all is reported", problems.size() == 1);
+    expectTrue("and it does change the hull", integrate(empty).volume < integrate(whole).volume);
+}
+
 // --- Ships in waves ----------------------------------------------------------
 
 namespace {
@@ -755,6 +805,7 @@ void runCoreTests() {
     testSinusoidalSurfaceAgainstAnalyticVolume();
     testWavySurfaceIsNotSecretlyFlat();
     testSurfaceIsQueriedOncePerVertex();
+    testShortStationsAreRepairedAndReported();
     testZeroAmplitudeWaveFieldMatchesFlatWater();
     testCrestDisplacesMoreThanTrough();
     testLongWavesLiftTheShipAndShortWavesDoNot();

@@ -9,17 +9,20 @@ of truth.
 ## The one command
 
 ```sh
-./scripts/verify.sh            # quick    build + tests            ~6 s
-./scripts/verify.sh full       # + clean rebuild, GPU, scenarios   ~150 s
-./scripts/verify.sh sanitize   # + ASan and TSan                   ~180 s
+./scripts/verify.sh            # quick    build + tests             ~18 s
+./scripts/verify.sh full       # + clean rebuild, GPU, scenarios   ~370 s
+./scripts/verify.sh sanitize   # + ASan and TSan                   ~510 s
 ```
 
-Run `quick` constantly and `sanitize` **before every commit** — on an idle
-machine it is 180 s against `full`'s 150 s, so the extra coverage is nearly free
-and there is no reason to reserve it for concurrency or raw-memory work. (Those
-are idle figures: sharing the box with one busy benchmark took the same gate to
-358 s. Budget accordingly before assuming it has hung.) **Warnings are
-failures** — the build is
+Run `quick` constantly and `sanitize` **before every commit** — the extra
+coverage over `full` is about a third more wall time, which is cheap enough that
+there is no reason to reserve it for concurrency or raw-memory work.
+
+Those figures are measured on an **idle** machine and they grow as the suite
+does; re-measure rather than trusting them. Sharing the box with one busy
+benchmark took the same gate from 180 s to 358 s at an earlier size, so budget
+generously before assuming a gate has hung. **Warnings are failures** — the build
+is
 `-Wall -Wextra -Wpedantic` and has been warning-clean since Phase 0, so a single
 warning means the signal is degrading.
 
@@ -88,6 +91,7 @@ most useful thing to know about this codebase:
 | Retardation fitted over 1.3 s of a 20 s decay, turning a damper into an integrator | a free-decay test, after the ship reached NaN in five steps |
 | Radiation damping added *on top of* the modal damping standing in for it | comparing an RAO sweep before and after, not any single run |
 | Reading `state.velocity.x` as "speed" — it is a *world* vector | a steady turn that looked like chaos until surge was taken along the bow |
+| `makeHullFromStations` padding a short station with **zeros** | writing a *second* way to build the same ship and comparing them |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct.

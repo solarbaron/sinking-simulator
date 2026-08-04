@@ -10,6 +10,7 @@
 #include "math.hpp"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace sim {
@@ -248,8 +249,17 @@ struct Station {
     double x = 0;                  // longitudinal position, m
     std::vector<double> halfBeam;  // half-breadth at each waterline, m
 };
+//
+// **A station must carry one half-breadth per waterline.** A short one used to be
+// padded silently with zeros, which turns the missing levels into a knife edge --
+// and the mesh still closes, still passes the manifold check, and still
+// integrates, to a displacement that is simply wrong. The padding now carries the
+// last supplied value upward instead, which is at worst a wall-sided extension,
+// and `problems` reports any station that needed it. Passing nullptr accepts the
+// repair without being told, which is why the loaders check the count themselves.
 TriMesh makeHullFromStations(const std::vector<Station>& stations,
-                             const std::vector<double>& waterlines);
+                             const std::vector<double>& waterlines,
+                             std::vector<std::string>* problems = nullptr);
 
 // Transform every vertex of a mesh by R*v + t. Used to bring compartment meshes
 // from their authoring frame into the ship body frame.
