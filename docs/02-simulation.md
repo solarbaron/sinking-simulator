@@ -1274,6 +1274,17 @@ of midship at 6 m/s, both floating free with hydrostatics, damping and drag:
 The patch lands within 5 cm of the station aimed at, on the port side, inside the
 hull's depth — which is the number the structural model consumes.
 
+**The 233 MJ is more than the two rigid ships carried into it**, and that is not
+an error. Their rigid closing energy is 223 MJ; the extra comes from the water
+each hull has to accelerate, which the contact removes momentum from as surely as
+it does from the steel. The striker decelerates along its own bow and carries
+surge added mass; the struck ship is driven along her beam and carries sway added
+mass, which is nearly her displacement again, so the pair's true closing energy is
+301 MJ. A bound written against the rigid masses passes this run by half a
+percent and would read as a model creating energy the first time anything moved.
+
+
+
 #### What this cannot represent
 
 - **Two contact regions at once.** A bow and a quarter touching simultaneously

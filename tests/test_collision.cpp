@@ -1330,12 +1330,28 @@ void testRammingAShip() {
                history.peakForce > 2e7 && history.peakForce < 5e9);
     expectTrue("energy was absorbed", history.work > 1e6);
 
-    // The energy absorbed cannot exceed the closing kinetic energy of the pair.
+    // The pair cannot give up more energy than it brought. **What it brought is
+    // not the rigid closing energy**: each ship must also accelerate the water it
+    // shoves aside, and the contact removes that entrained momentum too. The
+    // striker decelerates along its own bow, so it carries surge added mass; the
+    // struck ship is driven along her beam and carries sway added mass, which is
+    // nearly her own displacement again. At floating equilibrium rho times the
+    // submerged volume *is* the ship's mass, so the coefficients multiply it
+    // directly.
+    //
+    // Bounding against the rigid masses instead gives 223 MJ against a measured
+    // 233 MJ, and the model reads as though it were creating energy when it is
+    // only accounting for the water. That version passed, by half a percent.
     const double massA = striker.massProperties().mass;
     const double massB = struck.massProperties().mass;
-    const double reduced = massA * massB / (massA + massB);
-    expectTrue("and not more than the pair brought with them",
-               history.work < 0.5 * reduced * closing * closing * 1.05);
+    const double effectiveA = massA * (1.0 + striker.addedMassSurge);
+    const double effectiveB = massB * (1.0 + struck.addedMassSway);
+    const double reduced = effectiveA * effectiveB / (effectiveA + effectiveB);
+    expectTrue("and not more than the pair brought with them, entrained water included",
+               history.work < 0.5 * reduced * closing * closing);
+    expectTrue("but more than the rigid masses alone could have supplied, which is"
+               " the entrained water showing up",
+               history.work > 0.5 * (massA * massB / (massA + massB)) * closing * closing);
 
     // Where the load landed, in the struck ship's own frame: on her port side,
     // near the aimed station, and inside her depth. This is the number the
