@@ -55,7 +55,13 @@ CollapsePoint collapseAt(const std::vector<CollapseElement>& elements, double cu
     double lo = zLo - 4.0 * span, hi = zHi + 4.0 * span;
     if (curvature < 0.0) std::swap(lo, hi);   // force is increasing in the axis instead
 
-    for (int i = 0; i < 200; ++i) {
+    // Bisect to machine precision and stop, rather than to a fixed count. A
+    // double carries 53 bits, so a bracket nine section-depths wide is exhausted
+    // in about sixty halvings; the 200 this started with spent two thirds of the
+    // solve refining digits that do not exist. The sweep below calls this once
+    // per curvature step per station, so that waste was the whole cost.
+    const double tolerance = 1e-12 * span;
+    for (int i = 0; i < 100 && std::abs(hi - lo) > tolerance; ++i) {
         const double mid = 0.5 * (lo + hi);
         (force(mid) > 0.0 ? lo : hi) = mid;
     }
@@ -88,7 +94,8 @@ double fullyPlasticMoment(const std::vector<CollapseElement>& elements) {
         return sum;
     };
     double lo = zLo, hi = zHi;
-    for (int i = 0; i < 200; ++i) {
+    const double plasticTolerance = 1e-12 * std::max(zHi - zLo, 1e-6);
+    for (int i = 0; i < 100 && std::abs(hi - lo) > plasticTolerance; ++i) {
         const double mid = 0.5 * (lo + hi);
         (imbalance(mid) > 0.0 ? lo : hi) = mid;
     }
@@ -133,6 +140,79 @@ CollapseCurve progressiveCollapse(const std::vector<CollapseElement>& elements,
         }
     }
     return curve;
+}
+
+double firstYieldCurvature(const std::vector<CollapseElement>& elements) {
+    if (elements.empty()) return 0.0;
+    double area = 0, moment = 0;
+    for (const CollapseElement& e : elements) {
+        area += e.area;
+        moment += e.area * e.height;
+    }
+    if (area <= 0) return 0.0;
+    const double axis = moment / area;
+
+    // The fibre that yields first is the one with the largest strain demand per
+    // unit curvature relative to its own capacity -- which is not simply the
+    // furthest one, because a panel that buckles at half yield gets there in half
+    // the strain.
+    double smallest = 0;
+    for (const CollapseElement& e : elements) {
+        const double lever = std::abs(e.height - axis);
+        if (lever <= 0 || e.curve.youngsModulus <= 0) continue;
+        const double limit = std::min(e.curve.yieldStrength, e.curve.compressiveCapacity());
+        const double k = limit / (e.curve.youngsModulus * lever);
+        if (smallest == 0.0 || k < smallest) smallest = k;
+    }
+    return smallest;
+}
+
+std::vector<StrengthStation> longitudinalStrength(const HullGirder& girder,
+                                                  const StructuralMesh& structure,
+                                                  const Scantlings& scantlings,
+                                                  double shedExponent, int curvatureSteps) {
+    std::vector<StrengthStation> out;
+    out.reserve(girder.stations.size());
+
+    for (const GirderStation& g : girder.stations) {
+        const std::vector<CollapseElement> elements =
+            collapseElementsAt(structure, scantlings, g.x, shedExponent);
+        if (elements.empty()) continue;
+
+        StrengthStation s;
+        s.x = g.x;
+        s.appliedMoment = g.moment;
+
+        // Sweep far enough to be certain the peak is inside. Collapse arrives at
+        // a small multiple of first yield; six is comfortable and still cheap.
+        const double yieldCurvature = firstYieldCurvature(elements);
+        if (!(yieldCurvature > 0)) continue;
+        // In the direction the moment actually acts. A hull is not equally strong
+        // both ways and evaluating the wrong branch would report the stronger one.
+        const double sign = g.moment >= 0 ? 1.0 : -1.0;
+        const CollapseCurve curve =
+            progressiveCollapse(elements, sign * 6.0 * yieldCurvature, curvatureSteps);
+
+        s.ultimateMoment = curve.ultimateMoment;
+        s.fullyPlastic = curve.fullyPlasticMoment;
+        s.margin = std::abs(g.moment) > 1.0
+                       ? std::abs(curve.ultimateMoment / g.moment)
+                       : 0.0;
+        out.push_back(s);
+    }
+    return out;
+}
+
+double worstStrengthMargin(const std::vector<StrengthStation>& stations, double* atX) {
+    double worst = 0;
+    for (const StrengthStation& s : stations) {
+        if (s.margin <= 0) continue;           // nothing applied here to be worst at
+        if (worst == 0.0 || s.margin < worst) {
+            worst = s.margin;
+            if (atX) *atX = s.x;
+        }
+    }
+    return worst;
 }
 
 std::vector<CollapseElement> collapseElementsAt(const StructuralMesh& structure,

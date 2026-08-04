@@ -1513,6 +1513,26 @@ Against the standard wave of her own length the margins are 4.2× hogging and 7.
 sagging, which is comfortable and consistent with her carrying 1.7× the rule
 minimum section modulus.
 
+**Where does she break?** `longitudinalStrength()` runs the collapse calculation at
+every station of a bending moment curve and reports the ratio, because "how
+strong is midship" and "where does she fail" are different questions and the
+ferry separates them.
+
+Her scantlings already taper — `side_forward` and `side_aft` drop the side plating
+from 12 mm to 10 mm beyond ±44 m, and the element count falls at the ends as decks
+and bulkheads run out. Measured, her ultimate moment runs from 1.18 × 10⁹ N·m
+amidships down to 6.8 × 10⁸ at the ends, **a factor of 1.74**. So her weakest
+sections are her ends. Her worst *margin* is nonetheless amidships, because the
+ends carry almost no bending moment. A calculation reporting either number alone
+would be answering the other question.
+
+Sweeping the whole ship costs 142 ms hogging and 239 ms sagging over 41 stations.
+Getting there needed one fix: the neutral-axis bisection ran a fixed 200
+iterations, and a double carries 53 bits, so a bracket nine section-depths wide is
+exhausted in about sixty halvings. Two thirds of the solve was refining digits
+that do not exist. Stopping on bracket width instead is **4× faster** — 70.7 ms to
+17.3 ms for a 300-step curve — with identical answers to every figure.
+
 **The load-shortening curve is the model, and it is one number.** Past the
 compressive cap, `σ = σ_c (ε_c/ε)ⁿ`, continuous at the cap by construction, with
 `n ≈ 0.45` for plating and zero for stiffeners. The published curves are per

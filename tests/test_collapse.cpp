@@ -272,6 +272,191 @@ void testTheFerrySectionCollapsesAboveFirstYield() {
                curve.ultimateMoment < curve.fullyPlasticMoment);
 }
 
+// --- Along the length --------------------------------------------------------
+
+// A hull whose plating can be thinned over a chosen stretch, so the weak station
+// and the heavily loaded one can be put in different places on purpose.
+Ship prismaticShip() {
+    Ship s;
+    std::vector<Station> stations;
+    for (int i = 0; i <= 40; ++i) {
+        Station q;
+        q.x = -60.0 + 120.0 * i / 40.0;
+        q.halfBeam = {9.0, 9.0};
+        stations.push_back(q);
+    }
+    s.hull = makeHullFromStations(stations, {0.0, 12.0});
+    s.deckEdgeZ = 12.0;
+    s.lightshipMass = 120.0 * 18.0 * 5.0 * kRhoSeawater;
+    s.lightshipCog = {0, 0, 6.0};
+    s.gyradii = {6, 30, 30};
+    s.initialise(0.0);
+    return s;
+}
+
+// An imposed moment curve peaking amidships, so the applied side is known
+// exactly and nothing about the hydrostatics is in the way.
+HullGirder imposedHogging(const Ship& ship, double force) {
+    const std::vector<double> x = girderStations(ship, 41);
+    const std::size_t mid = x.size() / 2;
+    std::vector<double> w(x.size(), force / (x.back() - x.front())), b(x.size(), 0.0);
+    b[mid] = force / (x[1] - x[0]);
+    return integrateGirder(x, w, b);
+}
+
+// The weakest section and the worst margin are different questions, and the
+// reference ferry separates them -- which is the whole reason this sweep exists.
+//
+// Her scantlings already taper: `side_forward` and `side_aft` drop the side
+// plating from 12 mm to 10 mm beyond +-44 m, and the element count falls at the
+// ends as decks and bulkheads run out. Measured, the ultimate moment runs from
+// 1.18e9 amidships down to 6.8e8 at the ends, a factor of 1.74. So her *weakest*
+// sections are her ends -- and they are also where almost no bending moment
+// arrives, so her worst *margin* is still amidships. A calculation that reported
+// either number alone would be answering the other question.
+void testWeakestSectionAndWorstMarginAreDifferentQuestions() {
+    const Ship ship = prismaticShip();
+    const Scantlings sc = ferryScantlings();
+    const StructuralMesh structure = makeStructuralMesh(ship.hull, sc);
+    const HullGirder girder = imposedHogging(ship, 3.0e7);
+
+    const std::vector<StrengthStation> strength = longitudinalStrength(girder, structure, sc);
+    expectTrue("the sweep produced stations", strength.size() > 20);
+
+    double weakest = 1e300, weakestX = 0, strongest = 0;
+    double peak = 0, peakX = 0;
+    for (const StrengthStation& s : strength) {
+        if (std::abs(s.ultimateMoment) < weakest) {
+            weakest = std::abs(s.ultimateMoment);
+            weakestX = s.x;
+        }
+        strongest = std::max(strongest, std::abs(s.ultimateMoment));
+        if (std::abs(s.appliedMoment) > peak) {
+            peak = std::abs(s.appliedMoment);
+            peakX = s.x;
+        }
+    }
+    expectTrue("the imposed moment peaks amidships", std::abs(peakX) < 3.0);
+    expectTrue("her ends really are the weaker structure", weakest < 0.75 * strongest);
+    expectTrue("and they are her ends, not somewhere in the middle",
+               std::abs(weakestX) > 0.3 * (ship.hullHi.x - ship.hullLo.x));
+
+    double worstX = 0;
+    const double worst = worstStrengthMargin(strength, &worstX);
+    expectTrue("there is a finite worst margin", worst > 0);
+    expectNear("but the worst margin is at the moment peak, not at the weakest section",
+               worstX, peakX, 6.1);
+    expectTrue("which is nowhere near the weakest section",
+               std::abs(worstX - weakestX) > 20.0);
+}
+
+// The case the sweep exists for. Thin the plating away from midship and the
+// weakest station stops being the most loaded one -- which a midship-only
+// calculation cannot see at all, because it never looks there.
+void testThinnedPlatingMovesTheWeakStationOffTheMomentPeak() {
+    const Ship ship = prismaticShip();
+
+    Scantlings thinned = ferryScantlings();
+    // Thin every strake over a stretch that is off the moment peak but still
+    // carries a substantial share of it. Thinning further forward would not move
+    // the answer: the ends are already the weakest sections and they carry almost
+    // no moment, which is the point the previous test makes.
+    const std::size_t original = thinned.shell.size();
+    for (std::size_t i = 0; i < original; ++i) {
+        ShellRegion weak = thinned.shell[i];
+        weak.name = weak.name + "_weak";
+        weak.xFrom = 8.0;
+        weak.xTo = 28.0;
+        weak.thickness = 0.45 * weak.thickness;
+        thinned.shell.push_back(weak);
+    }
+    // Appended, and a later region overrides an earlier one.
+    const StructuralMesh structure = makeStructuralMesh(ship.hull, thinned);
+    const HullGirder girder = imposedHogging(ship, 3.0e7);
+    const std::vector<StrengthStation> strength = longitudinalStrength(girder, structure, thinned);
+
+    double weakest = 1e300, weakestX = 0;
+    double strongest = 0;
+    for (const StrengthStation& s : strength) {
+        if (std::abs(s.ultimateMoment) < weakest) {
+            weakest = std::abs(s.ultimateMoment);
+            weakestX = s.x;
+        }
+        strongest = std::max(strongest, std::abs(s.ultimateMoment));
+    }
+    expectTrue("thinning the plating really weakened a stretch of her",
+               weakest < 0.9 * strongest);
+    (void)weakestX;
+
+    double worstX = 0;
+    const double worst = worstStrengthMargin(strength, &worstX);
+    expectTrue("there is a finite worst margin", worst > 0);
+    expectTrue("and it has moved off the moment peak into the thinned stretch",
+               worstX > 6.0 && worstX < 30.0);
+
+    // Against the untouched ship, where it sits amidships. Without this the check
+    // above could be satisfied by a sweep that always reported the same station.
+    const Scantlings intact = ferryScantlings();
+    double intactX = 0;
+    worstStrengthMargin(longitudinalStrength(girder, makeStructuralMesh(ship.hull, intact),
+                                             intact),
+                        &intactX);
+    expectTrue("whereas the untouched ship is worst amidships", std::abs(intactX) < 6.1);
+}
+
+// The margin is a ratio, so it must scale exactly inversely with the load.
+void testMarginScalesInverselyWithTheAppliedMoment() {
+    const Ship ship = prismaticShip();
+    const Scantlings sc = ferryScantlings();
+    const StructuralMesh structure = makeStructuralMesh(ship.hull, sc);
+
+    const double a = worstStrengthMargin(
+        longitudinalStrength(imposedHogging(ship, 2.0e7), structure, sc));
+    const double b = worstStrengthMargin(
+        longitudinalStrength(imposedHogging(ship, 4.0e7), structure, sc));
+    expectTrue("both cases produced a margin", a > 0 && b > 0);
+    expectNear("doubling the load halves the margin", b, 0.5 * a, 0.02 * a);
+}
+
+// A hull is not equally strong both ways, so the sweep has to evaluate the
+// direction the moment actually acts. Evaluating the wrong branch would report
+// the stronger one and quietly bless a ship that sags to pieces.
+void testTheSweepFollowsTheDirectionOfTheMoment() {
+    const Ship ship = prismaticShip();
+    const Scantlings sc = ferryScantlings();
+    const StructuralMesh structure = makeStructuralMesh(ship.hull, sc);
+
+    const HullGirder hog = imposedHogging(ship, 3.0e7);
+    HullGirder sag = hog;
+    for (GirderStation& g : sag.stations) g.moment = -g.moment;
+
+    const auto hogging = longitudinalStrength(hog, structure, sc);
+    const auto sagging = longitudinalStrength(sag, structure, sc);
+    expectTrue("both directions produced stations", !hogging.empty() && !sagging.empty());
+
+    // Only where a moment actually acts. At the perpendiculars it is zero and the
+    // direction is undefined, so a sign there says nothing -- asserting on it was
+    // this test's own mistake, not the code's.
+    const double scale = std::abs(hog.maxMoment);
+    bool signsFollow = true;
+    int meaningful = 0;
+    for (std::size_t i = 0; i < hogging.size(); ++i) {
+        if (std::abs(hogging[i].appliedMoment) < 0.05 * scale) continue;
+        ++meaningful;
+        if (hogging[i].ultimateMoment < 0) signsFollow = false;
+        if (sagging[i].ultimateMoment > 0) signsFollow = false;
+    }
+    expectTrue("there are stations carrying a real moment to check", meaningful > 10);
+    expectTrue("the ultimate is reported in the direction the moment acts", signsFollow);
+
+    // On this section the deck is the weaker fibre, so sagging must come out
+    // lower. Without a real difference the check above proves only that a sign
+    // was copied.
+    const double hogWorst = worstStrengthMargin(hogging);
+    const double sagWorst = worstStrengthMargin(sagging);
+    expectTrue("sagging is genuinely the weaker direction", sagWorst < 0.95 * hogWorst);
+}
+
 }  // namespace
 
 void runCollapseTests() {
@@ -284,4 +469,8 @@ void runCollapseTests() {
     testSaggingMirrorsHoggingOnASymmetricSection();
     testLoadShorteningIsContinuousAndCapped();
     testTheFerrySectionCollapsesAboveFirstYield();
+    testWeakestSectionAndWorstMarginAreDifferentQuestions();
+    testThinnedPlatingMovesTheWeakStationOffTheMomentPeak();
+    testMarginScalesInverselyWithTheAppliedMoment();
+    testTheSweepFollowsTheDirectionOfTheMoment();
 }

@@ -33,6 +33,7 @@
 // reports both so the difference is visible rather than mysterious.
 #pragma once
 
+#include "girder.hpp"
 #include "scantlings.hpp"
 
 #include <vector>
@@ -112,5 +113,41 @@ double fullyPlasticMoment(const std::vector<CollapseElement>& elements);
 std::vector<CollapseElement> collapseElementsAt(const StructuralMesh& structure,
                                                 const Scantlings& scantlings, double x,
                                                 double shedExponent = 0.45);
+
+// Curvature at which the extreme fibre first reaches yield. Used to size a sweep
+// that is certain to contain the peak: collapse arrives at a small multiple of
+// it, so sweeping to several times this is safe without being wasteful.
+double firstYieldCurvature(const std::vector<CollapseElement>& elements);
+
+// --- Along the length ---------------------------------------------------------
+
+struct StrengthStation {
+    double x = 0;
+    double appliedMoment = 0;   // N m, signed, hogging positive
+    double ultimateMoment = 0;  // N m, signed, in the direction the moment acts
+    double fullyPlastic = 0;    // N m, magnitude
+    double margin = 0;          // |ultimate / applied|; zero where nothing is applied
+};
+
+// Ultimate strength at every station of a bending moment curve, against the
+// moment actually there.
+//
+// Midship is where the moment usually peaks and where the section is usually
+// strongest, and those two facts point in opposite directions -- so the station
+// that fails first is not reliably either. This walks both and reports the ratio,
+// which is the only quantity that decides anything.
+//
+// The ultimate is computed in the direction the moment acts at that station,
+// because a hull is not equally strong both ways: sagging compresses the deck,
+// which is the thin, widely stiffened structure, and on this ferry that costs a
+// third of the strength.
+std::vector<StrengthStation> longitudinalStrength(const HullGirder& girder,
+                                                  const StructuralMesh& structure,
+                                                  const Scantlings& scantlings,
+                                                  double shedExponent = 0.45,
+                                                  int curvatureSteps = 150);
+
+// The smallest margin anywhere, and where. Zero if nothing could be evaluated.
+double worstStrengthMargin(const std::vector<StrengthStation>& stations, double* atX = nullptr);
 
 }  // namespace sim
