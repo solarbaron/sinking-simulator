@@ -44,6 +44,7 @@ int main() {
     runRollDampingTests();
     runScantlingTests();
     runSchedulerTests();
+    runSolidShellTests();
     runSerialiseTests();
     runShipFileTests();
     runWorldIoTests();

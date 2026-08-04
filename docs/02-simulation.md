@@ -1423,7 +1423,7 @@ model is local.
   own (lower) strength. Structures fail at connections far more often than in the
   middle of a plate.
 
-### Element technology — revised after measurement
+### Element technology — revised after measurement, then built
 
 The original plan was uniform linear tetrahedra throughout Tier 2. **The spike in
 `07-fem-spike-findings.md` ruled that out**, and the reason is worth stating
@@ -1439,13 +1439,58 @@ close on each other and leave no workable resolution.
 So Tier 2 is mixed:
 
 - **Solid-shell / assumed-strain (EAS, ANS) elements for plating.** One element
-  through the thickness, no locking, and the timestep is governed by in-plane
-  size instead of plate thickness — worth 5–10× on the step alone, on top of the
-  element count reduction.
+  through the thickness, no locking.
 - **Tetrahedra where the geometry really is three-dimensional**: castings, engine
   seats, thick brackets, and the crush zone once plating has folded and shell
   kinematics no longer apply.
 - **Promotion from shell to tet** as an element crumples past that point.
+
+### The solid-shell element — **implemented**
+
+`engine/sim/solid_shell.{hpp,cpp}`, validated in `tests/test_solid_shell.cpp`,
+recorded in full in `07-fem-spike-findings.md` §6.
+
+An eight-node hexahedron with three translations per node — no rotational degrees
+of freedom, no director, so it stacks against tetrahedra at an interface for free,
+which is what the promotion path above needs. Locking is cured by **assumed
+natural strain** for the transverse shear (Dvorkin–Bathe) and the thickness strain
+(Betsch–Stein), plus **seven enhanced assumed strain** parameters (Simo–Rifai)
+condensed out at element level. Both are parameter-free. Reduced integration with
+hourglass control was rejected: it is cheaper, but its hourglass stiffness is a
+tuned coefficient that no measurement sets, and getting it wrong either invents
+zero-energy modes or stiffens the bending it exists to preserve.
+
+**Measured, on the same 8 × 2 × 1 mesh, as a ratio to the closed form:**
+
+| L/t | solid-shell | ANS without EAS | plain 8-node hex | linear tets |
+|---|---|---|---|---|
+| 10 | 1.003 | 0.820 | 0.569 | 0.199 |
+| 100 | 0.996 | 0.813 | 0.018 | 0.006 |
+| 500 | 0.996 | 0.813 | 0.0007 | 0.0003 |
+
+At the slenderness of real plating the plain hex is 1 400× too stiff and the
+linear tet 3 800× too stiff, where the solid-shell is within 0.4%. The middle
+column is the accounting: assumed strains alone fix shear locking and leave the
+thickness-locking penalty of 1.225 — which is exactly the ratio of the plane-stress
+modulus to the oedometer one, so the enhanced modes buy a closed form rather than
+a tuning.
+
+**Cost, one core:** 21.1 µs to form an element stiffness (once, at promotion),
+267 ns for an internal force step against 129 ns for `fem.cpp`'s linear tet. Per
+element that is 2×; per square metre of 20 mm plating per simulated second it is
+**37 s against 4.1 × 10⁶ s**, a factor of 1.1 × 10⁵, because the tet mesh pays in
+element count *and* in timestep and the solid-shell pays in neither.
+
+**Two corrections this produced.** The timestep claim above was wrong: a
+solid-shell keeps its through-thickness stretch mode — deliberately, a crush zone
+needs the plate to thin — so the stable step is `t/c_p` **regardless of in-plane
+size** (measured flat to 0.1% from 5t to 50t). The win over a bending-resolving tet
+mesh is real and measured at 6.7×, but it comes from the thickness element being
+the whole plate rather than an eighth of it, not from in-plane sizing. And the
+element's binding limit is not accuracy but **geometry**: the assumed strains are
+exact only for an element prismatic through its thickness, and non-parallel faces
+cost ≈ 90 × (offset/t)² in spurious stiffness. Keep the thickness direction near
+the surface normal and change plate thickness at a seam, not across an element.
 
 ### Solver
 

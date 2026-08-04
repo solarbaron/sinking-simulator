@@ -154,7 +154,16 @@ h⁻⁴ and the two constraints close on each other. A realistic 20 m collision 
 at plate-resolving tet resolution is 10³–10⁴× slower than real time.
 
 The fix is solid-shell elements for plating, with tets kept for genuinely
-three-dimensional regions. Full numbers and reasoning in
+three-dimensional regions — and that element now exists
+(`engine/sim/solid_shell.{hpp,cpp}`): an eight-node hex with assumed natural
+strains and seven enhanced strain parameters, one element through the plate. On
+the same mesh at the slenderness of real plating it lands within 0.4% of the
+closed form where a plain hex is 1 400× too stiff and a linear tet 3 800× too
+stiff, and a square metre of 20 mm plating costs 37 core-seconds per simulated
+second instead of 4.1 million. It also corrected the spike: the stable timestep is
+set by the plate thickness after all, not by the in-plane element size, because a
+solid-shell keeps its through-thickness stretch. Full numbers, limits and what
+mutation testing found in
 [docs/07 — FEM spike findings](docs/07-fem-spike-findings.md).
 
 The spike cost a day and moved an 18-engineer-month bet from assumed to measured,
