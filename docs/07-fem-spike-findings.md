@@ -237,11 +237,19 @@ matters. Per **square metre of 20 mm plating per simulated second**, single core
 | Solid-shell at 50 mm, one through the thickness | 400 | 3.3 × 10⁵ | **37 s** |
 
 **A factor of 1.1 × 10⁵.** A 20 m × 10 m collision zone is 200 m² of shell, so one
-simulated second costs ~2 core-hours as tets and ~2 core-minutes as solid-shells —
-about 5 minutes of wall time per simulated second on the 24-thread CPU, or well
-under a minute on the GPU at the throughput §3 measured. That is inside the time
-dilation the engine already plans for, and it is what makes the 20 m damage zone
-affordable rather than theoretical.
+simulated second costs **~8 × 10⁸ core-seconds as tets and ~7 400 core-seconds as
+solid-shells** — about 5 minutes of wall time per simulated second on the
+24-thread CPU, or well under a minute on the GPU at the throughput §3 measured.
+That is inside the time dilation the engine already plans for, and it is what
+makes the 20 m damage zone affordable rather than theoretical.
+
+> **Correction.** That sentence previously read "~2 core-hours as tets and
+> ~2 core-minutes as solid-shells", and **both figures were wrong** — 200 × 37 s is
+> 7 400 core-seconds, which is two core-*hours*, and 200 × 4.1 × 10⁶ s is 26
+> core-*years*, not two core-hours. The wall-time figure beside them was right all
+> along (7 400 / 24 = 5.1 minutes), which is why the error survived: the number
+> anyone would sanity-check was correct and the two feeding it were not. Found while
+> costing the elastoplastic path against it.
 
 Stiffness formation at 21 µs means promoting a 10⁵-element zone costs ~2 s on one
 core, ~0.1 s threaded. That is a hitch at promotion, not a per-frame cost, and it
@@ -306,10 +314,11 @@ locking and leaves the 22.5% thickness-locking penalty untouched.
    `Mz/I`), which is ordinary for a trilinear element but matters for a yield or
    fracture criterion evaluated on it. Budget a finer mesh for stress than for
    deflection, or recover stress by patch averaging.
-6. **No GPU path, no plasticity, no fracture, no `StructuralMesh` consumer yet.**
-   The element is elastic and co-rotational: it is the element technology, not the
-   Tier-2 solver. A float GPU kernel can be derived from it the way `fem_gpu.cpp`
-   was derived from `fem.cpp`, and will inherit §2's reproducibility bound.
+6. **No GPU path and no `StructuralMesh` consumer yet.** A float GPU kernel can be
+   derived from this the way `fem_gpu.cpp` was derived from `fem.cpp`, and will
+   inherit §2's reproducibility bound. **Plasticity and ductile failure are no
+   longer missing** — see §7 and `02-simulation.md` §3 — but the element is still
+   the element technology rather than the Tier-2 solver.
 7. **It is in `double`, where `fem.cpp` is in `float`.** The identities that
    establish an element is correct — the patch test, rigid-body invariance, the
    rank of the stiffness — are exact, and in float their noise floor sits at 1e-6,
@@ -358,3 +367,102 @@ the expectation or the design is wrong before loosening anything: a uniaxial
 `(1-ν)/((1+ν)(1-2ν))`, 34.6%, which is what identified it — and a convergence order
 computed from two numbers that were both already at the noise floor, reporting a
 confident 4.03 that meant nothing.
+
+---
+
+## 7. Plasticity and ductile failure — **implemented**
+
+`engine/sim/plasticity.{hpp,cpp}`, hooked into the element by
+`solidshell::elementPlasticUpdate`, checked by `tests/test_plasticity.cpp`.
+`02-simulation.md` §3 records the formulation, the failure criterion, the cost
+table and the limits. This section records what the *instruments* found, because
+that is the part that does not fit in a design document.
+
+### The step-independence test is the one that pays
+
+Backward Euler on the flow rule is exact for radial loading: the consistency
+condition fixes the plastic flow from the total deviatoric strain and from nothing
+else. So one step and ten thousand steps to the same final strain must give the
+same stress, and they do, to 10⁻¹². A forward-Euler update does not have that
+property and no accuracy test at a fixed step size would tell the two apart.
+
+It is paired with a **negative control** — a deliberately non-proportional path,
+which must come out step-dependent — because the first thing a step-independence
+test does when the plasticity is broken is pass.
+
+### What mutation testing found
+
+68 mutants, each a single plausible edit. The first pass killed 58; **six of the
+ten survivors were real holes**, and one of the tests written to close them found a
+defect in the code:
+
+- **`elasticStress` was reachable by no test at all.** Dropping its deviatoric
+  split — returning `K tr(ε) + 2μ ε_ii` instead of `K tr(ε) + 2μ(ε_ii − tr/3)` —
+  passed everything, on a public entry point. It is now tied both to `elasticModuli`
+  computed by a different route and, bit for bit, to the elastic branch of the
+  return map.
+- **The element's size could be taken off its bottom face**, because every element
+  under test was prismatic and on a prism the bottom face and the mid-surface have
+  the same area. A tapered element — 40 mm at the bottom, 60 mm at the top —
+  distinguishes them, and its volume is the exact integral of `(a + (b−a)s)²`, which
+  2×2×2 Gauss reproduces exactly because that is a quadratic.
+- **`initialisePlasticState` could decline to clear the history it was
+  initialising**, because every caller happened to hand it a freshly constructed
+  state. That is exactly the condition under which a re-promoted zone inherits the
+  damage of the last collision.
+- **An element could call itself torn on its first dead integration point.** Every
+  tearing test until then strained the element uniformly, where all eight points
+  die on the same step and "any" and "all" agree.
+- **The failure plane's normal was only ever asked for on an axis-aligned pull**,
+  where the stress tensor is already diagonal, the Jacobi sweep has nothing to do
+  and the eigenvectors come back as the identity however badly they are
+  accumulated. Freezing them entirely passed. The same tear, rotated 0.9 rad about
+  an arbitrary axis, kills it.
+- The suite went from 1 007 to 1 045 checks and from 58 to 65 kills.
+
+**The defect that came out of it.** Writing the partial-failure test exposed
+something no assertion had been aimed at: with four of eight integration points
+gone, the enhanced-strain problem `∫Gᵀσ dV = 0` loses rank, the Newton stops
+converging, α wanders, and the surviving points were driven to a triaxiality
+*below the damage cutoff* — their damage froze at 0.78 while their plastic strain
+ran on from 0.49 to 0.89. **The element stopped tearing.** An element now drops its
+enhanced modes the moment any point fails, and re-runs the step in which the point
+died so that nothing ill-posed is committed.
+
+**The three survivors are argued equivalent, and one of them measured so.**
+Loosening the return map's scalar-Newton step tolerance from 1e-15 to 1e-6 leaves
+the worst consistency residual **bit-identical** at 8.88 × 10⁻¹⁵, because Newton
+convergence is quadratic and the corrected iterate is already past anything the
+suite resolves — the same argument, and the same measurement, as the polar
+decomposition's tolerance in §6. The geometric midpoint in the Swift fit is
+conditioning rather than correctness: 200 arithmetic bisections reach the same
+root. And the pre-loop check that skips the enhanced modes for an
+already-degraded element is output-identical to letting the in-step retry catch
+it — it saves a wasted Newton pass per step for the rest of a torn element's life,
+which is a cost difference and not a behaviour one.
+
+### Two test-harness defects, both of the same shape
+
+Both were bisections walking off a function that stops being monotone at failure,
+and both produced a confidently wrong physical number rather than a crash:
+
+- The helper that drives a point in **uniaxial stress** bisects the lateral strain
+  to null the transverse stress. A torn probe returns *zero* transverse stress,
+  which reads as "not enough lateral stretch", so the bracket walked to its far
+  end and produced a near-hydrostatic state at η = 15.9 — where the failure strain
+  collapses to 4 × 10⁻⁶. A bar reported tearing at a seventh of its failure strain.
+  Fixed by searching with failure switched off, which is legitimate because damage
+  does not touch the stress until the point tears.
+- The load-control loop above it had the same fault: past the failure strain the
+  axial stress drops to zero, the "still too low" branch keeps pushing, and the
+  bracket runs away. A bar reported tearing at **93% strain**. Fixed by counting
+  failure as overshoot.
+
+### And one where the test used a mesh the element is known to be wrong on
+
+The plastic patch test — uniform deformation gradient, so the enhanced parameters
+must stay at exactly zero and every Gauss point must carry the point law's stress —
+failed by 1.6% and looked like a constitutive bug. It was §6 limit 1: the element
+was distorted by moving one face's node alone, making it *warped*, and the warped
+patch test fails in proportion to the warp. Distorted prismatically instead — the
+same offset on a node and the one above it — it is exact.

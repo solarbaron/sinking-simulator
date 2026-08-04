@@ -249,9 +249,16 @@ The longest and highest-risk phase.
 - Craig–Bampton offline reduction; Tier-0 beam and Tier-1 reduced models
 - Solid-shell elements for plating; explicit tet FEM for genuinely 3D regions
   (see `07-fem-spike-findings.md` §4 for why this split is not optional)
-- Co-rotational elasticity and J2 plasticity
+- ~~Co-rotational elasticity and J2 plasticity~~ — done: `engine/sim/solid_shell.hpp`
+  and `engine/sim/plasticity.hpp`, measured in `02-simulation.md` §3. Radial return
+  with isotropic hardening (kinematic available, defaulted off for want of a
+  measurement); rate dependence deliberately deferred, with the reason recorded
 - Adaptive zone promotion/demotion and interface coupling
-- Ductile damage and mesh-splitting fracture
+- Ductile damage — done, `engine/sim/plasticity.hpp`: equivalent plastic strain to
+  failure, regularised against the element's own size and against triaxiality.
+  **Mesh-splitting fracture is not**: a failed integration point is deleted, and the
+  maximum principal direction it returns — the plane a tear would open on — has no
+  consumer yet
 - GPU element solver
 - ~~FEM → flooding coupling (a tear becomes an orifice)~~ — done:
   `engine/sim/breach.hpp`, measured in `02-simulation.md` §3. Failed panels become

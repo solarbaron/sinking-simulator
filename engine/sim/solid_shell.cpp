@@ -580,6 +580,255 @@ void internalForce(const double stiffness[kDof * kDof], const double rest[kDof],
         }
 }
 
+// --- Plasticity and tearing ---------------------------------------------------
+
+void elementSize(const double nodes[kDof], double* inPlane, double* thickness) {
+    if (inPlane != nullptr) *inPlane = 0.0;
+    if (thickness != nullptr) *thickness = 0.0;
+
+    // Mid-surface quad, as two triangles, so a warped element is still exact --
+    // the same construction `PlatePanel::area()` uses.
+    double mid[4][3];
+    for (int a = 0; a < 4; ++a)
+        for (int i = 0; i < 3; ++i)
+            mid[a][i] = 0.5 * (nodes[a * 3 + i] + nodes[(a + 4) * 3 + i]);
+
+    double area = 0.0;
+    for (int t = 0; t < 2; ++t) {
+        const int b = t + 1, c = t + 2;
+        double e1[3], e2[3];
+        for (int i = 0; i < 3; ++i) {
+            e1[i] = mid[b][i] - mid[0][i];
+            e2[i] = mid[c][i] - mid[0][i];
+        }
+        const double cross[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                                 e1[0] * e2[1] - e1[1] * e2[0]};
+        area += 0.5 * std::sqrt(cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]);
+    }
+    if (!(area > 0.0)) return;
+
+    Forms forms;
+    computeForms(nodes, Formulation::Displacement, forms);
+    if (!forms.ok) return;
+    double volume = 0.0;
+    for (int gp = 0; gp < kGauss; ++gp) volume += forms.weight[gp];
+
+    if (inPlane != nullptr) *inPlane = std::sqrt(area);
+    // Volume over mid-surface area, not the length of an edge: a sheared element
+    // has the thickness of the perpendicular between its faces, and its slanted
+    // edge is longer than that by the shear.
+    if (thickness != nullptr) *thickness = volume / area;
+}
+
+void initialisePlasticState(const double nodes[kDof], const plasticity::Material& material,
+                            ElementPlasticState& state) {
+    state = ElementPlasticState{};
+    double inPlane = 0.0, thickness = 0.0;
+    elementSize(nodes, &inPlane, &thickness);
+    state.failureStrain =
+        plasticity::regularisedFailureStrain(material.failure, inPlane, thickness);
+}
+
+PlasticUpdate elementPlasticUpdate(const double rest[kDof], const double current[kDof],
+                                   const plasticity::Material& material, Formulation form,
+                                   ElementPlasticState& state, double force[kDof],
+                                   double stress[kGauss * 6]) {
+    PlasticUpdate result;
+    std::fill(force, force + kDof, 0.0);
+    if (stress != nullptr) std::fill(stress, stress + kGauss * 6, 0.0);
+
+    Forms forms;
+    computeForms(rest, form, forms);
+    if (!forms.ok) return result;
+
+    // Co-rotated displacement: the plastic history lives in the material frame, so
+    // a finite rotation must not touch it. u = R^T x - X, as `internalForce`.
+    double r[9];
+    elementRotation(rest, current, r);
+    double u[kDof];
+    for (int a = 0; a < kNodes; ++a)
+        for (int i = 0; i < 3; ++i) {
+            double s = 0.0;
+            for (int k = 0; k < 3; ++k) s += r[i * 3 + k] * current[a * 3 + k];
+            u[a * 3 + i] = s - rest[a * 3 + i];
+        }
+
+    // **Once any integration point has torn, the enhanced strains are dropped and
+    // the element finishes its life as the ANS hex.**
+    //
+    // r(alpha) = int G^T sigma dV = 0 says the enhanced modes carry no stress over
+    // the element. That is a statement about a continuum, and an element with a
+    // dead integration point in it is not one: Kaa loses rank as the tangent at the
+    // dead points goes to zero, the Newton stops converging, and alpha wanders.
+    // Measured on a plate torn under an in-plane strain gradient, the consequence
+    // was not a wobble but a **stall** -- with four of eight points gone, the
+    // surviving four were driven to a triaxiality below the damage cutoff, their
+    // damage froze at 0.78 while their plastic strain went on from 0.49 to 0.89,
+    // and the element never finished tearing at all. Dropping the enhanced modes
+    // costs a small jump in stress at the step a point dies, on an element that is
+    // in the act of failing, and it is the difference between a tear that completes
+    // and one that does not.
+    int easCount = forms.easCount;
+    bool degraded = false;
+    for (int gp = 0; gp < kGauss; ++gp) degraded = degraded || state.point[gp].failed;
+    if (degraded) easCount = 0;
+
+    double volume = 0.0;
+    for (int gp = 0; gp < kGauss; ++gp) volume += forms.weight[gp];
+
+    // Every Newton iterate restarts from the history at the *start* of the step;
+    // updating in place would make the answer depend on how many iterations it
+    // took, which is the classic way an element-level solve stops being a solve.
+    plasticity::State start[kGauss];
+    for (int gp = 0; gp < kGauss; ++gp) start[gp] = state.point[gp];
+
+    double alpha[kEas] = {};
+    for (int k = 0; k < easCount; ++k) alpha[k] = state.enhanced[k];
+
+    plasticity::State trial[kGauss];
+    plasticity::Increment increments[kGauss];
+    double gaussStress[kGauss][6];
+    double tangent[kGauss][36];
+
+    // The residual has units of stress times volume. Yield strength times element
+    // volume is the natural scale, and it is a property of the problem rather than
+    // of the iterate, so the tolerance does not move as the element unloads.
+    const double scale = material.flow.yieldStrength * volume;
+    constexpr int kMaxIterations = 40;
+
+    // Two attempts at most. The second is entered only when an integration point
+    // died *inside* this step, which is precisely the step in which Kaa was losing
+    // rank while the Newton was solving on it -- so whatever it converged to is not
+    // to be committed. Redoing the element without the enhanced modes costs one
+    // extra pass, once in the element's life.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        result.converged = false;
+        result.enhancedResidual = 0.0;
+        result.enhancedWork = 0.0;
+
+        for (int iteration = 0;; ++iteration) {
+            for (int gp = 0; gp < kGauss; ++gp) {
+                double strain[6];
+                for (int i = 0; i < 6; ++i) {
+                    double s = 0.0;
+                    for (int j = 0; j < kDof; ++j) s += forms.b[gp][i][j] * u[j];
+                    for (int k = 0; k < easCount; ++k) s += forms.g[gp][i][k] * alpha[k];
+                    strain[i] = s;
+                }
+                trial[gp] = start[gp];
+                increments[gp] = plasticity::update(material, state.failureStrain, strain, trial[gp],
+                                                    gaussStress[gp], tangent[gp]);
+            }
+            result.iterations = iteration + 1;
+
+            if (easCount == 0) {
+                result.converged = true;
+                break;
+            }
+
+            double residual[kEas] = {};
+            for (int gp = 0; gp < kGauss; ++gp)
+                for (int k = 0; k < easCount; ++k) {
+                    double s = 0.0;
+                    for (int i = 0; i < 6; ++i) s += forms.g[gp][i][k] * gaussStress[gp][i];
+                    residual[k] += forms.weight[gp] * s;
+                }
+            double norm = 0.0;
+            for (int k = 0; k < easCount; ++k) norm += residual[k] * residual[k];
+            norm = std::sqrt(norm);
+            result.enhancedResidual = norm;
+            if (norm <= 1e-12 * scale) {
+                result.converged = true;
+                break;
+            }
+            if (iteration + 1 >= kMaxIterations) break;
+
+            double kaa[kEas * kEas] = {};
+            for (int gp = 0; gp < kGauss; ++gp) {
+                double cg[6][kEas];
+                for (int i = 0; i < 6; ++i)
+                    for (int k = 0; k < easCount; ++k) {
+                        double s = 0.0;
+                        for (int m = 0; m < 6; ++m) s += tangent[gp][i * 6 + m] * forms.g[gp][m][k];
+                        cg[i][k] = s;
+                    }
+                for (int p = 0; p < easCount; ++p)
+                    for (int q = 0; q < easCount; ++q) {
+                        double s = 0.0;
+                        for (int i = 0; i < 6; ++i) s += forms.g[gp][i][p] * cg[i][q];
+                        kaa[p * kEas + q] += forms.weight[gp] * s;
+                    }
+            }
+            double delta[kEas];
+            for (int k = 0; k < easCount; ++k) delta[k] = -residual[k];
+            // A non-positive pivot here means every integration point has torn and the
+            // element has no stiffness left, which is a state to report rather than to
+            // iterate on.
+            if (!solveSmall(kaa, easCount, delta, 1)) break;
+
+            // Converge on the correction's **energy**, not on the residual's magnitude.
+            //
+            // ||r|| is not a scale-free measure here and it is worth being explicit
+            // about why. The enhanced thickness modes carry E_zeta,zeta, so their
+            // columns of G are scaled by the Voigt transform's 1/t^2 -- of order 3e7
+            // for 20 mm plate -- and Kaa inherits the square of that. Measured on a
+            // bent element: a residual of 1e-3 corresponds to an error in alpha of
+            // 6e-18 against an alpha of 2.7e-6, twelve significant digits. Chasing
+            // ||r|| below its own floor there costs forty iterations and moves nothing;
+            // the 40-iteration answer and the 4-iteration answer agree to every digit
+            // printed.
+            //
+            // delta . r is the work the correction would do, in joules, and sigma_y * V
+            // is the element's yield energy, so the ratio is dimensionless and
+            // independent of how the enhanced modes happen to be normalised. Stopping
+            // *before* applying the correction keeps the committed history matching the
+            // alpha it was computed at.
+            double work = 0.0;
+            for (int k = 0; k < easCount; ++k) work += delta[k] * residual[k];
+            result.enhancedWork = std::abs(work);
+            if (result.enhancedWork <= 1e-16 * scale) {
+                result.converged = true;
+                break;
+            }
+            for (int k = 0; k < easCount; ++k) alpha[k] += delta[k];
+        }
+
+        bool diedThisStep = false;
+        for (int gp = 0; gp < kGauss; ++gp) diedThisStep = diedThisStep || trial[gp].failed;
+        if (!(diedThisStep && easCount > 0)) break;
+        easCount = 0;
+        for (int k = 0; k < kEas; ++k) alpha[k] = 0.0;
+    }
+
+    for (int gp = 0; gp < kGauss; ++gp) {
+        state.point[gp] = trial[gp];
+        result.dissipation += forms.weight[gp] * increments[gp].dissipation;
+        if (increments[gp].yielded) ++result.yieldedPoints;
+        if (trial[gp].failed) ++result.failedPoints;
+        if (stress != nullptr)
+            for (int i = 0; i < 6; ++i) stress[gp * 6 + i] = gaussStress[gp][i];
+    }
+    // All seven, not just easCount of them: a degraded element must report zeros
+    // rather than the values it had before it started tearing.
+    for (int k = 0; k < kEas; ++k) state.enhanced[k] = alpha[k];
+    state.torn = result.failedPoints == kGauss;
+
+    double internal[kDof] = {};
+    for (int gp = 0; gp < kGauss; ++gp)
+        for (int j = 0; j < kDof; ++j) {
+            double s = 0.0;
+            for (int i = 0; i < 6; ++i) s += forms.b[gp][i][j] * gaussStress[gp][i];
+            internal[j] += forms.weight[gp] * s;
+        }
+    for (int a = 0; a < kNodes; ++a)
+        for (int i = 0; i < 3; ++i) {
+            double s = 0.0;
+            for (int k = 0; k < 3; ++k) s += r[k * 3 + i] * internal[a * 3 + k];
+            force[a * 3 + i] = -s;
+        }
+    return result;
+}
+
 double smallestJacobian(const double nodes[kDof]) {
     double worst = std::numeric_limits<double>::infinity();
     for (int a = 0; a < kNodes; ++a) {

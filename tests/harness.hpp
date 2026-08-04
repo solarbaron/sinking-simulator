@@ -43,6 +43,7 @@ void runRadiationTests();
 void runRollDampingTests();
 void runScantlingTests();
 void runSchedulerTests();
+void runPlasticityTests();
 void runSolidShellTests();
 void runSerialiseTests();
 void runShipFileTests();
