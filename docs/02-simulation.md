@@ -2380,9 +2380,9 @@ reach, which is exactly what that change was for.
 
 #### What it does not do yet
 
-1. **No coupling to Tier 1.** The zone is solved in isolation on a fixed boundary;
-   nothing feeds its reaction to the hull girder or takes the girder's stress as a
-   pre-load. That is adaptive zone promotion, still the largest thing outstanding.
+1. **No coupling to Tier 1**, which does not exist. Coupling to Tier 0 does — see
+   *Adaptive zone promotion* below — but the patch's edge is still clamped and
+   nothing outside it responds to what happens inside, so it is one way per solve.
 2. **The indenter is kinematic and rigid** — a prescribed rectangular punch, no
    contact search, no friction, no release, and the striking body does not crush. A
    prescribed motion cannot run away, which is what makes it testable; a delivered
@@ -2395,6 +2395,301 @@ reach, which is exactly what that change was for.
    is a breach interface that takes an area.
 4. **No GPU path**, and no rate dependence in the material, so the resistance is
    under-predicted by the 10–30% steel gains at collision strain rates.
+
+### Adaptive zone promotion — **implemented**
+
+`engine/sim/promotion.{hpp,cpp}`, checked by `tests/test_promotion.cpp`, run at
+ship scale by `tools/zone_probe` in `verify.sh full`. The piece that makes the
+tiers one system: **which patches deserve Tier 2, what a solved zone hands back to
+Tier 0, and what the girder hands it on the way in.**
+
+```cpp
+TierZero        tierZero(const Ship&, const Sea&, const StructuralMesh&, const Scantlings&, ...);
+class           Promoter { Review review(const StructuralMesh&, const TierZero&, contacts); ... };
+PreloadCheck    preloadFor(const HullGirder&, const StructuralMesh&, const zone::Patch&, ...);
+SectionReduction reactionOf(const StructuralMesh&, const zone::Patch&, const zone::Solver&);
+StructuralMesh  reduce(const StructuralMesh&, const SectionReduction&);
+```
+
+Tier 1 does not exist, so a zone couples to Tier 0 through a *section* rather than
+through retained interface DOF. That is cruder than the plan above and it is the
+honest thing available; everything below is arranged so that inserting
+Craig–Bampton later replaces the coupling and not the criterion.
+
+#### The criterion: what Tier-2 adds, not what is worst
+
+The cost is `4.0 × elementCount` core-seconds per simulated second and it is
+**linear in the number of zones** — measured, not assumed: two zones take
+2.00× one zone of the same size. So "promote where utilisation is high" is not
+usable. A ship at 0.9 of her buckling capacity everywhere is a *well* designed
+one — making utilisation uniform is what scantling design is for — and promoting
+everywhere is a ship-shaped Tier-2 model, three orders past affordable.
+
+What Tier-2 adds over Tier-0 is an answer where the response is **local and
+nonlinear**. So a station qualifies only when it is both past an absolute
+threshold for its trigger *and* standing at least `localExcess` above the
+**median** over the ship's own stations for that same trigger:
+
+| trigger | promote | hold | why there |
+|---|---|---|---|
+| yield, `σ/σ_y` | 0.90 | 0.80 | highest: a section modulus is not an approximation to something better |
+| plate/column buckling | 0.80 | 0.70 | lowest: past critical the problem is nonlinear and Tier-0 only reports a ratio |
+| collapse, `M/M_ult` | 0.80 | 0.70 | where load shedding along the length starts to matter |
+
+The median is the flat-ship guard and it is deliberately robust rather than a
+mean. Measured on synthetic profiles: flat at 0.90 gives **0 candidates with the
+guard and 31 without**; a hull worked to 0.88 amidships with light ends has median
+0.88 but mean 0.72, and only the median still says "flat".
+
+A **contact patch** is the other trigger and it is not treated the same way: a
+beam cannot represent a local load at all, so there is no background to stand
+above and the test is absolute — mean contact pressure against the struck bay's
+own plastic collapse pressure `p_L = 4 σ_y (t/span)²`, the three-hinge mechanism
+of a clamped strip. `span` is the **shorter side of the struck panel itself**,
+which is the one definition that cannot be got the wrong way round — and getting
+it the wrong way round is precisely the defect `indentation.hpp` records. On the
+ferry's 12 mm side plating over a 0.713 m bay that is **402 kPa**, and the
+criterion is bracketed against it: 80% of the hinging force promotes nothing and
+120% promotes one zone.
+
+Candidates are ranked by `utilisation / its own promote threshold` — not by raw
+utilisation, because a buckling utilisation and a yield utilisation are not the
+same currency — then thinned so no two zones sit closer than `2 × radius`, then
+accepted until the element budget is spent.
+
+**What it misses**, and none of it is small:
+
+1. **Everything Tier-0 cannot see**: no torsion, no shear lag, no racking, no
+   local pressure. A load that does not change `M(x)` and is not handed in as a
+   contact patch is invisible — slamming, sloshing, a dropped weight, a fire.
+2. **It is one-dimensional.** A station says *where along*, never where around the
+   girth. The site is the panel nearest the extreme fibre on the centreline, and a
+   beam cannot say which **side** is in trouble; only a contact patch can.
+3. **A uniform overload promotes nothing**, by construction. That is a decision —
+   a ship uniformly past capacity has a girder answer and `collapse.hpp` gives it
+   — and it is the one most worth revisiting.
+4. **It is a snapshot at a cadence.** Two costs, three orders apart and both
+   measured on the ferry: the **decision** is 7 µs over 8900 panels, which is
+   tick-cheap; the **Tier-0 answer it reads** is 167 ms, of which 137 ms is the
+   Smith's-method sweep. So promotion is emphatically *not* reviewed every tick,
+   and whipping and springing live below the cadence.
+5. **It has no memory** — corrosion, fatigue and previous damage enter only once
+   something has changed the structural mesh, which `reduce()` below does.
+6. **The element count is estimated, not meshed**: panels within the radius times
+   `subdivision²`, because `buildPatch` is 7 ms and the criterion runs over every
+   station. It over-states wherever a fold or a seam truncates the patch, which is
+   the safe direction for a budget.
+7. **Nothing is evicted.** A collision arriving on a full budget is refused and
+   reported, not traded against a zone already running, because stopping a zone
+   mid-solve throws away its plastic history.
+
+#### Chatter, and the two mechanisms against it
+
+Both, because they catch different things, and each tested against its own
+negative control — the same signal with the mechanism off, which has to chatter or
+the test proves nothing:
+
+| signal | mechanism | with | without |
+|---|---|---|---|
+| 0.82 ± 0.03 across a 0.80 threshold | hysteresis (hold at 0.70) | **1** promotion, 0 demotions | 5 promotions |
+| 0.95/0.55 alternating every review | dwell of 2 | **0** promotions | 20 promotions, 20 demotions |
+
+Hysteresis kills any oscillation that fits inside the band whatever its frequency;
+the dwell kills one *wider* than the band provided it is faster than the dwell.
+Neither subsumes the other. Guards both ways: a load that stays up is promoted on
+exactly the review the dwell is satisfied, and a zone whose load has gone survives
+`hold − 1` quiet reviews and is dropped on the `hold`-th.
+
+#### The pre-load, and a correction to the obvious argument
+
+`preloadFor()` reads the moment and the section at the patch's station and returns
+`σ_xx(z) = M (z − z_na) / I` as a `zone::Preload`. It is imposed as an initial
+**strain** — the rest configuration is the meshed one with the exact elasticity
+displacement field for that stress state taken back out — so the stress at step
+zero comes out of the same validated constitutive path as everything else and no
+new code goes inside the element. Measured: a patch asked for 84 MPa carries
+84.05 MPa of `σ_xx` and under 0.03 MPa of everything else, stores `σ²V/2E` to
+within 0.1%, and **does not move**: over 20 ms — many fundamental periods — the
+worst node travels 4.8 nm and the patch holds 1.5 × 10⁻⁵ J of kinetic energy
+against 439 J stored. The bending form is equilibrated too, which is a separate
+statement: its displacement field carries a curvature term in `x²` and a field
+missing it would spring the moment it was let go.
+
+It is refused where it would not be traction-free: a panel whose normal leans `φ`
+out of the athwartships plane is left with `σ sin²φ` unbalanced on its own face,
+so a transverse bulkhead — which carries no hull girder stress, which is why
+`hullGirderSection` leaves it out — gets no pre-load and is told why.
+
+**How much it matters is not the 24% the ratio suggests, and measuring it is what
+showed that.** Three findings, each from a different measurement:
+
+- **The capacity it spends is exact.** With no punch at all, a patch yields when
+  the pre-load reaches σ_y and not before — measured between 0.99 and 1.01 of
+  355 MPa, both signs. So a zone handed the ferry's 84 MPa starts with **76.3%**
+  of the uniaxial capacity an unloaded one claims. That part of the argument holds.
+- **Under a punch it moves *yield onset*, and by a lot — but only in the regime
+  the criterion actually promotes in.** A patch pre-loaded to 0.9 σ_y first yields
+  at **0.059** of the penetration an unloaded one needs. At the ferry's 84 MPa the
+  effect is a few per cent, and at 84 MPa nothing would have promoted a
+  girder-triggered zone in the first place: her worst buckling utilisation on a
+  3 m crest is 0.26.
+- **It barely moves *tearing*, and that is the correction.** The pre-strain is
+  elastic — 0.9 σ_y is 1.6 × 10⁻³ — against a regularised failure strain around
+  0.15, two orders larger. Measured: the first element lets go at **0.9942** of
+  the unloaded penetration. "A pre-loaded zone fails earlier" is true of yielding
+  and false of tearing.
+
+**And at ship scale it makes the zone *stronger*, not weaker.** `tools/zone_probe
+--no-preload` exists so this is a measurement rather than an argument. Driving a
+2 m punch into the ferry's own side at z = 8 m, on the 3 m crest that puts
+13.1 MPa of hogging tension through that plating:
+
+| at 0.078 m of penetration | resisting force |
+|---|---|
+| zone told it starts unstressed | **18.90 MN** — the figure this file published |
+| zone handed the girder's 13.1 MPa | **20.25 MN**, +7.1% |
+
+The reason is geometry. The girder's stress runs along **x**; the membrane stress
+a punch raises in longitudinally framed side plating runs across the bay, which is
+**vertical**, because the plating spans between longitudinals. The two are
+perpendicular, and von Mises subtracts the product of perpendicular stresses
+rather than adding them: `σ_vm² = σ_x² − σ_xσ_z + σ_z²`, so a *tensile* girder
+stress raises the transverse stress at which the plating yields — from 355 to
+389 MPa at 84 MPa of pre-load, closed form. **So on the ferry's side above the
+neutral axis in hogging, ignoring the pre-load under-states her resistance.** It
+over-states it below the neutral axis, and in sagging, where the same plating is
+in compression; the sign is a property of where the patch is and which way she is
+bending, and it is not available from the magnitude alone.
+
+First yield under a punch is a *bending* event at the clamp, which presents both
+signs of surface stress at once, so both signs of pre-load bring first yield
+forward. A membrane argument about the sign of *that* is not available and quoting
+one would be wrong.
+
+One more thing the tool found rather than a test: a pre-load is not damage, and
+neither is numerical dust. The reduction below reported twice as many damaged
+panels under a pre-load as without one, every extra one intact to six figures,
+until it was floored at a part in ten thousand of the plate — a micron on 12 mm,
+below the tolerance the strake was rolled to.
+
+#### The reaction back: damage is a thinner ship
+
+`reactionOf()` measures, per panel the zone meshed, the fraction of its thickness
+still working: a torn element counts zero; an intact one counts the thickness it
+**actually has now**, taken as volume over mid-surface area from its deformed
+geometry — measured, not modelled from a plastic strain and an assumed Poisson
+ratio; and the part of a panel the zone did not mesh counts as intact, because
+nothing looked at it.
+
+`reduce()` folds that into the `StructuralMesh` as a thinner ship, and **nothing
+in Tier-0 changes at all** — `hullGirderSection`, `girderStress`,
+`girderBuckling`, `collapseElementsAt` and `longitudinalStrength` already read a
+thickness. Measured, thinning forty side panels near the sheer at midship:
+
+| effectiveness | area (m²) | I (m⁴) | Z_deck (m³) | M_ult hog | M_ult sag |
+|---|---|---|---|---|---|
+| 1.00 | 1.8013 | 46.205 | 5.573 | 1.987e9 | −1.288e9 |
+| 0.50 | 1.7524 | 44.986 | 5.348 | 1.934e9 | −1.177e9 |
+| 0.00 | 1.7034 | 43.714 | 5.118 | 1.875e9 | −1.169e9 |
+
+Losing that plating costs **5.6%** of the hogging ultimate moment and **9.2%** of
+the sagging one. **Two things are not monotone and both are measured rather than
+assumed:**
+
+- **The section modulus at the *undamaged* fibre can rise.** Damage just above the
+  neutral axis pulls the axis down and the keel's lever shrinks faster than the
+  second moment does: measured, the axis moves 6.713 → 6.681 m and `modulusKeel`
+  goes 6.875 → 6.890 m³, *upwards*. So a far-fibre section modulus is not a
+  conservative reading of damage; the ultimate moment is, and that is what the
+  conservatism claim is made against.
+- **The sagging ultimate moment does not fall at every step**, rising by up to
+  0.35% over part of the range, because a thinner panel buckles *earlier* and
+  therefore sheds earlier and Smith's method lets the neutral axis migrate in
+  response. It is in the model rather than in the quadrature — eightfold the
+  curvature steps leaves it where it is — which is why the claim is "never more
+  than intact" rather than step-to-step monotone.
+
+**What the reduction does not carry**, in the un-conservative direction: the zone
+meshes plating only, so the stiffeners running through a torn panel are left at
+full strength. A collision that opens fourteen bays has certainly destroyed the
+longitudinals in them. It needs the multi-point constraint that would let the zone
+mesh a web at all. The other is that a **dented** panel is far weaker in
+compression than a merely thinner one; `dentedCompressiveCapacity()` computes that
+by Perry–Robertson from the measured deviation (`η = 6 w₀/t`, exact at `η = 0`)
+and it is deliberately *not* folded in, because it is a compression-only knockdown
+and an effective thickness is not. Folding it in needs a `collapse.hpp` that takes
+a per-element imperfection.
+
+#### A Tier-0 defect this coupling found
+
+`longitudinalStrength` sized its progressive-collapse sweep from
+`firstYieldCurvature`, which is set by the **weakest** element in the section.
+That is safe only while no element is anomalously weak — and it stops being safe
+exactly when it matters, because a damaged bay's critical stress falls as `t²`.
+
+Measured on the ferry with those forty side panels at an eighth of their
+thickness: first yield falls **25×**, and a sweep to six times it reports an
+ultimate moment of **1.26 × 10⁸ N m** against a true **1.89 × 10⁹**. The signature
+is unmistakable — taking the same plating away *entirely* reported
+**1.87 × 10⁹**, so the hull girder got fifteen times stronger when material was
+removed. Worse, before an unrelated epsilon was fixed a fully torn panel came out
+at an effectiveness of 1e-16 rather than zero, leaving a plate 10⁻¹⁸ m thick that
+`collapseElementsAt` kept, and the ferry's ultimate moment was reported as
+10⁻²¹ N m.
+
+The fix is `collapseCurve()`: size from `firstYieldCurvature` exactly as before,
+and extend **only if the peak lands on the last point of the sweep**, jumping to
+`extremeFibreYieldCurvature` — the classical first-yield curvature, ignoring
+buckling, which no single weak element can move. An intact section never enters
+that branch and its answer is **bit-identical** to the old sizing, which is what
+makes it a fix rather than a re-tuning; the ferry's worst strength margin is
+4.2366 before and after.
+
+#### What mutation testing found
+
+61 mutants, each a single plausible edit to the criterion, the pre-load field, the
+reaction or the corrected sweep. The first pass killed 37 of 59 and **every one of
+the 21 real survivors was a hole in the suite**; after the fixes below, 58 of 61
+die. The three that live are one deliberate no-op, kept as a control because a
+harness that reports everything killed is reporting nothing, and two argued
+equivalent.
+
+- **A flat profile cannot tell a median from a mean from a minimum.** Three
+  mutants of the background statistic all survived, because the only profile under
+  test was flat and all three agree on a flat profile. The fix is a *skewed* one —
+  a hull worked to 0.88 amidships with light ends, where the median says "flat"
+  and the mean does not — and a ship already past capacity everywhere with one
+  station 0.15 worse, which separates a difference from a ratio.
+- **Which fibre a zone lands on was never asked.** Flipping the collapse fibre,
+  forcing yield to the deck and ignoring `deckInCompression` all passed: nothing
+  looked at where the candidate actually was. Hogging now has to put the zone at
+  the keel and sagging at the deck, on a section whose two fibres are 15 m apart.
+- **A criterion sampled once is a criterion untested.** The contact trigger was
+  probed at 20 MN and 0.2 MN, two orders either side of a 2.8 MN threshold, so
+  using the wrong power of the contact radius passed. It is bracketed at ±20% now.
+- **Ranking and dedup were invisible** because no test had two candidates with
+  different triggers. Normalising the score by each trigger's own threshold is the
+  difference between promoting a station at 0.85 of a 0.80 buckling limit and one
+  at 0.92 of a 0.90 yield limit, and nothing had asked.
+- **Two real defects in the tests' reach rather than in the code**: the demotion
+  side of the hysteresis was never exercised (the chatter test never let anything
+  promote), and the element budget was only ever tested against an empty one, so
+  forgetting what was already running survived.
+- **The pre-load's `x²` bending term** could be dropped, because every pre-load
+  test used a uniform stress. A patch standing on its edge under a gradient, run
+  forward 20 ms, now has to stay still — and would not, since the field would no
+  longer be compatible with the strain it claims.
+- **A reduction measured against the nominal plate thickness** survived every flat
+  fixture, because on flat plating an element's volume over its mid-surface area
+  *is* the nominal thickness. It is not on a curved one, where the extrusion
+  follows nodal normals that disagree, so a bilge zone would have reported section
+  lost the moment it was promoted. A cylinder patch, unsolved, now has to report
+  nothing at all.
+- Two survivors are argued **equivalent given the mesher**: the "part nobody
+  looked at" term and the zero snap in `reactionOf` are both dead code while
+  `buildPatch` meshes whole panels or none. That invariant is now asserted, so if
+  the mesher ever starts clipping the tests will say so rather than the arithmetic
+  quietly reappearing.
 
 ### Solver
 

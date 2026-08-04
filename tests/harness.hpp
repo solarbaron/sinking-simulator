@@ -44,6 +44,7 @@ void runRollDampingTests();
 void runScantlingTests();
 void runSchedulerTests();
 void runPlasticityTests();
+void runPromotionTests();
 void runSolidShellTests();
 void runSerialiseTests();
 void runShipFileTests();

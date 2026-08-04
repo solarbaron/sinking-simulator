@@ -557,6 +557,10 @@ Solver::Solver(const Patch& patch, const plasticity::Material& material, const S
 
     rest_ = patch.mesh.position;
     position_ = rest_;
+    // Before anything is built from `rest_`: the mass, the failure strain and the
+    // Gauss volumes are all properties of the *undeformed* configuration, and a
+    // pre-loaded patch's undeformed configuration is not the one it was meshed in.
+    if (params_.preload.active()) applyPreload();
     velocity_.assign(nodes * 3, 0.0);
     force_.assign(nodes * 3, 0.0);
     mass_.assign(nodes, 0.0);
@@ -635,7 +639,61 @@ Solver::Solver(const Patch& patch, const plasticity::Material& material, const S
         done_ = true;
     }
     for (const std::string& problem : patch.problems) result_.problems.push_back(problem);
+
+    // Prime the element state, so the stress the patch is *handed* exists before
+    // the first step rather than appearing during it. Without this a pre-loaded
+    // patch reports zero mean stress and zero strain energy right up until step
+    // one, and the energy account then sees the pre-load's stored energy arrive
+    // as work nobody did. Costs one force evaluation, once.
+    //
+    // Whatever plastic work the ship did to the patch before it was promoted is
+    // the hull girder's, not the zone's, so the dissipation baseline is reset to
+    // zero here: `SolveResult::dissipation` counts what the *indenter* spends.
+    computeForces();
+    result_.dissipation = 0.0;
     accumulateEnergy();
+    result_.initialStrainEnergy = result_.strainEnergy;
+}
+
+// The pre-load, as an initial strain rather than an initial stress.
+//
+// The strain field of a uniaxial `sigma_xx(z) = stress + gradient * (z - ref)` is
+//
+//     eps_xx = e0 + k h,   eps_yy = eps_zz = -nu (e0 + k h),   h = z - ref
+//
+// with e0 = stress/E and k = gradient/E, and it is compatible: the displacement
+// field below reproduces it exactly, which is the classical pure-bending solution
+// of elasticity with a uniform axial part added. So the patch is handed a state
+// that is *equilibrated* -- the interior nodal forces vanish identically and only
+// the clamped edge carries reaction -- and a pre-loaded patch with no punch on it
+// therefore does not move. `tests/test_promotion.cpp` asserts that, because a
+// pre-load that quietly rings is worse than none.
+//
+// `rest = position - u(position)` rather than solving `position = rest + u(rest)`:
+// the two differ at second order in the strain, which at 84 MPa in steel is one
+// part in 2.4 million.
+void Solver::applyPreload() {
+    const Preload& pre = params_.preload;
+    const double youngs = patch_->material.youngsModulus;
+    if (!(youngs > 0)) {
+        result_.problems.push_back("cannot pre-load a patch whose material has no stiffness");
+        return;
+    }
+    const double nu = patch_->material.poissonRatio;
+    const double e0 = pre.stress / youngs;
+    const double k = pre.gradient / youngs;
+    const Vec3 centre = patch_->centre;
+
+    for (std::size_t node = 0; node < patch_->nodeCount(); ++node) {
+        const double x = position_[node * 3] - centre.x;
+        const double y = position_[node * 3 + 1] - centre.y;
+        const double h = position_[node * 3 + 2] - pre.reference;
+        const double strain = e0 + k * h;
+        rest_[node * 3] -= strain * x;
+        rest_[node * 3 + 1] -= -nu * strain * y;
+        rest_[node * 3 + 2] -=
+            -nu * (e0 * h + 0.5 * k * h * h) - 0.5 * k * x * x + 0.5 * nu * k * y * y;
+    }
 }
 
 void Solver::computeForces() {
@@ -878,6 +936,42 @@ void Solver::translate(const Vec3& velocity) {
     for (std::size_t node = 0; node < patch_->nodeCount(); ++node)
         for (int k = 0; k < 3; ++k) velocity_[node * 3 + static_cast<std::size_t>(k)] += velocity[k];
     accumulateEnergy();
+}
+
+void Solver::meanStress(double out[6]) const {
+    for (int i = 0; i < 6; ++i) out[i] = 0.0;
+    double volume = 0;
+    const std::size_t elements = patch_->elementCount();
+
+    if (params_.plastic) {
+        for (std::size_t e = 0; e < elements; ++e)
+            for (int gp = 0; gp < kGauss; ++gp) {
+                const double w = gaussVolume_[e * kGauss + static_cast<std::size_t>(gp)];
+                const double* s = &elementStress_[e * kGauss * 6 + static_cast<std::size_t>(gp) * 6];
+                volume += w;
+                for (int i = 0; i < 6; ++i) out[i] += w * s[i];
+            }
+    } else {
+        // The elastic path keeps no stress, so it is recovered from the
+        // displacement -- which is the same route `elementStress` serves the patch
+        // test by, and exact for the small strains a pre-load applies.
+        for (std::size_t e = 0; e < elements; ++e) {
+            double rest[kDof], current[kDof], displacement[kDof];
+            patch_->mesh.gather(e, rest_, rest);
+            patch_->mesh.gather(e, position_, current);
+            for (int d = 0; d < kDof; ++d) displacement[d] = current[d] - rest[d];
+            double stress[kGauss * 6], weight[kGauss];
+            solidshell::elementStress(rest, displacement, patch_->material,
+                                      solidshell::Formulation::SolidShell, stress);
+            solidshell::gaussVolumes(rest, weight);
+            for (int gp = 0; gp < kGauss; ++gp) {
+                volume += weight[gp];
+                for (int i = 0; i < 6; ++i) out[i] += weight[gp] * stress[gp * 6 + i];
+            }
+        }
+    }
+    if (volume > 0)
+        for (int i = 0; i < 6; ++i) out[i] /= volume;
 }
 
 double Solver::largestDisplacement() const {

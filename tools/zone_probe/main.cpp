@@ -26,10 +26,11 @@
 //
 //   ./zone_probe [--speed=M_PER_S] [--depth=METRES] [--radius=METRES]
 //                [--sub=N] [--aim=X_METRES] [--height=Z_METRES] [--threads=N]
-//                [--elastic]
+//                [--elastic] [--no-preload]
 #include "engine/core/jobs.hpp"
 #include "engine/sim/breach.hpp"
 #include "engine/sim/indentation.hpp"
+#include "engine/sim/promotion.hpp"
 #include "engine/sim/scantlings.hpp"
 #include "engine/sim/zone.hpp"
 #include "game/prototype/ferry.hpp"
@@ -51,6 +52,10 @@ struct Options {
     int subdivision = 4;
     int threads = 0;       // 0 takes the job system's default
     bool elastic = false;
+    // Solve the zone as if the hull girder were putting nothing through it, which
+    // is what it did before `promotion.hpp` existed. Here so the pre-load's effect
+    // at ship scale is a measurement rather than a claim.
+    bool noPreload = false;
 };
 
 bool parse(int argc, char** argv, Options& o) {
@@ -68,6 +73,7 @@ bool parse(int argc, char** argv, Options& o) {
         else if (const char* v = value("sub")) o.subdivision = std::atoi(v);
         else if (const char* v = value("threads")) o.threads = std::atoi(v);
         else if (a == "--elastic") o.elastic = true;
+        else if (a == "--no-preload") o.noPreload = true;
         else {
             std::printf("unknown option %s\n", a.c_str());
             return false;
@@ -82,18 +88,73 @@ int main(int argc, char** argv) {
     Options options;
     if (!parse(argc, argv, options)) return 2;
 
-    const sim::Ship ferry = game::buildFerry();
+    sim::Ship ferry = game::buildFerry();
+    ferry.initialise(0.0);
     const sim::Scantlings scantlings = sim::ferryScantlings();
     const sim::StructuralMesh structure = sim::makeStructuralMesh(ferry.hull, scantlings);
     std::printf("ferry  : %zu plating panels, %zu members, frames at %.2f m\n",
                 structure.panels.size(), structure.members.size(), structure.frameSpacing);
 
-    // --- 1. Promote a zone -----------------------------------------------------
+    // --- 0. Tier 0, and what it decides ----------------------------------------
+    //
+    // The whole point of `promotion.hpp`: the zone below is not promoted because a
+    // command line asked for it, it is promoted because a load arrived that a beam
+    // cannot represent. Both halves are exercised -- the ship on a wave, which
+    // promotes nothing, and the same ship with a bow against her side, which does.
+    const double length = ferry.hullHi.x - ferry.hullLo.x;
+    const double omega = std::sqrt(sim::kGravity * 2.0 * sim::kPi / length);
+    const sim::WaveField wave = sim::WaveField::regular(3.0, omega, 0.0);
+    sim::Sea crest;
+    crest.waves = &wave;
+    {
+        const double period = 2.0 * sim::kPi / omega;
+        double best = -1e30;
+        for (int i = 0; i < 720; ++i) {
+            const double t = period * i / 720.0;
+            const double eta = wave.elevation(ferry.state.position.x, 0.0, t);
+            if (eta > best) { best = eta; crest.time = t; }
+        }
+    }
+    const sim::promotion::TierZero tier =
+        sim::promotion::tierZero(ferry, crest, structure, scantlings);
+    std::printf("tier-0 : on a 3 m crest -- yield %.3f, buckling %.3f, collapse %.3f;"
+                " %.0f ms to know\n", tier.yieldUtilisation, tier.buckleUtilisation,
+                tier.collapseUtilisation, tier.seconds * 1e3);
+
     const sim::Vec3 impact{options.aim, -9.9, options.height};
-    sim::zone::MeshParams mesh;
-    mesh.radius = options.radius;
-    mesh.subdivision = options.subdivision;
-    const sim::zone::Patch patch = sim::zone::buildPatch(structure, impact, mesh);
+    sim::promotion::Criterion criterion;
+    criterion.mesh.radius = options.radius;
+    criterion.mesh.subdivision = options.subdivision;
+
+    sim::promotion::ContactPatch bow;
+    bow.centre = impact;
+    bow.radius = 1.5;
+    // A 5175 t bow at the run's approach speed, stopped in a tenth of a second:
+    // the order `ram_view` reports, and enough to be a load rather than a touch.
+    bow.force = 5.175e6 * options.speed / 0.1;
+
+    sim::promotion::Promoter promoter(criterion);
+    for (int review = 0; review < 4; ++review) {
+        const sim::promotion::Review r =
+            promoter.review(structure, tier, review == 0 ? std::vector<sim::promotion::ContactPatch>{}
+                                                         : std::vector{bow});
+        std::printf("promote: review %d -- %zu candidate(s), %zu promoted, %d element(s) active,"
+                    " %.0f core-s/s, decided in %.0f us\n", review, r.considered.size(),
+                    r.promoted.size(), r.elementsActive, r.costActive, r.microseconds);
+        for (const sim::promotion::Candidate& c : r.considered)
+            std::printf("         panel %d, %s, score %.2f: %s\n", c.panel,
+                        sim::promotion::name(c.trigger), c.score, c.why.c_str());
+    }
+    if (promoter.active().empty()) {
+        std::printf("nothing promoted: the criterion did not fire\n");
+        return 1;
+    }
+
+    // --- 1. Mesh the zone the criterion asked for ------------------------------
+    const sim::promotion::Active& zone = promoter.active().front();
+    sim::zone::MeshParams mesh = criterion.mesh;
+    mesh.role = zone.role;
+    const sim::zone::Patch patch = sim::zone::buildPatch(structure, zone.impact, mesh);
     if (patch.empty()) {
         std::printf("no zone: nothing to promote at that impact point\n");
         for (const std::string& problem : patch.problems) std::printf("       ! %s\n",
@@ -126,8 +187,21 @@ int main(int argc, char** argv) {
     // as the radius shrinks -- run it at two radii to see by how much.
     core::JobSystem jobs(options.threads > 0 ? static_cast<unsigned>(options.threads)
                                              : core::JobSystem::defaultWorkerCount());
+    // The girder's own stress through this patch, which is what the plating is
+    // already carrying before the bow arrives.
+    const sim::promotion::PreloadCheck preload =
+        sim::promotion::preloadFor(tier.girder, structure, patch);
+    std::printf("preload: M %.3e N m, neutral axis %.2f m -> %.1f MPa through the patch"
+                " (%.0f%% of yield spent before contact); obliquity %.4f rad, applied %d\n",
+                preload.moment, preload.neutralAxis, preload.surfaceStress / 1e6,
+                100.0 * std::abs(preload.surfaceStress) / patch.material.yieldStrength,
+                preload.obliquity, static_cast<int>(preload.applied));
+    for (const std::string& problem : preload.problems) std::printf("       ! %s\n",
+                                                                    problem.c_str());
+
     sim::zone::SolveParams solve;
     solve.plastic = !options.elastic;
+    solve.preload = options.noPreload ? sim::zone::Preload{} : preload.preload;
     solve.jobs = &jobs;
     solve.indenter.halfLength = 1.0;   // m along the ship
     solve.indenter.halfWidth = 1.0;    // m up her side
@@ -193,6 +267,44 @@ int main(int argc, char** argv) {
                 breaches.breaches.size(), open);
     for (const std::string& problem : breaches.problems)
         std::printf("       ! %s\n", problem.c_str());
+
+    // --- 3b. And back to Tier 0 -------------------------------------------------
+    //
+    // The other half of the coupling: what the zone lost, as a section the beam
+    // already knows how to read. Nothing in `girder.hpp`, `buckling.hpp` or
+    // `collapse.hpp` is reimplemented here -- the damaged ship is a thinner ship.
+    const sim::promotion::SectionReduction reduction =
+        sim::promotion::reactionOf(structure, patch, solver);
+    std::printf("react  : %zu panel(s) reduced, worst effectiveness %.3f, worst dent %.3f m,"
+                " %.2f m2 and %.0f kg of steel no longer carrying\n", reduction.panels.size(),
+                reduction.worstEffectiveness, reduction.worstOutOfPlane, reduction.lostPlateArea,
+                reduction.lostSteelMass);
+    for (const std::string& problem : reduction.problems) std::printf("       ! %s\n",
+                                                                      problem.c_str());
+    if (!reduction.empty()) {
+        const sim::StructuralMesh damaged = sim::promotion::reduce(structure, reduction);
+        const double station = patch.centre.x;
+        const sim::HullGirderSection before = sim::hullGirderSection(structure, station);
+        const sim::HullGirderSection after = sim::hullGirderSection(damaged, station);
+        const auto ultimate = [&](const sim::StructuralMesh& m) {
+            return sim::collapseCurve(sim::collapseElementsAt(m, scantlings, station),
+                                      tier.girder.hogging() ? 1.0 : -1.0)
+                .ultimateMoment;
+        };
+        const double intact = ultimate(structure), hurt = ultimate(damaged);
+        std::printf("         at x = %.2f: area %.4f -> %.4f m2, I %.3f -> %.3f m4,"
+                    " modulus %.4f -> %.4f m3\n", station, before.area, after.area,
+                    before.secondMoment, after.secondMoment, before.modulusDeck, after.modulusDeck);
+        std::printf("         ultimate moment %.4e -> %.4e N m (%+.2f%%), against an applied"
+                    " %.4e; margin %.2f -> %.2f\n", intact, hurt,
+                    100.0 * (hurt / intact - 1.0), tier.girder.maxMoment,
+                    std::abs(intact / tier.girder.maxMoment),
+                    std::abs(hurt / tier.girder.maxMoment));
+        if (!(hurt < intact)) {
+            std::printf("       ! the damaged section is not weaker than the intact one\n");
+            return 1;
+        }
+    }
 
     // --- 4. Against the membrane model -----------------------------------------
     //

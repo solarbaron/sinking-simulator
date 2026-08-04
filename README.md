@@ -181,6 +181,20 @@ plane-strain constraint the membrane model does not have — which is also what
 identified an order-of-magnitude error in which spacing that model was being handed
 as its span.
 
+And it now decides for itself when to exist (`engine/sim/promotion.{hpp,cpp}`).
+The beam model is on everywhere and a zone is promoted only where the response is
+*local* — a station standing above the ship's own median utilisation, or a contact
+patch past the struck bay's plastic collapse pressure — because a Tier-2 element
+costs 4.0 core-seconds per simulated second and that is linear in the number of
+zones, so a criterion that fires everywhere is unaffordable rather than merely
+noisy. A promoted zone is handed the girder's own stress to start from, which on
+the ferry's side turns out to make her *stiffer* rather than weaker, and hands back
+what it lost as a thinner ship that `girder.hpp`, `buckling.hpp` and `collapse.hpp`
+read unchanged. Wiring the two together found a real defect in the third: a
+progressive-collapse sweep sized from first yield never reached its peak on a
+damaged section, and reported a hull girder that grew fifteen times stronger when
+material was removed from it.
+
 The spike cost a day and moved an 18-engineer-month bet from assumed to measured,
 identifying one architectural change before any of that phase existed to rewrite.
 

@@ -146,10 +146,13 @@
 //
 // --- 5. What this does not do yet ---------------------------------------------
 //
-//  1. **No coupling to Tier 1.** The zone is solved in isolation on a fixed
-//     boundary; nothing feeds its reaction back to the hull girder or takes the
-//     hull girder's stress as a pre-load. That is adaptive zone promotion, which
-//     `06-roadmap.md` still lists as the largest thing outstanding.
+//  1. **No coupling to Tier 1**, which does not exist. What does exist is coupling
+//     to Tier 0, in `promotion.{hpp,cpp}`: it decides when a patch deserves a zone,
+//     hands the zone the girder's stress as a `Preload` below, and turns what tore
+//     back into a section the beam can read. The boundary is still fixed -- the
+//     patch's edge is clamped and nothing outside it moves in response to what
+//     happens inside -- so the coupling is one way per solve and the two-way
+//     interface-DOF version still waits on Craig-Bampton.
 //  2. **The indenter is kinematic and rigid.** Nodes inside a rectangular footprint
 //     are driven at a prescribed velocity; there is no contact search, no friction,
 //     no release, and the striking body does not crush. A prescribed motion cannot
@@ -347,8 +350,49 @@ struct Indenter {
     double rampTime = 0.0;    // s
 };
 
+// The stress the hull girder is *already* carrying through this patch when it is
+// promoted, and the thing §5 item 1 records as missing.
+//
+// A patch of side shell in a hogging ship is not unstressed. On the reference
+// ferry poised on a 3 m crest the deck carries 84 MPa against a 355 MPa yield
+// (`02-simulation.md` §3), so a zone told it starts from zero starts with a
+// quarter of a capacity it does not have. Uniaxial along the ship's x and linear
+// in height, which is exactly and only what a beam model knows:
+//
+//     sigma_xx(z) = stress + gradient * (z - reference)
+//
+// **It is imposed as a strain, not as a stress.** The rest configuration handed
+// to the elements is the meshed one with the corresponding displacement field
+// taken back out, so the stress at step zero comes out of the same validated
+// constitutive path as everything else and no new code goes inside the element.
+// The field is the exact elasticity solution for that stress state -- see
+// `applyPreload` -- so it is compatible and equilibrated, and a clamped patch
+// carrying it and nothing else does not move.
+//
+// **Where it is not right.** The state is uniaxial, so it is traction-free only
+// on a surface whose normal is perpendicular to x. That is every shell, deck and
+// longitudinal-bulkhead panel on a parallel-body ship, and it is *not* a
+// transverse bulkhead or a steeply raked stem: a panel whose normal leans by
+// `phi` out of the athwartships plane is left with `sigma sin^2(phi)` of
+// unbalanced traction on its own face. `promotion.hpp` measures that angle and
+// declines to pre-load a patch that is too far out, because a pre-load nobody
+// checked is worse than none.
+struct Preload {
+    double stress = 0;     // Pa at z = `reference`, tension positive
+    double gradient = 0;   // Pa per m of height
+    double reference = 0;  // m above the baseline; the girder's neutral axis
+
+    bool active() const { return stress != 0.0 || gradient != 0.0; }
+    double at(double z) const { return stress + gradient * (z - reference); }
+};
+
 struct SolveParams {
     Indenter indenter;
+
+    // What the hull girder is already putting through this patch. Default is
+    // none, which is the old behaviour and is right for a patch nothing is
+    // bending.
+    Preload preload;
 
     // False solves the co-rotational *elastic* element -- 273 ns against 7.3 µs,
     // and the path the geometric tests use, where plasticity would only add noise
@@ -403,8 +447,14 @@ struct SolveResult {
     double dissipation = 0;        // J, plastic
     double kinetic = 0;            // J
     double dampingLoss = 0;        // J removed by `SolveParams::damping`
+    // What a `Preload` put in before the run started. Zero without one, so the
+    // balance below is unchanged for every case that has none -- but a
+    // pre-stressed patch stores 84 MPa's worth of energy the indenter never paid
+    // for, and an account that did not subtract it would report the solver
+    // inventing 5 kJ on its first step.
+    double initialStrainEnergy = 0;  // J
     double energyResidual() const {
-        return work - (strainEnergy + dissipation + kinetic + dampingLoss);
+        return work - ((strainEnergy - initialStrainEnergy) + dissipation + kinetic + dampingLoss);
     }
 
     int yieldedElements = 0;
@@ -454,9 +504,28 @@ public:
     // Per-element plastic history, for a test that needs to see inside.
     const std::vector<solidshell::ElementPlasticState>& elementState() const { return plastic_; }
 
-    // Displacement of the patch's most-displaced node, m. A patch under no load
-    // must keep this at zero, which is a statement no energy total can make.
+    // Displacement of the patch's most-displaced node from the **rest**
+    // configuration, m. A patch under no load must keep this at zero, which is a
+    // statement no energy total can make.
+    //
+    // A `Preload` moves the rest configuration, so a pre-loaded patch reports the
+    // pre-load's own displacement here from the moment it is built and never
+    // returns to zero. "Has it moved since it was promoted" is `position()`
+    // against the `position()` it started with, and that is what a test of a
+    // pre-loaded patch has to ask.
     double largestDisplacement() const;
+
+    // Volume-averaged Cauchy stress over the patch, Voigt [xx, yy, zz, xy, yz, zx]
+    // in the body frame, Pa. A `Preload` is a statement about exactly this and
+    // nothing else in the result makes it visible: an energy total cannot tell a
+    // pre-stressed patch from an unstressed one, and neither can a displacement.
+    // Torn elements are averaged in as the zero they carry.
+    void meanStress(double out[6]) const;
+
+    // The stress-free configuration the elements are measuring strain from. It is
+    // the meshed geometry unless a `Preload` moved it -- which is the whole of how
+    // a pre-load is applied, so it is worth being able to look at.
+    const std::vector<double>& rest() const { return rest_; }
 
     // The panels at least `fraction` of whose meshed area has been deleted, as
     // ascending indices into `StructuralMesh::panels`. `SolveResult::tornPanels`
@@ -472,6 +541,7 @@ public:
     void translate(const Vec3& velocity);
 
 private:
+    void applyPreload();
     void computeForces();
     void accumulateEnergy();
     void collectTorn();

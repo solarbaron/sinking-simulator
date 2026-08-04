@@ -50,6 +50,7 @@ add_library(shipsim_engine
   engine/sim/scantlings.cpp
   engine/sim/fem.cpp
   engine/sim/plasticity.cpp
+  engine/sim/promotion.cpp
   engine/sim/solid_shell.cpp
   engine/sim/zone.cpp
   engine/sim/radiation.cpp
@@ -91,6 +92,7 @@ add_executable(shipsim_tests
   tests/test_core.cpp
   tests/test_ecs.cpp
   tests/test_plasticity.cpp
+  tests/test_promotion.cpp
   tests/test_png.cpp
   tests/test_propulsion.cpp
   tests/test_radiation.cpp
