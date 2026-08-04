@@ -42,6 +42,7 @@ add_library(shipsim_engine
   engine/sim/girder.cpp
   engine/sim/hullform.cpp
   engine/sim/rao.cpp
+  engine/sim/scantlings.cpp
   engine/sim/fem.cpp
   engine/sim/radiation.cpp
   engine/sim/roll_damping.cpp
@@ -80,6 +81,7 @@ add_executable(shipsim_tests
   tests/test_hullform.cpp
   tests/test_rao.cpp
   tests/test_roll_damping.cpp
+  tests/test_scantlings.cpp
   tests/test_scheduler.cpp
   tests/test_serialise.cpp
   tests/test_shipfile.cpp

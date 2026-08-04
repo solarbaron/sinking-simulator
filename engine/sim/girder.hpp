@@ -42,6 +42,7 @@
 // long.
 #pragma once
 
+#include "scantlings.hpp"
 #include "ship.hpp"
 
 #include <string>
@@ -135,6 +136,39 @@ HullGirder hullGirder(const Ship& ship, const Sea& sea, int stationCount = 41,
 
 // Stations spread over the hull's length, ends included.
 std::vector<double> girderStations(const Ship& ship, int count);
+
+// --- From moment to stress -----------------------------------------------------
+//
+// The bending moment alone does not say whether a ship survives; a moment is only
+// dangerous relative to the section carrying it. Dividing by the section modulus
+// is the whole of classical longitudinal strength:
+//
+//     sigma = M / Z
+//
+// Hogging puts the deck in tension and the keel in compression, because the hull
+// arches and the top fibres stretch. Sagging reverses both. Telling those apart
+// matters more than the magnitude does: deck plating in compression buckles at a
+// stress well below yield, and that is the failure a stress magnitude alone
+// cannot see.
+struct GirderStress {
+    double x = 0;
+    double moment = 0;          // N m, hogging positive
+    double modulusDeck = 0;     // m^3
+    double modulusKeel = 0;     // m^3
+    double stressDeck = 0;      // Pa, tension positive
+    double stressKeel = 0;      // Pa, tension positive
+    double utilisation = 0;     // worst |stress| over the yield strength
+};
+
+// Combine a bending moment curve with the section properties of a structural
+// mesh. Stations with no structure at that x are skipped rather than reported as
+// infinitely strong.
+std::vector<GirderStress> girderStress(const HullGirder& girder, const StructuralMesh& structure,
+                                       double yieldStrength);
+
+// Worst utilisation anywhere along the length, and where. Zero if nothing could
+// be evaluated.
+double worstUtilisation(const std::vector<GirderStress>& stresses, double* atX = nullptr);
 
 // Every way this calculation is outside what a beam model can honestly claim.
 std::vector<std::string> validateGirder(const HullGirder& girder);

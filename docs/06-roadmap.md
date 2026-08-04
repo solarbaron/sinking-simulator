@@ -242,7 +242,10 @@ At the end of Phase 2 there is a ship simulator, without the damage.
 
 The longest and highest-risk phase.
 
-- Structural mesh generation from scantlings
+- ~~Structural mesh generation from scantlings~~ — done: `engine/sim/scantlings.hpp`,
+  measured in `02-simulation.md` §3. Stiffeners are discrete rather than smeared,
+  and the structural mesh is independent of the hydrodynamic hull mesh; both
+  decisions are recorded there with what they rule out.
 - Craig–Bampton offline reduction; Tier-0 beam and Tier-1 reduced models
 - Solid-shell elements for plating; explicit tet FEM for genuinely 3D regions
   (see `07-fem-spike-findings.md` §4 for why this split is not optional)

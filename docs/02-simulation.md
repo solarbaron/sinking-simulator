@@ -1095,7 +1095,145 @@ All three are refinements with a clear route, not gaps in the coupling.
 
 ---
 
-## 3. Structure — adaptive tetrahedral FEM
+## 3. Structure — adaptive FEM
+
+### Scantlings → structural mesh — **implemented**
+
+`engine/sim/scantlings.hpp` / `.cpp`. The geometry foundation: a ship described
+the way a ship is actually specified — shell plating thickness by strake and
+region, frame spacing and section, longitudinal spacing and section, deck and
+bulkhead plating, girders — turned into plating panels and stiffener line
+elements against a hull form.
+
+**Two decisions everything downstream inherits.**
+
+**Stiffeners are discrete line elements, not smeared into an equivalent plate.**
+The smeared alternative (`t + A/s`, computed by `smearedThickness()` and kept for
+the Tier-0 beam) is a third of the elements and exactly right for axial
+stiffness. It is rejected because it cannot represent stiffened panel collapse:
+collapse is the plate buckling in half-waves *between* stiffeners, and a
+homogenised panel has no between. The missing thing is a length scale, not a
+value, so no choice of `t_eq` recovers it. Measured cost of the smearing: for a
+200 × 10 flat bar on 12 mm plating at 700 mm spacing, the panel's second moment
+falls from 2.49 × 10⁻⁵ m⁴ to 1.91 × 10⁻⁷ — **a factor of 130** — because the
+stiffener's area is moved into the plate, where its lever arm is zero. The two
+panels have identical area and identical axial stiffness, which is exactly why an
+axial check would not notice. What discrete costs: roughly 3× the elements, and every
+stiffener is an eccentric beam whose offset from the plate mid-surface has to be
+carried explicitly (`StructuralMember::rise`) or the section modulus is wrong by
+that same Steiner term.
+
+**The structural mesh is independent of the hydrodynamic hull mesh.** They are
+refined for different reasons and neither refinement is negotiable: the hull
+mesh's resolution comes from a *volume* convergence study (21 waterlines, 41
+stations — a 3 m station spacing on a 120 m ship) and is paid for every tick by
+the buoyancy integral; the structural mesh's comes from the frame spacing, which
+is a property of the ship. Sharing forces either refining the hull mesh to frame
+spacing and paying for it in the hydrostatic inner loop forever, or snapping the
+frames to whatever stations the hydrostatics chose. So the hull is a *reference
+surface* only, sampled by ray casting — which also means the same scantlings work
+against a hull from `makeHullFromParticulars`, from a `.ship` offset table or
+from an importer, with no shared topology. What that rules out: the two meshes
+cannot deform together for free. When the FEM moves the structure the
+hydrodynamic hull has to be updated by projection, an extra mapping with its own
+error, where a shared vertex would have moved once.
+
+Supporting conventions: panel corners lie on the plate's **mid-surface** (taken
+as the hull surface itself — the 6 mm difference from shipbuilding moulded lines
+is what a shell element wants); **girth** runs from the centreline keel outboard,
+round the bilge and up to the deck edge, and regions and stiffener seams are
+*fractions* of it, so a longitudinal is one continuous member while the girth it
+lives on shrinks towards the ends.
+
+**Measured, on the 120 m reference ferry** (`ferryScantlings()`, 2.4 m web
+frames, 0.70 m longitudinals, four decks, six bulkheads, three girder lines):
+
+| | |
+|---|---|
+| Generation | **3.0 ms** — once, at load |
+| Panels | 8 900 (3 100 shell, 4 172 deck, 1 628 bulkhead) |
+| Members | 11 846 (3 000 longitudinals, 3 162 frames, 3 772 deck longitudinals, 332 deck beams, 1 378 bulkhead stiffeners, 202 girder segments) |
+| Memory | 2.46 MB (120 B/panel, 128 B/member) |
+| `hullGirderSection()` | 0.09 ms per cut |
+| At 0.6 m ordinary framing | 15.1 ms, 31 786 panels, 44 162 members, 9.03 MB |
+| Steel | plating 1 084 t + stiffening 631 t = **1 716 t** |
+| Midship section | A = 1.80 m², neutral axis 6.71 m above baseline, I = 46.2 m⁴, Z<sub>deck</sub> = 5.57 m³, Z<sub>keel</sub> = 6.88 m³ |
+
+The section modulus is against an IACS unified-requirement minimum of 3.27 m³ for
+L = 120 m, B = 20 m, C<sub>b</sub> = 0.66 (`ruleMinimumSectionModulus()`), so the
+arrangement clears the rule by 1.7× at the deck. That is on the generous side and
+the reason is the hull, not the scantlings: this ferry's offsets carry full
+breadth to 15 m, giving L/D = 8 where a real ro-pax runs 10–12, so the girder is
+unusually deep.
+
+**Is 1 716 t credible for a 120 m ro-pax?** It is low, and knowably so. The
+generator builds plating and primary stiffening and nothing else — no brackets,
+no double-bottom floors, no pillars, no foundations, no stem or stern frame, no
+weld metal, no minor structure. Those are conventionally another 15–30% of hull
+steel, which puts the honest equivalent at 2 000–2 200 t against a real hull steel
+weight of roughly 2 500–3 500 t for the type. The internal proportions are right
+where they can be checked: 0.58 t of stiffening per tonne of plating against a
+shipbuilding norm of 0.4–0.7, and a mean plating thickness of 11.4 mm. The
+comparison against the ferry's own 8 984 t displacement at the design draft is
+weaker than it looks, because that vessel's lightship is heavy for its size by
+construction.
+
+**What the representation cannot express.** Recorded because each is a decision
+deferred, not an oversight:
+
+- **Bulb flats** — the commonest longitudinal on a real ship. IACS handles them by
+  converting to an equivalent angle with a published dimensional transformation,
+  and a transformation reproduced from memory would be a plausible wrong number in
+  the one place the whole section modulus depends on it. Add it with the rule text
+  in hand.
+- **Ordinary frames between web frames.** `frameSpacing` is one pitch. The ferry
+  is described with 2.4 m webs and no 600 mm ordinary frames between them.
+- **Longitudinals terminating towards the ends.** Seams are constant girth
+  *fractions*, so longitudinals converge instead of being dropped in groups.
+- **Horizontal stringers on bulkheads.** A transverse bulkhead's horizontal panel
+  seams are a mesh subdivision with no member on them.
+- **Stem, transom and stern-frame plating.** The shell runs keel to sheer only;
+  the hull mesh's end caps carry no structure.
+- **The product of inertia of an unsymmetrical section.** `secondMomentWeak` is
+  about the geometric axis parallel to the web. For the hull girder this cancels
+  identically wherever a web is vertical or horizontal and is confined to
+  stiffeners on the turn of the bilge; it would matter for lateral-torsional
+  buckling of an angle.
+- **Asymmetric hulls.** The starboard shell is the mirror of the port, which the
+  hull mesh format enforces anyway.
+- **Node connectivity.** Panels and members are independent geometric records;
+  merging coincident corners into shared FE nodes is the next step, not this one.
+- **Authoring.** Scantlings are built in C++, as hulls were before
+  `ships/ferry.ship`. A `structure` block in the ship file is Phase 7's.
+
+**How it is checked** (`tests/test_scantlings.cpp`). Three instruments do the
+work, and the first two each found a defect the third would not have:
+
+- A **box hull**, where the shell is `L·B + 2·L·D` exactly and every panel is
+  planar, so tiling and steel weight are equalities rather than estimates. This
+  caught `hullGirderSection()` counting *both* bays either side of a frame
+  station: area and second moment came out doubled while the neutral axis — a
+  ratio — looked perfectly correct at every station. The cut interval is now
+  half-open.
+- **Quadrature over the section's own width profile**, which reaches the same
+  second moment without ever forming a parallel-axis term.
+- **Refinement**: the shell panels are flat chords across a curved surface, so
+  they converge to the hull's own area *from below* — 2.1 × 10⁻³ at the reference
+  spacings, halving to 5.7 × 10⁻⁴ by the third refinement — and section properties
+  at a tapered station converge under frame refinement.
+
+**Mutation testing killed 36 of 37 mutants**, and the eight it did not kill on
+the first pass were all real holes in the suite: the hull girder taking a
+stiffener's strong axis where its web lay flat; starboard webs not mirrored; the
+frame count floored instead of rounded; panel area doubled from one triangle
+(exact for a rectangle, wrong for every trapezoid); a later plating region failing
+to override an earlier one; deck and bulkhead panels not clipped to the shell; a
+girder built outside the hull; and longitudinals shifted onto the wrong strake
+seam, which leaves one on the centreline keel while weight and count say nothing.
+The single survivor is genuinely equivalent: a station-and-waterline hull mesh has
+a single-valued half-breadth, so nearest and outermost hit are the same ray.
+
+### Adaptive tetrahedral FEM
 
 ### Tier-0: the hull girder — **implemented**
 
@@ -1144,11 +1282,35 @@ That is a sanity check rather than a validation: the rule is written for a
 specific design wave and load case, so what it establishes is the right order of
 magnitude arrived at down a completely different road.
 
-**What this tier cannot do.** It is a beam: it knows nothing about where stress
-goes within a section, nothing about buckling, nothing about shear lag, nothing
-about local loads. It answers "is the hull girder overloaded", which is the
-question that decides whether a long ship in a seaway survives being long. Turning
-the moment into a stress needs a section modulus, which needs scantlings.
+**From moment to stress.** `girderStress()` divides the moment curve by the
+section modulus from `hullGirderSection()` — the whole of classical longitudinal
+strength, `sigma = M / Z`. The sign carries more information than the magnitude:
+hogging stretches the deck and compresses the keel, sagging reverses both, and
+deck plating *in compression* buckles well below yield. A stress magnitude alone
+cannot see that failure.
+
+Measured on the ferry, with the reference scantlings (1716 t of steel, midship
+I = 46.2 m⁴, Z_deck = 5.57 m³ against an IACS minimum of 3.26 m³):
+
+| condition | M, N·m | deck | keel | utilisation |
+|---|---|---|---|---|
+| still water | +9.35 × 10⁷ | +28.9 MPa | −18.6 MPa | 0.12 |
+| crest amidships | +4.70 × 10⁸ | +84.4 MPa | −68.4 MPa | **0.36** |
+| trough amidships | −1.65 × 10⁸ | −29.6 MPa | +24.0 MPa | 0.13 |
+
+Hogging dominates because she already hogs in still water, so the wave crest adds
+to an existing moment while the trough subtracts from it.
+
+**That 0.36 is the cross-check worth having.** This hull carries 1.7× the rule
+minimum section modulus, so a rule-minimum ship in the same condition would run at
+0.36 × 1.7 = 0.61 of yield — squarely inside the 0.6–0.75 band real ships are
+designed to. The moment and the section were computed by completely separate
+routes, neither aimed at that number.
+
+**What this tier still cannot do.** It is a beam: it knows nothing about where
+stress goes *within* a section, nothing about buckling, nothing about shear lag,
+nothing about local loads. It answers "is the hull girder overloaded", which is
+the question that decides whether a long ship in a seaway survives being long.
 
 The lightship weight curve is a trapezoidal fit matched to total weight and LCG —
 the Prohaska/Biles construction, and an *assumption*. Floodwater is not assumed:
@@ -1170,7 +1332,10 @@ and blast FEA has always handled the same conflict:
 **Tier 0 — global girder, always on.** The hull as a Timoshenko beam with
 section properties derived from the real structural arrangement. ~200 DOF.
 Gives hull girder bending, hogging/sagging in waves, shear, torsion. Runs at
-100 Hz for free.
+100 Hz for free. Its input exists: `hullGirderSection()` returns area, neutral
+axis, second moment and section moduli at any cut, in 0.09 ms, taking membership
+from geometry rather than from element labels so nothing athwartships can leak
+into it.
 
 **Tier 1 — reduced 3D, always on.** The full 3D shell/solid model of the entire
 ship, condensed offline by **Craig–Bampton component mode synthesis**: retain the

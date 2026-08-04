@@ -244,6 +244,41 @@ HullGirder hullGirder(const Ship& ship, const Sea& sea, int stationCount, bool b
                            buoyancyDistribution(poised, sea, x));
 }
 
+std::vector<GirderStress> girderStress(const HullGirder& girder,
+                                       const StructuralMesh& structure, double yieldStrength) {
+    std::vector<GirderStress> out;
+    if (!(yieldStrength > 0)) return out;
+    out.reserve(girder.stations.size());
+    for (const GirderStation& station : girder.stations) {
+        const HullGirderSection section = hullGirderSection(structure, station.x);
+        // No structure here -- the ends, past the last frame. Reporting zero
+        // stress would read as "safe" rather than "not asked".
+        if (!(section.modulusDeck > 0) || !(section.modulusKeel > 0)) continue;
+
+        GirderStress s;
+        s.x = station.x;
+        s.moment = station.moment;
+        s.modulusDeck = section.modulusDeck;
+        s.modulusKeel = section.modulusKeel;
+        // Hogging arches the hull, stretching the deck and compressing the keel.
+        s.stressDeck = station.moment / section.modulusDeck;
+        s.stressKeel = -station.moment / section.modulusKeel;
+        s.utilisation = std::max(std::abs(s.stressDeck), std::abs(s.stressKeel)) / yieldStrength;
+        out.push_back(s);
+    }
+    return out;
+}
+
+double worstUtilisation(const std::vector<GirderStress>& stresses, double* atX) {
+    double worst = 0;
+    for (const GirderStress& s : stresses)
+        if (s.utilisation > worst) {
+            worst = s.utilisation;
+            if (atX) *atX = s.x;
+        }
+    return worst;
+}
+
 std::vector<std::string> validateGirder(const HullGirder& g) {
     std::vector<std::string> problems;
     if (g.stations.size() < 3) {

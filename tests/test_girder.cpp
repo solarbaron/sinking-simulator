@@ -11,6 +11,7 @@
 // are checked for the properties they must have (they integrate to the right
 // total and the right centre) rather than against a value nobody can state.
 #include "engine/sim/girder.hpp"
+#include "engine/sim/scantlings.hpp"
 #include "harness.hpp"
 
 #include <cmath>
@@ -293,6 +294,67 @@ void testFloodingBendsTheHull() {
                std::abs(after.maxMoment) > 0.01 * reference);
 }
 
+// --- From moment to stress ---------------------------------------------------
+
+// sigma = M / Z is arithmetic, so it is asserted as arithmetic. The part worth
+// testing is the *sign*: hogging stretches the deck and compresses the keel, and
+// a stress magnitude alone cannot tell those apart -- which matters because deck
+// plating in compression buckles well below yield.
+void testStressFollowsTheMomentAndItsSign() {
+    const Scantlings sc = ferryScantlings();
+    Ship ferry = barge(0.0);
+    ferry.initialise(0.0);
+    const StructuralMesh structure = makeStructuralMesh(ferry.hull, sc);
+    expectTrue("the structural mesh has panels to work with", !structure.panels.empty());
+
+    const std::vector<double> x = girderStations(ferry, 41);
+    const std::size_t mid = x.size() / 2;
+
+    // A pure hogging moment, imposed rather than derived, so the arithmetic has
+    // nothing else in it.
+    std::vector<double> w(x.size(), 0.0), b(x.size(), 0.0);
+    const double spacing = x[1] - x[0];
+    const double force = 1.0e7;
+    b[mid] = force / spacing;
+    for (double& v : w) v = force / (x.back() - x.front());
+    const HullGirder hog = integrateGirder(x, w, b);
+    expectTrue("the imposed case hogs", hog.hogging());
+
+    const double yield = 235e6;   // mild shipbuilding steel, Pa
+    const std::vector<GirderStress> stresses = girderStress(hog, structure, yield);
+    expectTrue("stress was evaluated where there is structure", !stresses.empty());
+
+    for (const GirderStress& s : stresses) {
+        if (std::abs(s.moment) < 1e-6) continue;
+        expectNear("deck stress is M over Z_deck", s.stressDeck, s.moment / s.modulusDeck,
+                   1e-9 * std::abs(s.moment / s.modulusDeck));
+        expectTrue("hogging puts the deck in tension and the keel in compression",
+                   s.stressDeck > 0 && s.stressKeel < 0);
+    }
+
+    // Sagging must reverse both, or the sign is decoration.
+    std::vector<double> w2 = b, b2 = w;   // swap: weight concentrated amidships
+    const HullGirder sag = integrateGirder(x, w2, b2);
+    expectTrue("the mirrored case sags", !sag.hogging());
+    const std::vector<GirderStress> sagStress = girderStress(sag, structure, yield);
+    bool reversed = true;
+    for (const GirderStress& s : sagStress)
+        if (std::abs(s.moment) > 1e-6 && !(s.stressDeck < 0 && s.stressKeel > 0)) reversed = false;
+    expectTrue("sagging compresses the deck and stretches the keel", reversed);
+
+    // Utilisation is the worst fibre over yield, and must scale with the moment.
+    double atX = 0;
+    const double u = worstUtilisation(stresses, &atX);
+    expectTrue("utilisation is a real fraction", u > 0);
+
+    HullGirder doubled = hog;
+    for (GirderStation& st : doubled.stations) st.moment *= 2.0;
+    expectNear("doubling the moment doubles the utilisation",
+               worstUtilisation(girderStress(doubled, structure, yield)), 2.0 * u, 1e-9 * u);
+    expectNear("and halving the yield strength doubles it too",
+               worstUtilisation(girderStress(hog, structure, 0.5 * yield)), 2.0 * u, 1e-9 * u);
+}
+
 }  // namespace
 
 void runGirderTests() {
@@ -306,4 +368,5 @@ void runGirderTests() {
     testAnEvenlyLoadedBargeBarelyBends();
     testCrestHogsAndTroughSags();
     testFloodingBendsTheHull();
+    testStressFollowsTheMomentAndItsSign();
 }
