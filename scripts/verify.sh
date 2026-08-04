@@ -120,6 +120,16 @@ if [ -x ./build/ram_view ]; then
 else
   skip "ram_view not built"
 fi
+# The Tier-2 zone at ship scale: solid-shell elements over the ferry's own
+# plating, driven to tearing, and the torn panels fed to breach. The unit suite
+# tests the pieces at unit scale because a real solve is core-minutes; this is the
+# only thing that runs the whole chain on a real ship, and it is why the zone's
+# cost has to stay visible.
+if [ -x ./build/zone_probe ]; then
+  expect_ok "zone_probe" '^ok$' ./build/zone_probe --radius=3.0 --depth=0.22
+else
+  skip "zone_probe not built"
+fi
 if [ -x ./build/seaway_view ]; then
   expect_ok "seaway_view" '^ok$|no usable GPU' \
             ./build/seaway_view --out=/tmp --frames=2

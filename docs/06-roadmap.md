@@ -253,20 +253,40 @@ The longest and highest-risk phase.
   **not** done, and are the piece between this and Tier-2
 - ~~**Solid-shell elements for plating**~~ **done** —
   `engine/sim/solid_shell.{hpp,cpp}`. Explicit tet FEM for genuinely 3D regions
-  already existed from the Phase 0 spike (`engine/sim/fem.{hpp,cpp}`). **What does
-  not exist is a consumer**: nothing builds elements over a `StructuralMesh` and
-  solves, so the elements are validated and unused
+  already existed from the Phase 0 spike (`engine/sim/fem.{hpp,cpp}`)
   (see `07-fem-spike-findings.md` §4 for why this split is not optional)
+- ~~**A consumer for them**~~ **done** — `engine/sim/zone.{hpp,cpp}`, measured in
+  `02-simulation.md` §3, run at ship scale by `tools/zone_probe` in `verify.sh
+  full`. `StructuralMesh` + a load → solid-shell elements → an explicit solve →
+  which panels tore, as indices `breachesFromFailedPanels()` takes unchanged. A
+  three-metre zone on the ferry's side is 224 elements and a 0.037 s ram through it
+  is 4.5 s of wall time on 23 workers against 15.4 s on one, bit-identical either
+  way — the speedup saturates at 3.4× because each step is a barrier, not because
+  the element kernel does not thread. Its
+  binding limit is geometric rather than numerical: the elements are exactly
+  prismatic on flat plating and 319% too stiff in bending across this hull's
+  shoulder, and the cure is a finer girth layout in `Scantlings` rather than a finer
+  zone. **Stiffeners are not meshed** — there is no way to attach a web to a
+  solid-shell plate without a multi-point constraint, which does not exist — so the
+  zone offers the two bounds that leaves and publishes the bracket
 - ~~Co-rotational elasticity and J2 plasticity~~ — done: `engine/sim/solid_shell.hpp`
   and `engine/sim/plasticity.hpp`, measured in `02-simulation.md` §3. Radial return
   with isotropic hardening (kinematic available, defaulted off for want of a
   measurement); rate dependence deliberately deferred, with the reason recorded
 - Adaptive zone promotion/demotion and interface coupling — **the largest thing
-  outstanding.** It is a cost problem as much as an engineering one: measured, an
-  elastoplastic solid-shell element costs 7.3 µs against 273 ns elastic, so a
-  200 m² collision zone is ~2 hours of wall time per simulated second on 24
-  threads. Promotion has to be rare and small, which is the whole reason the tier
-  structure exists
+  outstanding.** `zone.hpp` builds and solves a zone; nothing decides when to
+  promote one, nothing couples its reaction back to the hull girder, and nothing
+  gives it the girder's stress as a pre-load. It is a cost problem as much as an
+  engineering one: measured, an elastoplastic solid-shell element costs 7.3 µs
+  against 273 ns elastic and the stable step is thickness-governed, so cost is
+  `4.0 × elementCount` core-seconds per simulated second on 12 mm plating.
+
+  **The "200 m² is two core-hours per simulated second" figure needs its element
+  size beside it or it says nothing.** It assumes 50 mm elements; the same 200 m²
+  at the 300 mm the zone actually uses is 2 200 elements and four minutes. What is
+  bounded is the element *count*, and area and resolution trade as `area / h²` —
+  the step does not care how big an element is in plane. The event is short too: a
+  6 m/s bow reaching 0.22 m into her side is 0.037 s, not one second
 - Ductile damage — done, `engine/sim/plasticity.hpp`: equivalent plastic strain to
   failure, regularised against the element's own size and against triaxiality.
   **Mesh-splitting fracture is not**: a failed integration point is deleted, and the
@@ -277,8 +297,10 @@ The longest and highest-risk phase.
   pattern to follow
 - ~~FEM → flooding coupling (a tear becomes an orifice)~~ — done:
   `engine/sim/breach.hpp`, measured in `02-simulation.md` §3. Failed panels become
-  merged `Opening`s whose area, position and connectivity come from the structure;
-  what supplies the failed panels is still to come
+  merged `Opening`s whose area, position and connectivity come from the structure,
+  and `zone.hpp` now supplies them from elements rather than from a script. What
+  `breach.hpp` cannot yet take is a torn *area*, so a partly torn bay is rounded to
+  a whole panel — see `SolveParams::tearFraction`
 - ~~Ship-to-ship contact detection and rigid-body response~~ — done:
   `engine/sim/collision.hpp`, measured in `02-simulation.md` §2. Two hulls
   interpenetrate as an exact solid; the force follows the overlap volume and is
@@ -315,6 +337,18 @@ The longest and highest-risk phase.
   `ram_view` applies no damage control at all, which is Phase 0's `none` scenario,
   and `none` loses her too. The scenarios that let her live are the ones where
   somebody acts.
+
+  **A correction the FEM found in it.** `impactDamage()` takes the membrane span as
+  the *frame* spacing, 2.4 m, and the struck width as the longitudinal spacing. For
+  a longitudinally framed side that is the wrong way round — the plating spans
+  between longitudinals, 0.70 m — and `indentation.hpp`'s own header states the rule
+  with the two swapped. The zone FEM has no span in it, only plating and supports,
+  so it is the instrument that settles it: on the ferry's side at 0.078 m of
+  penetration it resists at 18.9 MN against 10.6 MN for a membrane on the 0.70 m
+  span and 1.10 MN on the 2.4 m one. **The long span under-predicts what a bay
+  absorbs by a factor of ten, so the figures above tear roughly ten times too many
+  bays.** The fix is one line; it moves every number this milestone publishes, so it
+  is recorded rather than folded in, and it needs a session that re-validates them.
 
   **What the milestone does not yet include.** The striking ship is rigid, so
   every joule goes into tearing the struck plating — `indentation.hpp` records that

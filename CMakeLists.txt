@@ -51,6 +51,7 @@ add_library(shipsim_engine
   engine/sim/fem.cpp
   engine/sim/plasticity.cpp
   engine/sim/solid_shell.cpp
+  engine/sim/zone.cpp
   engine/sim/radiation.cpp
   engine/sim/roll_damping.cpp
   engine/sim/waves.cpp
@@ -73,6 +74,13 @@ enable_testing()
 add_executable(job_bench tools/job_bench/main.cpp)
 target_link_libraries(job_bench PRIVATE shipsim_engine)
 target_compile_options(job_bench PRIVATE -Wall -Wextra)
+
+# The Tier-2 zone at ship scale: solid-shell elements over the ferry's own
+# plating, driven to tearing. No GPU, so it builds everywhere; it costs
+# core-minutes, which is why it is a tool and not a unit test.
+add_executable(zone_probe tools/zone_probe/main.cpp game/prototype/ferry.cpp)
+target_link_libraries(zone_probe PRIVATE shipsim_engine)
+target_compile_options(zone_probe PRIVATE -Wall -Wextra)
 
 add_executable(shipsim_tests
   tests/main.cpp
@@ -100,6 +108,7 @@ add_executable(shipsim_tests
   tests/test_solid_shell.cpp
   tests/test_shipfile.cpp
   tests/test_worldio.cpp
+  tests/test_zone.cpp
   tests/test_jobs.cpp
   tests/test_waves.cpp
   # The ship file is validated against the ship it describes, so the reference

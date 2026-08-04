@@ -166,6 +166,21 @@ solid-shell keeps its through-thickness stretch. Full numbers, limits and what
 mutation testing found in
 [docs/07 — FEM spike findings](docs/07-fem-spike-findings.md).
 
+That element now has a consumer (`engine/sim/zone.{hpp,cpp}`): a patch of a
+ship's own plating meshed into solid-shells around an impact, driven by a rigid
+punch, solved explicitly with plasticity and ductile failure, and reporting which
+plating panels tore — straight into the flooding network. A three-metre zone on the
+reference ferry is 224 elements and a 0.037 s ram through it is 4.5 s of wall time on 23
+threads, bit-identical however many of them run it. Its binding limit turned out to be
+geometric rather than numerical: the elements are *exactly* prismatic on flat
+plating and 319% too stiff in bending across this hull's shoulder, and the cure is a
+finer girth layout in the scantlings rather than a finer mesh. Run against
+`indentation.hpp`'s rigid-plastic membrane model on the same bay the two agree to a
+factor of two, and the factor is predicted by the hardening curve and the
+plane-strain constraint the membrane model does not have — which is also what
+identified an order-of-magnitude error in which spacing that model was being handed
+as its span.
+
 The spike cost a day and moved an 18-engineer-month bet from assumed to measured,
 identifying one architectural change before any of that phase existed to rewrite.
 

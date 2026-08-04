@@ -44,6 +44,25 @@
 //     6 m/s, 162 MJ  ->  139 bays,  234 m2
 //     8 m/s, 287 MJ  ->  245 bays,  415 m2
 //
+// **A correction the zone FEM found, recorded rather than applied.**
+// `impactDamage()` below hands this model `span = frameSpacing` -- 2.4 m on the
+// reference ferry -- and takes the struck width as the longitudinal spacing. For a
+// longitudinally framed side that is the wrong way round: the plating spans between
+// *longitudinals*, 0.70 m, and the frames are the long direction. The sentence
+// above about `span` has the two swapped for the same reason.
+//
+// `zone.{hpp,cpp}` is the instrument that settles it, because it has no span in it
+// at all -- only plating and supports. Driving a 2 m punch into the ferry's own
+// side, it resists at **18.9 MN at 0.078 m**, against 10.6 MN for this model on the
+// 0.70 m span and **1.10 MN** on the 2.4 m one. The short span is right, and the
+// long one under-predicts what a bay absorbs by an order of magnitude -- so the
+// table below, and `ram_view`'s hole, are about ten times too large again on top of
+// everything else here.
+//
+// It is one line to change and it moves every number the Phase 3 milestone
+// publishes, including the three quoted in `06-roadmap.md`, so it is left for a
+// session that can re-validate them rather than folded in beside unrelated work.
+//
 // The low end is credible. **The high end is not** -- 415 m2 is most of her side,
 // and a real 287 MJ collision does not open that, because the striking bow crushes
 // too, the longitudinals resist in their own right, and friction takes a share.

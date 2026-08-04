@@ -136,6 +136,14 @@ void elementStress(const double nodes[kDof], const double displacement[kDof],
 // row sum is the lumping that still moves rigid translation exactly.
 void elementMass(const double nodes[kDof], double density, double out[kNodes]);
 
+// The volume each of the eight Gauss points carries: the 2x2x2 weight times det J,
+// summing to the element volume. Exposed because an energy balance over an
+// elastoplastic element is a quadrature -- strain energy is `sum_gp w_gp * sigma :
+// C^-1 : sigma` -- and volume/8 is exact only on a parallelepiped, so a solver that
+// assumed it would report a distorted element's stored energy wrongly and in a way
+// no deflection test can see.
+void gaussVolumes(const double nodes[kDof], double out[kGauss]);
+
 // Rotation carried by the element: the polar factor of the deformation gradient at
 // the element centre. Column-major 3x3, matching fem.cpp's M3 layout.
 void elementRotation(const double rest[kDof], const double current[kDof], double out[9]);

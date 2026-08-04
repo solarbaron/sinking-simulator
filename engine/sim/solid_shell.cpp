@@ -529,6 +529,16 @@ void elementMass(const double nodes[kDof], double density, double out[kNodes]) {
         for (int a = 0; a < kNodes; ++a) out[a] += density * forms.weight[gp] * forms.shape[gp][a];
 }
 
+void gaussVolumes(const double nodes[kDof], double out[kGauss]) {
+    std::fill(out, out + kGauss, 0.0);
+    Forms forms;
+    // The weights are geometry, so the formulation is irrelevant and the cheapest
+    // one is used. `weight` already carries det J times the 2x2x2 Gauss weight of 1.
+    computeForms(nodes, Formulation::Displacement, forms);
+    if (!forms.ok) return;
+    for (int gp = 0; gp < kGauss; ++gp) out[gp] = forms.weight[gp];
+}
+
 void elementRotation(const double rest[kDof], const double current[kDof], double out[9]) {
     Point r, c;
     evaluate(rest, 0.0, 0.0, 0.0, r);

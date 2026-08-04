@@ -2136,6 +2136,266 @@ exact only for an element prismatic through its thickness, and non-parallel face
 cost ≈ 90 × (offset/t)² in spurious stiffness. Keep the thickness direction near
 the surface normal and change plate thickness at a seam, not across an element.
 
+### The Tier-2 zone — **implemented**
+
+`engine/sim/zone.{hpp,cpp}`, checked by `tests/test_zone.cpp`, run at ship scale by
+`tools/zone_probe` in `verify.sh full`. The consumer the element and the return map
+did not have: **`StructuralMesh` + a load → solid-shell elements → an explicit
+solve → which panels tore**, as indices `breachesFromFailedPanels()` takes
+unchanged.
+
+```cpp
+Patch  buildPatch(const StructuralMesh&, const Vec3& impact, const MeshParams& = {});
+class  Solver { bool step(); const SolveResult& run(); ... };
+double estimatedCost(const Patch&, bool plastic = true);   // core-seconds per simulated second
+ZoneDamage indent(const StructuralMesh&, const Vec3&, const MeshParams&, const SolveParams&, ...);
+```
+
+#### Cost decides the design, so it is measured before the solve and after
+
+The stable step is `t / c_p` — thickness governed, flat in the in-plane element
+size — so for 12 mm plating it is 1.8 µs and 5.5 × 10⁵ steps buy one simulated
+second. At 7.3 µs per elastoplastic element that is
+
+```
+core-seconds per simulated second = 4.0 x elementCount
+```
+
+and **the zone is bounded by element count, not by area**. Since the step does not
+care about the in-plane size, area and resolution trade as `elements = area / h²`:
+200 m² is 80 000 elements at 50 mm and 2 200 at 300 mm — two hours of wall time on
+24 threads against four minutes. *Quoting an affordable area without its in-plane
+size says nothing*, which is the correction this made to the figure in
+`07-fem-spike-findings.md` §6.
+
+The other half is that the event is short. A 6 m/s bow reaching 0.22 m into the
+ferry's side is 0.037 s, not one second. Measured, on the reference ferry, a
+three-metre zone at four elements across each 0.70 m bay:
+
+| | |
+|---|---|
+| Zone | 14 panels → **224 elements**, 522 nodes, 24.0 m² of 12 mm plating |
+| Promotion — meshing, and a power iteration per element for the step | **7 ms**, once |
+| Predicted | 900 core-seconds per simulated second |
+| Delivered, 23 workers | 21 290 steps, **4.5 s of wall time**, 0.94 µs/element/step |
+| The same run, one worker | 15.4 s, 3.24 µs/element/step |
+
+The element loop is dispatched through `core::JobSystem` and the nodal accumulation
+is a CSR gather in a fixed order, so **the threaded answer is bit-identical to the
+serial one at any worker count** — asserted, not hoped for, because that is the
+property replays and multiplayer rest on.
+
+**Threading saturates at about 3.4×, and the reason is the step and not the
+element.** Measured on the same zone: 15.4 s at one worker, 6.9 at four, 5.2 at
+eight, 4.9 at sixteen, 4.5 at twenty-three. Fitting `s + p/N` puts the serial and
+barrier cost at **188 µs per step against 542 µs of element work** — twenty-one
+thousand barriers in a four-second run, each dispatching twenty-eight chunks. A
+larger zone does better (736 elements reaches 4.3×) but not much. What is left to
+attack is the per-step barrier and the per-step energy accounting, not the element
+kernel, and any GPU path will meet the same structure.
+
+#### Meshing: the element's geometry limit is the mesher's problem
+
+`07-fem-spike-findings.md` §6 limit 1 is binding: the ANS interpolation is exact
+only for an element prismatic through its thickness, and non-parallel faces cost
+≈ `90 × (offset/t)²`.
+
+**One normal per mid-surface node**, area-weighted over the elements around it,
+and the element extruded ± t/2 along it. On flat plating the offset is then
+*identically zero* — not small, zero, and the tests assert the identity. On curved
+plating the spread of nodal normals across an element **is** the offset ratio, and
+it is reported rather than incurred silently. Extruding each element along its own
+face normal instead is exactly prismatic everywhere and was rejected: the elements
+then share no nodes on a curve and the patch falls into loose plates.
+
+Measured on the ferry, and the result is a constraint on where a zone may go:
+
+| zone | offset/t | excess bending stiffness |
+|---|---|---|
+| flat of side, z = 9 m, r = 2 m | **0.0000** | 0% |
+| flat of side, z = 8 m, r = 4 m | 0.019 | 3% |
+| flat of bottom | **0.0000** | 0% |
+| across the shoulder at z ≈ 4.2 m | 0.188 | **319%** |
+
+The shoulder is a 43° facet between two girth bands where this hull reaches full
+breadth. **Refining `MeshParams::subdivision` does not help**, and that is the
+useful part: a panel is a flat facet, so all the turning is at the seam whatever
+the subdivision. The cure is a finer girth layout in `Scantlings` — halving the
+band halves the offset and quarters the penalty, asserted against the closed form
+`offset = facet angle / 4` on a cylinder.
+
+**Thickness seams stop a zone** rather than being averaged across, because a node
+between a 12 mm and a 16 mm strake has no single position and splitting the
+difference puts a taper inside both elements. The truncation is reported; so is the
+thickness used, if a caller overrides it.
+
+The mesher itself is validated against a closed form the same way the element was:
+a patch meshed from panels, loaded by `uniformPressureLoad` and solved by
+`solveStatic`, reproduces **Timoshenko's clamped square plate** — 0.00126 q a⁴/D —
+converging −3.7%, −0.6%, +0.3% at 4×4, 8×8 and 16×16 elements.
+
+#### Boundaries, and the stiffeners that are not there
+
+The patch is cut out of a ship, so its edge is a lie either way. **Clamped**, and
+the price is paid in zone size rather than in a tuned spring stiffness: the
+boundary error is a Saint-Venant effect that decays away from the edge, so growing
+the radius makes it go away and the convergence is measurable.
+
+**Stiffeners are not meshed**, and the reason is that the only element in the
+inventory is the solid-shell hex and there is no way to attach a web to a plate
+with it that is not wrong: a web sharing one node row along the seam is a hinge
+with a zero-energy tripping mode; a web widened to the plate's element size has its
+strong-axis stiffness wrong by `(h/t_web)³`, 3 000× here; and smearing is what
+`§3` above rejects with a factor of 130. What is needed is a multi-point constraint
+tying an eccentric beam to a shell — the same machinery Tier-1/Tier-2 interface
+coupling needs, and the next thing to build.
+
+**Leaving them out is not the neutral choice, and measuring it is what showed
+that.** With no supports the plating spans from one clamped zone edge to the other,
+so the span it uses is the *zone radius* — a meshing parameter. That is exactly the
+defect `indentation.hpp` records in its own history, where the size of the hole came
+out a property of the contact radius rather than of the collision. So the two
+honest readings are offered as the two bounds:
+
+| | ferry side, 2 m punch, at 0.078 m | against a membrane on the real 0.70 m span |
+|---|---|---|
+| `Stiffeners::Ignored` | 6.6 MN at 0.35 m (spanning the whole zone) | ~5× too soft |
+| `Stiffeners::RigidSupport` (default) | **18.9 MN** at 0.078 m | 10.6 MN — the expected ×1.8 |
+
+`RigidSupport` pins every plating node a stiffener line runs through, which is what
+a member far stiffer than its plating does in the limit; `Ignored` is the lower
+bound; the truth is between and the bracket is published rather than a point
+estimate. The default needs `subdivision ≥ 3` — the stiffener lines *are* the panel
+seams, so at 2 a bay is left with one free node — and `Patch::freeFraction` says so
+when it is not met.
+
+#### Against the membrane model, and one thing it settles
+
+`indentation.hpp` on the same bay is the load-bearing comparison, and it is set up
+so that the membrane model's own idealisation holds: a long strip, a rigid line
+punch across it, boundaries held. Two models built from different physics:
+
+| at 0.24 m into a 0.8 m span of 20 mm plate | force | energy |
+|---|---|---|
+| rigid-plastic membrane | 11.7 MN | 1.51 MJ |
+| solid-shell FEM | 24.8 MN | 3.00 MJ |
+| ratio | 2.12 | 1.99 |
+
+**And the factor of two is predicted, not accepted.** The membrane model carries
+the tension at σ_y flat and in one direction. The FEM carries it at the hardening
+flow stress averaged over the path — 509 MPa against 355 — and under the
+plane-strain constraint the clamped side edges impose, which raises the yield stress
+to 2/√3 of it. Correcting the membrane model by those two closed forms brings the
+disagreement to **20%**, and what is left is bending and the strip's own ends. The
+run is quasi-static (kinetic energy 0.3% of the work) so the comparison against a
+rate-independent model is fair.
+
+They part company on *where* a bay tears: the FEM tears at 0.055 m where the
+membrane model says 0.092 m, earlier by the predictable direction, because the
+membrane model spreads one strain over the whole leg where the FEM has the punch
+edge and the clamped support concentrating it.
+
+> **What this settles, and it is a correction to `indentation.hpp`.** `impactDamage()`
+> takes the membrane span as the **frame** spacing — 2.4 m on this ship — and the
+> struck width as the longitudinal spacing. For a longitudinally framed side that is
+> the wrong way round: the plating spans between *longitudinals*, 0.70 m. The FEM has
+> no span in it at all, only plating and supports, so it is the instrument that can
+> say. On the ferry's own side at 0.078 m of penetration it resists at **18.9 MN**,
+> against 10.6 MN for a membrane on the 0.70 m span and **1.10 MN** for one on the
+> 2.4 m span. The short span is right, and the long one under-predicts the energy a
+> bay absorbs by a factor of ten — which means `ram_view` currently tears roughly ten
+> times too many bays. The line to change is one line in `indentation.cpp`; it moves
+> every number the Phase 3 milestone publishes, so it is recorded here and left for
+> a session that can re-validate them rather than folded in here.
+
+#### The energy account, and where it stops closing
+
+Work in = strain energy + plastic dissipation + kinetic + damping, checked every
+run. Measured on a 32-element bay: **−0.15%** elastic, **+0.43%** plastic,
+**+0.45%** plastic with damping (which is in the account, or every balance above
+would be satisfied by a solver that quietly removed energy).
+
+Two limits came out of it and neither was assumed:
+
+- **The residual is not an integrator error.** Quartering the step leaves it where
+  it was. It grows with the *rotation* the elements carry — +0.9% at 0.01 rad,
+  −0.03% at 0.05, −3.7% at 0.15 — which is the co-rotational frame's additive small
+  strain measure, `§3`'s "what it cannot do yet" item 1, measured as an energy error
+  rather than as a strain one.
+- **Element deletion breaks it outright.** Past the first tear the account runs
+  −70%: the deleted elements' stored energy vanishes, and dropping the enhanced
+  modes at the step a point dies commits a strain jump that reads as dissipation
+  nobody paid for. The balance is a check on the *solver*, and it is only meaningful
+  before anything tears.
+
+A third tie is worth more than either: **the plastic path with a material that
+cannot yield reproduces the elastic path node for node**, to 8 × 10⁻¹⁶ m of 4 mm
+travelled. Different force routine, different strain-energy expression, different
+state — and the same trajectory.
+
+#### What mutation testing found
+
+56 mutants, each a single plausible edit. The first pass killed 43, and **every one
+of the thirteen real survivors was a hole in the suite** — plus one deliberate
+no-op, kept as a control, because a mutation harness that reports everything killed
+is reporting nothing.
+
+- **Three of them were in the weld**, and they share a shape: every mesh under test
+  had its duplicate points either bit-identical or centimetres apart, so nothing
+  probed the band the tolerance actually decides. Forgetting to square the tolerance,
+  halving the bucket, and dropping the neighbour probe all passed. The fix in the
+  tests is a gap of *one and a half tolerances* — the band a hundred-tolerance gap
+  cannot see — and a shared corner placed one ulp across a bucket boundary, which is
+  the real case the mirrored starboard panels produce.
+- **The fix in the code came from the same place.** The probe was `±1` cell with the
+  cell at twice the tolerance, which is correct and *silently coupled*: shrink the
+  cell and the weld stops being a distance without anything saying so. The reach is
+  now derived from `tolerance / cell`, which makes the cell size a free choice again
+  and the coupling impossible to reintroduce.
+- **Which way is out was never asked.** Every synthetic mesh happened to be wound so
+  that the outward test never fired, so both dropping it and ignoring the caller's
+  own direction passed. Panels wound the other way now have to produce an identical
+  patch, and the ferry's own axes are asserted on both sides and on her bottom.
+- **Area weighting of the nodal normals was invisible** because every mesh was
+  uniform, and **the trapezoid was missing**: taking a quad's area from one doubled
+  triangle is exact on a parallelogram, which every synthetic panel was. The same
+  trap `test_scantlings.cpp` records finding in `PlatePanel::area()`.
+- **A second real defect**: the stiffener proximity filter measured from a member's
+  *midpoint*, so a girder running the length of a ship — midpoint two hundred metres
+  away, passing straight through the zone — would have been dropped. It measures to
+  the segment now. The mutant that put the midpoint back needed a test with a real
+  radius in it before it would die, which is its own lesson: a test that sets
+  `radius = 1000` has switched off every filter downstream of it.
+- The spurious-stiffness penalty could be made linear in the offset instead of
+  quadratic, and `estimatedCost` could forget the step count entirely, because both
+  were printed and never asserted on.
+
+Adding those took the suite from 164 checks to 179 and killed 52 of 56. **Four are
+argued equivalent**: relabelling a quad's corners to reverse its winding gives the
+same element (the formulation is symmetric in ξ and η); skipping the update for an
+element every point of which has failed is output-identical to running it, because
+the return map returns no stress there; dropping the member proximity filter is a
+cost difference; and halving the weld's cell size is now compensated by the derived
+reach, which is exactly what that change was for.
+
+#### What it does not do yet
+
+1. **No coupling to Tier 1.** The zone is solved in isolation on a fixed boundary;
+   nothing feeds its reaction to the hull girder or takes the girder's stress as a
+   pre-load. That is adaptive zone promotion, still the largest thing outstanding.
+2. **The indenter is kinematic and rigid** — a prescribed rectangular punch, no
+   contact search, no friction, no release, and the striking body does not crush. A
+   prescribed motion cannot run away, which is what makes it testable; a delivered
+   *energy* needs the striking body's mass and is what `collision.hpp` would supply.
+3. **Element deletion, not splitting**, so the hole is the deleted area — reported
+   as whole panels because that is what `breachesFromFailedPanels` consumes.
+   `tearFraction` decides at what share of a panel it counts, and neither end of it
+   is right: a first dead element over-states a slit by the subdivision squared and
+   requiring all of them under-states a tear that has crossed the bay. The real fix
+   is a breach interface that takes an area.
+4. **No GPU path**, and no rate dependence in the material, so the resistance is
+   under-predicted by the 10–30% steel gains at collision strain rates.
+
 ### Solver
 
 Explicit central-difference time integration inside Tier 2 (standard for
