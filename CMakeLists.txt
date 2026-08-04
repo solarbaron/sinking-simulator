@@ -38,6 +38,7 @@ add_library(shipsim_engine
   engine/gpu/material.cpp
   engine/sim/ship.cpp
   engine/sim/propulsion.cpp
+  engine/sim/hullform.cpp
   engine/sim/rao.cpp
   engine/sim/fem.cpp
   engine/sim/radiation.cpp
@@ -73,6 +74,7 @@ add_executable(shipsim_tests
   tests/test_png.cpp
   tests/test_propulsion.cpp
   tests/test_radiation.cpp
+  tests/test_hullform.cpp
   tests/test_rao.cpp
   tests/test_roll_damping.cpp
   tests/test_scheduler.cpp

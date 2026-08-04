@@ -53,6 +53,8 @@ Real hull forms come as:
   Import via OpenCASCADE, tessellate to the watertight mesh the sim needs.
 - **Offset tables** — the classical station/waterline half-breadth table. Already
   supported by `makeHullFromStations()`.
+- **Principal particulars** — **implemented**, `engine/sim/hullform.{hpp,cpp}`.
+  See below: the case where no offsets exist at all, which is most ships.
 - **DXF / lines plans** — traced body plans, for historical vessels where that is
   all that survives.
 - **Point clouds / photogrammetry** — for scanned wrecks and preserved ships.
@@ -61,6 +63,57 @@ Public hull forms available for validation and as shipped content: DTMB 5415
 (naval combatant), KCS (container ship), KVLCC2 (tanker), S175, JBC, Duisburg Test
 Case, Wigley and Series 60 parametric hulls, and the various IMO/HARDER damage
 stability test cases.
+
+### From principal particulars alone — **implemented**
+
+Offsets are proprietary for almost every real hull and published for almost none,
+while *every* reference gives length, beam, draft and a handful of form
+coefficients. `makeHullFromParticulars()` builds a hull that **measures** as the
+requested ship.
+
+The construction is the classical one. `Cp = Cb / Cm` separates how full the
+midship section is from how full the ship is along its length. The midship
+section is a rectangle with a radiused bilge, and the radius follows in closed
+form from Cm, since each bilge removes `r²(1 − π/4)`. The sectional area curve is
+`f(u) = 1 − (1 − e)|u|ⁿ` with one exponent and one end value per end; the mean of
+the exponents sets Cp and their difference sets LCB, both through closed forms,
+so the pair is *solved* rather than searched. Every station is then the midship
+section scaled in breadth, which makes the sectional areas exact by construction
+and leaves only tessellation between the request and the result.
+
+**It is not the real hull, and that distinction is load-bearing.** Two ships with
+identical coefficients can have visibly different bodies and measurably different
+seakeeping. For stability, flooding and manoeuvring — dominated by volume,
+waterplane and their distribution — this is a reasonable stand-in. For
+**validation against published RAOs it is not**, because the comparison would
+then be against a hull that is not the benchmark ship. That needs real offsets,
+and any such claim should say which table it used.
+
+**Measured accuracy**, S-175 form, block-coefficient error against what was asked:
+
+| stations | 11 waterlines | 21 | 41 |
+|---|---|---|---|
+| 21 | 0.52% | 0.23% | 0.15% |
+| 41 | 0.43% | 0.13% | 0.06% |
+| 161 | 0.40% | 0.10% | 0.025% |
+
+The error is dominated by **waterline** count, not station count, because the
+waterlines are what resolve the bilge arc — going 41→161 stations barely moves
+it. The default therefore spends its triangles on waterlines. LCB is analytic and
+lands within 6 × 10⁻⁵ of Lpp at every resolution.
+
+**Two defects this turned up, both silent.** The first version solved the area
+curve *without* the transom and stem end values, then rescaled the exponents to
+recover Cp — which leaves LCB wherever the rescale put it. The error tracked
+`transomFraction` exactly: 0.0003 of Lpp at a cruiser stern, 0.021 at a wide
+transom, which is a metre and a half of LCB on a frigate. And
+`bilgeRadiusForMidshipCoefficient()` clamps, because a radius cannot exceed the
+draft or the half-beam — so a fine enough Cm on a shallow hull is unreachable and
+was being quietly rounded up, meeting Cp and missing Cb, which is the confusing
+way round. Both are now reported through the `problems` out-parameter.
+
+`kvlcc2Particulars()` and `s175Particulars()` are supplied, the former matching
+the `HullParams` already in `propulsion.cpp` so the two describe one ship.
 
 ## 3. Editor
 

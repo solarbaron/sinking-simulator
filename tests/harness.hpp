@@ -44,4 +44,5 @@ void runSchedulerTests();
 void runSerialiseTests();
 void runWorldIoTests();
 void runWaveTests();
+void runHullFormTests();
 void runRaoTests();
