@@ -40,6 +40,7 @@ void runPngTests();
 void runPropulsionTests();
 void runRadiationTests();
 void runRollDampingTests();
+void runScantlingTests();
 void runSchedulerTests();
 void runSerialiseTests();
 void runShipFileTests();
