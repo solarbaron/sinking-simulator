@@ -206,10 +206,16 @@ worth trusting.
 
   Three things a look at its output showed that no unit test would have:
 
-  - **The ocean patch edge is visible against the sky.** A finite grid ends, and
-    at 1050 m it ends inside the frame. The fix is the planned cascade in
-    `03-renderer-audio.md`, not a bigger uniform grid — resolution is set by the
-    *shortest* component, so widening the patch squares the cost.
+  - ~~**The ocean patch edge is visible against the sky.**~~ **Fixed by the
+    geometric cascade** (`03-renderer-audio.md`, "The cascade"). A finite grid
+    ends, and at 1050 m it ended inside the frame; a bigger uniform grid was never
+    the answer, because resolution is set by the *shortest* component and widening
+    the patch squares the cost. Rings that halve their resolution each time they
+    double their extent make reach exponential in the level count instead: the sea
+    now reaches 67 km — the distance at which its edge is one pixel from the
+    horizon for a 69 m eye at 720p — for **46 ms** of displacement against the old
+    patch's 55 ms at 525 m. What it did *not* fix is the near field, which still
+    costs what it always did and is still the FFT's job.
   - **The area curve has no parallel middle body.** `f(u) = 1 − (1−e)|u|ⁿ` is
     smooth everywhere, so a fine hull comes out canoe-like where a real
     containership has a long constant midship. It matters for appearance and for

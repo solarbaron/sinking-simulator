@@ -137,6 +137,10 @@ public:
     // already carries the spectrum's own analytic slope, and re-deriving a normal
     // from the mesh here would throw that away.
     void appendOcean(const OceanSurface& surface, std::uint32_t material);
+    // The cascade, which is the sea that reaches the horizon. Same conversion:
+    // its levels already share their seam vertices, so there is nothing to weld
+    // and nothing here that could unweld them.
+    void appendOcean(const OceanCascadeSurface& surface, std::uint32_t material);
 
     const std::vector<HullVertex>& vertices() const { return vertices_; }
     const std::vector<std::uint32_t>& indices() const { return indices_; }
@@ -151,6 +155,8 @@ private:
     void appendTriangles(const sim::TriMesh& mesh, const sim::Mat3& rotation,
                          const sim::Vec3& translation, const HullShading& shading,
                          const std::uint32_t* perFaceMaterial, std::uint32_t singleMaterial);
+    void appendOceanGeometry(const std::vector<OceanVertex>& vertices,
+                             const std::vector<std::uint32_t>& indices, std::uint32_t material);
 
     std::vector<HullVertex> vertices_;
     std::vector<std::uint32_t> indices_;
