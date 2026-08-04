@@ -1307,10 +1307,55 @@ minimum section modulus, so a rule-minimum ship in the same condition would run 
 designed to. The moment and the section were computed by completely separate
 routes, neither aimed at that number.
 
+### Buckling — **implemented**
+
+`engine/sim/buckling.{hpp,cpp}`. Dividing a moment by a section modulus is the
+right answer for the fibre in *tension*. For the one in compression it is not even
+the right question: a plate panel under edge compression folds at a stress that
+can be a small fraction of yield.
+
+Two modes, checked separately because they fail at different stresses and are
+cured by different things — **plate buckling** between stiffeners, going as
+`k π²E/(12(1−ν²)) · (t/b)²`, and **stiffener column buckling** between frames, as
+`π²EI/(AL²)`. The buckling coefficient is a minimum of `(m/α + α/m)²` over integer
+half-wave counts: exactly 4 at every whole aspect ratio, peaking at 4.5 at the
+crossovers, tending to 4 for a long panel. That is why "4" is the number quoted
+for ship plating, and why a square panel is no weaker than a long one.
+
+Elastic buckling stress is not strength — above about half yield the material goes
+plastic before the instability arrives, and the elastic formula runs away to
+values the plate cannot reach. The Johnson–Ostenfeld cap is continuous at the
+transition **by construction**: at `σ_cr = σ_y/2` the lower branch returns its
+input and the upper returns `σ_y(1 − σ_y/(4·σ_y/2)) = σ_y/2`, the same number
+exactly.
+
+**What it changes.** The ferry, same conditions as the table above but against
+AH36's 355 MPa:
+
+| condition | yield utilisation | compressed fibre | buckling utilisation |
+|---|---|---|---|
+| still water | 0.08 | keel | 0.09 |
+| crest, hogging | 0.24 | keel | 0.26 |
+| trough, sagging | **0.08** | deck | **0.30** |
+
+Hogging barely moves — the keel is thick, closely framed structure. Sagging moves
+by a factor of **3.7**: a condition that reads as 8% of yield is at 30% of what
+the deck can actually carry, because the deck is the thinner, more widely
+stiffened structure and it is furthest from the neutral axis. A yield check alone
+would rank sagging as the benign case. It is the dangerous one.
+
+**Limits, and they are not small.** This is elastic buckling of an ideal flat
+panel: no initial distortion, no welding residual stress, no lateral pressure, no
+interaction between the two modes, simply-supported edges throughout. A real rule
+check applies knock-down factors for every one of those. What is here answers "is
+this panel in the dangerous region", which is a question the hull girder result
+could not ask at all.
+
 **What this tier still cannot do.** It is a beam: it knows nothing about where
-stress goes *within* a section, nothing about buckling, nothing about shear lag,
-nothing about local loads. It answers "is the hull girder overloaded", which is
-the question that decides whether a long ship in a seaway survives being long.
+stress goes *within* a section, nothing about shear lag, nothing about local
+loads, and nothing about what happens *after* a panel buckles — post-buckling
+strength, load shedding to the stiffeners, and the progressive collapse that
+follows are what the FEM tiers are for.
 
 The lightship weight curve is a trapezoidal fit matched to total weight and LCG —
 the Prohaska/Biles construction, and an *assumption*. Floodwater is not assumed:

@@ -46,6 +46,7 @@ void runSerialiseTests();
 void runShipFileTests();
 void runWorldIoTests();
 void runWaveTests();
+void runBucklingTests();
 void runGirderTests();
 void runHullFormTests();
 void runRaoTests();

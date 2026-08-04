@@ -39,6 +39,7 @@ add_library(shipsim_engine
   engine/sim/ship.cpp
   engine/sim/shipfile.cpp
   engine/sim/propulsion.cpp
+  engine/sim/buckling.cpp
   engine/sim/girder.cpp
   engine/sim/hullform.cpp
   engine/sim/rao.cpp
@@ -77,6 +78,7 @@ add_executable(shipsim_tests
   tests/test_png.cpp
   tests/test_propulsion.cpp
   tests/test_radiation.cpp
+  tests/test_buckling.cpp
   tests/test_girder.cpp
   tests/test_hullform.cpp
   tests/test_rao.cpp

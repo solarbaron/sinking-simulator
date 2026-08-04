@@ -48,6 +48,7 @@ int main() {
     runShipFileTests();
     runWorldIoTests();
     runWaveTests();
+    runBucklingTests();
     runGirderTests();
     runHullFormTests();
     runRaoTests();
