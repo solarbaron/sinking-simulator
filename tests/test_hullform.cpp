@@ -69,8 +69,9 @@ void testBilgeRadiusAndMidshipCoefficientAreInverses() {
 void testAreaCurveIntegralsMatchQuadrature() {
     for (double cp : {0.55, 0.65, 0.80}) {
         for (double lcb : {-0.03, 0.0, 0.025}) {
-            for (double transom : {0.0, 0.15}) {
-                const AreaCurve curve = solveAreaCurve(cp, lcb, transom, 0.01);
+            for (double parallel : {0.0, 0.35}) {
+                const double transom = parallel > 0.0 ? 0.15 : 0.0;
+                const AreaCurve curve = solveAreaCurve(cp, lcb, transom, 0.01, parallel);
 
                 const int steps = 400000;
                 double area = 0, moment = 0;
@@ -92,6 +93,60 @@ void testAreaCurveIntegralsMatchQuadrature() {
             }
         }
     }
+}
+
+// A parallel middle body is a span of *constant* section, so the area curve must
+// be flat over it and the hull's stations identical there. Nothing about Cb, Cp
+// or LCB can see the difference -- which is why its absence went unnoticed until
+// a rendered frame showed a canoe.
+void testParallelMiddleBodyIsActuallyParallel() {
+    const AreaCurve curve = solveAreaCurve(0.70, 0.0, 0.12, 0.01, 0.40);
+    expectNear("the solve still reaches Cp with a parallel middle body",
+               curve.prismaticCoefficient(), 0.70, 1e-6);
+    expectNear("and still reaches LCB", curve.lcbFraction(), 0.0, 1e-6);
+
+    for (double u : {-0.39, -0.2, 0.0, 0.2, 0.39})
+        expectNear("the section is constant over the parallel middle body", curve(u), 1.0, 1e-12);
+    expectTrue("and tapers outside it", curve(0.7) < 0.999 && curve(-0.7) < 0.999);
+
+    // Without one, the same request has no flat span at all.
+    const AreaCurve tapered = solveAreaCurve(0.70, 0.0, 0.12, 0.01, 0.0);
+    expectTrue("a curve without a middle body is nowhere flat", tapered(0.2) < 0.999);
+
+    // And the hull built from it really does repeat its stations. This is the
+    // check that ties the curve to the geometry rather than to itself.
+    HullParticulars p = s175Particulars();
+    p.parallelMiddleBodyFraction = 0.40;
+    p.stationCount = 41;
+    const TriMesh hull = makeHullFromParticulars(p);
+    expectTrue("the hull is still a closed manifold", isClosedManifold(hull));
+
+    const HullCoefficients c = measureHull(hull, p.draft, p.lengthPp, p.beam);
+    expectNear("and still measures as the ship that was asked for", c.blockCoefficient,
+               p.blockCoefficient, 0.005 * p.blockCoefficient);
+    expectNear("with LCB where it was asked", c.lcbFraction, p.lcbFraction, 1e-3);
+
+    // Two slabs inside the parallel span must have equal sectional area; one
+    // outside must not.
+    const double halfLength = 0.5 * p.lengthPp;
+    Vec3 lo = hull.verts[0], hi = hull.verts[0];
+    for (const Vec3& v : hull.verts) {
+        lo = {std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+        hi = {std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
+    }
+    const double slab = 0.004 * p.lengthPp;
+    const auto sectionArea = [&](double x) {
+        const TriMesh cut = clipToBox(hull, {x - 0.5 * slab, lo.y - 1e3, lo.z - 1e3},
+                                      {x + 0.5 * slab, hi.y + 1e3, lo.z + p.draft});
+        return integrate(cut).volume / slab;
+    };
+    const double inner = sectionArea(0.0);
+    const double alsoInner = sectionArea(0.30 * halfLength);
+    const double outer = sectionArea(0.80 * halfLength);
+    expectTrue("the section really is non-trivial", inner > 1.0);
+    expectNear("two stations inside the parallel body have the same area", alsoInner, inner,
+               1e-6 * inner);
+    expectTrue("and one outside it does not", outer < 0.9 * inner);
 }
 
 // --- The mesh ----------------------------------------------------------------
@@ -226,6 +281,7 @@ void runHullFormTests() {
     std::printf("\n--- hull generation from particulars ---\n");
     testBilgeRadiusAndMidshipCoefficientAreInverses();
     testAreaCurveIntegralsMatchQuadrature();
+    testParallelMiddleBodyIsActuallyParallel();
     testAFullBlockIsExactlyABox();
     testGeneratedHullMeasuresAsRequestedAndConverges();
     testMeasuredCoefficientsAreSelfConsistent();

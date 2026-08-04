@@ -58,6 +58,11 @@ struct HullParticulars {
     // bar, large enough to be a triangle.
     double stemFraction = 0.01;
 
+    // Length of constant midship section, as a fraction of Lpp. Full hulls carry
+    // a long one -- a VLCC is nearly half parallel -- and fine fast hulls carry
+    // almost none. Zero reproduces the earlier single-curve behaviour exactly.
+    double parallelMiddleBodyFraction = 0.0;
+
     // Measured convergence on the S-175 form: the block-coefficient error is
     // dominated by *waterline* count, because that is what resolves the bilge
     // arc. At 41 stations it runs 0.43% with 11 waterlines, 0.13% with 21 and
@@ -100,6 +105,13 @@ struct AreaCurve {
     double transomFraction = 0.0;
     double stemFraction = 0.01;
 
+    // Half-extent of the parallel middle body, as a fraction of Lpp/2. Real
+    // ships have one -- a tanker's runs most of its length -- and a curve
+    // without it comes out canoe-like: smooth everywhere, tapering from
+    // amidships in both directions. It barely moves Cb, Cp or LCB, which is
+    // exactly why a coefficient test cannot see its absence.
+    double parallelMiddleBody = 0.0;
+
     double operator()(double u) const;
     double prismaticCoefficient() const;  // analytic, not quadratured
     double lcbFraction() const;           // fraction of Lpp forward of midship
@@ -110,6 +122,7 @@ struct AreaCurve {
 // that had to be clamped rather than silently missing it.
 AreaCurve solveAreaCurve(double prismaticCoefficient, double lcbFraction,
                          double transomFraction = 0.0, double stemFraction = 0.01,
+                         double parallelMiddleBody = 0.0,
                          std::vector<std::string>* problems = nullptr);
 
 // Midship coefficient actually delivered by a given bilge radius -- the inverse

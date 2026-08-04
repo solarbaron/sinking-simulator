@@ -112,6 +112,21 @@ draft or the half-beam — so a fine enough Cm on a shallow hull is unreachable 
 was being quietly rounded up, meeting Cp and missing Cb, which is the confusing
 way round. Both are now reported through the `problems` out-parameter.
 
+**Parallel middle body.** Real ships have a span of constant midship section — a
+VLCC is close to half parallel — and the first version of the area curve had
+none, so a fine hull came out canoe-like. Nothing about Cb, Cp or LCB can see the
+difference, which is why every coefficient test passed; a rendered frame showed
+it immediately. The curve is now flat over |u| ≤ p and tapers over the rest, with
+both integrals still closed forms.
+
+That change also moved where the stations belong. Uniform spacing spends them
+where the section never changes and starves the ends where it changes fastest —
+and the taper is *steeper* with a parallel body, because the same fall-off is
+squeezed into (1 − p) of the length. Measured on the S-175 form with p = 0.40,
+uniform spacing at 41 stations put Cb 0.76% high and needed 161 stations to reach
+0.04%. Concentrating them in the tapers, where a constant section needs only two,
+brings 41 stations to 0.44%.
+
 `kvlcc2Particulars()` and `s175Particulars()` are supplied, the former matching
 the `HullParams` already in `propulsion.cpp` so the two describe one ship.
 

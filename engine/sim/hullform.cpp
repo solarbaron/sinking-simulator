@@ -50,29 +50,58 @@ double midshipHalfBreadth(double beam, double draft, double bilgeRadius, double 
 // f(u) = 1 - (1 - e) |u|^n, one exponent and one end value per end. At u = 0 the
 // section is the midship section; at |u| = 1 it is the end value.
 
+namespace {
+
+// One half of the curve, integrated over [0, 1]: p of parallel middle body at
+// f = 1, then a taper to the end value e over the remaining (1 - p).
+//
+// With t = (u - p) / (1 - p) the taper is the same 1 - (1-e) t^n as before, so
+//   area   = p + (1-p) [1 - (1-e)/(n+1)]
+//   moment = p^2/2 + (1-p) { p [1 - (1-e)/(n+1)] + (1-p) [1/2 - (1-e)/(n+2)] }
+// both exact, which keeps the solve analytic rather than quadratured.
+struct HalfIntegrals {
+    double area = 0;
+    double moment = 0;
+};
+
+HalfIntegrals halfIntegrals(double n, double end, double p) {
+    const double body = 1.0 - end;
+    const double taper = 1.0 - body / (n + 1.0);
+    HalfIntegrals h;
+    h.area = p + (1.0 - p) * taper;
+    h.moment = 0.5 * p * p +
+               (1.0 - p) * (p * taper + (1.0 - p) * (0.5 - body / (n + 2.0)));
+    return h;
+}
+
+}  // namespace
+
 double AreaCurve::operator()(double u) const {
     const double clamped = std::clamp(u, -1.0, 1.0);
+    const double magnitude = std::abs(clamped);
+    const double p = std::clamp(parallelMiddleBody, 0.0, 0.98);
+    if (magnitude <= p) return 1.0;   // constant midship section
     const double end = clamped < 0.0 ? transomFraction : stemFraction;
     const double n = clamped < 0.0 ? aftExponent : forwardExponent;
-    return 1.0 - (1.0 - end) * std::pow(std::abs(clamped), n);
+    const double t = (magnitude - p) / (1.0 - p);
+    return 1.0 - (1.0 - end) * std::pow(t, n);
 }
 
 double AreaCurve::prismaticCoefficient() const {
-    // integral over [0,1] of 1 - (1-e) u^n is 1 - (1-e)/(n+1); average the ends.
-    const double aft = 1.0 - (1.0 - transomFraction) / (aftExponent + 1.0);
-    const double forward = 1.0 - (1.0 - stemFraction) / (forwardExponent + 1.0);
-    return 0.5 * (aft + forward);
+    const double p = std::clamp(parallelMiddleBody, 0.0, 0.98);
+    return 0.5 * (halfIntegrals(aftExponent, transomFraction, p).area +
+                  halfIntegrals(forwardExponent, stemFraction, p).area);
 }
 
 double AreaCurve::lcbFraction() const {
-    // integral over [0,1] of u (1 - (1-e) u^n) is 1/2 - (1-e)/(n+2). The aft half
-    // contributes with the opposite sign because u is negative there.
-    const double moment = (1.0 - transomFraction) / (aftExponent + 2.0) -
-                          (1.0 - stemFraction) / (forwardExponent + 2.0);
+    // The aft half contributes with the opposite sign because u is negative there.
+    const double p = std::clamp(parallelMiddleBody, 0.0, 0.98);
+    const double moment = halfIntegrals(aftExponent, transomFraction, p).moment -
+                          halfIntegrals(forwardExponent, stemFraction, p).moment;
     const double area = 2.0 * prismaticCoefficient();
     if (area <= 0.0) return 0.0;
     // moment/area is in units of u, i.e. of half-lengths; halve again for Lpp.
-    return moment / area * 0.5;
+    return -moment / area * 0.5;
 }
 
 double midshipCoefficientForBilgeRadius(double beam, double draft, double bilgeRadius) {
@@ -82,8 +111,9 @@ double midshipCoefficientForBilgeRadius(double beam, double draft, double bilgeR
 
 AreaCurve solveAreaCurve(double prismaticCoefficient, double lcbFraction,
                          double transomFraction, double stemFraction,
-                         std::vector<std::string>* problems) {
+                         double parallelMiddleBody, std::vector<std::string>* problems) {
     AreaCurve curve;
+    curve.parallelMiddleBody = std::clamp(parallelMiddleBody, 0.0, 0.98);
     // The end values shape both Cp and LCB, so they go in *before* the solve.
     // Setting them afterwards and rescaling the exponents to recover Cp -- which
     // is what the first version did -- leaves LCB wherever the rescale put it.
@@ -144,8 +174,8 @@ TriMesh makeHullFromParticulars(const HullParticulars& p, std::vector<std::strin
     // Cp is asked of the section this hull will actually have, not of the one
     // that was requested and clamped away.
     const double cp = p.blockCoefficient / std::max(achievableCm, 1e-6);
-    const AreaCurve curve =
-        solveAreaCurve(cp, p.lcbFraction, p.transomFraction, p.stemFraction, problems);
+    const AreaCurve curve = solveAreaCurve(cp, p.lcbFraction, p.transomFraction, p.stemFraction,
+                                          p.parallelMiddleBodyFraction, problems);
 
     // Waterlines: clustered towards the baseline and towards the design draft,
     // because the bilge radius lives at one end and the waterplane at the other,
@@ -162,11 +192,39 @@ TriMesh makeHullFromParticulars(const HullParticulars& p, std::vector<std::strin
     for (int k = 1; k <= above; ++k)
         waterlines.push_back(p.draft + (p.depth - p.draft) * k / above);
 
-    const int stations = std::max(5, p.stationCount | 1);   // odd: one on midship
+    // Station positions: uniform without a parallel middle body, and concentrated
+    // in the tapers with one.
+    //
+    // Uniform spacing spends stations where the section never changes and starves
+    // the ends where it changes fastest, and the taper is *steeper* with a
+    // parallel body because the same fall-off is squeezed into (1 - p) of the
+    // length. Measured on the S-175 form with a 0.40 parallel body, uniform
+    // spacing at 41 stations put the block coefficient 0.76% high; it needed 161
+    // to come back to 0.04%. A section that is constant needs two stations to
+    // describe it exactly, so the rest belong in the tapers.
+    const int stations = std::max(5, p.stationCount | 1);
+    const double parallel = std::clamp(p.parallelMiddleBodyFraction, 0.0, 0.98);
+    std::vector<double> positions;
+    positions.reserve(static_cast<std::size_t>(stations));
+    if (parallel <= 1e-6) {
+        for (int i = 0; i < stations; ++i)
+            positions.push_back(-1.0 + 2.0 * i / (stations - 1));
+    } else {
+        // A handful across the flat span, purely so the mesh has faces there;
+        // the geometry is exact with two.
+        constexpr int kMiddle = 5;
+        const int perTaper = std::max(3, (stations - kMiddle) / 2);
+        for (int i = 0; i < perTaper; ++i)
+            positions.push_back(-1.0 + (1.0 - parallel) * i / (perTaper - 1));
+        for (int i = 1; i < kMiddle - 1; ++i)
+            positions.push_back(-parallel + 2.0 * parallel * i / (kMiddle - 1));
+        for (int i = 0; i < perTaper; ++i)
+            positions.push_back(parallel + (1.0 - parallel) * i / (perTaper - 1));
+    }
+
     std::vector<Station> out;
-    out.reserve(static_cast<std::size_t>(stations));
-    for (int i = 0; i < stations; ++i) {
-        const double u = -1.0 + 2.0 * i / (stations - 1);
+    out.reserve(positions.size());
+    for (double u : positions) {
         const double scale = curve(u);
         Station station;
         station.x = 0.5 * p.lengthPp * u;
@@ -257,6 +315,9 @@ HullParticulars kvlcc2Particulars() {
     p.midshipCoefficient = 0.998;
     p.lcbFraction = 0.035;
     p.transomFraction = 0.0;
+    // A VLCC is close to half parallel. Typical for the type rather than a
+    // published figure for this hull, and it barely moves the coefficients.
+    p.parallelMiddleBodyFraction = 0.45;
     p.stationCount = 41;
     return p;
 }
@@ -271,6 +332,7 @@ HullParticulars s175Particulars() {
     p.midshipCoefficient = 0.98;
     p.lcbFraction = -0.02;
     p.transomFraction = 0.10;
+    p.parallelMiddleBodyFraction = 0.18;
     p.stationCount = 41;
     return p;
 }
