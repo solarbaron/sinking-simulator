@@ -159,19 +159,28 @@ worth trusting.
   mod adds a surface without recompiling (`03-renderer-audio.md`,
   `05-data-modding-validation.md` §4). 0.26 ms of GPU time at 1080p for a whole ship
   and sea on the target card
+- ~~**Propulsion coupled into the seakeeping path**~~ **done** — `Ship::propulsion`
+  applies the MMG hull, propeller and rudder forces to the 6-DOF body, so a ship
+  makes way under its own power. The **encounter frequency is emergent**: a hull
+  translating through `A cos(kx − ωt + φ)` meets waves at `|ω − kU|` with nothing
+  imposing it, measured against `encounterFrequency()` to 0.1%. `measureRaoAt()`
+  runs the ship up to its own speed and steers to hold heading, because the
+  reference hull is directionally unstable and departs into a turn after about
+  1900 s of straight running (`02-simulation.md` §2)
 - **Milestone:** drive a ship in a real seaway. Validated against published RAOs.
-  **Not met, and the remaining gap is specific.** Every piece of machinery now
-  exists — spectral sea, nonlinear Froude–Krylov, radiation with memory, an RAO
-  instrument, and a renderer showing the ship in the sea it is actually
-  responding to. What is missing is **forward speed**. `encounterFrequency()` is
-  implemented and tested, but `RaoSettings::forwardSpeed` only chooses the
-  frequency the response is fitted at; it does not propel the hull, and the
-  propulsion module is not coupled to the seakeeping path. The standard published
-  benchmarks — the S-175 containership above all — are tabulated at Fn ≈ 0.275,
-  so comparing against them is not merely untried but currently *meaningless*.
-  Zero-speed RAOs are the validated case. Coupling propulsion into the wavy path
-  is therefore the next task, and it is a prerequisite for the milestone rather
-  than an item beside it.
+  **Half met.** *Drive a ship in a real seaway* — yes: a hull under power, in a
+  directional spectral sea, responding through nonlinear Froude–Krylov with
+  radiation memory, drawn in the sea it is actually responding to, holding its
+  heading. That works today.
+
+  *Validated against published RAOs* — not yet, and what remains is now an
+  **input** problem rather than a capability one. Comparison needs (a) a real
+  hull's offsets, so the mesh is the benchmark ship and not an approximation of
+  it, and (b) the published curves themselves. The S-175 containership is the
+  obvious target; its RAOs are tabulated at Fn ≈ 0.275, which the machinery can
+  now reach in principle but which the reference barge's propeller cannot. Sizing
+  a powerplant for a real hull and sourcing the benchmark data are the two tasks
+  left, and neither is a physics gap.
 
 **Performance, now measured rather than projected.** The wave-field query is
 essentially 100% of a wavy tick. Evaluating the surface once per hull *vertex*
