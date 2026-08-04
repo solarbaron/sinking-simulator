@@ -53,6 +53,7 @@ int main() {
     runWaveTests();
     runBucklingTests();
     runCollapseTests();
+    runCollisionTests();
     runGirderTests();
     runIndentationTests();
     runHullFormTests();

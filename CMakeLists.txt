@@ -42,6 +42,7 @@ add_library(shipsim_engine
   engine/sim/propulsion.cpp
   engine/sim/buckling.cpp
   engine/sim/collapse.cpp
+  engine/sim/collision.cpp
   engine/sim/girder.cpp
   engine/sim/indentation.cpp
   engine/sim/hullform.cpp
@@ -87,6 +88,7 @@ add_executable(shipsim_tests
   tests/test_radiation.cpp
   tests/test_buckling.cpp
   tests/test_collapse.cpp
+  tests/test_collision.cpp
   tests/test_girder.cpp
   tests/test_indentation.cpp
   tests/test_hullform.cpp

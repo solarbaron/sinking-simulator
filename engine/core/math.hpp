@@ -53,6 +53,14 @@ inline Vec3 normalize(const Vec3& v) {
 
 // Row-major 3x3.
 struct Mat3 {
+    // **A default-constructed Mat3 is the IDENTITY, not zero.** That is right for
+    // a rotation, which is what most of them are, and it is a trap for an
+    // accumulator: `Mat3 sum{};` followed by `sum = sum + ...` starts at I and
+    // every diagonal comes out one too large. It cost exactly that once -- a
+    // second-moment accumulator reporting every solid slightly fat, with the
+    // volumes all correct, which reads as a modelling choice rather than a bug.
+    // Use `Mat3::zero()` to accumulate. `Ship::MassProperties::inertiaAboutCog{}`
+    // is safe only because it is assigned rather than added into.
     std::array<double, 9> m{1, 0, 0, 0, 1, 0, 0, 0, 1};
 
     constexpr double& operator()(int r, int c)       { return m[r * 3 + c]; }

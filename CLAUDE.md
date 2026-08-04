@@ -9,9 +9,9 @@ of truth.
 ## The one command
 
 ```sh
-./scripts/verify.sh            # quick    build + tests             ~18 s
-./scripts/verify.sh full       # + clean rebuild, GPU, scenarios   ~370 s
-./scripts/verify.sh sanitize   # + ASan and TSan                   ~510 s
+./scripts/verify.sh            # quick    build + tests             ~35 s
+./scripts/verify.sh full       # + clean rebuild, GPU, scenarios   ~400 s
+./scripts/verify.sh sanitize   # + ASan and TSan                   ~670 s
 ```
 
 Run `quick` constantly and `sanitize` **before every commit** — the extra
@@ -93,6 +93,8 @@ most useful thing to know about this codebase:
 | Reading `state.velocity.x` as "speed" — it is a *world* vector | a steady turn that looked like chaos until surge was taken along the bow |
 | `makeHullFromStations` padding a short station with **zeros** | writing a *second* way to build the same ship and comparing them |
 | A wing tank authored **inside** a hold, 217 m³ flooding twice | a pairwise overlap check; the total-volume one saw 89% and was happy |
+| `Mat3{}` is the **identity**, so an accumulator started at I | a second moment measured two ways: every volume right, every diagonal one too large |
+| Two coincident faces counted twice, overlap 5/3 too large | an overlap coming out *larger than one of the solids* |
 | Roll stiffness finite-differenced about the **body origin** while the moment was taken about the cog, so `zetaRoll = 0.08` delivered 0.144 | timing a free decay's log decrement against the ζ the label claims |
 
 A green functional test is evidence the code does what you thought of, not that

@@ -51,6 +51,7 @@ void runWorldIoTests();
 void runWaveTests();
 void runBucklingTests();
 void runCollapseTests();
+void runCollisionTests();
 void runGirderTests();
 void runIndentationTests();
 void runHullFormTests();

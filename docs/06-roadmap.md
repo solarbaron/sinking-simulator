@@ -264,6 +264,12 @@ The longest and highest-risk phase.
   `engine/sim/breach.hpp`, measured in `02-simulation.md` §3. Failed panels become
   merged `Opening`s whose area, position and connectivity come from the structure;
   what supplies the failed panels is still to come
+- ~~Ship-to-ship contact detection and rigid-body response~~ — done:
+  `engine/sim/collision.hpp`, measured in `02-simulation.md` §2. Two hulls
+  interpenetrate as an exact solid; the force follows the overlap volume and is
+  reported as a patch, a pressure and an energy rather than as a velocity change,
+  which is the load case the FEM-active zone needs. The rigid half of the
+  milestone; what it does *not* do is deform or tear
 - Deformation and tear rendering
 - **Milestone:** ram the ferry. The hull deforms, tears where the stress says it
   should, and the resulting hole floods at a rate the hole's own area determines.

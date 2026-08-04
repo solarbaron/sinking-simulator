@@ -216,6 +216,21 @@ public:
     RollDampingCondition rollCondition{};
     RollDamping rollDampingApplied{};
 
+    // Force and moment from something that is not the sea: today, contact with
+    // another ship's hull. World frame; the moment is taken about the centre of
+    // gravity, which is the point integrateRigidBody() takes every other moment
+    // about. Added to by whoever is applying the load, consumed and **cleared** by
+    // the next step(), so a caller that stops pushing gets a ship that stops being
+    // pushed rather than one that coasts on a stale force.
+    //
+    // Unlike radiation, Ikeda and the MMG polynomial, this replaces nothing.
+    // Every damping and added-mass term above is a *fluid* mechanism that acts on
+    // a ship with no other ship anywhere near it, so none of them was ever a
+    // lumped stand-in for contact and none of them is switched off while contact
+    // is happening. See engine/sim/collision.hpp §4.
+    Vec3 externalForce{};
+    Vec3 externalMoment{};
+
     RigidState state;
 
     // --- Lifecycle ---
@@ -275,18 +290,21 @@ public:
     int findCompartment(std::string_view name) const;
     double totalFloodwaterMass() const;
 
-private:
+    // Mass, centre of gravity and inertia as the rigid body sees them, floodwater
+    // included. Public because the contact solver needs exactly the numbers the
+    // integrator uses, and a second implementation of them would be a second
+    // answer that agrees until the day it does not.
     struct MassProperties {
         double mass = 0;
         Vec3   cog{};              // body frame
         Mat3   inertiaAboutCog{};  // body frame
     };
+    MassProperties massProperties() const;
 
+private:
     void updateInternalFreeSurfaces(const Sea& sea);
     void solveFlowNetwork(double dt, const Sea& sea);
     void integrateRigidBody(double dt, const Sea& sea);
-
-    MassProperties massProperties() const;
 
     // Pressure and phase presented by one side of an opening.
     struct SideState {
