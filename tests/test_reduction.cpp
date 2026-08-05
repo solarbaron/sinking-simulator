@@ -1563,6 +1563,172 @@ void testTwoComponentsAssembleIntoTheWhole() {
     expectTrue("and an unmatched interface is reported rather than assembled silently",
                !reduction::matchBoundaries(sa, sWhole, 1e-12).problems.empty() ||
                    reduction::matchBoundaries(sa, sb, 1e-9).shared > 0);
+
+    // --- The static path, against the same reference ----------------------------
+    //
+    // Frequencies exercise the assembled matrices. They do not exercise getting a
+    // load in or a displacement out, and `assembledStaticSolve` and
+    // `componentState` were written and shipped without a test until this was
+    // noticed. Both are on the path a caller actually uses.
+    //
+    // Restraining it is the fiddly part and it is worth being explicit. The reduced
+    // model exposes only boundary and modal DOF, so the plate's *ends* cannot be
+    // clamped -- they are interior to their components. What can be held is the
+    // interface, and holding all of it would decouple the halves and quietly turn
+    // this into two separate problems. So the six DOF are a proper 3-2-1 restraint
+    // on three interface nodes, which removes exactly the six rigid body modes and
+    // leaves the two components carrying each other.
+    {
+        const std::vector<std::uint32_t>& bdofA = sa.boundaryDof();
+        const auto nodeOf = [&](std::uint32_t d) { return static_cast<std::size_t>(d) / 3; };
+        const auto axisOf = [&](std::uint32_t d) { return static_cast<std::size_t>(d) % 3; };
+        const auto posOf = [&](std::size_t n, int c) { return left.position[3 * n + c]; };
+
+        // Three distinct interface nodes: a corner, one along y, one along z.
+        std::size_t p1 = 0, p2 = 0, p3 = 0;
+        for (std::size_t i = 0; i < bdofA.size(); ++i) {
+            const std::size_t n = nodeOf(bdofA[i]);
+            if (posOf(n, 1) < posOf(nodeOf(bdofA[p1]), 1) + 1e-12 &&
+                posOf(n, 2) < posOf(nodeOf(bdofA[p1]), 2) + 1e-12)
+                p1 = i;
+        }
+        const std::size_t n1 = nodeOf(bdofA[p1]);
+        for (std::size_t i = 0; i < bdofA.size(); ++i) {
+            const std::size_t n = nodeOf(bdofA[i]);
+            if (std::fabs(posOf(n, 2) - posOf(n1, 2)) < 1e-12 &&
+                posOf(n, 1) > posOf(nodeOf(bdofA[p2]), 1))
+                p2 = i;
+            if (std::fabs(posOf(n, 1) - posOf(n1, 1)) < 1e-12 &&
+                posOf(n, 2) > posOf(nodeOf(bdofA[p3]), 2))
+                p3 = i;
+        }
+        const std::size_t n2 = nodeOf(bdofA[p2]), n3 = nodeOf(bdofA[p3]);
+        expectTrue("the three restraint nodes are distinct", n1 != n2 && n1 != n3 && n2 != n3);
+
+        // 3-2-1: all of n1; x and z of n2 (killing rotation about x and about z);
+        // x of n3 (killing rotation about y). Every interface node shares an x, so
+        // the usual textbook arrangement has to be read in this plane.
+        std::vector<std::uint32_t> held;
+        std::vector<std::uint8_t> pin(3 * left.nodeCount(), 0);
+        const auto hold = [&](std::size_t node, std::size_t axis) {
+            for (std::size_t i = 0; i < bdofA.size(); ++i)
+                if (nodeOf(bdofA[i]) == node && axisOf(bdofA[i]) == axis)
+                    held.push_back(static_cast<std::uint32_t>(i));   // fromA[i] == i
+            pin[3 * node + axis] = 1;
+        };
+        hold(n1, 0); hold(n1, 1); hold(n1, 2);
+        hold(n2, 0); hold(n2, 2);
+        hold(n3, 0);
+        expectEqualCount("a 3-2-1 restraint holds six DOF", held.size(), 6u);
+
+        // The same load on both models: a transverse pull on one interior node of
+        // each half, which is a load the interface has to carry across.
+        const std::size_t pullA = 0, pullB = 0;   // node 0 of each half, an outer corner
+        std::vector<double> loadA(sa.dofCount(), 0.0), loadB(sb.dofCount(), 0.0);
+        loadA[3 * pullA + 2] = 5.0e3;
+        loadB[3 * pullB + 2] = -5.0e3;
+
+        reduction::ReduceParams sp;
+        sp.modes = 12;
+        sp.cutoffFrequency = 0;
+        const reduction::Reduction sra = reduction::craigBampton(sa, sp);
+        const reduction::Reduction srb = reduction::craigBampton(sb, sp);
+        const reduction::Assembly sasm = reduction::assemble(sra, srb, map);
+
+        const std::vector<double> fa = reduction::reduceLoad(sa, sra, loadA);
+        const std::vector<double> fb = reduction::reduceLoad(sb, srb, loadB);
+        std::vector<double> f(static_cast<std::size_t>(sasm.size()), 0.0);
+        for (std::size_t i = 0; i < fa.size(); ++i) f[static_cast<std::size_t>(sasm.fromA[i])] += fa[i];
+        for (std::size_t i = 0; i < fb.size(); ++i) f[static_cast<std::size_t>(sasm.fromB[i])] += fb[i];
+
+        std::vector<double> x;
+        std::string problem;
+        expectTrue("the assembled model solves with six DOF held",
+                   reduction::assembledStaticSolve(sasm, f, held, x, &problem));
+
+        // The reference: the whole plate, same restraint, same load, solved by the
+        // element code rather than by anything here.
+        solidshell::HexMesh clamped = whole;
+        clamped.fixed.assign(3 * clamped.nodeCount(), 0);
+        std::vector<double> loadFull(3 * clamped.nodeCount(), 0.0);
+        const auto wholeNodeAt = [&](double px, double py, double pz) {
+            for (std::size_t n = 0; n < clamped.nodeCount(); ++n)
+                if (std::fabs(clamped.position[3 * n] - px) < 1e-9 &&
+                    std::fabs(clamped.position[3 * n + 1] - py) < 1e-9 &&
+                    std::fabs(clamped.position[3 * n + 2] - pz) < 1e-9)
+                    return n;
+            return clamped.nodeCount();
+        };
+        for (std::size_t n = 0; n < left.nodeCount(); ++n)
+            for (std::size_t axis = 0; axis < 3; ++axis)
+                if (pin[3 * n + axis]) {
+                    const std::size_t w =
+                        wholeNodeAt(posOf(n, 0), posOf(n, 1), posOf(n, 2));
+                    expectTrue("every restrained node exists in the whole plate too",
+                               w < clamped.nodeCount());
+                    if (w < clamped.nodeCount()) clamped.fixed[3 * w + axis] = 1;
+                }
+        const std::size_t wa = wholeNodeAt(left.position[3 * pullA], left.position[3 * pullA + 1],
+                                           left.position[3 * pullA + 2]);
+        const std::size_t wb = wholeNodeAt(right.position[3 * pullB], right.position[3 * pullB + 1],
+                                           right.position[3 * pullB + 2]);
+        expectTrue("both loaded nodes exist in the whole plate",
+                   wa < clamped.nodeCount() && wb < clamped.nodeCount());
+        loadFull[3 * wa + 2] = 5.0e3;
+        loadFull[3 * wb + 2] = -5.0e3;
+
+        std::vector<double> uFull;
+        expectTrue("the reference plate solves",
+                   solidshell::solveStatic(clamped, steel, solidshell::Formulation::SolidShell,
+                                           loadFull, uFull, &problem));
+        double peak = 0;
+        for (double v : uFull) peak = std::max(peak, std::fabs(v));
+        expectTrue("the load actually moves the reference plate", peak > 1e-6);
+
+        // Interface displacements come straight out of the assembled state -- the
+        // boundary DOF are physical, which is the whole reason they are kept.
+        double worstInterface = 0;
+        for (std::size_t i = 0; i < bdofA.size(); ++i) {
+            const std::size_t n = nodeOf(bdofA[i]);
+            const std::size_t w = wholeNodeAt(posOf(n, 0), posOf(n, 1), posOf(n, 2));
+            if (w >= clamped.nodeCount()) continue;
+            worstInterface = std::max(worstInterface,
+                                      std::fabs(x[i] - uFull[3 * w + axisOf(bdofA[i])]));
+        }
+        std::printf("     static: interface to %.2e m of a peak %.3e m\n", worstInterface, peak);
+        // Exact, not merely close: static condensation reproduces the interface
+        // response for any load at any mode count, and that survives assembly.
+        // Asserted at 1e-9 relative because 1e-3 would pass on a model that had
+        // lost the property entirely and was simply well converged.
+        expectTrue("the assembled model reproduces the interface displacement exactly",
+                   worstInterface < 1e-9 * peak);
+
+        // And `componentState` + `recover` put a component's own field back. The
+        // boundary part must agree with what was just read out of the assembly,
+        // which is the check that the index map is not quietly transposed.
+        const std::vector<double> xa = reduction::componentState(sasm, sasm.fromA, x);
+        expectEqualCount("a component's state is its own reduced size", xa.size(),
+                         static_cast<std::size_t>(sra.size()));
+        double worstMap = 0;
+        for (int i = 0; i < sra.boundary; ++i)
+            worstMap = std::max(worstMap, std::fabs(xa[static_cast<std::size_t>(i)] -
+                                                    x[static_cast<std::size_t>(i)]));
+        expectTrue("componentState returns that component's own DOF", worstMap < 1e-15);
+
+        const std::vector<double> ua = reduction::recover(sa, sra, xa);
+        double worstInterior = 0;
+        for (std::size_t n = 0; n < left.nodeCount(); ++n) {
+            const std::size_t w = wholeNodeAt(posOf(n, 0), posOf(n, 1), posOf(n, 2));
+            if (w >= clamped.nodeCount()) continue;
+            for (std::size_t axis = 0; axis < 3; ++axis)
+                worstInterior =
+                    std::max(worstInterior, std::fabs(ua[3 * n + axis] - uFull[3 * w + axis]));
+        }
+        std::printf("     static: recovered interior to %.2e m of a peak %.3e m\n", worstInterior,
+                    peak);
+        expectTrue("and the recovered interior field is the plate's own",
+                   worstInterior < 1e-3 * peak);
+    }
 }
 
 }  // namespace
