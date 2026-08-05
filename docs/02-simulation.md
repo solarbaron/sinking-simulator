@@ -3418,10 +3418,15 @@ makes, arriving as a frequency.
 
 #### What it does not do yet
 
-1. **There is no whole-ship Tier-1 model.** The reduction takes a `HexMesh`, and
-   the only mesher that produces one is `zone::buildPatch` — plating only, within
-   a radius, stopping at thickness seams. A hold-sized substructure is a mesher
-   problem, not a reduction problem, and it is the next piece.
+1. ~~**There is no whole-ship Tier-1 model.**~~ **Partly done** —
+   `section.{hpp,cpp}`, §*Tier-1 section mesher* below, cuts a region between two
+   transverse planes and hands it over with its longitudinals attached. What it
+   cannot do is *weld a junction*: `makeStructuralMesh` shares no corner between
+   two panel roles, so a hold arrives in seven disconnected pieces, and a
+   solid-shell node pair could not carry a corner even if it did. The section is
+   therefore right for the hull girder's axial and bending stiffness — measured
+   against `hullGirderSection` at 0.3% once the members it cannot attach are
+   accounted for — and wrong for torsion and for every frequency.
 2. ~~**Nothing assembles two substructures.**~~ **Done** — `matchBoundaries()` and
    `assemble()`. Two components meeting at an interface have the same displacement
    there, so their shared boundary DOF *are* the same unknown and coupling is
@@ -3454,8 +3459,9 @@ makes, arriving as a frequency.
    `Assembly` has no substructure behind it, so there is no way to add a third. The
    fix is to carry the boundary DOF identity through an assembly rather than to
    rewrite the scatter-add, which already does not care how many components it is
-   given. And the real blocker is still the *mesher*, item 1 — nothing yet cuts a
-   ship into components worth joining, so this has the join and no pieces.
+   given. The mesher that item 1 was waiting for now exists — `section.{hpp,cpp}` —
+   so there are pieces to join; what stops a *whole-ship* model is the
+   three-component limit above and the unwelded junctions inside each piece.
 3. ~~**A zone's edge is still clamped.**~~ **Done** — `coupling.{hpp,cpp}`,
    §*Tier-1 to Tier-2 coupling* below. What remains is that a reduced model cannot
    represent a zone that has *yielded* without tearing, which is item 6 there.
@@ -3525,6 +3531,253 @@ adding a test: the interface check tested a node count and then collinearity, an
 changing the count threshold from three to two altered nothing, because two nodes
 are collinear and one is and none is. The count was dead. It survives only in the
 message, where it does tell a caller something the word "collinear" does not.
+
+### Tier-1 section mesher — **implemented**
+
+`engine/sim/section.{hpp,cpp}`, checked by `tests/test_section.cpp` — which is where
+every box-girder figure below is an assertion rather than a reading — and measured at
+ship scale by `tools/section_probe`, which is where every ferry figure below comes
+from and how it is re-checked rather than re-quoted. **A region of a real ship between two
+transverse planes, meshed as solid-shell elements with its longitudinals attached,
+with the two cut sections as the interface a `reduction::Substructure` is built on.**
+It is what item 1 above was waiting for, and it changes two things that were
+believed about the problem.
+
+#### What it found before it built anything
+
+**`makeStructuralMesh` produces three topologically disjoint panel sets.** Of the
+reference ferry's 9 390 distinct panel corners, the number shared between a `Shell`
+panel and a `Deck` panel is **zero**. Shell-to-bulkhead is zero, deck-to-bulkhead is
+zero, and two *different* bulkheads share none either. The three roles are laid out
+on three independent grids — the shell on girth fractions of each station, a deck on
+fixed |y| lines clipped to the hull, a bulkhead on its own — so a deck edge lands in
+the *middle* of a shell panel, missing the nearest shell corner by up to **0.31 m**.
+
+So a section of this ship arrives as several disconnected surfaces however it is
+meshed, and that is a property of the input rather than of the meshing. It is why
+`Section` counts its connected components, says which of them reach the interface,
+and measures how much free edge is lying on another surface's plating without being
+joined to it — 370 m of it on an eleven-bay hold, at a worst gap of 9 mm, which is
+the deck edge sitting on the shell to within the hull tessellation.
+
+**The second half of the junction answer is a formulation limit and would bite on a
+conforming mesh too.** A solid-shell carries its thickness as *geometry*, so two
+plates meeting at an angle have two thickness directions and a shared node pair
+would have to point between them. Measured on a box girder whose four plates really
+do share corners: welding the right-angled corners extrudes those nodes along the
+45° mean normal, thins the plating towards the corner by `cos 45`, and costs **9.4%
+of EA and 8.9% of EI**, both in the unsafe direction. The mesher therefore refuses to
+weld across a fold and reports the junction instead.
+
+#### The validation that proves nothing, and the two that do
+
+**A section's EA, its neutral axis and its EI are insensitive to whether the
+junctions are welded**, and that is a statement about the test rather than about the
+ship. Prescribe both cut sections to a plane-sections field and every
+longitudinally continuous strip carries `σ = E ε` whatever it is attached to,
+because the ends alone already say what its strain is. On the box, the section whose
+four corners are **cut** reproduces `EA` to a relative **6e-13** and `EI` to **5e-7**,
+against −9.4% and −8.9% for the welded one. The unjoined mesh is the *more* accurate
+of the two for this question, so a mesher that welded nothing would score best on a
+section-properties test.
+
+Two things do see the junctions:
+
+- **Torsion.** A closed cell carries torque by Bredt's `4A²/∮(ds/t)`; an open one
+  does not. On the box the welded section gives **0.966** of Bredt and the cut one
+  **0.083** — a factor of 11.6 at `L = 8 m`. The factor depends on length and that
+  matters: **1.7 at 2 m, 11.6 at 8 m, 166 at 32 m**, because a short open section is
+  held by the warping restraint of its own end planes rather than by torsion. A
+  one-bay section would have shown almost nothing.
+- **The lowest fixed-interface frequency**, which is the sharper instrument on a real
+  ship. On the ferry's hold between x = −7.2 m and 19.2 m the whole section's first
+  fixed-interface mode is **0.7785 Hz**; the decks *on their own* are 0.7785 Hz to
+  four figures and the shell on its own is **3.4600 Hz**. The softest thing in the
+  section is a 26 m deck held on two edges instead of four, and adding the shell it
+  ought to be welded to changes it by nothing at all. (Both figures are bracketed by
+  `Substructure::eigenvaluesBelow`, an exact inertia count, because the subspace
+  iteration reports that it did not converge and a frequency it produced is not
+  evidence on its own.)
+
+#### Against Tier 0, and what closes the gap
+
+`hullGirderSection` reaches `A`, `z_na` and `I` by summing `A`, `Az` and `Az²` over a
+transverse cut, sharing no line of code with the mesher, the element or the solver.
+On the ferry's hold at `subdivision = 1`:
+
+| | A (m²) | z_na (m) | I (m⁴) |
+|---|---|---|---|
+| Tier 0, `hullGirderSection` | 1.80133 | 6.71317 | 46.2047 |
+| Tier 0 less the members the mesher cannot attach | 1.72669 | 6.8534 | 43.746 |
+| the section | **1.73122** | **6.85797** | **43.875** |
+| the section, bare plating | 1.37058 | 6.99161 | 35.650 |
+
+The mesher's shortfall against Tier 0 is an **accounting**, not a discrepancy.
+`Section::attachedMemberArea + missedMemberArea` equals `sectionElements`' stiffener
+area to 1e-9, and what is missed is exactly the three girders — 0.07464 m² — which
+sit off the longitudinal spacing and so pass through no node of a mesh whose nodes
+are panel seams. Correcting for them leaves **+0.26% on the area** and **+0.29% on
+the second moment** — the middle row subtracts the girders' second moment about the
+section's own neutral axis; carrying the shift of that axis through as well gives
+43.70 and +0.40%, which is the size of the residual either way. And even that is
+explained: the frames and deck beams restrain the section's Poisson contraction,
+which a beam model has no way to represent and which is worth +0.52% of the area,
+measured by omitting them.
+
+The **negative control** lands where the section properties say it must: bare
+plating is 23.9% short on `EA` where Tier 0 says the stiffeners are 23.8% of the
+section, and 22.8% short on `EI`. That is `reduction.hpp` §8's warning — one flat bar
+was 7.9% on one patch — arriving at ship scale.
+
+#### Resolution: the Tier-2 ceiling was never the binding constraint
+
+`applyBeamLoad` prescribes the interface and relaxes the interior, so what it
+reports **is** `½ uᵦᵀ K_r uᵦ` for the Guyan reduction of the section — the static
+condensation identity, asserted against a real `craigBampton` rather than taken on
+trust. Refining it is therefore refining the reduced answer:
+
+| subdivision | elements | A_eff (m²) | z_na (m) | I_eff (m⁴) | GJ (N m²) | solve |
+|---|---|---|---|---|---|---|
+| 1 | 2 068 | 1.73122 | 6.85797 | 43.8749 | 3.6165e12 | 0.42 s |
+| 2 | 8 272 | 1.73222 | 6.85626 | 43.9042 | 3.5999e12 | 3.07 s |
+| 3 | 18 612 | 1.73255 | 6.85567 | 43.9127 | 3.5948e12 | 12.40 s |
+| 4 | 33 088 | 1.73271 | 6.85535 | 43.9165 | 3.5924e12 | 35.66 s |
+
+**One element per panel is converged.** From subdivision 1 to 4 the area moves
+0.086%, the neutral axis 2.6 mm and the second moment 0.095%, while the element
+count moves sixteenfold. The one quantity with plate bending in it — the torsional
+stiffness — moves 0.67%, seven times as much, which is the same membrane/bending
+split the junction measurements make.
+
+So a hold-sized Tier-1 section is **2 068 elements**, a quarter of the ~8 000 where
+Tier 2's per-element stiffness store leaves L3. That ceiling is a property of an
+explicit solve touching every element every step and it does not apply here. What
+does bind is the **interface**: a transverse cut of this ferry is 195 panel corners
+and therefore 2 340 boundary DOF at subdivision 1 — the whole of the reduced model
+at zero modes and 93% of it with the 178 the cutoff asks for — and
+`ΨᵀMΨ` is `O(n_i n_b²)` — so refining costs sixteen times per doubling and buys
+0.05%.
+
+**`ReduceParams`' default is wrong at this size and says nothing about it.** With the
+hold's lowest fixed-interface frequency at 0.78 Hz, the 20 Hz cutoff asks for **178
+modes**; that takes 275 s and the subspace iteration does not converge in its 60
+iterations. Guyan alone is 6.2 s and is exactly right at the interface for any static
+load. A substructure softer than the ship it belongs to is a sign that the section is
+not yet a component, not a reason to keep more modes.
+
+#### Thickness seams: taper rather than stop
+
+`zone.hpp` §2 stops a patch at a plate thickness seam. A section cannot: the ferry's
+shell crosses four seams per side between keel and sheer, and stopping at each would
+deliver eight loose girth bands. So each mid-surface node carries the area-weighted
+mean thickness of the sub-quads round it and the taper lands inside one element
+either side of the seam — `dt/t = 0.131` at worst on this ship, which
+`07-fem-spike-findings.md` §6 limit 1 prices at 154% excess *plate bending* stiffness.
+
+That sounds fatal and is not, for the same reason the junctions do not matter to
+`EA`: the excess is on the plating's own bending about its own mid-surface, which is
+0.0175 m⁴ of the ferry's 46.2 m⁴ — **0.038%**. Measured directly on a box whose flanges
+step from 10 mm to 16 mm, `ThicknessSeam::Split` (every element exactly prismatic,
+section disconnected at the strake) and `ThicknessSeam::Taper` differ in `EA` by
+**4.5e-7**, at a taper the spike's rule prices at 610%.
+
+**What the taper does cost is stiffener steel, and mutation testing is what found
+it.** `constraint::addStiffener` turns one `plateThickness` into one tie weight per
+fibre, `(e + t/2)/t`, and applies it to a node pair whose real separation is the
+*local* nodal thickness — so a member run crossing a seam, where that thickness is a
+mean of two strakes, puts its fibres at `e·t_local/t_run`. Measured on the ferry:
+**47 mm** out on a 700 mm frame, a quarter of its Steiner term in the wrong place,
+and invisible in `EA`, in `EI` and in the mass. A run therefore stops at a thickness
+change, and the seam station — whose neighbours both differ from it — is left in a run
+of one and dropped. That costs **5.2% of the section's member steel** (146.8 t against
+139.1 t) and **none** of its longitudinally effective member area, because a
+longitudinal runs along the ship at constant thickness and it is the athwartships
+members that cross strakes. Missing steel is visible in a mass; a misplaced
+eccentricity is not, which is the direction to fail in. The fix that costs neither is
+a per-station thickness in `constraint::SeamRun`, and it is that file's change rather
+than this one's.
+
+#### Three smaller things worth carrying
+
+- **Cut on a frame station, not at a bulkhead.** The obvious place to cut a ship is
+  at a watertight bulkhead, and on this ship it is the wrong place: the bulkheads are
+  at x = −44, −38, −8, 20 and 44 and the frames are multiples of 2.4 m, so a bulkhead
+  plane passes through **188 panels**. They are dropped and counted, which is why the
+  28 m bulkhead cut ends up with *less* plating per metre than the 26.4 m frame cut.
+- **The interface has to be chosen on the mid-surface.**
+  `reduction::nodesNearPlanes` at anything like its 1e-9 default keeps only the node
+  of each through-thickness pair that happened to land on the plane, and the plating's
+  normal leans out of the transverse direction wherever the hull is not
+  parallel-sided — up to `t/2`, 8 mm on this ship. Half an interface is not a cut, it
+  is a hinge. Measured and asserted on a section forward of amidships, where the
+  node-based rule returns strictly fewer nodes than the mid-surface one.
+- **The node numbering is a hundredfold, not a rounding.** `solidshell::solveStatic`
+  numbers its free DOF in the mesh's own order and has no renumbering pass, unlike
+  `reduction::Substructure`. Which ordering is right is a property of the section — a
+  hold has twelve stations along x and hundreds round the girth, a slender box is the
+  other way round — so three candidates are built and the narrowest kept, including
+  `reduction::bandwidthReducingOrder`, which is exposed for this. Getting it wrong
+  cost a 6 240-DOF solve **9.53 s instead of 0.06**, and took the ferry hold's
+  half-bandwidth from 146 to 1 382 — 0.14 s of banded factorisation against 5.3.
+
+#### What mutation testing found
+
+40 mutants, each a single plausible edit, run against the section suite alone with a
+per-mutant timeout. The first pass killed 27 and every one of the nine survivors was
+a real hole or an equivalent mutant; **39 are killed now and the one that survives is
+argued equivalent.** The ones worth recording:
+
+- **A tie weight computed against the wrong thickness** — the 47 mm defect above.
+  It was found by a mutant that swapped the meshed thickness for the member's own
+  nominal one, which changed *nothing measurable*, which is what made it worth
+  looking at. The invariant that kills it now is that a fibre's tied point sits at
+  the offset the fibre records, from its own pair's mid-surface: exact to **1.8e-13 m**
+  where it had been 4.7e-2.
+- **The weld radius and the bucket probe mask each other.** Comparing the squared
+  distance against the tolerance rather than against its square makes the weld radius
+  a millimetre — and the mutant survived a test that nudged a panel by ten microns,
+  because the bucket probe never looks that far. It dies at **three** microns, inside
+  the probe's reach and outside the tolerance, where only the distance test can
+  refuse it.
+- **Reversing whole plates proves nothing about orientation.** A test that flipped
+  every other *panel* in the list flipped whole surfaces, so their normals still all
+  agreed and a mutant that dropped the orientation walk entirely survived. It dies
+  when alternate *bays within* each surface are flipped, which is what
+  `makeStructuralMesh` actually does when it mirrors the starboard side.
+- **`spanningComponents` and `floatingComponents` are not the same test.** A
+  component reaching one cut plane and stopping is restrained, so nothing refuses it,
+  and it carries none of the section's axial or bending stiffness. Only a case with
+  such a component tells the two apart.
+- **The junction census must exclude a surface's own plating**, or it degenerates
+  into "this edge is free" and the ferry's 370 m means nothing. The control is a
+  single flat plate, whose two long edges are free and whose junction length must be
+  zero.
+- The one **equivalent** mutant halves the welder's bucket size. It cannot matter,
+  because the probe's reach is computed from the tolerance and the cell rather than
+  hard-coded — which is the fix `zone.cpp` made after exactly this mutant survived
+  there.
+
+#### What it does not do
+
+1. **It cannot weld a junction**, for the two independent reasons above: the input
+   shares no corner across one, and a solid-shell node pair has one thickness
+   direction where a corner has two. What would close one honestly is a tie between
+   two plates' node pairs — the non-matching interface `constraint.hpp`'s header
+   already names as the missing case — or a small element filling the corner. Until
+   then a section is right for the hull girder's axial and bending stiffness and wrong
+   for torsion, transverse shear, and every frequency.
+2. **It takes one material.** A section spanning two is meshed entirely as the first
+   and says so; on this ship the weather deck's mild steel differs from AH36 in yield
+   alone, so nothing the reduction reads is affected.
+3. **A member is only picked up where it runs along a panel seam.** A girder
+   positioned off the longitudinal spacing is invisible to a mesh built from panels,
+   which is 0.075 m² and 4% of this ferry's section area. It is reported rather than
+   quietly absorbed.
+4. **A member touching two surfaces is refused rather than projected.** The
+   eccentricity is measured along the plating's thickness direction, and a member
+   reaching a corner picks up node pairs whose directions are 90° apart. Twelve of
+   this ship's members in a two-bay section; the alternative is a plausible wrong
+   second moment.
 
 ### Tier-1 to Tier-2 coupling — **implemented**
 

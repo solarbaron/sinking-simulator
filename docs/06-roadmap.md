@@ -361,8 +361,15 @@ The longest and highest-risk phase.
   plate meshed and solved in one piece, the coupled zone reproduces the monolithic
   punch reaction exactly and its displacement field to **1.06e-15 m of a 2.0e-4 m
   peak**, at 0, 4 and 12 modes alike, where the clamped zone it replaces is **74%**
-  out and 433× too stiff. What is still missing is the *mesher*: nothing yet cuts a
-  ship into hold-sized components, so synthesis still has more join than pieces.
+  out and 433× too stiff. The *mesher* that was missing now exists —
+  `engine/sim/section.{hpp,cpp}`, `docs/02-simulation.md` §3 — and cuts a region
+  between two transverse planes: a hold of the ferry is 2 068 elements and agrees
+  with `hullGirderSection` to 0.3% on area and second moment once the girders it
+  cannot attach are accounted for. What it cannot do is **weld a junction**, because
+  `makeStructuralMesh` shares no corner between two panel roles and a solid-shell
+  node pair carries one thickness direction where a corner has two. So a section is
+  right for the hull girder and wrong for torsion and for every frequency, and the
+  next piece is a tie across a non-matching interface rather than another mesher.
   The section
   reduction also carries plating only, because the zone meshed plating only — a collision that opens
   fourteen bays leaves their longitudinals at full strength, which is the
@@ -569,9 +576,11 @@ The longest and highest-risk phase.
 
   With the zone solver, the Tier-0 coupling and the Craig–Bampton reduction done,
   **the largest thing outstanding in Phase 3 is the Tier-1 coupling** — three
-  pieces, none of which is the reduction itself. A **mesher** that can produce a
+  pieces, none of which is the reduction itself. A ~~**mesher** that can produce a
   hold-sized substructure, since the only one that exists is `zone::buildPatch`:
-  plating only, within a radius, stopping at thickness seams. An **assembly** pass
+  plating only, within a radius, stopping at thickness seams~~ — **done**,
+  `engine/sim/section.{hpp,cpp}`, with the junctions between panel roles named as
+  what it cannot do. An **assembly** pass
   that matches two substructures' interfaces and stacks their modal blocks, which
   is what makes component mode synthesis a synthesis. And a **two-way zone
   interface**, so a promoted zone is driven by the structure around it instead of

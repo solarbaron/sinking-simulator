@@ -429,6 +429,11 @@ double vonMises(const double s[6]) {
 
 }  // namespace
 
+std::vector<std::uint32_t> bandwidthReducingOrder(
+    const std::vector<std::vector<std::uint32_t>>& adjacency) {
+    return reverseCuthillMcKee(adjacency);
+}
+
 // --- Public dense eigensolvers ---------------------------------------------------
 
 Eigenpairs symmetricEigen(const std::vector<double>& a, int n) {
