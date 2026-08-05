@@ -551,4 +551,83 @@ struct Validity {
 Validity checkValidity(const Substructure& substructure, const Reduction& reduced,
                        const std::vector<double>& state);
 
+// --- Synthesis: coupling two reduced components ----------------------------------
+//
+// Reduction alone is not component mode *synthesis*. Until two substructures can be
+// joined at a shared interface it is one component, and one component is a
+// curiosity: the whole point of the tier is that a ship is built from pieces that
+// are reduced once and then assembled cheaply.
+//
+// The coupling is exact and it is nothing more than addition, which is the reason
+// the reduced DOF are ordered boundary-first. Two components meeting at an
+// interface must have the same displacement there, so their shared boundary DOF
+// *are* the same unknown; every other DOF is its own. Assembling is therefore
+// scatter-add of both reduced pairs into one, with shared boundary DOF landing on
+// the same row and column and the modal blocks stacked side by side. Nothing is
+// approximated at this step -- whatever error the assembled model has, it came
+// from truncating each component's modes, not from joining them.
+//
+// **Interface mass is not double counted, and it is worth saying why**, because it
+// looks as though it should be. Each element belongs to exactly one component, and
+// a component's lumped mass at a shared node comes only from *its own* elements.
+// A node on the interface therefore receives part of its mass from each side and
+// the sum is the mass the unsplit model had. Splitting a mesh by *node* instead of
+// by element would double it, which is the mistake this note exists to prevent.
+
+// Which boundary DOF of two substructures are the same physical DOF.
+//
+// Matched by position, because two independently built meshes share no numbering.
+// A DOF matches only if the node coincides within `tolerance` **and the axis is the
+// same** -- without the axis check a coincident node would couple x to y and the
+// assembled model would be quietly, plausibly wrong.
+struct InterfaceMap {
+    // For each boundary index of A, the boundary index of B it coincides with, or
+    // -1 for a DOF that A does not share.
+    std::vector<int> aToB;
+    std::size_t shared = 0;
+    double worstGap = 0;  // m, the furthest apart a matched pair actually was
+    std::vector<std::string> problems;
+};
+
+InterfaceMap matchBoundaries(const Substructure& a, const Substructure& b,
+                             double tolerance = 1e-9);
+
+// Two reduced components coupled at their shared boundary.
+//
+// Assembled DOF are ordered: A's boundary, then B's *unshared* boundary, then A's
+// modal coordinates, then B's. `fromA` and `fromB` give the assembled index of
+// each component reduced DOF, which is what a caller needs to place a load or read
+// a component's state back out.
+struct Assembly {
+    int boundary = 0;  // the union of the two boundary sets, shared counted once
+    int modes = 0;     // a.modes + b.modes
+    int size() const { return boundary + modes; }
+
+    std::vector<double> stiffness;  // N/m
+    std::vector<double> mass;       // kg
+
+    std::vector<int> fromA;  // size = reduction A's size()
+    std::vector<int> fromB;  // size = reduction B's size()
+
+    std::vector<std::string> problems;
+    bool empty() const { return size() == 0; }
+};
+
+Assembly assemble(const Reduction& a, const Reduction& b, const InterfaceMap& map);
+
+// Natural frequencies of an assembled model, rad/s ascending, with the listed
+// assembled DOF held. The same upper-bound property holds as for one component.
+std::vector<double> assembledFrequencies(const Assembly& assembly,
+                                         const std::vector<std::uint32_t>& held);
+
+// Solve K x = f on an assembled model, with `held` fixed at zero.
+bool assembledStaticSolve(const Assembly& assembly, const std::vector<double>& load,
+                          const std::vector<std::uint32_t>& held, std::vector<double>& state,
+                          std::string* problem = nullptr);
+
+// The part of an assembled state belonging to one component, in that component's
+// own reduced DOF order -- what `recover()` wants.
+std::vector<double> componentState(const Assembly& assembly, const std::vector<int>& from,
+                                   const std::vector<double>& state);
+
 }  // namespace sim::reduction

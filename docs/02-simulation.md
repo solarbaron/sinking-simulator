@@ -1870,10 +1870,11 @@ The cost saving on the same patch of the ferry's side is **2800×**, not 10⁻�
 "a few percent for the frequency range that matters" needs the frequency range
 named: the standard cutoff at twice the band of interest buys **0.6% inside the
 10 Hz hull-girder band and 8% up to 20 Hz**, and five or six times the band is
-what buys a part in ten thousand. What does not exist yet is a mesher that can
-produce a whole-ship substructure, or the pass that assembles two of them, so
-"everything away from damage stays here forever" is still the plan rather than
-the code.
+what buys a part in ten thousand. The pass that assembles two substructures now exists
+(`assemble`, §below); what does not is a mesher that can produce a whole-ship
+substructure to feed it, so "everything away from damage stays here forever" is
+still the plan rather than the code — the join is built and there is nothing yet
+worth joining.
 
 **Tier 2 — full nonlinear tet FEM, adaptive.** Around an impact, a fire, or a
 growing crack, a region is *promoted*: the reduced model is replaced by genuine
@@ -3080,10 +3081,35 @@ against the full model's 11.08 MPa with Guyan alone, converging to 11.01 MPa wit
    the only mesher that produces one is `zone::buildPatch` — plating only, within
    a radius, stopping at thickness seams. A hold-sized substructure is a mesher
    problem, not a reduction problem, and it is the next piece.
-2. **Nothing assembles two substructures.** Boundary DOF are kept exactly and
-   listed in the global numbering, so a reduced model is couplable by
-   construction; what does not exist is the pass that matches two interfaces and
-   stacks the modal blocks. Component mode *synthesis* is still one component.
+2. ~~**Nothing assembles two substructures.**~~ **Done** — `matchBoundaries()` and
+   `assemble()`. Two components meeting at an interface have the same displacement
+   there, so their shared boundary DOF *are* the same unknown and coupling is
+   scatter-add of both reduced pairs into one, shared boundary landing on the same
+   row and column, modal blocks stacked. Exact: nothing is approximated at the
+   join, and whatever error the assembled model carries came from truncating each
+   component's modes.
+
+   Validated against the structure it claims to reproduce — a plate split down the
+   middle by element, each half reduced independently, against the same plate
+   meshed in one piece whose free-free spectrum is formed densely from the operator
+   and owes nothing to the reduction. Worst of the first four elastic modes:
+   **16 at zero modes a side, 4.6e-3 at four, 2.6e-5 at twelve**, always from above.
+   The zero-mode figure is the useful one — Guyan is *exact* for statics and
+   1600% wrong for dynamics, which is the whole reason the normal modes are there.
+
+   Two controls, because a wrong assembly still produces a full set of plausible
+   frequencies. Halves that were never coupled have **twelve** rigid body modes
+   rather than six, each floating free of the other; without that the test passes
+   on an assembly that joined nothing. And the split must be by *element*, asserted
+   through total mass — splitting by **node** would count the interface mass twice
+   and pull every frequency down while looking entirely reasonable.
+
+   Matching requires the **axis** to agree and not merely the position: a
+   coincident node would otherwise couple x to y, and the assembled model would be
+   wrong in the way that is hardest to see.
+
+   What is still missing is the *mesher*, item 1 — two components can now be
+   joined, but nothing yet cuts a ship into components worth joining.
 3. **A zone's edge is still clamped.** `zone.hpp` §5 item 1 and `promotion.hpp`
    are unchanged by this file's arrival: the two-way coupling needs something that
    drives interface DOF from the surrounding structure instead of pinning them.

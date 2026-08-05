@@ -1453,4 +1453,204 @@ Validity checkValidity(const Substructure& sub, const Reduction& reduced,
     return out;
 }
 
+// --- Synthesis -------------------------------------------------------------------
+
+namespace {
+
+// Solve a dense symmetric system with some DOF held at zero. Shared by the one
+// component and the assembled paths, which differ only in where the matrix lives.
+bool solveHeld(const std::vector<double>& stiffness, std::size_t n,
+               const std::vector<double>& load, const std::vector<std::uint32_t>& held,
+               std::vector<double>& state, std::string* problem) {
+    state.assign(n, 0.0);
+    if (n == 0) {
+        if (problem) *problem = "the model is empty";
+        return false;
+    }
+    std::vector<std::uint8_t> fixed(n, 0);
+    for (std::uint32_t d : held)
+        if (d < n) fixed[d] = 1;
+    std::vector<std::ptrdiff_t> map(n, -1);
+    std::size_t free = 0;
+    for (std::size_t d = 0; d < n; ++d)
+        if (!fixed[d]) map[d] = static_cast<std::ptrdiff_t>(free++);
+    if (free == 0) return true;
+
+    std::vector<double> a(free * free, 0.0), rhs(free, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (map[i] < 0) continue;
+        const std::size_t ii = static_cast<std::size_t>(map[i]);
+        rhs[ii] = i < load.size() ? load[i] : 0.0;
+        for (std::size_t j = 0; j < n; ++j)
+            if (map[j] >= 0)
+                a[ii * free + static_cast<std::size_t>(map[j])] = stiffness[i * n + j];
+    }
+    if (!cholesky(a, static_cast<int>(free))) {
+        if (problem)
+            *problem = "the stiffness is singular with what is held: a rigid body mode is free";
+        return false;
+    }
+    forwardSolve(a, static_cast<int>(free), rhs.data());
+    backwardSolve(a, static_cast<int>(free), rhs.data());
+    for (std::size_t d = 0; d < n; ++d)
+        if (map[d] >= 0) state[d] = rhs[static_cast<std::size_t>(map[d])];
+    return true;
+}
+
+}  // namespace
+
+InterfaceMap matchBoundaries(const Substructure& a, const Substructure& b, double tolerance) {
+    InterfaceMap out;
+    if (!a.ready() || !b.ready()) {
+        out.problems.push_back("a substructure is not ready, so its boundary means nothing");
+        return out;
+    }
+    const std::vector<std::uint32_t>& da = a.boundaryDof();
+    const std::vector<std::uint32_t>& db = b.boundaryDof();
+    const std::vector<double>& pa = a.mesh().position;
+    const std::vector<double>& pb = b.mesh().position;
+    out.aToB.assign(da.size(), -1);
+
+    const double tol2 = tolerance * tolerance;
+    std::vector<std::uint8_t> takenB(db.size(), 0);
+    for (std::size_t i = 0; i < da.size(); ++i) {
+        const std::uint32_t axis = da[i] % 3u;
+        const std::size_t na = da[i] / 3u;
+        if (3 * na + 2 >= pa.size()) continue;
+        for (std::size_t j = 0; j < db.size(); ++j) {
+            // The axis must agree. Matching on position alone would let a
+            // coincident node couple x to y, and the assembled model would be
+            // wrong in a way that still produces plausible numbers.
+            if (takenB[j] || db[j] % 3u != axis) continue;
+            const std::size_t nb = db[j] / 3u;
+            if (3 * nb + 2 >= pb.size()) continue;
+            const double dx = pa[3 * na] - pb[3 * nb];
+            const double dy = pa[3 * na + 1] - pb[3 * nb + 1];
+            const double dz = pa[3 * na + 2] - pb[3 * nb + 2];
+            const double d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > tol2) continue;
+            out.aToB[i] = static_cast<int>(j);
+            takenB[j] = 1;
+            out.shared++;
+            out.worstGap = std::max(out.worstGap, std::sqrt(d2));
+            break;
+        }
+    }
+    if (out.shared == 0)
+        out.problems.push_back("the two substructures share no boundary DOF at this tolerance, so "
+                               "assembling them would produce two independent models side by side");
+    return out;
+}
+
+Assembly assemble(const Reduction& a, const Reduction& b, const InterfaceMap& map) {
+    Assembly out;
+    if (a.empty() || b.empty()) {
+        out.problems.push_back("a component reduction is empty");
+        return out;
+    }
+    if (map.aToB.size() != static_cast<std::size_t>(a.boundary)) {
+        out.problems.push_back("the interface map does not describe component A's boundary");
+        return out;
+    }
+    for (int i : map.aToB)
+        if (i >= b.boundary) {
+            out.problems.push_back("the interface map points past component B's boundary");
+            return out;
+        }
+
+    // A's boundary first, then B's unshared boundary, then the modal blocks.
+    std::vector<int> bBoundary(static_cast<std::size_t>(b.boundary), -1);
+    for (std::size_t i = 0; i < map.aToB.size(); ++i)
+        if (map.aToB[i] >= 0) bBoundary[static_cast<std::size_t>(map.aToB[i])] =
+                static_cast<int>(i);
+    int next = a.boundary;
+    for (std::size_t j = 0; j < bBoundary.size(); ++j)
+        if (bBoundary[j] < 0) bBoundary[j] = next++;
+
+    out.boundary = next;
+    out.modes = a.modes + b.modes;
+    const std::size_t n = static_cast<std::size_t>(out.size());
+    out.stiffness.assign(n * n, 0.0);
+    out.mass.assign(n * n, 0.0);
+
+    out.fromA.assign(static_cast<std::size_t>(a.size()), -1);
+    for (int i = 0; i < a.boundary; ++i) out.fromA[static_cast<std::size_t>(i)] = i;
+    for (int j = 0; j < a.modes; ++j)
+        out.fromA[static_cast<std::size_t>(a.boundary + j)] = out.boundary + j;
+
+    out.fromB.assign(static_cast<std::size_t>(b.size()), -1);
+    for (int i = 0; i < b.boundary; ++i)
+        out.fromB[static_cast<std::size_t>(i)] = bBoundary[static_cast<std::size_t>(i)];
+    for (int j = 0; j < b.modes; ++j)
+        out.fromB[static_cast<std::size_t>(b.boundary + j)] = out.boundary + a.modes + j;
+
+    // Scatter-add. Shared boundary DOF land on the same row and column, which is
+    // the whole of the coupling: two components meeting at an interface have the
+    // same displacement there, so those are the same unknown.
+    const auto scatter = [&](const Reduction& r, const std::vector<int>& from) {
+        const std::size_t m = static_cast<std::size_t>(r.size());
+        for (std::size_t i = 0; i < m; ++i) {
+            const int ri = from[i];
+            if (ri < 0) continue;
+            for (std::size_t j = 0; j < m; ++j) {
+                const int rj = from[j];
+                if (rj < 0) continue;
+                out.stiffness[static_cast<std::size_t>(ri) * n + static_cast<std::size_t>(rj)] +=
+                    r.stiffness[i * m + j];
+                out.mass[static_cast<std::size_t>(ri) * n + static_cast<std::size_t>(rj)] +=
+                    r.mass[i * m + j];
+            }
+        }
+    };
+    scatter(a, out.fromA);
+    scatter(b, out.fromB);
+
+    for (const std::string& p : map.problems) out.problems.push_back(p);
+    return out;
+}
+
+std::vector<double> assembledFrequencies(const Assembly& assembly,
+                                         const std::vector<std::uint32_t>& held) {
+    const std::size_t n = static_cast<std::size_t>(assembly.size());
+    std::vector<std::uint8_t> fixed(n, 0);
+    for (std::uint32_t d : held)
+        if (d < n) fixed[d] = 1;
+    std::vector<std::size_t> keep;
+    for (std::size_t d = 0; d < n; ++d)
+        if (!fixed[d]) keep.push_back(d);
+    const std::size_t f = keep.size();
+    if (f == 0) return {};
+
+    std::vector<double> k(f * f), m(f * f);
+    for (std::size_t i = 0; i < f; ++i)
+        for (std::size_t j = 0; j < f; ++j) {
+            k[i * f + j] = assembly.stiffness[keep[i] * n + keep[j]];
+            m[i * f + j] = assembly.mass[keep[i] * n + keep[j]];
+        }
+    const Eigenpairs spectrum = generalisedEigen(k, m, static_cast<int>(f));
+    std::vector<double> out;
+    out.reserve(f);
+    for (double value : spectrum.value) out.push_back(std::sqrt(std::max(0.0, value)));
+    return out;
+}
+
+bool assembledStaticSolve(const Assembly& assembly, const std::vector<double>& load,
+                          const std::vector<std::uint32_t>& held, std::vector<double>& state,
+                          std::string* problem) {
+    return solveHeld(assembly.stiffness, static_cast<std::size_t>(assembly.size()), load, held,
+                     state, problem);
+}
+
+std::vector<double> componentState(const Assembly& assembly, const std::vector<int>& from,
+                                   const std::vector<double>& state) {
+    std::vector<double> out(from.size(), 0.0);
+    for (std::size_t i = 0; i < from.size(); ++i) {
+        const int a = from[i];
+        if (a >= 0 && static_cast<std::size_t>(a) < state.size())
+            out[i] = state[static_cast<std::size_t>(a)];
+    }
+    (void)assembly;
+    return out;
+}
+
 }  // namespace sim::reduction

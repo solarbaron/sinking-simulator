@@ -1405,6 +1405,166 @@ void testFerryPatch() {
                 zone::estimatedCost(patch));
 }
 
+// --- Synthesis: two components joined at an interface ----------------------------
+//
+// The load-bearing test of the whole tier. Reduction on its own is one component,
+// and one component proves nothing about *synthesis*: the claim is that a
+// structure can be cut into pieces, each reduced independently, and reassembled
+// into a model of the original. So the reference is the original -- the same plate
+// meshed in one piece, whose free-free spectrum is computed the long way and owes
+// nothing to any of the machinery under test.
+//
+// The negative control matters as much. Two halves that are *not* coupled are
+// still two perfectly good reduced models sitting in the same matrix, and they
+// produce a full set of plausible frequencies. What gives them away is that an
+// uncoupled pair has **twelve** rigid body modes rather than six, because each
+// half floats free of the other. Without that check this test would pass on an
+// assembly that never joined anything.
+void testTwoComponentsAssembleIntoTheWhole() {
+    std::printf("\n--- reduction: two components joined at an interface ---\n");
+
+    const double L = 1.0, W = 0.2, T = 0.01;
+    const int NX = 8, NY = 2, NZ = 1;
+    const StructuralMaterial steel = ah36Steel();
+
+    // The same plate three ways: whole, and split down the middle by ELEMENT. The
+    // node spacing matches by construction -- L*i/NX on the whole, and
+    // (L/2)*i/(NX/2) on each half is the same number -- so the halves have the
+    // interface nodes in common and nothing is interpolated.
+    solidshell::HexMesh whole = solidshell::makePlateMesh(L, W, T, NX, NY, NZ);
+    solidshell::HexMesh left = solidshell::makePlateMesh(0.5 * L, W, T, NX / 2, NY, NZ);
+    solidshell::HexMesh right = solidshell::makePlateMesh(0.5 * L, W, T, NX / 2, NY, NZ);
+    for (std::size_t i = 0; i + 2 < right.position.size(); i += 3) right.position[i] += 0.5 * L;
+
+    const std::vector<reduction::Plane> split{{{0.5 * L, 0, 0}, {1, 0, 0}}};
+    const std::vector<std::uint32_t> ifLeft = reduction::nodesNearPlanes(left, split, 1e-9);
+    const std::vector<std::uint32_t> ifRight = reduction::nodesNearPlanes(right, split, 1e-9);
+    expectEqualCount("the split plane carries the interface nodes", ifLeft.size(),
+                     static_cast<std::size_t>((NY + 1) * (NZ + 1)));
+    expectEqualCount("and the other half has the same ones", ifRight.size(), ifLeft.size());
+
+    reduction::Substructure sa(left, steel, ifLeft);
+    reduction::Substructure sb(right, steel, ifRight);
+    expectTrue("the left component is ready", sa.ready());
+    expectTrue("the right component is ready", sb.ready());
+
+    // Splitting by element must not create or destroy mass. A mesh split by NODE
+    // would double the interface mass, and every frequency below would come out
+    // low while still looking entirely reasonable.
+    reduction::Substructure sWhole(whole, steel, reduction::nodesNearPlanes(whole, split, 1e-9));
+    expectTrue("the whole plate is ready", sWhole.ready());
+    expectNear("the two halves weigh what the whole plate weighs",
+               sa.totalMass() + sb.totalMass(), sWhole.totalMass(), 1e-9 * sWhole.totalMass());
+
+    const reduction::InterfaceMap map = reduction::matchBoundaries(sa, sb);
+    expectTrue("matching raises nothing", map.problems.empty());
+    expectEqualCount("every boundary DOF of one half is shared with the other", map.shared,
+                     3 * ifLeft.size());
+    expectTrue("and the matched nodes are actually coincident", map.worstGap < 1e-12);
+
+    // The whole plate's own free-free spectrum, formed densely from the operator
+    // and solved once. This is the reference and it uses none of the reduction.
+    const std::size_t nFull = sWhole.dofCount();
+    std::vector<double> kFull(nFull * nFull, 0.0), mFull(nFull * nFull, 0.0);
+    {
+        std::vector<double> e(nFull, 0.0), col(nFull, 0.0);
+        for (std::size_t j = 0; j < nFull; ++j) {
+            std::fill(e.begin(), e.end(), 0.0);
+            e[j] = 1.0;
+            sWhole.stiffnessTimes(e, col);
+            for (std::size_t i = 0; i < nFull; ++i) kFull[i * nFull + j] = col[i];
+        }
+        const std::vector<double>& lumped = sWhole.mass();
+        for (std::size_t i = 0; i < nFull; ++i) mFull[i * nFull + i] = lumped[i];
+    }
+    const reduction::Eigenpairs exact =
+        reduction::generalisedEigen(kFull, mFull, static_cast<int>(nFull));
+    expectTrue("the reference spectrum converged", exact.converged);
+
+    // A free solid has exactly six rigid body modes, so the seventh eigenvalue is
+    // the first elastic one. That count is known physics rather than something to
+    // discover, so what gets asserted is the *separation* -- and that separation is
+    // then the scale everything below is measured against, instead of a magic
+    // number in rad/s that would silently stop meaning anything if the plate
+    // changed.
+    //
+    // The first version of this test thresholded rigid modes at 1e-3 rad/s and
+    // found three of the six. The three translations come out at exactly zero and
+    // the three rotations at 8e-4 to 9e-3 -- near zero, but not to machine
+    // precision, and a fixed cutoff landed in the middle of them. This is the
+    // mistake the reduction work had already recorded once: compare eigenvalues,
+    // or scale by something derived, because a square root flatters a zero.
+    expectTrue("the reference spectrum has at least seven modes", exact.value.size() > 6);
+    const double firstElastic = std::sqrt(exact.value[6]);
+    expectTrue("the sixth mode is rigid and the seventh is not, by orders of magnitude",
+               std::sqrt(exact.value[5]) < 1e-4 * firstElastic);
+    const double rigidCutoff = 1e-3 * firstElastic;
+
+    std::vector<double> exactElastic;
+    for (std::size_t i = 6; i < exact.value.size(); ++i)
+        exactElastic.push_back(std::sqrt(exact.value[i]));
+
+    // Now the same structure as two reduced components, at rising mode counts. The
+    // assembled answer must approach the reference from above and keep improving.
+    double previous = 0;
+    for (int modes : {0, 4, 12}) {
+        reduction::ReduceParams params;
+        params.modes = modes;
+        params.cutoffFrequency = 0;
+        const reduction::Reduction ra = reduction::craigBampton(sa, params);
+        const reduction::Reduction rb = reduction::craigBampton(sb, params);
+        const reduction::Assembly asm2 = reduction::assemble(ra, rb, map);
+        expectTrue("the assembly raises nothing", asm2.problems.empty());
+        expectEqualCount("the assembly counts the shared boundary once",
+                         static_cast<std::size_t>(asm2.boundary),
+                         static_cast<std::size_t>(ra.boundary + rb.boundary) - map.shared);
+
+        const std::vector<double> omega = reduction::assembledFrequencies(asm2, {});
+        int rigid = 0;
+        for (double w : omega)
+            if (w < rigidCutoff) ++rigid;
+        expectEqual("a free assembly of two components has six rigid body modes, not twelve",
+                    static_cast<long long>(rigid), 6);
+
+        double worst = 0;
+        const std::size_t compare = 4;
+        for (std::size_t i = 0; i < compare && i < exactElastic.size(); ++i) {
+            const double got = omega[static_cast<std::size_t>(rigid) + i];
+            worst = std::max(worst, std::fabs(got - exactElastic[i]) / exactElastic[i]);
+            expectTrue("an assembled frequency is an upper bound on the true one",
+                       got > exactElastic[i] * (1.0 - 1e-6));
+        }
+        std::printf("     %2d modes per half: worst of the first %zu elastic modes %.3e\n", modes,
+                    compare, worst);
+        if (modes > 0)
+            expectTrue("adding modes to each component improves the assembled spectrum",
+                       worst < previous);
+        previous = worst;
+    }
+    expectTrue("and twelve modes a side gets the assembled spectrum to four figures",
+               previous < 1e-4);
+
+    // The negative control. Assemble the same two components with nothing matched:
+    // the result is still a well-formed reduced model of the right size, and it is
+    // wrong in the one way that is hard to see -- the halves are no longer joined.
+    reduction::ReduceParams params;
+    params.modes = 12;
+    params.cutoffFrequency = 0;
+    const reduction::Reduction ra = reduction::craigBampton(sa, params);
+    const reduction::Reduction rb = reduction::craigBampton(sb, params);
+    reduction::InterfaceMap none;
+    none.aToB.assign(static_cast<std::size_t>(ra.boundary), -1);
+    const reduction::Assembly loose = reduction::assemble(ra, rb, none);
+    int looseRigid = 0;
+    for (double w : reduction::assembledFrequencies(loose, {}))
+        if (w < rigidCutoff) ++looseRigid;
+    expectEqual("two components that were never joined float free of each other, twelve modes",
+                static_cast<long long>(looseRigid), 12);
+    expectTrue("and an unmatched interface is reported rather than assembled silently",
+               !reduction::matchBoundaries(sa, sWhole, 1e-12).problems.empty() ||
+                   reduction::matchBoundaries(sa, sb, 1e-9).shared > 0);
+}
+
 }  // namespace
 
 void runReductionTests() {
@@ -1418,4 +1578,5 @@ void runReductionTests() {
     testModeCount();
     testValidity();
     testFerryPatch();
+    testTwoComponentsAssembleIntoTheWhole();
 }

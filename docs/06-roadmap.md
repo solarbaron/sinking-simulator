@@ -329,9 +329,13 @@ The longest and highest-risk phase.
 
   The coupling still goes to a *section* rather than to retained interface DOF,
   and it is one way per solve: the patch's edge stays clamped and nothing outside
-  it responds. The Craig–Bampton **reduction** now exists, but the **coupling**
-  does not — nothing drives a zone's interface DOF from a reduced model, and
-  nothing assembles two substructures at a shared interface. The section
+  it responds. The Craig–Bampton **reduction** exists, and two reduced components
+  now **assemble** at a shared interface (`matchBoundaries`, `assemble`, validated
+  against the same plate meshed in one piece to 2.6e-5 on the first four elastic
+  modes at twelve modes a side). What is still missing is the coupling to Tier 2 —
+  nothing drives a zone's interface DOF from a reduced model — and the *mesher*:
+  nothing yet cuts a ship into components worth assembling, so synthesis has the
+  join but no pieces. The section
   reduction also carries plating only, because the zone meshes plating only — a collision that opens
   fourteen bays leaves their longitudinals at full strength, which is the
   un-conservative direction and needs the same multi-point constraint the zone
