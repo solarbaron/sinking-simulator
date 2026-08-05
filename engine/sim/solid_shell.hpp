@@ -433,6 +433,79 @@ struct DofBlock {
     std::vector<double> stiffness;  // dof.size()^2, row-major, symmetric
 };
 
+// --- Multi-point constraints ----------------------------------------------------
+//
+// **A `DofBlock` can only add stiffness, and that is why a junction between two
+// plates is not one.** `constraint.hpp` eliminates an eccentric stiffener's fibre
+// with a `Tie` and hands the result over as a block, and that works because the
+// fibre's endpoints are *not mesh nodes*: they have no rows of their own, so
+// `T^T K T` over the masters is the whole of what the fibre contributes. A
+// junction ties a node that **is** a mesh node, with elements of its own, and
+// eliminating it means changing rows that already exist rather than adding new
+// ones. No block can do that -- see `section.hpp` §5.
+//
+// So the constraint is carried as data and applied by the assembler. One slave
+// degree of freedom, written as a weighted sum of masters:
+//
+//     u[slave] = sum_a weight[a] * u[master[a]]
+//
+// The slave keeps no unknown of its own; `solveStatic` and
+// `reduction::Substructure` both scatter through the transformation, so the system
+// they factor **is** `T^T K T` and nothing is enforced by a penalty. A weight set
+// that sums to one reproduces every rigid body translation exactly, and one whose
+// masters interpolate a point reproduces a rigid rotation exactly as well -- the
+// same argument `constraint.hpp` §1 makes for its two-master case, which is this
+// with `master.size() == 2`.
+struct Mpc {
+    std::uint32_t slave = 0;
+    std::vector<std::uint32_t> master;
+    std::vector<double> weight;  // same length as `master`
+};
+
+// What every degree of freedom stands for once a set of `Mpc`s is applied: itself,
+// or the masters it was eliminated in favour of. Built once and shared by both
+// assemblers, so there is one place that decides what a constrained scatter means.
+//
+// **Chained constraints are refused, not resolved.** A master that is itself a
+// slave has a well-defined expansion and composing it silently is exactly the kind
+// of thing that turns a mesher bug into a plausible answer -- so is a degree of
+// freedom constrained twice. Both come back as `ok() == false` with a reason.
+class DofExpansion {
+public:
+    struct Term {
+        std::uint32_t dof;
+        double weight;
+    };
+
+    DofExpansion() = default;
+    DofExpansion(std::size_t dofCount, const std::vector<Mpc>& constrained);
+
+    bool ok() const { return ok_; }
+    const std::string& problem() const { return problem_; }
+    // True when nothing is constrained, in which case every expansion is the
+    // identity and both assemblers reduce to what they always did.
+    bool empty() const { return eliminated_ == 0; }
+    std::size_t eliminatedCount() const { return eliminated_; }
+    std::size_t dofCount() const { return isSlave_.size(); }
+    bool eliminated(std::uint32_t dof) const { return isSlave_[dof] != 0; }
+
+    const Term* begin(std::uint32_t dof) const { return term_.data() + start_[dof]; }
+    const Term* end(std::uint32_t dof) const { return term_.data() + start_[dof + 1]; }
+
+    // Fill every eliminated degree of freedom of `values` from its masters. What
+    // turns a solution over the free degrees of freedom back into one over the
+    // mesh's own.
+    void recover(std::vector<double>& values) const;
+
+private:
+    std::vector<std::size_t> start_;
+    std::vector<Term> term_;
+    std::vector<std::uint8_t> isSlave_;
+    std::size_t eliminated_ = 0;
+    bool ok_ = true;
+    std::string problem_;
+};
+
 // Assemble and solve K u = f. Pinned DOF take their prescribed values and their
 // contribution moves to the right-hand side, so a non-zero prescribed
 // displacement -- which is what a patch test is -- is handled exactly rather than
@@ -448,6 +521,20 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
 bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formulation form,
                  const std::vector<DofBlock>& extra, const std::vector<double>& load,
                  std::vector<double>& displacement, std::string* problem = nullptr);
+
+// The same, with multi-point constraints. Every scatter -- element, block, load and
+// prescribed term alike -- goes through the expansion, so the system factored is
+// `T^T K T` exactly and a slave degree of freedom is filled in afterwards from its
+// masters rather than solved for.
+//
+// **A constrained degree of freedom that the mesh also pins is refused.** The two
+// say different things about the same unknown and there is no reading of "both"
+// that is not a guess; a caller who wants the boundary to win should not have
+// constrained it.
+bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formulation form,
+                 const std::vector<DofBlock>& extra, const std::vector<Mpc>& constrained,
+                 const std::vector<double>& load, std::vector<double>& displacement,
+                 std::string* problem = nullptr);
 
 // Consistent nodal loads for a uniform pressure acting on every +zeta face that
 // lies on the boundary of the mesh -- the top surface of a plate. Positive

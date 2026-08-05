@@ -32,6 +32,7 @@
 #include "harness.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <numbers>
@@ -113,6 +114,25 @@ section::SectionParams boxParams(int subdivision = 1) {
     return p;
 }
 
+// The same box with the junction tie switched off -- what the mesher delivered
+// before §5 existed, and the negative control every junction claim below is made
+// against. It is also the *right* configuration for anything that is not about the
+// junctions: the tie joins the four corners, so a test of the welder or of the
+// closed-form `EI` would otherwise be measuring two things at once.
+section::SectionParams openBoxParams(int subdivision = 1) {
+    section::SectionParams p = boxParams(subdivision);
+    p.junctions = false;
+    return p;
+}
+
+// And with the corners welded instead: one node pair where two plates meet, which
+// is what `section.hpp` §1 refuses to build and §5 prices the tie against.
+section::SectionParams weldedBoxParams(int subdivision = 1) {
+    section::SectionParams p = openBoxParams(subdivision);
+    p.foldLimit = 2.0;
+    return p;
+}
+
 // Uniform-thickness closed forms.
 constexpr double kBoxArea = 2 * (kB + kH) * kT;
 // The plates' own second moment about their own centroids is in this and is *not*
@@ -142,7 +162,7 @@ constexpr double kBendingTolerance = 2e-6;
 
 void testBoxMesh() {
     const StructuralMesh structure = makeBox(kT, kT);
-    const section::Section cut = section::buildSection(structure, boxParams());
+    const section::Section cut = section::buildSection(structure, openBoxParams());
 
     expectEqualCount("box elements at subdivision 1", cut.elementCount(),
                      static_cast<std::size_t>(kNx) * (2 * kNy + 2 * kNz));
@@ -180,9 +200,7 @@ void testBoxMesh() {
     expectTrue("every interface node lies on a cut plane", worstOffPlane < 1e-12);
 
     // Welding the corners: one surface, no free edge, and the price is in §1.
-    section::SectionParams welded = boxParams();
-    welded.foldLimit = 2.0;
-    const section::Section joined = section::buildSection(structure, welded);
+    const section::Section joined = section::buildSection(structure, weldedBoxParams());
     expectEqual("raising the fold limit welds the box into one surface", joined.surfaces, 1);
     expectEqual("and one component", joined.components, 1);
     expectNear("with no free edge left", joined.freeEdgeLength, 0.0, 1e-12);
@@ -195,6 +213,123 @@ void testBoxMesh() {
     // `2 sin(pi/16)`. A closed form for the geometry §1 refuses to build.
     expectNear("the welded corner turns the thickness direction 22.5 degrees off the element",
                joined.worstNormalSpread, 2.0 * std::sin(std::numbers::pi / 16), 1e-9);
+
+    // --- And the third way, which is the one this file is now about --------------
+    //
+    // Tying moves no geometry at all: the same nodes, in the same places, still four
+    // surfaces, still every corner edge free in the element sense -- and one
+    // connected component, because the constraint joins what the weld would have
+    // merged. That combination is the whole claim: `surfaces` counts what shares
+    // nodes, `components` counts what is joined, and a tie separates the two
+    // questions for the first time.
+    const section::Section tied = section::buildSection(structure, boxParams());
+    expectEqual("tying leaves the box four surfaces", tied.surfaces, 4);
+    expectEqual("and one component", tied.components, 1);
+    expectEqual("which spans the section", tied.spanningComponents, 1);
+    expectEqualCount("with exactly the nodes the untied mesh had", tied.nodeCount(),
+                     cut.nodeCount());
+    {
+        // The same points, not the same indices: tying changes the numbering,
+        // because the ordering is chosen knowing which nodes the ties couple. So the
+        // two position arrays are compared as sorted sets.
+        std::vector<std::array<double, 3>> a, b;
+        for (std::size_t n = 0; n < tied.nodeCount(); ++n) {
+            a.push_back({tied.mesh.position[n * 3], tied.mesh.position[n * 3 + 1],
+                         tied.mesh.position[n * 3 + 2]});
+            b.push_back({cut.mesh.position[n * 3], cut.mesh.position[n * 3 + 1],
+                         cut.mesh.position[n * 3 + 2]});
+        }
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        double worst = 0;
+        for (std::size_t n = 0; n < a.size(); ++n)
+            for (int k = 0; k < 3; ++k)
+                worst = std::max(worst, std::abs(a[n][static_cast<std::size_t>(k)] -
+                                                 b[n][static_cast<std::size_t>(k)]));
+        expectNear("in exactly the same places", worst, 0.0, 0.0);
+    }
+    expectNear("and the same mid-surface area", tied.area, cut.area, 1e-12);
+    expectNear("and the same steel", tied.plateMass, cut.plateMass, 1e-9);
+    // The welded mesh is the contrast: same elements, but its nodal normals have
+    // turned, which is exactly the thinning §1 measures.
+    expectNear("where welding turns the thickness direction and tying does not",
+               tied.worstNormalSpread, 0.0, 1e-12);
+
+    // Four corner lines, 17 stations each, of which the two on the cut planes cannot
+    // be tied: an interface degree of freedom is prescribed, and prescribing it and
+    // deriving it are two different claims on one unknown.
+    expectEqual("every corner station off the cut planes is tied", tied.junctionTies,
+                4 * (kNx - 1));
+    expectEqual("and the ones on them are counted, not silently dropped",
+                tied.junctionsOnInterface, 4 * 2 * 2);
+    expectEqual("nothing was refused as a chain", tied.junctionsChained, 0);
+    expectEqual("nor for landing outside a face", tied.junctionsOutsideFace, 0);
+    // A butt corner puts the flange's node half a plate thickness past the end of
+    // the side plate's mid-surface: `t / 2` over a half-metre element is 0.02 of the
+    // face's natural coordinate, and it is a closed form rather than a reading.
+    expectNear("the overshoot is half a plate thickness over half an element",
+               tied.worstJunctionOvershoot, (kT / 2) / (0.5 * (kH / kNz)), 1e-12);
+    // Both plates' mid-surfaces meet at the corner line, so there is no
+    // through-thickness offset to carry and the weight is the mid-surface.
+    expectNear("and the through-thickness weight is the mid-surface", tied.worstJunctionWeight, 0.5,
+               1e-12);
+    // The free edge is unchanged -- no element grew a neighbour -- and all but the
+    // twelve half-metre segments touching a cut plane is now joined.
+    expectNear("the free edge is what it was", tied.freeEdgeLength, cut.freeEdgeLength, 1e-12);
+    expectNear("and so is the junction census", tied.junctionEdges, cut.junctionEdges, 1e-12);
+    expectNear("of which all but the segments against a cut plane is tied", tied.tiedEdges,
+               8 * kL - 12 * (kL / kNx), 1e-9);
+    expectNear("where the untied mesh joins none of it", cut.tiedEdges, 0.0, 0.0);
+}
+
+// --- 1c. What the tie is, before what it does ------------------------------------
+//
+// Two identities, checked on the constraint set itself rather than through a solve,
+// because a tie that is wrong in either is wrong in a way an energy comparison
+// would report as a small stiffness change.
+
+void testJunctionTieIsAPartitionOfUnity() {
+    const section::Section tied = section::buildSection(makeBox(kT, kT), boxParams());
+    expectTrue("the box built some ties", !tied.attachment.constrained.empty());
+    expectEqualCount("three constraints per extruded node, eight masters each",
+                     tied.attachment.constrained.size(),
+                     static_cast<std::size_t>(tied.junctionTies) * 2 * 3);
+
+    double worstSum = 0, worstPoint = 0, worstAxis = 0;
+    for (const solidshell::Mpc& mpc : tied.attachment.constrained) {
+        expectEqualCount("a junction tie has eight masters", mpc.master.size(), 8u);
+        double sum = 0;
+        Vec3 interpolated{0, 0, 0};
+        for (std::size_t a = 0; a < mpc.master.size(); ++a) {
+            sum += mpc.weight[a];
+            // Every master must be the same axis as the slave: the constraint is
+            // between like components, and a tie that mixed them would rotate the
+            // plating it joined.
+            worstAxis = std::max<double>(worstAxis,
+                                         std::abs(static_cast<int>(mpc.master[a] % 3) -
+                                                  static_cast<int>(mpc.slave % 3)));
+            const std::size_t node = mpc.master[a] / 3;
+            for (int k = 0; k < 3; ++k)
+                interpolated[k] += mpc.weight[a] * tied.mesh.position[node * 3 + static_cast<std::size_t>(k)];
+        }
+        worstSum = std::max(worstSum, std::abs(sum - 1.0));
+        const std::size_t slaveNode = mpc.slave / 3;
+        worstPoint = std::max(
+            worstPoint,
+            length(interpolated - Vec3{tied.mesh.position[slaveNode * 3],
+                                       tied.mesh.position[slaveNode * 3 + 1],
+                                       tied.mesh.position[slaveNode * 3 + 2]}));
+    }
+    std::printf("     junction tie: |sum w - 1| %.2e, |sum w X - X_slave| %.2e m\n", worstSum,
+                worstPoint);
+    expectNear("a master and its slave are the same axis", worstAxis, 0.0, 0.0);
+    // Sum to one: the tie reproduces a rigid **translation** exactly. 1.1e-16
+    // measured, so the tolerance is rounding and not a band drawn round zero.
+    expectTrue("the weights are a partition of unity", worstSum < 4e-16);
+    // And the weighted master positions are the slave's own position, so the tie
+    // reproduces a rigid **rotation** exactly too: `sum w R X = R sum w X = R X`.
+    // 8.9e-16 m measured on a box two metres across.
+    expectTrue("and they interpolate the slave's own position", worstPoint < 1e-14);
 }
 
 // --- 1b. The weld is a distance, the winding is not a promise --------------------
@@ -207,7 +342,10 @@ void testBoxMesh() {
 
 void testWeldIsADistance() {
     const StructuralMesh structure = makeBox(kT, kT);
-    const section::Section reference = section::buildSection(structure, boxParams());
+    // Untied throughout: the junction tie joins the four corners into one component
+    // whatever the welder does, so a component count taken with it on would be
+    // measuring the tie and reporting it as the weld.
+    const section::Section reference = section::buildSection(structure, openBoxParams());
 
     // A displacement of 0.3 um is inside the 1 um weld tolerance, so the panel must
     // stay joined -- **and it is chosen to straddle a bucket boundary**. The welder
@@ -220,7 +358,7 @@ void testWeldIsADistance() {
         for (int c = 0; c < 4; ++c)
             if (std::abs(nudged.panels[0].corner[c].x - 0.5) < 1e-12)
                 nudged.panels[0].corner[c].x = 0.5 + delta;
-        const section::Section joined = section::buildSection(nudged, boxParams());
+        const section::Section joined = section::buildSection(nudged, openBoxParams());
         expectEqual("a sub-tolerance nudge across a bucket boundary still welds",
                     joined.components, reference.components);
         expectEqualCount("and adds no nodes", joined.nodeCount(), reference.nodeCount());
@@ -237,7 +375,7 @@ void testWeldIsADistance() {
         for (int c = 0; c < 4; ++c)
             if (std::abs(torn.panels[0].corner[c].x - 0.5) < 1e-12)
                 torn.panels[0].corner[c].x = 0.5 + delta;
-        const section::Section split = section::buildSection(torn, boxParams());
+        const section::Section split = section::buildSection(torn, openBoxParams());
         expectTrue("a nudge past the tolerance does not weld",
                    split.components > reference.components);
         expectTrue("and shows up as extra nodes", split.nodeCount() > reference.nodeCount());
@@ -249,8 +387,8 @@ void testReversedWindingIsOriented() {
     // not all wind the same way round. The surface walk has to orient them against
     // one another; without it the nodal normals cancel, the extrusion collapses and
     // the elements are degenerate -- which is a mesh that computes numbers.
-    const section::Section section = section::buildSection(makeBox(kT, kT, true), boxParams());
-    const section::Section reference = section::buildSection(makeBox(kT, kT), boxParams());
+    const section::Section section = section::buildSection(makeBox(kT, kT, true), openBoxParams());
+    const section::Section reference = section::buildSection(makeBox(kT, kT), openBoxParams());
 
     expectEqual("alternating winding is still four surfaces", section.surfaces, 4);
     expectTrue("no element is inverted", section.worstJacobian > 0);
@@ -274,7 +412,12 @@ void testReversedWindingIsOriented() {
 
 void testBoxSectionProperties() {
     const StructuralMesh structure = makeBox(kT, kT);
-    const section::Section box = section::buildSection(structure, boxParams());
+    // The closed forms below are beam theory, which is exact for this problem: a
+    // linear `sigma_xx` field is self-equilibrated and compatible, so it is the
+    // three-dimensional answer too. They are asserted on the **untied** box because
+    // that mesh reproduces it to rounding; what the tie costs the same numbers is
+    // `testJunctionTieClosesTheCell` and it is a consistency error that converges.
+    const section::Section box = section::buildSection(structure, openBoxParams());
     const StructuralMaterial material = ah36Steel();
     const double youngs = material.youngsModulus;
 
@@ -329,17 +472,23 @@ void testBoxSectionProperties() {
 }
 
 // --- 3. The junctions: invisible to bending, loud in torsion ---------------------
+//
+// **The three meshes this file can build over the same panels, and there is exactly
+// one question that separates them.** `EA` and `EI` are prescribed by the two cut
+// planes -- every longitudinally continuous strip carries `sigma = E eps` whatever
+// it is attached to -- so a mesh that joins nothing scores *best* on them. Torsion
+// is the one that needs the cell closed, and it is the whole of §5's case.
 
-void testJunctionsShowUpInTorsionAndNotInBending() {
+void testJunctionTieClosesTheCell() {
     const StructuralMesh structure = makeBox(kT, kT);
     const StructuralMaterial material = ah36Steel();
     const double youngs = material.youngsModulus;
     const double shear = youngs / (2 * (1 + material.poissonRatio));
+    const double bredt = shear * kBoxTorsionConstant;
 
-    section::SectionParams weldedParams = boxParams();
-    weldedParams.foldLimit = 2.0;
-    const section::Section cut = section::buildSection(structure, boxParams());
-    const section::Section welded = section::buildSection(structure, weldedParams);
+    const section::Section cut = section::buildSection(structure, openBoxParams());
+    const section::Section welded = section::buildSection(structure, weldedBoxParams());
+    const section::Section tied = section::buildSection(structure, boxParams());
 
     section::BeamLoad axial;
     axial.strain = 1e-6;
@@ -347,35 +496,125 @@ void testJunctionsShowUpInTorsionAndNotInBending() {
     bending.curvature = 1e-6;
     bending.reference = kH / 2;
 
-    const double cutAxial =
-        section::applyBeamLoad(cut, material, axial).axialStiffness / (youngs * kBoxArea);
-    const double weldedAxial =
-        section::applyBeamLoad(welded, material, axial).axialStiffness / (youngs * kBoxArea);
-    const double cutBending = section::applyBeamLoad(cut, material, bending).bendingStiffness /
-                              (youngs * kBoxSecondMoment);
-    const double weldedBending = section::applyBeamLoad(welded, material, bending).bendingStiffness /
-                                 (youngs * kBoxSecondMoment);
+    struct Row {
+        const char* label;
+        const section::Section& section;
+        double area, second, torsion;
+    };
+    Row rows[] = {{"corners cut", cut, 0, 0, 0},
+                  {"corners welded", welded, 0, 0, 0},
+                  {"corners tied", tied, 0, 0, 0}};
+    for (Row& row : rows) {
+        const section::BeamResponse stretched =
+            section::applyBeamLoad(row.section, material, axial);
+        const section::BeamResponse bent = section::applyBeamLoad(row.section, material, bending);
+        const section::TorsionResponse twisted =
+            section::applyTwist(row.section, material, 1e-6, kH / 2);
+        expectTrue(std::string(row.label) + " solves: " + stretched.problem + bent.problem +
+                       twisted.problem,
+                   stretched.ok && bent.ok && twisted.ok);
+        row.area = stretched.axialStiffness / (youngs * kBoxArea);
+        row.second = bent.bendingStiffness / (youngs * kBoxSecondMoment);
+        row.torsion = twisted.torsionalStiffness / bredt;
+        std::printf("     %-15s %d component(s), band %4zu: EA %.8f  EI %.8f  GJ/Bredt %.4f\n",
+                    row.label, row.section.components, row.section.halfBandwidth, row.area,
+                    row.second, row.torsion);
+    }
+    const Row& open = rows[0];
+    const Row& joined = rows[1];
+    const Row& tie = rows[2];
 
-    // The whole of `section.hpp` §2 in four numbers. The **unjoined** mesh is exact;
-    // the joined one is 9% soft, because welding a right-angled corner extrudes the
-    // node along the mean normal and thins the plating towards the corner by cos 45.
-    expectNear("EA is exact on the section whose corners are cut", cutAxial, 1.0,
+    // --- What each one costs the quantities the two cut planes prescribe ---
+    //
+    // Welding a right-angled corner extrudes the shared node along the mean normal
+    // and thins the plating towards the corner by `cos 45`, so the section simply
+    // loses steel. A tie moves no node, so it loses none: `EA` comes out at the
+    // untied mesh's own exactness, which is machine precision.
+    expectNear("EA is exact on the section whose corners are cut", open.area, 1.0,
                kAxialTolerance);
-    expectNear("EI is exact on the section whose corners are cut", cutBending, 1.0,
-               kBendingTolerance);
-    expectTrue("welding the corners loses at least 5% of EA", weldedAxial < 0.95);
-    expectTrue("and at least 5% of EI", weldedBending < 0.95);
+    expectNear("and on the one whose corners are tied, because a tie moves no steel", tie.area,
+               1.0, kAxialTolerance);
+    expectTrue("where welding them loses at least 5% of EA", joined.area < 0.95);
+    expectTrue("and at least 5% of EI", joined.second < 0.95);
 
-    // So bending cannot see the junctions and torsion can. Bredt's shear flow needs
-    // the cell closed.
-    const double cutTorsion = section::applyTwist(cut, material, 1e-6, kH / 2).torsionalStiffness;
-    const double weldedTorsion =
-        section::applyTwist(welded, material, 1e-6, kH / 2).torsionalStiffness;
-    const double bredt = shear * kBoxTorsionConstant;
-    expectNear("the welded box carries Bredt's torsion", weldedTorsion / bredt, 1.0, 0.05);
-    expectTrue("the cut box carries less than a fifth of it", cutTorsion / bredt < 0.2);
-    expectTrue("which is at least a factor of five between two meshes of the same size",
-               weldedTorsion / cutTorsion > 5.0);
+    // What the tie *does* cost `EI` is a consistency error at the butt corner, where
+    // the tied node sits half a plate thickness past the end of the other plate's
+    // mid-surface and the bilinear extrapolation of a quadratic transverse
+    // contraction is out by `O(h^2)`. 2.16e-3 measured at one element per panel;
+    // `testResolutionConvergence` is the evidence that it is a discretisation error
+    // and not the formulation, because it falls by twenty-five fold over a
+    // three-fold refinement.
+    expectNear("the tie costs EI 0.22% at one element per panel", tie.second, 1.0021578, 1e-6);
+    expectTrue("which is forty times less than welding costs it",
+               (1.0 - joined.second) / (tie.second - 1.0) > 40.0);
+
+    // --- And the one quantity that can tell them apart ---
+    //
+    // Bredt's shear flow needs the cell closed. It is not closed by proximity: the
+    // untied mesh has its four corner lines coincident to a weld tolerance and
+    // carries a twelfth of Bredt.
+    expectTrue("the cut box carries less than a fifth of Bredt", open.torsion < 0.2);
+    expectNear("the welded box carries Bredt's torsion", joined.torsion, 1.0, 0.05);
+    // The tied box carries Bredt **plus** the open-section term, which is the
+    // `sum s t^3 / 3` the cut box is made of: a closed cell does not stop having
+    // plate torsion. The two add to 1.083 and the mesh gives 1.099 at one element
+    // per panel, converging downwards on refinement. Asserted as a band round the
+    // sum rather than round 1, because 1 is the number a section that had *lost*
+    // its open-section term would give.
+    expectNear("and the tied box carries Bredt plus the plating's own torsion",
+               tie.torsion, 1.0 + open.torsion, 0.02);
+    expectTrue("which is more than the welded box manages, because tying loses no steel",
+               tie.torsion > joined.torsion);
+    expectTrue("and thirteenfold what the cut one does", tie.torsion / open.torsion > 13.0);
+
+    // **The tied section has to be in equilibrium, and only the tie's transpose puts
+    // it there.** A junction eliminates its slave, so `K u` lands on a degree of
+    // freedom the solved system does not have; until it is moved to the masters by
+    // the transpose of the constraint, the masters' rows are short by whatever the
+    // junction next to them carries. Nothing else here would see it -- `EA` comes
+    // from the *interface* reaction, which is a long way from any tie.
+    {
+        const section::BeamResponse stretched = section::applyBeamLoad(tied, material, axial);
+        const section::BeamResponse bent = section::applyBeamLoad(tied, material, bending);
+        std::printf("     tied box equilibrium: residual %.2e N and %.2e N, restraint %.2e N, "
+                    "against an axial force of %.3e N\n",
+                    stretched.residual, bent.residual, stretched.restraintReaction,
+                    stretched.axialForce);
+        // 3.7e-9 and 5.6e-8 measured against an axial force of 1.24e4 N, so 1e-6 N is
+        // 1e-10 of the load and not a band drawn round zero.
+        expectTrue("the free degrees of freedom of the tied section are in equilibrium",
+                   stretched.residual < 1e-6 && bent.residual < 1e-6);
+        expectTrue("and its rigid-body restraints still carry nothing",
+                   stretched.restraintReaction < 1e-5);
+        expectTrue("against a load worth measuring against", stretched.axialForce > 1e4);
+    }
+
+    // **The overshoot limit is a real gate, not a formality.** A butt corner puts the
+    // tied node 0.02 of a face outside it; a limit either side of that number turns
+    // every tie in the box on or off, so the parameter is exercised rather than
+    // merely present.
+    for (const auto& [limit, want] : std::vector<std::pair<double, int>>{{0.019, 0}, {0.021, 60}}) {
+        section::SectionParams bounded = boxParams();
+        bounded.junctionOvershoot = limit;
+        const section::Section gated = section::buildSection(structure, bounded);
+        expectEqual("an overshoot limit of " + std::to_string(limit) + " leaves " +
+                        std::to_string(want) + " ties",
+                    gated.junctionTies, want);
+        expectEqual("and the refusals are counted rather than dropped",
+                    gated.junctionsOutsideFace, want == 0 ? 120 : 0);
+        expectEqual("so the components follow", gated.components, want == 0 ? 4 : 1);
+    }
+
+    // The vacuity guard for the whole comparison: these are three meshes of the
+    // *same* elements over the *same* panels. If they differed in size the torsion
+    // ratio would be a statement about resolution.
+    expectEqualCount("all three meshes have the same elements", tie.section.elementCount(),
+                     open.section.elementCount());
+    expectEqualCount("and the welded one too", joined.section.elementCount(),
+                     open.section.elementCount());
+    expectEqualCount("the tie adds no nodes either", tie.section.nodeCount(),
+                     open.section.nodeCount());
+    expectTrue("where welding removes some", joined.section.nodeCount() < open.section.nodeCount());
 }
 
 // --- 4. Thickness seams -----------------------------------------------------------
@@ -499,10 +738,11 @@ void testResolutionConvergence() {
     bending.curvature = 1e-6;
     bending.reference = kH / 2;
 
-    std::vector<double> torsion;
+    std::vector<double> torsion, tiedBendingError, tiedTorsion;
     std::size_t coarseElements = 0, fineElements = 0;
     for (int subdivision = 1; subdivision <= 3; ++subdivision) {
-        const section::Section box = section::buildSection(structure, boxParams(subdivision));
+        const section::Section box =
+            section::buildSection(structure, openBoxParams(subdivision));
         if (subdivision == 1) coarseElements = box.elementCount();
         if (subdivision == 3) fineElements = box.elementCount();
         expectNear("EA does not move with resolution, subdivision " + std::to_string(subdivision),
@@ -514,6 +754,21 @@ void testResolutionConvergence() {
                        (youngs * kBoxSecondMoment),
                    1.0, kBendingTolerance);
         torsion.push_back(section::applyTwist(box, material, 1e-6, kH / 2).torsionalStiffness);
+
+        // The same sweep with the junctions tied. `EA` stays exact at every
+        // resolution -- the tie moves no steel -- while `EI` carries the butt
+        // corner's extrapolation error, and **that** is what has to converge.
+        const section::Section joined = section::buildSection(structure, boxParams(subdivision));
+        expectNear("EA is exact whatever the resolution, tied, subdivision " +
+                       std::to_string(subdivision),
+                   section::applyBeamLoad(joined, material, axial).axialStiffness /
+                       (youngs * kBoxArea),
+                   1.0, kAxialTolerance);
+        tiedBendingError.push_back(
+            std::abs(section::applyBeamLoad(joined, material, bending).bendingStiffness /
+                         (youngs * kBoxSecondMoment) -
+                     1.0));
+        tiedTorsion.push_back(section::applyTwist(joined, material, 1e-6, kH / 2).torsionalStiffness);
     }
     // The vacuity guard for the two assertions above: the mesh really did refine
     // ninefold, so "did not move" is a property of the quantity and not of the sweep.
@@ -527,6 +782,28 @@ void testResolutionConvergence() {
                (torsion[0] - torsion[2]) / torsion[0] > 1e-3);
     expectTrue("but by less than three per cent, so one element per panel is converged",
                (torsion[0] - torsion[2]) / torsion[0] < 0.03);
+
+    std::printf("     tied box under refinement: EI error %.2e %.2e %.2e, GJ %.4e %.4e %.4e\n",
+                tiedBendingError[0], tiedBendingError[1], tiedBendingError[2], tiedTorsion[0],
+                tiedTorsion[1], tiedTorsion[2]);
+    // **This is the assertion that says the tie is consistent rather than merely
+    // close.** A formulation error would sit still under refinement; a
+    // discretisation error goes away. It falls monotonically and by twenty-five
+    // fold over a threefold refinement, which is faster than first order.
+    expectTrue("the tie's EI error falls monotonically under refinement",
+               tiedBendingError[1] < tiedBendingError[0] &&
+                   tiedBendingError[2] < tiedBendingError[1]);
+    expectTrue("and by more than tenfold over a threefold refinement",
+               tiedBendingError[0] / tiedBendingError[2] > 10.0);
+    // The guard that keeps that from being vacuous: the coarse error has to be
+    // something worth converging from, or "it fell" is a statement about rounding.
+    expectTrue("from a coarse error worth converging from", tiedBendingError[0] > 1e-3);
+    // And the tied torsion converges too -- downwards, like the open one, and to a
+    // value that is still an order of magnitude above the open section's.
+    expectTrue("the tied torsion also falls monotonically",
+               tiedTorsion[1] < tiedTorsion[0] && tiedTorsion[2] < tiedTorsion[1]);
+    expectTrue("and stays more than ten times the open section's",
+               tiedTorsion[2] / torsion[2] > 10.0);
 }
 
 // --- 6. What the mesher refuses ---------------------------------------------------
@@ -580,6 +857,12 @@ void testRefusals() {
     const section::Section adrift = section::buildSection(floating, boxParams());
     expectEqual("a plate touching neither cut plane is reported as floating",
                 adrift.floatingComponents, 1);
+    // And the tie did not reach it: it is half a metre inboard of the side plates,
+    // which is twenty times `junctionTolerance`, so nothing joined it and the
+    // mechanism survives to be reported. Without this the test would pass on a tie
+    // that joined everything to everything.
+    expectEqual("a plate in fresh air is tied to nothing", adrift.junctionTies,
+                section::buildSection(structure, boxParams()).junctionTies);
     const section::BeamResponse refused =
         section::applyBeamLoad(adrift, ah36Steel(), section::BeamLoad{1e-6, 0, 0});
     expectTrue("and loading a section with one in it is refused rather than solved", !refused.ok);
@@ -601,8 +884,14 @@ void testRefusals() {
     }
     const section::Section stub = section::buildSection(halfLength, boxParams());
     expectEqual("a plate reaching one plane does not float", stub.floatingComponents, 0);
-    expectEqual("but it is a component", stub.components, 5);
-    expectEqual("and it does not span the section", stub.spanningComponents, 4);
+    // Two components, not five: the box's own four are tied into one, and the stub
+    // is the second. Taken against `openBoxParams` below, which is the count this
+    // assertion had before the tie existed.
+    expectEqual("but it is a component", stub.components, 2);
+    expectEqual("and it does not span the section", stub.spanningComponents, 1);
+    const section::Section untiedStub = section::buildSection(halfLength, openBoxParams());
+    expectEqual("where untied the same input is five pieces", untiedStub.components, 5);
+    expectEqual("four of which span", untiedStub.spanningComponents, 4);
 }
 
 void testBandwidthReducingOrder() {
@@ -683,7 +972,40 @@ void testFreeEdgesInFreshAirAreNotJunctions() {
     // choice is a hundredfold in the factorisation rather than a wrong answer. 62 is
     // what the box delivers; the lexicographic ordering that loses here gives more.
     expectTrue("the mesher picks a numbering with a narrow band",
-               section::buildSection(makeBox(kT, kT), boxParams()).halfBandwidth <= 80);
+               section::buildSection(makeBox(kT, kT), openBoxParams()).halfBandwidth <= 80);
+    // **And the ordering has to be chosen knowing about the ties**, because a tie
+    // couples nodes no element edge joins and an ordering scored on the sub-quads
+    // alone is scored on the wrong graph. Scoring it on the element graph gave the
+    // box 62 and the ferry hold 146, and both were fictions: the assembled band was
+    // 1 337 and 10 769. Joining the box genuinely costs a factor of four here; the
+    // assertion is that it costs four and not twenty.
+    const section::Section tied = section::buildSection(makeBox(kT, kT), boxParams());
+    expectTrue("and one that knows the junction ties are part of the graph",
+               tied.halfBandwidth <= 250);
+    expectTrue("which is a real cost, not a free lunch", tied.halfBandwidth > 150);
+    // The band the mesher reports has to be the band the assembly delivers, or it is
+    // a decoration. Rebuild it here from the mesh and the constraints, the way
+    // `solveStatic` does.
+    std::vector<std::vector<std::uint32_t>> stands(tied.mesh.nodeCount() * 3);
+    for (std::size_t d = 0; d < stands.size(); ++d)
+        stands[d].push_back(static_cast<std::uint32_t>(d));
+    for (const solidshell::Mpc& mpc : tied.attachment.constrained) stands[mpc.slave] = mpc.master;
+    std::size_t assembled = 0;
+    for (std::size_t e = 0; e < tied.mesh.elementCount(); ++e) {
+        std::uint32_t lo = 0xffffffffu, hi = 0;
+        for (int a = 0; a < 8; ++a) {
+            const std::uint32_t n = tied.mesh.index[e * 8 + static_cast<std::size_t>(a)];
+            for (int k = 0; k < 3; ++k)
+                for (std::uint32_t t : stands[n * 3 + static_cast<std::size_t>(k)]) {
+                    lo = std::min(lo, t);
+                    hi = std::max(hi, t);
+                }
+        }
+        assembled = std::max(assembled, static_cast<std::size_t>(hi - lo));
+    }
+    std::printf("     box band: reported %zu, assembled %zu\n", tied.halfBandwidth, assembled);
+    expectTrue("the reported band covers what the assembly needs",
+               assembled <= tied.halfBandwidth + 3);
 }
 
 // --- 7. The reduction consumes it, and Guyan is the same solve -------------------
@@ -790,14 +1112,55 @@ void testFerrySection() {
     expectEqual("nothing floats free of the interface", hold.floatingComponents, 0);
     expectEqual("and every piece reaches both cut planes", hold.spanningComponents, hold.components);
 
-    // The finding this whole file is built around: `makeStructuralMesh` shares no
+    // The finding this whole file was built around: `makeStructuralMesh` shares no
     // corner between two panel roles, so a section of a real ship arrives in pieces
     // however it is meshed, and hundreds of metres of its free edge are lying on
-    // plating they are not joined to.
-    expectTrue("the ferry's section is in several disconnected pieces", hold.components > 1);
-    expectTrue("with tens of metres of unwelded junction", hold.junctionEdges > 10.0);
+    // plating they are not joined to. That is still true of the *mesh* -- and the
+    // junction tie is what stops it being true of the model.
+    const section::Section untied =
+        section::buildSection(structure, [] {
+            section::SectionParams p = ferryParams();
+            p.junctions = false;
+            return p;
+        }());
+    expectTrue("the ferry's mesh is in several disconnected pieces", untied.components > 1);
+    expectTrue("with tens of metres of unwelded junction", untied.junctionEdges > 10.0);
     expectTrue("and the junction really is a junction rather than a gap",
-               hold.worstJunctionGap < 0.02);
+               untied.worstJunctionGap < 0.02);
+    expectEqual("the tie makes it one", hold.components, 1);
+    expectEqual("which reaches both cut planes", hold.spanningComponents, 1);
+    expectNear("over the same plating", hold.junctionEdges, untied.junctionEdges, 1e-9);
+    expectEqualCount("with the same elements", hold.elementCount(), untied.elementCount());
+    expectEqualCount("and the same nodes", hold.nodeCount(), untied.nodeCount());
+    expectTrue("some of that junction is now tied", hold.tiedEdges > 0.0);
+    expectNear("and none of it was before", untied.tiedEdges, 0.0, 0.0);
+    // Two bays is three stations, of which two are cut planes, so most of this
+    // section's junction nodes are on the interface and cannot be tied -- which is
+    // why the frequency measurement below runs on eight bays instead. It is asserted
+    // here so that the small `tiedEdges` is a stated property rather than a
+    // surprise.
+    expectTrue("most of a two-bay section's junction nodes are on a cut plane",
+               hold.junctionsOnInterface > hold.junctionTies);
+    // A real ship's junction has a real gap -- 9 mm at worst on this hull -- so the
+    // through-thickness weight extrapolates rather than interpolating, and the tie
+    // has to survive a weight outside [0, 1] without producing a negative nodal
+    // mass. `reduction::Substructure` is the thing that would refuse it.
+    expectTrue("a real junction extrapolates through the master's thickness",
+               hold.worstJunctionWeight > 1.0);
+    const reduction::Substructure substructure(hold.mesh, hold.material, hold.interfaceNodes,
+                                               hold.attachment);
+    expectTrue("and the substructure still finds every nodal mass positive",
+               substructure.ready());
+    // Not against `hold.mass()`, which is `area * thickness * density` and differs
+    // from the element lumping by 0.07% on a curved hull -- against the *same*
+    // substructure without the ties, which is the property being claimed: an
+    // eliminated degree of freedom's steel goes to its masters and none of it is
+    // lost. Exact, because the weights are a partition of unity.
+    const reduction::Substructure loose(untied.mesh, untied.material, untied.interfaceNodes,
+                                        untied.attachment);
+    expectTrue("the untied section is a substructure too", loose.ready());
+    expectNear("with the section's steel, none of it lost to the elimination",
+               substructure.totalMass(), loose.totalMass(), 1e-9 * loose.totalMass());
 
     // The member accounting. Every longitudinally effective member is either
     // attached or reported missing, and the two together are exactly what
@@ -859,6 +1222,118 @@ void testFerrySection() {
     // one per cent of either, which is why the tolerance is not tighter.
     expectNear("EI against the girder's own second moment, less the girders",
                bent.bendingStiffness / youngs / (girder.secondMoment - 2.459), 1.0, 0.01);
+}
+
+// --- 8b. The measurement the junctions were costing --------------------------------
+//
+// **`EA` and `EI` cannot see a junction and this can.** Prescribing plane sections
+// at two cuts makes every longitudinally continuous strip carry `sigma = E eps`
+// whatever it is attached to, so an unjoined section reports the right hull girder.
+// A fixed-interface frequency has no such crutch: it is the softest thing the
+// section can do with its interface held, and on this ship that is a deck spanning
+// twenty-six metres on two edges instead of four.
+//
+// Eight bays rather than the eleven `tools/section_probe` uses, because the effect
+// grows with length and eight is where it is still unmistakable inside a unit gate:
+// 1.84x here against 2.96x there.
+void testFerryJunctionMovesTheLowestFrequency() {
+    const StructuralMesh structure = ferryStructure();
+    const auto lowest = [&](bool shell, bool deck, bool bulkhead, bool junctions,
+                            const char* label) {
+        section::SectionParams p;
+        p.xFrom = -7.2;
+        p.xTo = -7.2 + 2.4 * 8;
+        p.subdivision = 1;
+        p.shell = shell;
+        p.deck = deck;
+        p.bulkhead = bulkhead;
+        p.junctions = junctions;
+        const section::Section piece = section::buildSection(structure, p);
+        const reduction::Substructure substructure(piece.mesh, piece.material,
+                                                   piece.interfaceNodes, piece.attachment);
+        expectTrue(std::string(label) + " is a substructure", substructure.ready());
+        const reduction::Eigenpairs modes = substructure.fixedInterfaceModes(1);
+        expectTrue(std::string(label) + " has a lowest mode", !modes.value.empty());
+        const double omega = modes.value.empty() ? 0.0 : std::sqrt(std::max(0.0, modes.value[0]));
+        // Subspace iteration converges to *a* mode; `eigenvaluesBelow` counts by the
+        // inertia of an LDL^T factorisation, which is a different instrument
+        // answering the same question, and it is what says nothing was skipped.
+        expectEqual(std::string(label) + " has nothing below what was found",
+                    substructure.eigenvaluesBelow(0.99 * 0.99 * omega * omega), 0);
+        expectTrue(std::string(label) + " has something at it",
+                   substructure.eigenvaluesBelow(1.01 * 1.01 * omega * omega) >= 1);
+        std::printf("     %-24s %d component(s), band %3zu (mesh %4zu): %.4f Hz\n", label,
+                    piece.components, substructure.halfBandwidth(), piece.halfBandwidth,
+                    omega / (2 * std::numbers::pi));
+        if (junctions) {
+            // **The ordering has to be chosen on the tied graph, and on real geometry
+            // that is worth more than it is on the box.** A tie couples nodes no
+            // element edge joins; leaving those edges out of the Cuthill-McKee
+            // adjacency gives 1 910 here against 740, and the box cannot see the
+            // difference at all because its four corner lines are already adjacent in
+            // every candidate ordering. Measured 740; asserted at 1 200 so a change of
+            // ordering heuristic is allowed and a loss of the tie edges is not.
+            expectTrue("the ordering knows about the ties on real geometry",
+                       piece.halfBandwidth < 1200);
+            expectTrue("which is a real cost and not a free lunch", piece.halfBandwidth > 400);
+            // What the tie's geometry costs, on plating that is genuinely warped: the
+            // bilinear surface through a master face's four corners does not pass
+            // exactly through the node being tied, and the gap is the modelling error
+            // the tie carries. 1.94e-05 m on this ship, against a 2.4 m element.
+            double worstOffset = 0, worstSum = 0;
+            for (const solidshell::Mpc& mpc : piece.attachment.constrained) {
+                double sum = 0;
+                Vec3 interpolated{0, 0, 0};
+                for (std::size_t a = 0; a < mpc.master.size(); ++a) {
+                    sum += mpc.weight[a];
+                    const std::size_t node = mpc.master[a] / 3;
+                    for (int k = 0; k < 3; ++k)
+                        interpolated[k] += mpc.weight[a] *
+                                           piece.mesh.position[node * 3 + static_cast<std::size_t>(k)];
+                }
+                worstSum = std::max(worstSum, std::abs(sum - 1.0));
+                const std::size_t slave = mpc.slave / 3;
+                worstOffset = std::max(
+                    worstOffset,
+                    length(interpolated - Vec3{piece.mesh.position[slave * 3],
+                                               piece.mesh.position[slave * 3 + 1],
+                                               piece.mesh.position[slave * 3 + 2]}));
+            }
+            std::printf("     %-24s tie geometry: |sum w - 1| %.2e, |interp - slave| %.2e m\n", "",
+                        worstSum, worstOffset);
+            expectTrue("the weights are a partition of unity on real geometry too",
+                       worstSum < 4e-16);
+            expectTrue("and the tied point is where the node is, to a fiftieth of a millimetre",
+                       worstOffset < 5e-5);
+        }
+        return omega / (2 * std::numbers::pi);
+    };
+
+    const double decks = lowest(false, true, false, false, "decks alone");
+    const double shell = lowest(true, false, false, false, "shell alone");
+    const double open = lowest(true, true, true, false, "whole section, untied");
+    const double tied = lowest(true, true, true, true, "whole section, tied");
+
+    // **The defect, as a number.** The untied section's softest mode is the decks'
+    // own, to four figures: adding the shell they are welded to in the ship changes
+    // it by nothing, because in the model they are not welded to it.
+    expectNear("untied, the whole section is exactly as soft as its decks alone", open / decks,
+               1.0, 1e-4);
+    // The vacuity guard: the shell is a genuinely different structure, so the
+    // agreement above is a statement about the junction and not about the two pieces
+    // happening to be alike.
+    expectTrue("where the shell alone is a different answer entirely", shell / decks > 1.5);
+
+    // And what tying it buys. 1.8415 measured; asserted as a factor rather than a
+    // frequency so it does not have to be re-measured when the ferry's scantlings
+    // move.
+    expectTrue("tying the junctions stiffens the softest mode by more than half again",
+               tied / open > 1.5);
+    expectTrue("and it is no longer the decks' own mode", std::abs(tied / decks - 1.0) > 0.5);
+    // A tie can only add constraint, so it can only raise a fixed-interface
+    // frequency -- there is no configuration in which joining the section softens
+    // it, and a tie that had gone in with the wrong sign somewhere could.
+    expectTrue("a constraint cannot soften the section", tied > open);
 }
 
 void testFerryMembersAreWorthWhatTheSectionSays() {
@@ -1028,10 +1503,11 @@ void testInterfaceIsChosenOnTheMidSurface() {
 void runSectionTests() {
     std::printf("\n=== Tier-1 section mesher ===\n");
     testBoxMesh();
+    testJunctionTieIsAPartitionOfUnity();
     testWeldIsADistance();
     testReversedWindingIsOriented();
     testBoxSectionProperties();
-    testJunctionsShowUpInTorsionAndNotInBending();
+    testJunctionTieClosesTheCell();
     testThicknessSeam();
     testMemberRunsStopAtAThicknessStep();
     testResolutionConvergence();
@@ -1040,6 +1516,7 @@ void runSectionTests() {
     testFreeEdgesInFreshAirAreNotJunctions();
     testSubstructureConsumesTheSection();
     testFerrySection();
+    testFerryJunctionMovesTheLowestFrequency();
     testFerryMembersAreWorthWhatTheSectionSays();
     testFerryFibresAndTheirMass();
     testFerryBulkheadCutIsNotASeam();

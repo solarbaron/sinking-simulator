@@ -128,6 +128,12 @@ int main(int argc, char** argv) {
     std::printf("  free edge %.1f m, of which %.1f m sits on plating it is not welded to"
                 " (worst gap %.4f m)\n",
                 hold.freeEdgeLength, hold.junctionEdges, hold.worstJunctionGap);
+    std::printf("  junction ties: %d nodes tied joining %.1f m of that edge; %d left on a cut"
+                " plane, %d refused as a chain, %d outside a master face\n",
+                hold.junctionTies, hold.tiedEdges, hold.junctionsOnInterface,
+                hold.junctionsChained, hold.junctionsOutsideFace);
+    std::printf("  worst tie: overshoot %.4f of a face, through-thickness weight %.4f\n",
+                hold.worstJunctionOvershoot, hold.worstJunctionWeight);
     std::printf("  panels straddling a cut plane: %d\n", hold.straddlingPanels);
     std::printf("  members: %d attached, %d refused, %d missed; effective area attached %.5f"
                 " + missed %.5f = %.5f m^2\n",
@@ -185,13 +191,56 @@ int main(int argc, char** argv) {
 
     // --- Resolution ------------------------------------------------------------------
 
+    // --- What the junction tie costs and buys, at one element per panel -------------
+    //
+    // The two quantities a prescribed plane-sections field cannot see. `EA` and `EI`
+    // are above and they move 0.19% and 0.12%; these move by factors.
+    {
+        std::printf("\n=== the junction tie: cut against tied ===\n");
+        std::printf("  %-6s %7s %6s %9s %9s %8s %12s %10s %10s\n", "", "band", "comps", "tied m",
+                    "A_eff", "solve s", "GJ", "first Hz", "reduce s");
+        for (int tie = 0; tie < 2; ++tie) {
+            sim::section::SectionParams part = params;
+            part.junctions = tie != 0;
+            const sim::section::Section piece = sim::section::buildSection(structure, part);
+            const double solving = now();
+            sim::section::BeamLoad axial;
+            axial.strain = 1e-6;
+            const sim::section::BeamResponse stretched =
+                sim::section::applyBeamLoad(piece, material, axial);
+            const sim::section::TorsionResponse twisted =
+                sim::section::applyTwist(piece, material, 1e-6, girder.neutralAxis);
+            const double solveSeconds = now() - solving;
+            const double reducing = now();
+            const sim::reduction::Substructure substructure(piece.mesh, piece.material,
+                                                            piece.interfaceNodes, piece.attachment);
+            double hz = 0;
+            if (substructure.ready()) {
+                const sim::reduction::Eigenpairs modes = substructure.fixedInterfaceModes(1);
+                if (!modes.value.empty())
+                    hz = std::sqrt(std::max(0.0, modes.value[0])) / (2.0 * std::numbers::pi);
+            }
+            std::printf("  %-6s %7zu %6d %9.1f %9.5f %8.2f %12.4e %10.4f %10.2f\n",
+                        tie ? "tied" : "cut", piece.halfBandwidth, piece.components,
+                        piece.tiedEdges, stretched.axialStiffness / youngs, solveSeconds,
+                        twisted.torsionalStiffness, hz, now() - reducing);
+            std::fflush(stdout);
+        }
+    }
+
+    // The resolution sweep runs **untied**. It is a study of the mesher's own
+    // convergence, and the tie's cost is a band: 146 against 1 520 at subdivision 1,
+    // which is 0.16 s of banded factorisation against 5.34, and 278 against 3 188 at
+    // subdivision 2, which is 1.1 s against 149. Sweeping tied would take an hour and
+    // measure the same four columns to within 0.2%.
     if (options.sweep >= 1) {
-        std::printf("\n=== resolution: refining the reduced answer ===\n");
+        std::printf("\n=== resolution: refining the reduced answer (junctions untied) ===\n");
         std::printf("  %4s %9s %7s %11s %10s %12s %13s %9s\n", "sub", "elements", "band", "A_eff",
                     "z_na", "I_eff", "GJ", "solve s");
         for (int subdivision = 1; subdivision <= options.sweep; ++subdivision) {
             sim::section::SectionParams refined = params;
             refined.subdivision = subdivision;
+            refined.junctions = false;
             const sim::section::Section section = sim::section::buildSection(structure, refined);
             const double start = now();
             sim::section::BeamLoad axial;
@@ -219,23 +268,26 @@ int main(int argc, char** argv) {
 
     if (options.reduce) {
         std::printf("\n=== Craig-Bampton ===\n");
-        // Which piece of the section owns the softest fixed-interface mode. On this
-        // ship the answer is the decks, and it is the same number with and without
-        // the shell they should be welded to -- which is the junctions' cost stated
-        // as a frequency. See `section.hpp` §2.
+        // Which piece of the section owns the softest fixed-interface mode. Untied,
+        // the answer is the decks and it is the *same number* with and without the
+        // shell they should be welded to -- the junctions' cost stated as a
+        // frequency. Tied, the whole section is stiffer than either piece, which is
+        // what a joined structure does. See `section.hpp` §2 and §5.
         struct Case {
             const char* label;
-            bool shell, deck, bulkhead;
+            bool shell, deck, bulkhead, junctions;
         };
-        const Case cases[] = {{"shell only", true, false, false},
-                              {"decks only", false, true, false},
-                              {"bulkheads only", false, false, true},
-                              {"whole section", true, true, true}};
+        const Case cases[] = {{"shell only", true, false, false, false},
+                              {"decks only", false, true, false, false},
+                              {"bulkheads only", false, false, true, false},
+                              {"whole, untied", true, true, true, false},
+                              {"whole, tied", true, true, true, true}};
         for (const Case& one : cases) {
             sim::section::SectionParams part = params;
             part.shell = one.shell;
             part.deck = one.deck;
             part.bulkhead = one.bulkhead;
+            part.junctions = one.junctions;
             const sim::section::Section piece = sim::section::buildSection(structure, part);
             if (piece.empty()) continue;
             const double assembled = now();

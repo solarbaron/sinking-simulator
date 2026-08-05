@@ -110,6 +110,7 @@ most useful thing to know about this codebase:
 | A published "hole size stops mattering" finding that was an **artefact of that gap** — the extra hole opened onto nothing by construction | re-deriving the finding after the defect was fixed, not just the figures |
 | A rigid-body count that found **three of six** modes: translations come out at exactly zero, rotations at 8e-4…9e-3, and a fixed 1e-3 rad/s cutoff landed between them | scaling the threshold off an independently-derived frequency instead of a constant |
 | Two functions on the caller's own path shipped **with no test at all**, in a commit whose headline feature was well tested | asking what in the diff was *not* exercised, rather than whether the tests passed |
+| A node ordering chosen on the element graph while the solver assembled a *constrained* one, so a reported half-bandwidth of 146 was really 10 769 and the suite stopped finishing | a test that **rebuilds the assembled band from the mesh and the constraints** instead of asserting the number the mesher reports |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct. **Nothing at all tests a comment** — three documents here repeated a
