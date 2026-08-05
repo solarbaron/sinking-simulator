@@ -101,11 +101,23 @@ most useful thing to know about this codebase:
 | "The hole is 10× too big" inferred from a **force** ratio, when the hole is set by energy per unit area and moves 5% | measuring the two effects separately instead of propagating one number |
 | The ferry's **mid wing tanks were never authored**, so 41% of a ram amidships tore open onto no compartment and could not flood | reading a warning `ram_view` had printed on every run for months |
 | A published "hole size stops mattering" finding that was an **artefact of that gap** — the extra hole opened onto nothing by construction | re-deriving the finding after the defect was fixed, not just the figures |
+| A rigid-body count that found **three of six** modes: translations come out at exactly zero, rotations at 8e-4…9e-3, and a fixed 1e-3 rad/s cutoff landed between them | scaling the threshold off an independently-derived frequency instead of a constant |
+| Two functions on the caller's own path shipped **with no test at all**, in a commit whose headline feature was well tested | asking what in the diff was *not* exercised, rather than whether the tests passed |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct. **Nothing at all tests a comment** — three documents here repeated a
 wrong factor of ten because each quoted the previous one rather than the
 measurement, and the code beneath them had been right for weeks.
+
+**A loose assertion is nearly a vacuous one.** An interface displacement that is
+exact to 8e-12 was first asserted at 1e-3, which would have passed on a model that
+had lost the property entirely and was merely well converged. When a measurement
+comes back far better than the tolerance, tighten the tolerance to what was
+measured and say why it is allowed to be that tight.
+
+**Writing a lesson down does not make it learned.** The rigid-body threshold above
+is the second time that mistake was made in this repo — the first was recorded, in
+this table, by the work that immediately preceded it.
 
 ## Settled decisions — do not reopen
 
