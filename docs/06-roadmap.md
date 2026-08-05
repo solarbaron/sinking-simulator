@@ -265,9 +265,34 @@ The longest and highest-risk phase.
   binding limit is geometric rather than numerical: the elements are exactly
   prismatic on flat plating and 319% too stiff in bending across this hull's
   shoulder, and the cure is a finer girth layout in `Scantlings` rather than a finer
-  zone. **Stiffeners are not meshed** — there is no way to attach a web to a
-  solid-shell plate without a multi-point constraint, which does not exist — so the
-  zone offers the two bounds that leaves and publishes the bracket
+  zone. **Stiffeners were not meshed** — there is no way to attach a web to a
+  solid-shell plate without a multi-point constraint — so the zone offered the two
+  bounds that leaves and published the bracket
+- ~~**The multi-point constraint**~~ **done** — `engine/sim/constraint.{hpp,cpp}`,
+  measured in `02-simulation.md` §3 under *Eccentric stiffeners*. A solid-shell has
+  no rotational degree of freedom and does not need one: its two nodes through the
+  thickness *are* the rotation of the cross-section, so a member at offset `e` is
+  the exact linear combination `u_bottom + ((e + t/2)/t)(u_top − u_bottom)` —
+  exact for a finite rotation, measured at 3.6 × 10⁻¹⁵ m after 0.70 rad.
+
+  `zone::Stiffeners::Modelled` builds a member out of axial fibres tied that way,
+  two-point Gauss through each rectangle of the profile so the section's area,
+  neutral axis and second moment come out of the finite element model **equal to
+  `scantlings::stiffenedSection` to 2 × 10⁻¹⁰**, checked by sweeping the bending
+  axis and reading all three off the parabola. It lands inside the published
+  bracket (5.54 MN against 4.90 and 7.72), and because the member is *condensed*
+  it adds no degrees of freedom and therefore no zero-energy mode — the stiffened
+  patch has the same six as the bare one, measured on the whole spectrum.
+
+  Three things it does not do, and one cost. It cannot represent tripping: the
+  fibres contribute exactly zero to it and the plating alone restrains it, at the
+  closed-form `16 D / b`, so the formulation *over*-restrains where the hinge
+  leaves free. It carries no weak-axis second moment. The stiffener never tears.
+  And it re-introduces an in-plane length scale into a stable step that was
+  thickness-governed: free at the ferry's resolution, 2.4× at a four-times finer
+  one. **What it leaves ready**: the Tier-1/Tier-2 interface coupling below, which
+  needs the same tie to drive a zone's boundary from a reduced model, and a
+  whole-ship section mesh that has webs in it
 - ~~**Craig–Bampton reduction**~~ **done** — `engine/sim/reduction.{hpp,cpp}`,
   measured in `02-simulation.md` §3. The missing middle: nothing could give a
   structural answer for a whole hold or the region between two bulkheads, because
@@ -336,10 +361,12 @@ The longest and highest-risk phase.
   nothing drives a zone's interface DOF from a reduced model — and the *mesher*:
   nothing yet cuts a ship into components worth assembling, so synthesis has the
   join but no pieces. The section
-  reduction also carries plating only, because the zone meshes plating only — a collision that opens
+  reduction also carries plating only, because the zone meshed plating only — a collision that opens
   fourteen bays leaves their longitudinals at full strength, which is the
-  un-conservative direction and needs the same multi-point constraint the zone
-  needs to mesh a web at all
+  un-conservative direction. The multi-point constraint that blocked it now exists
+  and `zone::Stiffeners::Modelled` uses it; what is still missing is
+  `promotion::reduce` consuming the fibres' state, which it cannot until the
+  fibres carry damage
 
   **The "200 m² is two core-hours per simulated second" figure needs its element
   size beside it or it says nothing.** It assumes 50 mm elements; the same 200 m²

@@ -457,15 +457,21 @@ Patch buildPatch(const StructuralMesh& structure, const Vec3& impact, const Mesh
     // costs.
     patch.mesh.fixed.assign(patch.mesh.nodeCount() * 3, 0u);
     patch.mesh.prescribed.assign(patch.mesh.nodeCount() * 3, 0.0);
+
+    // Which mid-surface pairs are joined by an element edge. The perimeter is the
+    // edges used once; a stiffener's fibres may only span the edges used at all,
+    // so that a member crossing a hole in the patch is broken into runs instead of
+    // being bridged by a fibre through thin air.
+    std::map<std::pair<std::uint32_t, std::uint32_t>, int> use;
+    for (const SubQuad& q : quads)
+        for (int e = 0; e < 4; ++e) {
+            const std::uint32_t a = q.node[static_cast<std::size_t>(e)];
+            const std::uint32_t b = q.node[static_cast<std::size_t>((e + 1) % 4)];
+            if (a == b) continue;
+            ++use[{std::min(a, b), std::max(a, b)}];
+        }
+
     if (params.edge == Edge::Clamped) {
-        std::map<std::pair<std::uint32_t, std::uint32_t>, int> use;
-        for (const SubQuad& q : quads)
-            for (int e = 0; e < 4; ++e) {
-                const std::uint32_t a = q.node[static_cast<std::size_t>(e)];
-                const std::uint32_t b = q.node[static_cast<std::size_t>((e + 1) % 4)];
-                if (a == b) continue;
-                ++use[{std::min(a, b), std::max(a, b)}];
-            }
         int pinnedNodes = 0;
         std::vector<std::uint8_t> onEdge(mid.size(), 0u);
         for (const auto& [edge, count] : use) {
@@ -489,13 +495,14 @@ Patch buildPatch(const StructuralMesh& structure, const Vec3& impact, const Mesh
 
     // --- Stiffeners -------------------------------------------------------------
     //
-    // Not meshed -- see the header §3 -- so the two things that can honestly be
-    // done with them are nothing at all and a rigid support, and those are the two
-    // bounds. A rigid support is every plating node the stiffener runs through,
-    // pinned. The nodes are exact: a member is built along a panel seam, so the
-    // grid points on that seam lie on the member's own segment.
+    // See the header §3. `RigidSupport` pins every plating node the stiffener runs
+    // through -- the upper bound; `Modelled` builds the member out of eccentric
+    // fibres tied to the plating by `constraint.hpp` and pins nothing. The nodes
+    // are exact either way: a member is built along a panel seam, so the grid
+    // points on that seam lie on the member's own segment.
     std::vector<std::uint8_t> onStiffener(mid.size(), 0u);
-    if (params.stiffeners == Stiffeners::RigidSupport) {
+    if (params.stiffeners != Stiffeners::Ignored) {
+        patch.stiffening.material = patch.material;
         const double reach = params.radius + 2.0;
         for (const StructuralMember& member : structure.members) {
             const Vec3 edge = member.b - member.a;
@@ -506,23 +513,81 @@ Patch buildPatch(const StructuralMesh& structure, const Vec3& impact, const Mesh
             // straight through one, and a midpoint filter would drop it.
             const double along = std::clamp(dot(impact - member.a, edge) / lengthSquared, 0.0, 1.0);
             if (length(impact - (member.a + edge * along)) > reach) continue;
+
+            // The nodes this member passes through, in order along it. Ordered by
+            // the parameter rather than by index, because the mesher numbers nodes
+            // for bandwidth and a member may run either way through that numbering.
+            std::vector<std::pair<double, std::uint32_t>> onMember;
             for (std::size_t i = 0; i < mid.size(); ++i) {
-                if (onStiffener[i]) continue;
                 const double t =
                     std::clamp(dot(mid[i] - member.a, edge) / lengthSquared, 0.0, 1.0);
                 if (length(mid[i] - (member.a + edge * t)) > params.weldTolerance) continue;
+                onMember.push_back({t, static_cast<std::uint32_t>(i)});
                 onStiffener[i] = 1u;
             }
+            if (params.stiffeners != Stiffeners::Modelled || onMember.size() < 2) continue;
+            std::sort(onMember.begin(), onMember.end());
+
+            // Which way the web rises against the pair direction. The tie measures
+            // the eccentricity along the plating's own thickness direction, so a
+            // web that is not perpendicular to the plate has no single offset and
+            // is refused rather than projected -- a projected one would be a
+            // plausible wrong second moment.
+            const Vec3 rise = normalize(member.rise);
+            double alignment = 0;
+            for (const auto& [t, node] : onMember) alignment += dot(rise, nodeNormal[node]);
+            alignment /= static_cast<double>(onMember.size());
+            if (std::abs(alignment) < 0.9) {
+                report("a stiffener's web rises " + std::to_string(alignment) +
+                       " out of the plating's thickness direction, so it has no single"
+                       " eccentricity and was left out of the zone");
+                continue;
+            }
+
+            // Runs of stations actually joined by an element edge. A member that
+            // leaves the patch and comes back is two runs, not one fibre spanning
+            // the gap.
+            constraint::SeamRun run;
+            run.sign = alignment > 0 ? 1.0 : -1.0;
+            std::uint32_t previous = 0;
+            bool have = false;
+            // Counted once per *member*, not once per run: a member the patch
+            // carries in two pieces is still one longitudinal, and a count that
+            // said two would make `members` a property of the zone's shape.
+            bool contributed = false;
+            const auto flush = [&]() {
+                if (run.bottom.size() >= 2 &&
+                    constraint::addStiffener(run, member.profile, patch.thickness,
+                                             patch.mesh.position, patch.stiffening) > 0)
+                    contributed = true;
+                run.bottom.clear();
+                run.top.clear();
+            };
+            for (const auto& [t, node] : onMember) {
+                if (have && use.find({std::min(previous, node), std::max(previous, node)}) ==
+                                use.end())
+                    flush();
+                run.bottom.push_back(static_cast<std::uint32_t>(rank[node]) * 2);
+                run.top.push_back(static_cast<std::uint32_t>(rank[node]) * 2 + 1);
+                previous = node;
+                have = true;
+            }
+            flush();
+            if (contributed) ++patch.stiffening.members;
         }
         for (std::size_t i = 0; i < mid.size(); ++i) {
             if (!onStiffener[i]) continue;
             ++patch.stiffenerNodes;
+            if (params.stiffeners != Stiffeners::RigidSupport) continue;
             for (int side = 0; side < 2; ++side)
                 for (int k = 0; k < 3; ++k)
                     patch.mesh.pin(static_cast<std::size_t>(rank[i]) * 2 +
                                        static_cast<std::size_t>(side),
                                    k);
         }
+        if (params.stiffeners == Stiffeners::Modelled && patch.stiffening.empty())
+            report("no stiffener reached this zone, so Stiffeners::Modelled is the same"
+                   " request as Stiffeners::Ignored");
     }
 
     std::size_t free = 0;
@@ -538,8 +603,34 @@ Patch buildPatch(const StructuralMesh& structure, const Vec3& impact, const Mesh
                " perimeter have eaten it, and a subdivision of at least 3 is needed for the"
                " plating between them to be able to deform");
 
-    patch.criticalTimestep = solidshell::criticalTimestep(patch.mesh, patch.material,
-                                                          solidshell::Formulation::SolidShell);
+    patch.platingTimestep = solidshell::criticalTimestep(patch.mesh, patch.material,
+                                                         solidshell::Formulation::SolidShell);
+    patch.criticalTimestep = patch.platingTimestep;
+
+    // The fibres' share of the stability limit, taken rather than assumed. A tie
+    // amplifies a fibre's stiffness by the square of its weight -- for the outer
+    // fibre of a 200 mm flat bar on 12 mm plating that is a factor of 373 -- while
+    // its mass arrives at the pair unamplified, so it is entirely possible for the
+    // stiffener rather than the plating to set the step. Whether it does is a
+    // property of the element size, and the answer is exact here because a rank-one
+    // stiffness against a diagonal mass has a closed-form largest eigenvalue.
+    if (!patch.stiffening.empty()) {
+        std::vector<double> nodalMass(patch.nodeCount(), 0.0);
+        for (std::size_t e = 0; e < patch.elementCount(); ++e) {
+            double nodePosition[kDof], lumped[kNodes];
+            patch.mesh.gather(e, patch.mesh.position, nodePosition);
+            solidshell::elementMass(nodePosition, patch.material.density, lumped);
+            for (int a = 0; a < kNodes; ++a)
+                nodalMass[patch.mesh.index[e * kNodes + static_cast<std::size_t>(a)]] += lumped[a];
+        }
+        const constraint::RestFibers forms =
+            constraint::restFibers(patch.stiffening, patch.mesh.position);
+        constraint::lumpFiberMass(patch.stiffening, forms, patch.material.density, nodalMass);
+        const double fibre =
+            constraint::criticalTimestep(patch.stiffening, forms, patch.mesh.position, nodalMass,
+                                         patch.material.youngsModulus);
+        if (fibre > 0 && fibre < patch.criticalTimestep) patch.criticalTimestep = fibre;
+    }
     return patch;
 }
 
@@ -611,6 +702,19 @@ Solver::Solver(const Patch& patch, const plasticity::Material& material, const S
                                          solidshell::Formulation::SolidShell,
                                          &stiffness_[e * kDof * kDof]);
         }
+    }
+
+    // The stiffeners. `rest_`, not `patch.mesh.position`: a `Preload` has already
+    // moved the rest configuration by this point, and a fibre whose rest length
+    // came from the meshed geometry would be handed the pre-strain for free -- the
+    // same mistake, in the same place, that mutation testing found in the element
+    // forms above.
+    if (!patch.stiffening.empty()) {
+        fiberForms_ = constraint::restFibers(patch.stiffening, rest_);
+        if (!fiberForms_.ok)
+            result_.problems.push_back("a stiffener fibre came out with no length");
+        constraint::lumpFiberMass(patch.stiffening, fiberForms_, patch.material.density, mass_);
+        if (params_.plastic) fiber_.assign(patch.stiffening.fiberCount(), {});
     }
 
     // Node -> incident element corners, as CSR. Gathering rather than scattering
@@ -795,6 +899,18 @@ void Solver::computeForces() {
         force_[node * 3 + 1] = sum[1];
         force_[node * 3 + 2] = sum[2];
     }
+    // The stiffeners, after the plating's gather and in a fixed order, so the
+    // answer stays bit-identical whatever the worker count. There are a couple of
+    // hundred fibres against tens of thousands of element-corner writes, so this is
+    // not where a thread would go anyway.
+    fiberEnergy_ = 0;
+    if (!patch_->stiffening.empty()) {
+        const constraint::FiberForces fibres =
+            constraint::fiberForces(patch_->stiffening, fiberForms_, position_, material_,
+                                    params_.plastic ? &fiber_ : nullptr, force_);
+        fiberEnergy_ = fibres.strainEnergy;
+        result_.dissipation += fibres.dissipation;
+    }
     if (params_.plastic) {
         int torn = 0;
         for (std::size_t e = 0; e < elements; ++e) {
@@ -856,7 +972,12 @@ void Solver::accumulateEnergy() {
             }
         }
     }
-    result_.strainEnergy = strain;
+    // The fibres' stored energy, which `computeForces` has already accumulated: it
+    // is `sigma^2 A L / 2E` per fibre and needs no B matrix, exactly as the
+    // plating's does not. Added here rather than reported separately because the
+    // energy balance is a statement about the whole patch, and a stiffener that
+    // stored energy outside the account would show up as the solver inventing it.
+    result_.strainEnergy = strain + fiberEnergy_;
 }
 
 bool Solver::step() {
@@ -1011,9 +1132,19 @@ void Solver::adopt(const std::vector<double>& position, const std::vector<double
     // no longer be the state that was adopted. Found by writing the test that says
     // adopting a run's own output reproduces that run.
     const std::vector<solidshell::ElementPlasticState> committed = plastic_;
+    const std::vector<constraint::FiberState> committedFibers = fiber_;
     computeForces();
     plastic_ = committed;
+    fiber_ = committedFibers;
     result_.dissipation = dissipation;
+    // The accelerator does not carry the stiffeners: `gpu::ZoneGpuSolver` uploads
+    // the element arrays and nothing else, so a patch with fibres in it that was
+    // stepped elsewhere has been stepped without them. Said rather than silently
+    // absorbed, because the answer would look like a slightly soft zone.
+    if (!patch_->stiffening.empty())
+        result_.problems.push_back("this state was computed by a path that does not carry the"
+                                   " zone's " + std::to_string(patch_->stiffening.fiberCount()) +
+                                   " stiffener fibres, so they took no part in it");
     accumulateEnergy();
     collectTorn();
     done_ = true;

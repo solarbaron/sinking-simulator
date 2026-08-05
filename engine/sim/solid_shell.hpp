@@ -415,6 +415,17 @@ private:
     std::vector<double> a_;  // a_[i * (b_ + 1) + (i - j)] is A(i, j), j <= i
 };
 
+// Stiffness the hex mesh does not carry, as a dense symmetric block over an
+// arbitrary set of global degrees of freedom (3 * node + axis). It exists because
+// `constraint.hpp` ties an eccentric stiffener to the plating and condenses it
+// onto the shell's own DOF, and a second assembly path for that would be a second
+// place the two could disagree. It is not stiffener-specific: an interface spring
+// coupling two substructures is the same shape.
+struct DofBlock {
+    std::vector<std::uint32_t> dof;
+    std::vector<double> stiffness;  // dof.size()^2, row-major, symmetric
+};
+
 // Assemble and solve K u = f. Pinned DOF take their prescribed values and their
 // contribution moves to the right-hand side, so a non-zero prescribed
 // displacement -- which is what a patch test is -- is handled exactly rather than
@@ -423,6 +434,13 @@ private:
 bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formulation form,
                  const std::vector<double>& load, std::vector<double>& displacement,
                  std::string* problem = nullptr);
+
+// The same, with extra stiffness assembled alongside the elements. The blocks are
+// counted in the bandwidth, so a block coupling distant DOF widens the band rather
+// than being dropped on the floor.
+bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formulation form,
+                 const std::vector<DofBlock>& extra, const std::vector<double>& load,
+                 std::vector<double>& displacement, std::string* problem = nullptr);
 
 // Consistent nodal loads for a uniform pressure acting on every +zeta face that
 // lies on the boundary of the mesh -- the top surface of a plate. Positive

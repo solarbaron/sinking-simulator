@@ -1103,6 +1103,260 @@ void testStiffenersBracketTheAnswer() {
                membrane(0.5 * spanY) > 1.5 * membrane(spanY));
 }
 
+// --- 12b. And the member itself, which has to land between them -----------------
+//
+// `Stiffeners::Modelled` builds the stiffener out of eccentric fibres tied to the
+// plating by `constraint.hpp`. `test_constraint.cpp` checks its section properties
+// against `scantlings::stiffenedSection`; what is checked here is the thing only a
+// solve can say -- that a real member is stiffer than no member and softer than an
+// infinitely rigid one. **Neither inequality is guaranteed by the arithmetic**: a
+// tie with the wrong sign would put the stiffener on the other side of the plate
+// and could come out either way, and a fibre stiffness that had lost the tie's
+// weight would be three hundred times too soft, so the bracket is a real test and
+// not a formality.
+
+void testTheModelledStiffenerLandsInsideTheBracket() {
+    std::printf("\n   the modelled stiffener, against the two bounds it has to sit between\n");
+    const double lengthX = 1.6, spanY = 0.8, thickness = 0.020, depth = 0.05;
+    const StructuralMesh strip = flatStrip(lengthX, spanY, thickness, 4, 4, true);
+
+    struct Run {
+        zone::Patch patch;
+        zone::SolveResult result;
+        double fibreEnergy = 0;
+        std::size_t fibres = 0;
+    };
+    const auto run = [&](zone::Stiffeners stiffeners, double stopAt) {
+        Run out;
+        zone::MeshParams params = flatParams(2);
+        params.stiffeners = stiffeners;
+        out.patch = zone::buildPatch(strip, {0, 0, 0}, params);
+        out.fibres = out.patch.stiffening.fiberCount();
+        zone::SolveParams solve;
+        solve.indenter.halfLength = 0.06;
+        solve.indenter.halfWidth = 1e3;
+        solve.indenter.speed = 20.0;
+        solve.indenter.rampTime = 1.0e-3;
+        solve.indenter.stopAt = stopAt;
+        zone::Solver solver(out.patch, unbreakableSteel(), solve);
+        out.result = solver.run();
+        out.fibreEnergy = solver.fiberStrainEnergy();
+        return out;
+    };
+
+    const Run loose = run(zone::Stiffeners::Ignored, depth);
+    const Run member = run(zone::Stiffeners::Modelled, depth);
+    const Run held = run(zone::Stiffeners::RigidSupport, depth);
+
+    expectTrue("the modelled patch built fibres", member.fibres > 0);
+    expectEqual("from both longitudinals",
+                static_cast<long long>(member.patch.stiffening.members), 2LL);
+    expectTrue("and it pinned nothing, so the plating keeps every degree of freedom",
+               member.patch.freeFraction == loose.patch.freeFraction);
+    expectTrue("where a rigid support eats a fifth of them",
+               held.patch.freeFraction < 0.8 * loose.patch.freeFraction);
+
+    std::printf("     %-22s %12s %12s %12s %10s\n", "", "force (N)", "work (J)", "fibre U (J)",
+                "residual");
+    const auto say = [&](const char* label, const Run& r) {
+        std::printf("     %-22s %12.5g %12.5g %12.5g %9.3f%%\n", label, r.result.force,
+                    r.result.work, r.fibreEnergy,
+                    100.0 * r.result.energyResidual() / r.result.work);
+    };
+    say("stiffener ignored", loose);
+    say("stiffener modelled", member);
+    say("stiffener held rigid", held);
+
+    expectTrue("a modelled member is stiffer than no member",
+               member.result.force > loose.result.force);
+    expectTrue("and softer than an infinitely rigid one",
+               member.result.force < held.result.force);
+    expectTrue("on the energy too, which is the integral rather than the instant",
+               member.result.work > loose.result.work && member.result.work < held.result.work);
+    // Non-vacuous: the bracket has to be wide, or "inside it" says nothing. It is
+    // the same bracket `testStiffenersBracketTheAnswer` measures.
+    expectTrue("and the bracket it lands in is a wide one",
+               held.result.force > 1.4 * loose.result.force);
+    expectTrue("the fibres store a real share of the energy",
+               member.fibreEnergy > 0.05 * member.result.strainEnergy);
+    expectTrue("and an unstiffened zone stores none in fibres it does not have",
+               loose.fibreEnergy == 0.0);
+
+    // **The solver's own mass, not the module's.** `test_constraint.cpp` checks
+    // that `lumpFiberMass` keeps the stiffener's mass; what is checked here is that
+    // `zone::Solver` calls it, which is a different statement and the one mutation
+    // testing found untested -- a zone whose stiffeners weighed nothing would
+    // accelerate too easily and nothing in a force or an energy would say so.
+    {
+        zone::MeshParams params = flatParams(2);
+        params.stiffeners = zone::Stiffeners::Modelled;
+        const zone::Patch patch = zone::buildPatch(strip, {0, 0, 0}, params);
+        zone::SolveParams solve;
+        solve.indenter.halfLength = -1;
+        solve.indenter.halfWidth = -1;
+        zone::Solver solver(patch, unbreakableSteel(), solve);
+        double total = 0;
+        for (double m : solver.nodalMass()) total += m;
+        std::printf("     the solver carries %.4f kg: %.4f kg of plating and %.4f kg of"
+                    " stiffener\n", total, patch.mass, patch.stiffening.mass);
+        expectNear("the solver's lumped mass is the plating plus the stiffeners", total,
+                   patch.mass + patch.stiffening.mass,
+                   1e-9 * (patch.mass + patch.stiffening.mass));
+        expectTrue("and the stiffeners are a real share of it",
+                   patch.stiffening.mass > 0.05 * patch.mass);
+    }
+
+    // **The account, and the reason it is bracketed rather than bounded.** At 50 mm
+    // into a 200 mm half-span the elements turn 0.245 rad, and `§7` above measures
+    // the co-rotational frame's own residual at -3.7% by 0.15 rad. So the account
+    // does not close at this depth *with or without* a stiffener, and the useful
+    // question is whether the fibres take it outside the band the two plating-only
+    // settings already span. They do not, and the ordering is the give-away: the
+    // rigid support, which has no fibres in it at all, is the worst of the three,
+    // because the residual tracks how hard the plating is being bent and not what
+    // is holding it.
+    const double looseResidual = std::abs(loose.result.energyResidual() / loose.result.work);
+    const double memberResidual = std::abs(member.result.energyResidual() / member.result.work);
+    const double heldResidual = std::abs(held.result.energyResidual() / held.result.work);
+    std::printf("     at 50 mm the elements turn %.3f rad; the residual is %.3f%% with no"
+                " stiffener, %.3f%% with the member and %.3f%% with a rigid support\n",
+                std::atan2(depth, 0.2), 100.0 * looseResidual, 100.0 * memberResidual,
+                100.0 * heldResidual);
+    expectTrue("the fibres leave the account inside the band the plating alone already spans",
+               memberResidual <= std::max(looseResidual, heldResidual) + 1e-4 &&
+                   memberResidual >= std::min(looseResidual, heldResidual) - 1e-4);
+    expectTrue("and the residual is a property of the bending, not of the stiffener",
+               heldResidual > looseResidual);
+
+    // And where the frame is not the limit, the stiffened account closes outright.
+    const Run gentle = run(zone::Stiffeners::Modelled, 0.006);
+    const Run gentleBare = run(zone::Stiffeners::Ignored, 0.006);
+    std::printf("     at 6 mm: stiffened %+.3f%%, bare %+.3f%%, and the fibres hold %.4g J of"
+                " %.4g J\n", 100.0 * gentle.result.energyResidual() / gentle.result.work,
+                100.0 * gentleBare.result.energyResidual() / gentleBare.result.work,
+                gentle.fibreEnergy, gentle.result.strainEnergy);
+    expectTrue("the stiffened zone's energy account closes where the frame allows it",
+               std::abs(gentle.result.energyResidual()) < 0.02 * gentle.result.work);
+    expectTrue("and it had real energy to account for", gentle.result.work > 1.0e3);
+}
+
+// The eccentric stiffener seen through the *solver* rather than through a linear
+// assembly: hand the patch a pure-bending pre-load about a chosen axis and the
+// energy it stores has to be `E kappa^2 I L / 2` for the second moment
+// `scantlings::stiffenedSection` computes. `test_constraint.cpp` makes the same
+// comparison linearly, where it is an identity; here it goes through
+// `zone::Preload`, the fibres' own rest lengths and the co-rotational element, and
+// what is left over is that path's known O(theta^2) error and nothing else.
+
+void testAPreLoadedStiffenedPatchStoresItsSectionsEnergy() {
+    std::printf("\n   a pre-loaded stiffened patch, against stiffenedSection through the solver\n");
+    const double lengthX = 2.0, spanY = 0.8, thickness = 0.020;
+    const StructuralMaterial steel = ah36Steel();
+    const StiffenerProfile bar = flatBar(0.200, 0.010);
+    // One longitudinal, on the strip's own centreline, so the plate width working
+    // with it is the whole strip and `stiffenedSection` needs no effective breadth
+    // guess.
+    StructuralMesh strip = flatStrip(lengthX, spanY, thickness, 4, 2);
+    StructuralMember member;
+    member.a = {-0.5 * lengthX, 0.0, 0.0};
+    member.b = {0.5 * lengthX, 0.0, 0.0};
+    member.rise = {0, 0, 1};
+    member.profile = bar;
+    member.attachedPlateThickness = thickness;
+    member.role = MemberRole::Longitudinal;
+    strip.members.push_back(member);
+
+    const StiffenedSection section = stiffenedSection(bar, thickness, spanY);
+    const double plateSecond = spanY * thickness * thickness * thickness / 12.0;
+    std::printf("     stiffenedSection: A %.6e m^2, neutral axis %.6f m, I %.6e m^4 (the bare"
+                " plate is %.6e, a factor of %.1f)\n", section.area, section.neutralAxis,
+                section.secondMoment, plateSecond, section.secondMoment / plateSecond);
+
+    // Small curvature on purpose. The residual here is the co-rotational frame's
+    // additive small-strain measure, which grows as the square of the rotation the
+    // elements carry -- `theta = kappa x`, so a metre from the centre at 1e-3 /m is
+    // 1e-3 rad and 1.6% of energy. At 1e-5 /m it is 1.6e-6 and the comparison is
+    // about the formulation rather than about the frame.
+    const double kappa = 1.0e-5;
+    std::printf("     %-12s %10s %16s %16s %10s\n", "stiffener", "axis (m)", "stored (J)",
+                "E k^2 I L / 2", "ratio");
+    for (bool stiffened : {false, true}) {
+        zone::MeshParams params = flatParams(2);
+        params.stiffeners = stiffened ? zone::Stiffeners::Modelled : zone::Stiffeners::Ignored;
+        const zone::Patch patch = zone::buildPatch(strip, {0, 0, 0}, params);
+        expectTrue("the patch meshed", !patch.empty());
+        if (stiffened) expectTrue("with fibres on it", !patch.stiffening.empty());
+
+        for (double axis : {0.0, section.neutralAxis}) {
+            zone::SolveParams solve;
+            solve.plastic = false;
+            solve.indenter.halfLength = -1;
+            solve.indenter.halfWidth = -1;
+            solve.preload.gradient = steel.youngsModulus * kappa;
+            solve.preload.reference = axis;
+            zone::Solver solver(patch, plasticity::shipSteel(), solve);
+
+            const double offset = axis - (stiffened ? section.neutralAxis : 0.0);
+            const double second =
+                stiffened ? section.secondMoment + section.area * offset * offset
+                          : plateSecond + spanY * thickness * offset * offset;
+            const double want = 0.5 * steel.youngsModulus * kappa * kappa * second * lengthX;
+            const double got = solver.result().initialStrainEnergy;
+            std::printf("     %-12s %10.6f %16.8e %16.8e %10.6f\n",
+                        stiffened ? "modelled" : "none", axis, got, want, got / want);
+            expectNear("the pre-loaded patch stores its section's bending energy", got, want,
+                       0.002 * want);
+            if (stiffened) {
+                // And the split is the section's own: the fibres hold the Steiner
+                // term and the plating holds the rest, so a formulation that had
+                // quietly put the stiffener's area in the plate would show up here
+                // even though the total was right.
+                const double fibreShare = solver.fiberStrainEnergy() / got;
+                const double predicted =
+                    (profileSection(bar).secondMoment +
+                     profileSection(bar).area *
+                         (0.5 * thickness + profileSection(bar).centroid - axis) *
+                         (0.5 * thickness + profileSection(bar).centroid - axis)) /
+                    second;
+                std::printf("     %-12s %10s the fibres hold %.4f of it; the section says %.4f\n",
+                            "", "", fibreShare, predicted);
+                expectNear("and the fibres hold the share the section gives them", fibreShare,
+                           predicted, 0.005);
+            }
+        }
+    }
+
+    // Non-vacuous: the stiffened patch stores far more than the bare one at the
+    // same curvature, or every ratio above would be satisfied by a stiffener that
+    // did nothing.
+    zone::MeshParams params = flatParams(2);
+    params.stiffeners = zone::Stiffeners::Modelled;
+    const zone::Patch stiff = zone::buildPatch(strip, {0, 0, 0}, params);
+    params.stiffeners = zone::Stiffeners::Ignored;
+    const zone::Patch bare = zone::buildPatch(strip, {0, 0, 0}, params);
+    const auto stored = [&](const zone::Patch& patch) {
+        zone::SolveParams solve;
+        solve.plastic = false;
+        solve.indenter.halfLength = -1;
+        solve.indenter.halfWidth = -1;
+        solve.preload.gradient = steel.youngsModulus * kappa;
+        zone::Solver solver(patch, plasticity::shipSteel(), solve);
+        return solver.result().initialStrainEnergy;
+    };
+    const double ratio = stored(stiff) / stored(bare);
+    // The prediction is the parallel axis theorem about the plate's own
+    // mid-surface, which is the axis both patches are bent about here.
+    const double predicted =
+        (section.secondMoment + section.area * section.neutralAxis * section.neutralAxis) /
+        plateSecond;
+    std::printf("     at the same curvature about the plate's own mid-surface the stiffened patch"
+                " stores %.2f times the bare one; the section says %.2f\n", ratio, predicted);
+    expectNear("the stiffener multiplies the panel's bending stiffness by what its section says",
+               ratio, predicted, 0.005 * predicted);
+    expectTrue("and that factor is a large one, so this is not a rounding effect",
+               predicted > 20.0);
+}
+
 // --- 13. What the weld tolerance means, and what the bucket grid is for ---------
 //
 // Mutation testing found this whole class untested: squaring the tolerance,
@@ -1564,6 +1818,8 @@ void runZoneTests() {
     testTheParallelSolveIsBitIdentical();
     testAZoneOnTheFerry();
     testStiffenersBracketTheAnswer();
+    testTheModelledStiffenerLandsInsideTheBracket();
+    testAPreLoadedStiffenedPatchStoresItsSectionsEnergy();
     testTheWeldIsADistanceAndNotABucket();
     testTheAxisPointsOutward();
     testAreasAreRightOnATrapezoid();

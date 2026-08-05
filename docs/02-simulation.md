@@ -1371,7 +1371,9 @@ panels have identical area and identical axial stiffness, which is exactly why a
 axial check would not notice. What discrete costs: roughly 3× the elements, and every
 stiffener is an eccentric beam whose offset from the plate mid-surface has to be
 carried explicitly (`StructuralMember::rise`) or the section modulus is wrong by
-that same Steiner term.
+that same Steiner term. `constraint.hpp` is what carries it in the FEM, and
+`stiffenedSection()` here is the independent route its section properties are
+checked against — the 130× above reproduces exactly (130.25, at identical area).
 
 **The structural mesh is independent of the hydrodynamic hull mesh.** They are
 refined for different reasons and neither refinement is negotiable: the hull
@@ -2331,14 +2333,16 @@ the price is paid in zone size rather than in a tuned spring stiffness: the
 boundary error is a Saint-Venant effect that decays away from the edge, so growing
 the radius makes it go away and the convergence is measurable.
 
-**Stiffeners are not meshed**, and the reason is that the only element in the
+**Stiffeners were not meshed**, and the reason was that the only element in the
 inventory is the solid-shell hex and there is no way to attach a web to a plate
 with it that is not wrong: a web sharing one node row along the seam is a hinge
 with a zero-energy tripping mode; a web widened to the plate's element size has its
 strong-axis stiffness wrong by `(h/t_web)³`, 3 000× here; and smearing is what
-`§3` above rejects with a factor of 130. What is needed is a multi-point constraint
+`§3` above rejects with a factor of 130. What was needed is a multi-point constraint
 tying an eccentric beam to a shell — the same machinery Tier-1/Tier-2 interface
-coupling needs, and the next thing to build.
+coupling needs. It now exists: `engine/sim/constraint.{hpp,cpp}`, and
+`Stiffeners::Modelled` builds the member out of it. See *Eccentric stiffeners*
+below.
 
 **Leaving them out is not the neutral choice, and measuring it is what showed
 that.** With no supports the plating spans from one clamped zone edge to the other,
@@ -2358,6 +2362,201 @@ bound; the truth is between and the bracket is published rather than a point
 estimate. The default needs `subdivision ≥ 3` — the stiffener lines *are* the panel
 seams, so at 2 a bay is left with one free node — and `Patch::freeFraction` says so
 when it is not met.
+
+> Those membrane figures are **per bay times the number of bays the punch covers**,
+> and re-deriving them turned up how easily that is dropped. `indentationForce` on
+> a 0.70 m span of 12 mm plate under a 2 m contact is 3.71 MN at 0.078 m and
+> 12.05 MN at 0.35 m; the 2 m punch spans `2.0 / 0.70 = 2.86` bays, and
+> `3.71 × 2.86 = 10.6` and `12.05 × 2.86 = 34.4`. Both published numbers
+> reproduce. What does **not** reproduce is the "seven times too soft" in
+> `zone::Stiffeners::Ignored`'s own comment: `6.6 → 34` is 5.15, which is what this
+> section and `zone.hpp` §3 both say. The comment was the outlier and is corrected.
+
+#### Eccentric stiffeners — **implemented**
+
+`engine/sim/constraint.{hpp,cpp}`, checked by `tests/test_constraint.cpp`.
+
+**The formulation, and why it needs no rotational degree of freedom.** A
+solid-shell keeps `kDof == 24` — three translations per node and no rotation
+anywhere — and carries bending as *differential displacement between its two
+faces*. The rotation of a plate's cross-section is therefore already in the model,
+as the pair of nodes through the thickness, and a point rigidly attached at
+through-thickness offset `e` is an exact linear function of that pair:
+
+```
+u(e) = u_bottom + ((e + t/2)/t) · (u_top − u_bottom)
+```
+
+At `e = 0.1 m` on 12 mm plating the weight is 8.83, so the tie is an
+*extrapolation* far outside the element — which is what an eccentric member needs.
+It is exact for a **finite** rigid rotation, because a rotation is linear and
+commutes with the interpolation: measured at 3.6 × 10⁻¹⁵ m after 0.70 rad and 2.9 m
+of travel, which is under one ulp of the amplified operand.
+
+**The member is a set of axial fibres**, two-node bars along the stiffener line,
+each at its own offset and each tied that way. "Plane sections remain plane" is not
+assumed; it is *imposed by the tie*, which is the physical statement that the web
+is welded to the plate. The stations are **two-point Gauss through each rectangle
+of the profile**, which makes the area, the first moment and the second moment of
+each rectangle exact — so the fibres carry the profile's own `I_own` as well as its
+Steiner term. One station per rectangle would lose `I_own`, and that is 25% of a
+200×10 flat bar's second moment about the weld line.
+
+**Against `scantlings::stiffenedSection`, two independent routes to one number.**
+Impose pure bending about an axis `z₀` and the stored energy is
+`E κ² (I_NA + A (z₀ − z_NA)²) L / 2` — a parabola in `z₀` whose minimum is the
+neutral axis, whose value there is the second moment, and whose curvature is the
+area. Sweeping `z₀` therefore checks all three of `stiffenedSection`'s outputs at
+once, and an offset that is wrong moves the vertex. For a 200×10 flat bar on 12 mm
+plating at 700 mm spacing:
+
+| | finite element | `stiffenedSection` |
+|---|---|---|
+| stored energy, five axes from −0.05 m to +0.15 m | — | ratio **1.000000000** at every one |
+| neutral axis, from the parabola's vertex | −0.02038462 m | −0.02038462 m |
+| area, from the parabola's curvature | 1.04000000 × 10⁻² m² | 1.04000000 × 10⁻² m² |
+
+Both routes are exact, so this is an identity and is asserted at 10⁻⁸ having been
+measured at 2 × 10⁻¹⁰. It runs through a *linear* assembly on purpose: the same
+comparison through `zone::Solver` picks up the co-rotational frame's own O(θ²)
+error, which at `κ = 10⁻³` over a two-metre patch is **1.6%** and does not converge
+away with the mesh — that is measured too, in `test_zone.cpp`, at `κ = 10⁻⁵` where
+it is 10⁻⁴ and the comparison is about the formulation instead.
+
+The negative controls are what make that non-vacuous. Tying the same fibres to the
+mid-surface instead — zero eccentricity, which is what a wrong weight produces —
+leaves the panel **exactly** the bare plate again, Steiner term and `I_own`
+together, which is `§3`'s smearing argument written as an energy. And one fibre per
+rectangle instead of two comes out 22.8% soft, which is precisely `I_own`.
+
+**Tripping is not a zero-energy mode, and the reason is structural.** The member is
+*condensed*: it has no degrees of freedom of its own, so it cannot add a mechanism.
+Measured on a free-free stiffened patch, the whole spectrum: the bare plating has
+exactly six zero eigenvalues and so does the stiffened one, with the threshold
+scaled off the first elastic eigenvalue (1.17 × 10⁵ N/m) rather than fixed —
+this repo has twice been bitten by a constant rigid-body cutoff. Tipping the web by
+10⁻³ rad costs 29.2 J, and the tie carries the eccentric kinematics exactly: every
+fibre moves laterally by its own offset times the rotation, to **0.000 × 10⁰ m**.
+
+**And the honest half.** A bar has stiffness along its own axis and none across it,
+so the fibres contribute *exactly zero* to that tipping motion — asserted as an
+identity, not as "small". What restrains tripping here is the plating alone, and
+the number is a closed form: a strip of width `b` with the seam down the middle and
+both far edges clamped resists a seam rotation at `16 D / b` per unit length, met to
+0.04% at 4 × 32 elements. So this formulation **over**-restrains tripping where the
+hinge leaves it free — the web is forced to follow the plate's cross-section
+exactly. That is the opposite error, and lateral-torsional buckling of a stiffener
+stays `buckling.hpp`'s question.
+
+**The stiffener re-introduces an in-plane length scale into the stable step, and
+that is a cost decision.** `§1`'s "thickness-governed, flat in the in-plane element
+size" is a property of the *plating*. A fibre's is not: the tie amplifies its
+stiffness by the square of the weight — 373× for the outer fibre of a 200 mm bar on
+12 mm plating — while its mass arrives at the pair unamplified, and `EA/L` grows as
+the elements shrink. Measured on a 2.0 × 0.7 m strip:
+
+| subdivision | plating step | with fibres | ratio |
+|---|---|---|---|
+| 2 (0.25 × 0.175 m) | 1.816 µs | 1.816 µs | 1.000 |
+| 4 | 1.812 µs | 1.622 µs | 1.118 |
+| 8 (0.0625 × 0.044 m) | 1.797 µs | 0.738 µs | **2.436** |
+
+At the resolution the reference ferry uses the stiffener is free; past it, it sets
+the step and the zone costs proportionally more. The figure is **exact rather than
+bounded**: a rank-one stiffness against a diagonal mass has the closed-form largest
+eigenvalue `k Σ vᵢ²/mᵢ`, checked against a power iteration on the same block.
+
+**The mass is lumped equally over the pair, and the consistent alternative is a
+trap.** `TᵀMT` preserves the total for any weight — the row sums are `(1−w) m` and
+`w m` — but for `w = 8.83` those are `−7.83 m` and `+8.83 m`: a **negative nodal
+mass**, which an explicit scheme cannot integrate. There is no lumping of a
+positive mass over two nodes six millimetres apart that reproduces the first moment
+of a mass a hundred millimetres away; the first moment is what the extrapolation is
+for. So the total is exact and the stiffener's rotary inertia about the seam is
+given up, and a test asserts every nodal mass is positive so the code cannot
+quietly go back.
+
+**Where it lands.** `Stiffeners::Modelled` on the flat reference strip, 50 mm into
+a 200 mm half-span:
+
+| | force | work |
+|---|---|---|
+| `Ignored` | 4.90 MN | 159 kJ |
+| `Modelled` | **5.54 MN** | **179 kJ** |
+| `RigidSupport` | 7.72 MN | 241 kJ |
+
+Inside the bracket on both, which is the thing only a solve can say — a tie with
+the wrong sign would put the member on the other side of the plate and could come
+out either way. `RigidSupport` stays the default: it is what every figure in this
+section was taken with, and it is the setting that makes the comparison against
+`indentation.hpp` an equal one.
+
+**What the arithmetic costs is nothing; what the step costs is everything.**
+`fiberForces` is **20 ns per fibre per step**, measured over 20 000 evaluations of
+a 240-fibre set. At the 0.42 fibres per element the ferry's resolution delivers
+that is **8.4 ns per element per step**, or 0.27% of the 3.1 µs elastoplastic
+element — invisible in an end-to-end A/B, which came back at +1.0% and −0.1% on two
+runs of the same case. So the only cost that matters is the stable step in the
+table above, and it is a cost of *resolution* rather than of stiffeners.
+
+**What it still cannot do**, stated rather than discovered: no tripping (above);
+no weak-axis second moment, because every fibre sits on the stiffener line, so a
+tee with a wide flange loses more than a flat bar does; and **the stiffener does
+not tear** — a fibre yields on its own uniaxial flow curve and hardens, but it has
+no damage variable, so a zone whose plating has torn away from under a longitudinal
+still has the longitudinal. That last one is what `promotion::reduce` is waiting
+on, and it is a failure criterion rather than more constraint machinery. The GPU
+path does not carry fibres either, and `Solver::adopt` says so rather than
+absorbing it.
+
+#### What mutation testing found here
+
+33 mutants, each a single plausible edit to `constraint.cpp`, to the new code in
+`zone.cpp`, or to `solveStatic`'s extra-block path. The first pass killed 27. **All
+six survivors but one were real holes**, and closing them added five checks:
+
+- **A fibre's plastic strain was stored unsigned.** `state.plasticStrain +=
+  increment` instead of `direction * increment` passes every tensile test, because
+  the sign only matters to the *next* trial stress. A stiffener on the far side of
+  a dent is in compression, and the error is invisible until the load turns round.
+  The suite now yields a fibre at −1% strain and releases it: it has to come back
+  in tension at `E |ε_p|`, capped by the flow stress it has hardened to.
+- **A run of exactly two stations built nothing.** A member crossing a single
+  element of the patch is a member; the off-by-one was invisible because no zone
+  large enough to mesh is that small. Checked on `addStiffener` directly.
+- **Fibres bridged a gap in the plating.** The check that a fibre may only span an
+  element *edge* survived its own removal, because nothing in the fixtures had a
+  member the patch carries in two pieces. There is now a U of panels whose two arms
+  both carry the seam and whose spine does not: 1.4 m of fibres over a 2.1 m
+  member, and a bridged gap would show as 2.1.
+- **`zone::Solver` never lumped the fibres' mass.** `lumpFiberMass` was tested;
+  the solver *calling* it was not, which is a different statement. A zone whose
+  stiffeners weighed nothing would accelerate too easily and no force or energy
+  would say so.
+- **A `DofBlock` reaching outside the element bandwidth was dropped in silence** —
+  `BandedSpd::add` discards an out-of-band entry without a word. It does not bite
+  the stiffener, whose four nodes are already banded, but `DofBlock` is the general
+  shape an interface coupling has and it would bite that.
+
+  **And the first version of that test passed against the mutant**, which is worth
+  recording on its own. A spring whose off-diagonal is dropped while its diagonal
+  survives is two enormous springs to earth: both nodes go to zero, they agree
+  perfectly, and "the block tied them" is satisfied by a coupling that is gone. The
+  check that works is *what sets the tied deflection* — the plate's compliance
+  (5.4 × 10⁻² m) or the spring's stiffness (`load/k` = 2 × 10⁻⁸ m). A factor of
+  2.7 million between them.
+
+The one survivor is argued **equivalent**: the return map's first estimate of the
+plastic increment can drop the hardening modulus, `f/E` instead of `f/(E+H)`,
+because it is only the Newton start and one step lands on the root exactly for a
+linear curve. Kept as the control, because a mutation harness that reports
+everything killed is reporting nothing.
+
+One mutant is worth a note on *cost*: shrinking the fibre timestep by dropping its
+square root made the suite take twenty minutes instead of one, because every zone
+solve then ran 30 000 times as many steps. It is killed by the reference-resolution
+assertion, but a mutation sweep over an explicit solver needs a per-mutant timeout
+or one bad edit eats the budget.
 
 #### Against the membrane model, and one thing it settles
 

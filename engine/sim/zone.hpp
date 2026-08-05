@@ -87,10 +87,10 @@
 // asks for. `Patch::problems` says when a zone was truncated that way, because a
 // truncation that is not reported is indistinguishable from a small ship.
 //
-// --- 3. Stiffeners are not meshed, and the answer is a bracket -----------------
+// --- 3. Stiffeners: two bounds, and now the member itself ----------------------
 //
-// The zone is plating only, and the reason is that **the only element in the
-// inventory is the solid-shell hex, and there is no way to attach a web to a plate
+// The zone was plating only, and the reason is that **the only element in the
+// inventory was the solid-shell hex, and there is no way to attach a web to a plate
 // with it that is not wrong.**
 //
 //   * A web sharing one row of nodes along the seam is a **hinge**. It carries the
@@ -103,9 +103,16 @@
 //   * Smearing into the plate is the thing `scantlings.hpp` §1 rejects with a
 //     measurement: the panel's second moment falls by **130x** at identical area.
 //
-// What is actually needed is a multi-point constraint tying an eccentric beam to
-// the shell, which is the same machinery Tier-1/Tier-2 interface coupling needs
-// and does not exist yet.
+// What was needed is a multi-point constraint tying an eccentric beam to the
+// shell, and that is now `constraint.{hpp,cpp}`: the solid-shell's two nodes
+// through the thickness *are* the rotation of the plate's cross-section, so a
+// member at through-thickness offset `e` is an exact linear function of that pair
+// and needs no rotational degree of freedom anywhere. `Stiffeners::Modelled`
+// builds the member out of axial fibres tied that way. What it buys and what it
+// still cannot do are in `constraint.hpp`'s own header; the short version is that
+// it carries the section's area, neutral axis and second moment exactly -- checked
+// against `scantlings::stiffenedSection` -- and that it *over*-restrains tripping
+// where the hinge leaves it free.
 //
 // **Leaving them out entirely is not the neutral choice, and measuring it is what
 // showed that.** On the ferry's side under a 2 m punch at 0.35 m of penetration,
@@ -116,21 +123,27 @@
 // `indentation.hpp` records in its own history, where the size of the hole came out
 // a property of the contact radius rather than of the collision.
 //
-// So `Stiffeners` offers the two bounds the omission leaves, and the honest answer
-// is the bracket rather than either end:
+// So `Stiffeners` offers the two bounds the omission leaves, and the member that
+// now sits between them:
 //
 //   * `Ignored` -- the lower bound. Soft by the factor above; conservative for a
 //     damage-stability question and useless for a survivability one.
-//   * `RigidSupport` -- the upper bound, and the default. Every plating node a
-//     stiffener runs through is pinned, which is what a member far stiffer than the
-//     plate it carries does in the limit. Measured on the same zone, the resisting
-//     force comes out 23-30 MN against the membrane model's 28 MN on the same
-//     0.70 m span, so the plating between supports is behaving as the membrane
+//   * `RigidSupport` -- the upper bound, and still the default. Every plating node
+//     a stiffener runs through is pinned, which is what a member far stiffer than
+//     the plate it carries does in the limit. Measured on the same zone, the
+//     resisting force comes out 23-30 MN against the membrane model's 28 MN on the
+//     same 0.70 m span, so the plating between supports is behaving as the membrane
 //     model says it should.
+//   * `Modelled` -- the member itself, eccentric fibres tied to the plating. It has
+//     to land *inside* the bracket, and `tests/test_zone.cpp` asserts that rather
+//     than trusting it: a stiffener that came out stiffer than a rigid support or
+//     softer than no support at all would be a formulation error that no single
+//     run could see.
 //
-// It is also the setting that makes the two models comparable at all, because
-// `indentation.hpp` assumes one bay with its boundaries held -- which is precisely
-// a rigid support on every stiffener line.
+// `RigidSupport` remains the default because it is the setting that makes the two
+// models comparable at all -- `indentation.hpp` assumes one bay with its boundaries
+// held, which is precisely a rigid support on every stiffener line -- and because
+// it is what every published figure in `02-simulation.md` §3 was taken with.
 //
 // --- 4. Boundary conditions --------------------------------------------------
 //
@@ -181,6 +194,7 @@
 // SI units, body frame per CLAUDE.md.
 #pragma once
 
+#include "constraint.hpp"
 #include "plasticity.hpp"
 #include "scantlings.hpp"
 #include "solid_shell.hpp"
@@ -208,8 +222,13 @@ enum class Edge { Clamped, Free };
 enum class Stiffeners {
     // Not there at all. The plating then spans from one clamped zone edge to the
     // other, which is soft by a large factor -- measured on the ferry's side at
-    // 0.35 m of penetration under a 2 m punch, **seven times** too soft against a
-    // membrane model spanning the real 0.70 m longitudinal spacing. Worse, the
+    // 0.35 m of penetration under a 2 m punch, **five times** too soft against a
+    // membrane model spanning the real 0.70 m longitudinal spacing (6.6 MN against
+    // 34). This comment said *seven* times until the membrane figure was
+    // re-derived: `indentationForce` on that span under a 2 m contact is 12.05 MN
+    // per bay and the punch covers 2.0/0.70 = 2.86 of them, so 34.4 MN and a ratio
+    // of 5.15 -- which is what §3 and `02-simulation.md` §3 both already said.
+    // Nothing tests a comment. Worse, the
     // span it does use is the *zone radius*, so the answer depends on a meshing
     // parameter. That is the failure `indentation.hpp` records in its own history,
     // where the hole came out a property of the contact radius rather than of the
@@ -226,6 +245,17 @@ enum class Stiffeners {
     // are the panel seams, so at subdivision 2 a panel is left with one free node
     // and cannot deform. `Patch::problems` says so when it happens.
     RigidSupport,
+    // The member itself: axial fibres at the profile's own through-thickness Gauss
+    // stations, each tied to the plating by `constraint.hpp`'s multi-point
+    // constraint. Nothing is pinned, so the plating between stiffeners spans the
+    // real distance *and* the supports deflect, which is the whole point -- the
+    // two bounds above differ by a factor of two to five on the reference ferry and
+    // the answer is somewhere in there.
+    //
+    // It is not the default. `RigidSupport` is what every figure `02-simulation.md`
+    // §3 publishes was taken with, and changing the default would silently move
+    // them; a caller that wants the member asks for it.
+    Modelled,
 };
 
 struct MeshParams {
@@ -318,11 +348,26 @@ struct Patch {
     double freeFraction = 0;
     int stiffenerNodes = 0;   // pinned because a stiffener runs through them
 
+    // The members themselves, under `Stiffeners::Modelled` and empty otherwise.
+    // Fibres tied to the plating by `constraint.hpp`; they carry no degrees of
+    // freedom of their own, so they change the patch's stiffness and mass without
+    // changing its node count.
+    constraint::Stiffening stiffening;
+
     // Smallest stable explicit step over the patch, computed here rather than in
     // the solver because it is what makes the cost knowable *before* the run: it
     // is 0.5 ms of power iteration per element, which is a promotion cost like the
     // stiffness formation beside it and not a per-step one.
+    //
+    // **The fibres are in it.** A tie amplifies a fibre's stiffness by the square
+    // of its weight while its mass arrives unamplified, so whether a stiffener
+    // shortens the step is a measurement rather than an assumption; it is taken
+    // here, exactly, because a rank-one stiffness against a diagonal mass has a
+    // closed-form largest eigenvalue.
     double criticalTimestep = 0;    // s
+    // What the plating alone would have allowed, so the fibres' share of the cost
+    // is visible instead of being discovered as a slower run.
+    double platingTimestep = 0;     // s
 
     std::vector<std::string> problems;
 
@@ -566,6 +611,14 @@ public:
     const std::vector<double>& nodalMass() const { return mass_; }
     // Per-element plastic history, for a test that needs to see inside.
     const std::vector<solidshell::ElementPlasticState>& elementState() const { return plastic_; }
+    // Per-fibre plastic history and the fibres' rest lengths, for the same reason.
+    const std::vector<constraint::FiberState>& fiberState() const { return fiber_; }
+    const constraint::RestFibers& restFibers() const { return fiberForms_; }
+    // Strain energy stored in the stiffeners alone, J. `SolveResult::strainEnergy`
+    // is the plating and this together; separating them is what lets a test compare
+    // the stiffener's contribution against a closed form without the plating's own
+    // discretisation error in the way.
+    double fiberStrainEnergy() const { return fiberEnergy_; }
 
     // Displacement of the patch's most-displaced node from the **rest**
     // configuration, m. A patch under no load must keep this at zero, which is a
@@ -647,6 +700,11 @@ private:
     std::vector<solidshell::RestForms> forms_;
     std::vector<solidshell::ElementPlasticState> plastic_;
     std::vector<double> dissipation_;    // per element, this step
+    // The stiffeners. `fiberForms_` is the step-invariant half, taken from `rest_`
+    // after any `Preload` has moved it.
+    constraint::RestFibers fiberForms_;
+    std::vector<constraint::FiberState> fiber_;
+    double fiberEnergy_ = 0;
 
     std::vector<std::uint32_t> adjacencyOffset_, adjacencyEntry_;  // node -> element corner
     std::vector<std::uint32_t> driven_;   // node indices the indenter holds
