@@ -146,13 +146,21 @@
 //
 // --- 5. What this does not do yet ---------------------------------------------
 //
-//  1. **No coupling to Tier 1**, which does not exist. What does exist is coupling
-//     to Tier 0, in `promotion.{hpp,cpp}`: it decides when a patch deserves a zone,
-//     hands the zone the girder's stress as a `Preload` below, and turns what tore
-//     back into a section the beam can read. The boundary is still fixed -- the
-//     patch's edge is clamped and nothing outside it moves in response to what
-//     happens inside -- so the coupling is one way per solve and the two-way
-//     interface-DOF version still waits on Craig-Bampton.
+//  1. **No coupling to Tier 1.** What does exist is coupling to Tier 0, in
+//     `promotion.{hpp,cpp}`: it decides when a patch deserves a zone, hands the
+//     zone the girder's stress as a `Preload` below, and turns what tore back into
+//     a section the beam can read. The boundary is still fixed -- the patch's edge
+//     is clamped and nothing outside it moves in response to what happens inside --
+//     so the coupling is one way per solve.
+//
+//     The **reduction** the two-way version needs now exists:
+//     `reduction.{hpp,cpp}` will take this patch's own mesh, treat its clamped
+//     perimeter as an interface (`reduction::nodesPinned`) and hand back a reduced
+//     pair whose boundary DOF are kept exactly. What is still missing is the
+//     *coupling*: something that drives those interface DOF from the surrounding
+//     structure instead of pinning them, and a matching pass that ties two
+//     substructures' interfaces together. Until that exists the edge is clamped,
+//     and `zone.cpp` is unchanged by the reduction's arrival.
 //  2. **The indenter is kinematic and rigid.** Nodes inside a rectangular footprint
 //     are driven at a prescribed velocity; there is no contact search, no friction,
 //     no release, and the striking body does not crush. A prescribed motion cannot

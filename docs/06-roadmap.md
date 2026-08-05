@@ -249,8 +249,7 @@ The longest and highest-risk phase.
 - ~~**Tier-0 beam**~~ **done** — `engine/sim/girder.{hpp,cpp}` and
   `collapse.{hpp,cpp}`: the hull girder as a free beam balanced on the wave, first
   yield, buckling, and Smith's-method progressive collapse swept along the length
-  (`02-simulation.md` §3). Craig–Bampton reduction and the Tier-1 reduced model are
-  **not** done, and are the piece between this and Tier-2
+  (`02-simulation.md` §3)
 - ~~**Solid-shell elements for plating**~~ **done** —
   `engine/sim/solid_shell.{hpp,cpp}`. Explicit tet FEM for genuinely 3D regions
   already existed from the Phase 0 spike (`engine/sim/fem.{hpp,cpp}`)
@@ -269,6 +268,38 @@ The longest and highest-risk phase.
   zone. **Stiffeners are not meshed** — there is no way to attach a web to a
   solid-shell plate without a multi-point constraint, which does not exist — so the
   zone offers the two bounds that leaves and publishes the bracket
+- ~~**Craig–Bampton reduction**~~ **done** — `engine/sim/reduction.{hpp,cpp}`,
+  measured in `02-simulation.md` §3. The missing middle: nothing could give a
+  structural answer for a whole hold or the region between two bulkheads, because
+  Tier 0 is a beam and Tier 2 is a patch. Boundary DOF kept exactly, the interior
+  carried by constraint modes plus a handful of fixed-interface normal modes, and
+  a small dense mass and stiffness pair out of it.
+
+  Four properties are identities rather than tolerances and are asserted as such:
+  zero modes reproduces static condensation and static condensation is **exact at
+  the interface for any load** (2 × 10⁻¹⁰ m of a 0.31 m deflection against an
+  independent solve); a free-free substructure keeps exactly six zero eigenvalues;
+  the reduced frequencies come down **from above**, monotonically, because a
+  reduction can only stiffen; and the reduced pair is `TᵀKT` and `TᵀMT`, formed
+  the long way in the tests. Symmetric eigensolvers written rather than taken —
+  dense Householder/QL, and subspace iteration whose mode count is verified by a
+  **Sturm sequence** because a skipped mode is otherwise silent.
+
+  **Three published figures were wrong and are corrected there**: the cost saving
+  is 2800× rather than 10⁻⁵; "the static interface response improves with mode
+  count" is false, it starts exact and the modes buy the *interior* and the
+  dynamics; and the standard "cut off at twice the band of interest" buys 0.6%
+  inside the 10 Hz hull-girder band, not four figures, because the cutoff is a
+  frequency of the fixed-interface spectrum and the band is a frequency of the
+  assembled one.
+
+  Cost on the same plating: **0.10 core-seconds per simulated second** for Tier 0
+  over the whole ship, **0.35–0.41** for this patch at Tier 1, **1155** for the
+  same patch at Tier 2. What it cannot do is yield, tear, buckle, contact or
+  rotate — it is linear by construction — so `checkValidity` exists to say when the
+  region has to be promoted, and it under-predicts a concentration so the warning
+  is late rather than early
+
 - ~~Co-rotational elasticity and J2 plasticity~~ — done: `engine/sim/solid_shell.hpp`
   and `engine/sim/plasticity.hpp`, measured in `02-simulation.md` §3. Radial return
   with isotropic hardening (kinematic available, defaulted off for want of a
@@ -296,10 +327,12 @@ The longest and highest-risk phase.
   **Tier-0 answer it reads** is 167 ms, of which 137 ms is the Smith sweep — so it
   is reviewed at a cadence and explicitly not every tick.
 
-  What is still missing is **Tier 1**, so the coupling goes to a *section* rather
-  than to retained interface DOF, and it is one way per solve: the patch's edge
-  stays clamped and nothing outside it responds. The reduction also carries
-  plating only, because the zone meshes plating only — a collision that opens
+  The coupling still goes to a *section* rather than to retained interface DOF,
+  and it is one way per solve: the patch's edge stays clamped and nothing outside
+  it responds. The Craig–Bampton **reduction** now exists, but the **coupling**
+  does not — nothing drives a zone's interface DOF from a reduced model, and
+  nothing assembles two substructures at a shared interface. The section
+  reduction also carries plating only, because the zone meshes plating only — a collision that opens
   fourteen bays leaves their longitudinals at full strength, which is the
   un-conservative direction and needs the same multi-point constraint the zone
   needs to mesh a web at all
@@ -444,11 +477,17 @@ The longest and highest-risk phase.
   a number of joules, and closing that needs the striking body's mass, which is
   `collision.hpp`'s to supply.
 
-  With the zone solver and the coupling done, **the largest thing outstanding in
-  Phase 3 is Tier 1** — Craig–Bampton reduction. Without it a promoted zone is
-  clamped on a boundary that cannot move, and a hull girder that has lost a bay
-  learns about it through a section rather than through the interface DOF where
-  the load actually redistributes.
+  With the zone solver, the Tier-0 coupling and the Craig–Bampton reduction done,
+  **the largest thing outstanding in Phase 3 is the Tier-1 coupling** — three
+  pieces, none of which is the reduction itself. A **mesher** that can produce a
+  hold-sized substructure, since the only one that exists is `zone::buildPatch`:
+  plating only, within a radius, stopping at thickness seams. An **assembly** pass
+  that matches two substructures' interfaces and stacks their modal blocks, which
+  is what makes component mode synthesis a synthesis. And a **two-way zone
+  interface**, so a promoted zone is driven by the structure around it instead of
+  clamped on a boundary that cannot move. Until those exist, a hull girder that
+  has lost a bay still learns about it through a section rather than through the
+  interface DOF where the load actually redistributes.
 
 This is the phase the whole concept is named for. If it works, everything after
 it is addition; if it does not, the project is a very good flooding simulator and
@@ -534,7 +573,9 @@ Phase 0 ✅ ──▶ Phase 1 ──┬──▶ Phase 2 ──┬──▶ Phas
    Residual risk moves to solid-shell element implementation, which is
    better-understood work than an open performance question. The tier structure
    still means a failure here degrades to Tier-1-only (elastic deformation,
-   scripted-threshold tearing) rather than killing the project.
+   scripted-threshold tearing) rather than killing the project — and Tier 1 now
+   exists and is measured at 2800× cheaper than Tier 2 on the same plating, so
+   that fallback is a real one rather than a plan.
 2. **Coupling stability.** Partitioned multiphysics can go unstable in ways
    neither solver does alone. Mitigation: every coupling gets an energy-balance
    check in CI; the flooding↔rigid-body predictor-corrector already in the code

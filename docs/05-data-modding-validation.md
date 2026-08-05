@@ -182,7 +182,8 @@ at load instead of becoming a space that never floods. The remaining half is a
 shared plane set and a partition of the interior between them.
 
 **Everything derived is cached and content-hashed.** BEM coefficient solves take
-hours; windage sweeps take longer; FEM Craig–Bampton reduction takes minutes.
+hours; windage sweeps take longer; FEM Craig–Bampton reduction takes 0.1–5 s for
+a patch of side shell and would take minutes for a whole ship.
 These are build artefacts keyed on the hash of their inputs, computed once, and
 distributed with the ship.
 
@@ -371,8 +372,14 @@ trajectory one. A comparison that cannot fail is not a measurement.
   ships.
 - Impact and tearing against published ship collision experiments and the
   large-scale grounding tests in the literature.
-- Cross-check the Craig–Bampton reduced model against the full model it was
-  reduced from — this one is free and should run in CI.
+- ~~Cross-check the Craig–Bampton reduced model against the full model it was
+  reduced from — this one is free and should run in CI.~~ **Done**, and it is
+  free: `tests/test_reduction.cpp` builds the full model's own dense spectrum and
+  asserts that the reduced frequencies bound it **from above** and fall
+  monotonically as modes are added, which is stronger than closeness because a
+  reduction can only stiffen. Static condensation is checked against
+  `solidshell::solveStatic` on the same problem, to 2 × 10⁻¹⁰ m of a 0.31 m
+  deflection. See `02-simulation.md` §3.
 
 **Fire and thermal**
 - The NIST/FDS verification and validation suite compartment-fire cases.

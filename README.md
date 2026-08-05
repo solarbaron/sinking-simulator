@@ -195,6 +195,23 @@ progressive-collapse sweep sized from first yield never reached its peak on a
 damaged section, and reported a hull girder that grew fifteen times stronger when
 material was removed from it.
 
+Between the beam and the zone there was, until recently, nothing — so a whole
+hold, a superstructure, or the region between two bulkheads had no structural
+answer at all. `engine/sim/reduction.{hpp,cpp}` is that middle tier:
+**Craig–Bampton component mode synthesis**, keeping every interface degree of
+freedom exactly and carrying the interior on a handful of fixed-interface modes,
+with the symmetric eigensolvers written out rather than taken from a library. It
+is unusually well supplied with exact answers and they are asserted as identities:
+static condensation is exact at the interface for *any* load (2 × 10⁻¹⁰ m of a
+0.31 m deflection against an independent solve), a free component keeps exactly
+six zero eigenvalues, and the reduced frequencies come down **from above**,
+monotonically, because a reduction can only stiffen. On the same patch of the
+ferry's side it costs 0.4 core-seconds per simulated second against Tier 2's 1155
+— 2800× — and what it buys with that is nothing nonlinear at all: it cannot yield,
+tear, buckle or rotate, so it also reports when it has stopped being valid and the
+region has to be promoted. Three published figures in the plan turned out to be
+optimistic and are corrected there.
+
 The spike cost a day and moved an 18-engineer-month bet from assumed to measured,
 identifying one architectural change before any of that phase existed to rewrite.
 
