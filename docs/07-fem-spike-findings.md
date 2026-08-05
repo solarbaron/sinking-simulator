@@ -751,12 +751,31 @@ which says the fix earns its place.
 
 1. **Keep the `RestForms` hoist.** It is 2× on the CPU, free, and bit-identical.
    It is the one part of this work that is unambiguously worth having.
-2. **Fix the conditioning in the element, not in the shader.** The enhanced modes
-   are a basis and their scaling is a free choice; normalising each column of G by
-   its own natural scale makes Kaa O(1) and is exact, so it costs the double CPU
-   path nothing and would remove the largest single obstacle to a float one. That
-   is a change to `solid_shell.cpp` and it should be made and validated against the
-   existing 207 assertions *before* any more GPU work.
+2. ~~**Fix the conditioning in the element, not in the shader.**~~ **Done.**
+   `computeRestForms` normalises each column of G by its own weighted L2 norm.
+   Measured on this element, κ(Kaa) against slenderness:
+
+   | h/t | before | after |
+   |---|---|---|
+   | 5  | 2.19e3 | 3.50 |
+   | 10 | 3.50e4 | 3.50 |
+   | 30 | 2.84e6 | 3.50 |
+   | 60 | 4.54e7 | 3.50 |
+
+   Before, that is **(h/t)⁴ to three figures**, which is the diagnosis §8 reached
+   from the float failure. After, it is constant in the geometry, and the residual
+   3.50 is exactly the material's own anisotropy — 277 GPa against 79.2 GPa — so
+   the geometric spread is entirely gone rather than merely reduced. No material is
+   needed to do it, which is why it fits in the rest forms.
+
+   Exactness is asserted as an identity, not inferred from the suite still passing.
+   The test re-derives the condensation independently from the public `RestForms`
+   and its own constitutive matrix, then repeats it with the enhanced basis rescaled
+   across twelve orders of magnitude: Kua → Kua S and Kaa → S Kaa S, so
+   Kua S (S Kaa S)⁻¹ S Kuaᵀ collapses back exactly. Wrecking κ to **2.86e23** moves
+   the element by 1.91e-06 of 1.03e12 — a relative 1.9e-18. Both vacuity guards are
+   there: that the rescaling really did ruin Kaa, and that the independent
+   condensation reproduces the shipped element.
 
    **Two things decide whether it is safe, and neither is the scaling itself.**
    `Kua` has to be scaled with `Kaa` or the condensation is no longer the same
@@ -778,6 +797,6 @@ which says the fix earns its place.
 4. **Re-map the kernel to a workgroup per element** before measuring throughput
    again. The current numbers measure register spilling, not the element.
 
-Until 2 and 4 are done, **the CPU is the faster and the more trustworthy path for
+Until 4 is done, **the CPU is the faster and the more trustworthy path for
 Tier 2**, and the honest statement of this item's status is that the pattern
 applies, the kernel was built to it, and the element does not fit the mapping.

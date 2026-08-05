@@ -1872,6 +1872,156 @@ void testCachedRestFormsAreBitIdentical() {
     expectTrue("and an update off them returns no force rather than a wrong one", zeroed);
 }
 
+
+// The enhanced modes are a basis, and `computeRestForms` now normalises them so
+// that Kaa is O(1) instead of O((h/t)^4). That is only allowed to be free if the
+// element it produces is *identical*, so the identity is asserted rather than the
+// conditioning alone.
+//
+// The check re-derives the condensation independently from the public `RestForms`
+// and a constitutive matrix built here, then does it again with the enhanced basis
+// rescaled by wildly different per-column factors. Scaling column j of G by s_j
+// takes Kua -> Kua S and Kaa -> S Kaa S, so the condensation
+// Kua S (S Kaa S)^-1 S Kua^T collapses back to Kua Kaa^-1 Kua^T exactly -- the
+// scaling cancels, which is the whole reason the normalisation costs nothing.
+void testEnhancedBasisScalingCannotChangeTheElement() {
+    const StructuralMaterial steel = ah36Steel();
+    // Slender, because that is where the conditioning is bad and where a mistake
+    // in the cancellation would show.
+    const double t = 0.010, h = 0.600;
+    const double rest[24] = {
+        0, 0, -t / 2,  h, 0, -t / 2,  h, h, -t / 2,  0, h, -t / 2,
+        0, 0,  t / 2,  h, 0,  t / 2,  h, h,  t / 2,  0, h,  t / 2};
+
+    solidshell::RestForms f;
+    expectTrue("the slender element builds its rest forms",
+               solidshell::computeRestForms(rest, solidshell::Formulation::SolidShell, f));
+    expectTrue("and it carries enhanced modes", f.easCount > 0);
+
+    // Isotropic C, written here so the comparison is against an independent
+    // derivation rather than against the same code twice.
+    double c[6][6] = {};
+    {
+        const double E = steel.youngsModulus, nu = steel.poissonRatio;
+        const double a = E * (1.0 - nu) / ((1.0 + nu) * (1.0 - 2.0 * nu));
+        const double b = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
+        const double g = 0.5 * E / (1.0 + nu);
+        c[0][0] = c[1][1] = c[2][2] = a;
+        c[0][1] = c[0][2] = c[1][0] = c[1][2] = c[2][0] = c[2][1] = b;
+        c[3][3] = c[4][4] = c[5][5] = g;
+    }
+
+    const int n = f.easCount;
+    // Condense from the rest forms, with column j of G scaled by scale[j].
+    const auto condense = [&](const std::vector<double>& columnScale, std::vector<double>& out,
+                              double* conditionProxy) {
+        std::vector<double> kuu(24 * 24, 0.0), kua(24 * static_cast<std::size_t>(n), 0.0),
+            kaa(static_cast<std::size_t>(n) * n, 0.0);
+        for (int gp = 0; gp < 8; ++gp) {
+            double cb[6][24] = {}, cg[6][7] = {};
+            for (int i = 0; i < 6; ++i) {
+                for (int d = 0; d < 24; ++d)
+                    for (int k = 0; k < 6; ++k) cb[i][d] += c[i][k] * f.b[gp][k][d];
+                for (int j = 0; j < n; ++j)
+                    for (int k = 0; k < 6; ++k)
+                        cg[i][j] += c[i][k] * f.g[gp][k][j] * columnScale[static_cast<std::size_t>(j)];
+            }
+            for (int i = 0; i < 24; ++i) {
+                for (int j = 0; j < 24; ++j) {
+                    double s = 0;
+                    for (int k = 0; k < 6; ++k) s += f.b[gp][k][i] * cb[k][j];
+                    kuu[static_cast<std::size_t>(i) * 24 + j] += f.weight[gp] * s;
+                }
+                for (int j = 0; j < n; ++j) {
+                    double s = 0;
+                    for (int k = 0; k < 6; ++k) s += f.b[gp][k][i] * cg[k][j];
+                    kua[static_cast<std::size_t>(i) * n + j] += f.weight[gp] * s;
+                }
+            }
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < n; ++j) {
+                    double s = 0;
+                    for (int k = 0; k < 6; ++k)
+                        s += f.g[gp][k][i] * columnScale[static_cast<std::size_t>(i)] * cg[k][j];
+                    kaa[static_cast<std::size_t>(i) * n + j] += f.weight[gp] * s;
+                }
+        }
+        if (conditionProxy) {
+            double lo = kaa[0], hi = kaa[0];
+            for (int i = 0; i < n; ++i) {
+                lo = std::min(lo, kaa[static_cast<std::size_t>(i) * n + i]);
+                hi = std::max(hi, kaa[static_cast<std::size_t>(i) * n + i]);
+            }
+            *conditionProxy = hi / lo;
+        }
+        // Kaa^-1 Kua^T by Gaussian elimination on the small system.
+        std::vector<double> a(kaa), x(static_cast<std::size_t>(n) * 24);
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < 24; ++j)
+                x[static_cast<std::size_t>(i) * 24 + j] = kua[static_cast<std::size_t>(j) * n + i];
+        for (int col = 0; col < n; ++col) {
+            const double pivot = a[static_cast<std::size_t>(col) * n + col];
+            for (int r = 0; r < n; ++r) {
+                if (r == col) continue;
+                const double factor = a[static_cast<std::size_t>(r) * n + col] / pivot;
+                for (int k = 0; k < n; ++k)
+                    a[static_cast<std::size_t>(r) * n + k] -= factor * a[static_cast<std::size_t>(col) * n + k];
+                for (int k = 0; k < 24; ++k)
+                    x[static_cast<std::size_t>(r) * 24 + k] -= factor * x[static_cast<std::size_t>(col) * 24 + k];
+            }
+        }
+        for (int r = 0; r < n; ++r)
+            for (int k = 0; k < 24; ++k)
+                x[static_cast<std::size_t>(r) * 24 + k] /= a[static_cast<std::size_t>(r) * n + r];
+
+        out.assign(24 * 24, 0.0);
+        for (int i = 0; i < 24; ++i)
+            for (int j = 0; j < 24; ++j) {
+                double s = 0;
+                for (int k = 0; k < n; ++k)
+                    s += kua[static_cast<std::size_t>(i) * n + k] * x[static_cast<std::size_t>(k) * 24 + j];
+                out[static_cast<std::size_t>(i) * 24 + j] =
+                    kuu[static_cast<std::size_t>(i) * 24 + j] - s;
+            }
+    };
+
+    std::vector<double> unit(static_cast<std::size_t>(n), 1.0), plain, skewed;
+    double conditionPlain = 0, conditionSkewed = 0;
+    condense(unit, plain, &conditionPlain);
+
+    // Deliberately awful scaling, spanning twelve orders of magnitude.
+    std::vector<double> wild(static_cast<std::size_t>(n));
+    for (int j = 0; j < n; ++j) wild[static_cast<std::size_t>(j)] = std::pow(10.0, 2 * j - 6);
+    condense(wild, skewed, &conditionSkewed);
+
+    // Vacuity: the rescaling has to have actually wrecked Kaa, or invariance is
+    // being asserted about nothing.
+    expectTrue("the normalised basis leaves Kaa well conditioned", conditionPlain < 10.0);
+    expectTrue("and the deliberate rescaling ruins it", conditionSkewed > 1e12);
+
+    // Vacuity: the enhanced modes have to be doing something, or Kuu alone would
+    // pass every comparison below.
+    double norm = 0, difference = 0;
+    for (std::size_t i = 0; i < plain.size(); ++i) norm = std::max(norm, std::fabs(plain[i]));
+    expectTrue("the element has stiffness at all", norm > 0);
+
+    // The independent condensation must reproduce the shipped element...
+    double shipped[24 * 24];
+    solidshell::elementStiffness(rest, steel, solidshell::Formulation::SolidShell, shipped);
+    double worstShipped = 0;
+    for (std::size_t i = 0; i < plain.size(); ++i)
+        worstShipped = std::max(worstShipped, std::fabs(plain[i] - shipped[i]));
+    expectTrue("an independent condensation reproduces the shipped element",
+               worstShipped < 1e-9 * norm);
+
+    // ...and the enhanced basis's scaling must not reach the answer.
+    for (std::size_t i = 0; i < plain.size(); ++i)
+        difference = std::max(difference, std::fabs(plain[i] - skewed[i]));
+    std::printf("     enhanced basis: kappa %.2e normalised, %.2e wrecked; element moves %.2e of %.2e\n",
+                conditionPlain, conditionSkewed, difference, norm);
+    expectTrue("rescaling the enhanced basis cannot change the element", difference < 1e-8 * norm);
+}
+
 }  // namespace
 
 void runSolidShellTests() {
@@ -1894,4 +2044,5 @@ void runSolidShellTests() {
     testExplicitStabilityLimit();
     testCostPerElement();
     testCachedRestFormsAreBitIdentical();
+    testEnhancedBasisScalingCannotChangeTheElement();
 }

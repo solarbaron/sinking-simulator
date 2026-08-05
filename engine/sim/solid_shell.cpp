@@ -327,6 +327,51 @@ void computeForms(const double nodes[kDof], Formulation form, RestForms& out,
                 out.g[gp][i][j] = scale * s;
             }
     }
+
+    // --- Normalise the enhanced modes ------------------------------------------
+    //
+    // The enhanced modes are a *basis* and their scaling is a free choice: scaling
+    // column j of G by s and alpha_j by 1/s leaves G alpha, and therefore the
+    // element, exactly unchanged. Unnormalised they are the natural-coordinate
+    // polynomials, and for a thin element the thickness modes pick up the
+    // Jacobian's t/2 against the in-plane h/2, so Kaa's condition number goes as
+    // **(h/t)^4** -- measured on this element at 2.19e3, 3.50e4, 2.84e6 and 4.54e7
+    // for h/t of 5, 10, 30 and 60, which is that power to three figures.
+    //
+    // At the ferry's 300 mm elements on 10 mm plating that is 2.8e6, and it is why
+    // the float GPU path had to equilibrate Kaa in the shader before factoring it
+    // and still lost the enhanced parameters entirely (`07-fem-spike-findings.md`
+    // §8). Fixing it here fixes it for every path.
+    //
+    // **Why this is safe, which is the part that is not obvious.** `alpha` is
+    // persistent per-element state -- `ElementPlasticState::enhanced` carries it
+    // between steps -- so a scale that is recomputed differently on any step would
+    // silently reinterpret the history already stored. This one is a function of
+    // the **rest** configuration alone, so it is constant for the element's life
+    // and the stored alpha stays in one basis by construction. Deriving it from the
+    // current configuration is the version that looks equivalent and is not.
+    //
+    // Nothing downstream needs to know: `Kua` and `Kaa` are both built from `G`, so
+    // scaling `G` scales them consistently, and alpha comes back out of a system
+    // built the same way. That is what makes this a basis change rather than an
+    // approximation, and the tests assert it as an identity on the recovered
+    // displacement rather than as a tolerance.
+    //
+    // The norm is the weighted L2 one over the Gauss points -- the material is not
+    // available here, and does not need to be: Kaa is diagonal to within the
+    // material's own anisotropy, so removing the geometric spread is what matters.
+    if (out.easCount > 0) {
+        for (int j = 0; j < kEas; ++j) {
+            double norm = 0.0;
+            for (int gp = 0; gp < kGauss; ++gp)
+                for (int i = 0; i < 6; ++i)
+                    norm += out.weight[gp] * out.g[gp][i][j] * out.g[gp][i][j];
+            if (!(norm > 0.0)) continue;   // an unused mode stays as it is
+            const double inverse = 1.0 / std::sqrt(norm);
+            for (int gp = 0; gp < kGauss; ++gp)
+                for (int i = 0; i < 6; ++i) out.g[gp][i][j] *= inverse;
+        }
+    }
 }
 
 struct Blocks {
