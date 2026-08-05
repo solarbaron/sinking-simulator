@@ -1715,6 +1715,13 @@ void testTwoComponentsAssembleIntoTheWhole() {
                                                     x[static_cast<std::size_t>(i)]));
         expectTrue("componentState returns that component's own DOF", worstMap < 1e-15);
 
+        // A state of the wrong length is the one mistake it cannot otherwise
+        // notice: every index in `fromA` is in range, so a short state would come
+        // back as a plausible field silently missing its modal content.
+        std::vector<double> truncated(x.begin(), x.end() - 1);
+        expectTrue("and refuses a state that is not this assembly's",
+                   reduction::componentState(sasm, sasm.fromA, truncated).empty());
+
         const std::vector<double> ua = reduction::recover(sa, sra, xa);
         double worstInterior = 0;
         for (std::size_t n = 0; n < left.nodeCount(); ++n) {

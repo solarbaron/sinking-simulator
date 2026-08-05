@@ -1643,13 +1643,18 @@ bool assembledStaticSolve(const Assembly& assembly, const std::vector<double>& l
 
 std::vector<double> componentState(const Assembly& assembly, const std::vector<int>& from,
                                    const std::vector<double>& state) {
+    // The assembly is here to be checked against, not for symmetry. A state of the
+    // wrong length is the one mistake this call cannot otherwise notice: every
+    // index in `from` is in range for the assembly, so a short state would silently
+    // return zeros for the tail and the caller would recover a plausible field that
+    // is missing its modal content.
+    if (state.size() != static_cast<std::size_t>(assembly.size())) return {};
     std::vector<double> out(from.size(), 0.0);
     for (std::size_t i = 0; i < from.size(); ++i) {
         const int a = from[i];
         if (a >= 0 && static_cast<std::size_t>(a) < state.size())
             out[i] = state[static_cast<std::size_t>(a)];
     }
-    (void)assembly;
     return out;
 }
 

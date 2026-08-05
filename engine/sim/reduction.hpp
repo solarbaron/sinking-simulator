@@ -626,7 +626,9 @@ bool assembledStaticSolve(const Assembly& assembly, const std::vector<double>& l
                           std::string* problem = nullptr);
 
 // The part of an assembled state belonging to one component, in that component's
-// own reduced DOF order -- what `recover()` wants.
+// own reduced DOF order -- what `recover()` wants. Empty if `state` is not this
+// assembly's: every index is otherwise in range, so a short state would come back
+// as a plausible field quietly missing its modal content.
 std::vector<double> componentState(const Assembly& assembly, const std::vector<int>& from,
                                    const std::vector<double>& state);
 
