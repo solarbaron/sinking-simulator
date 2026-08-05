@@ -613,6 +613,18 @@ struct Assembly {
     bool empty() const { return size() == 0; }
 };
 
+// **Two components, and only two.** There is no way to join an `Assembly` to a
+// third component, because `InterfaceMap` is expressed in the *substructures'*
+// boundary DOF and an `Assembly` has no substructure behind it. A ship is many
+// components, so this is a real limit and not a simplification for exposition.
+//
+// Generalising it wants one change rather than a rewrite: an assembled model needs
+// to carry the boundary DOF identity its components had -- which global DOF of
+// which mesh each assembled boundary row *is* -- so that the same position match
+// can be run against it. The scatter-add underneath already does not care how many
+// components it is given. That is the next piece here, and it is smaller than the
+// mesher which is the actual blocker: nothing yet cuts a ship into components
+// worth assembling at all.
 Assembly assemble(const Reduction& a, const Reduction& b, const InterfaceMap& map);
 
 // Natural frequencies of an assembled model, rad/s ascending, with the listed

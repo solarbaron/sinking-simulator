@@ -3108,8 +3108,13 @@ against the full model's 11.08 MPa with Guyan alone, converging to 11.01 MPa wit
    coincident node would otherwise couple x to y, and the assembled model would be
    wrong in the way that is hardest to see.
 
-   What is still missing is the *mesher*, item 1 — two components can now be
-   joined, but nothing yet cuts a ship into components worth joining.
+   Two limits, named rather than left to be found. It joins **two** components and
+   only two: `InterfaceMap` is expressed in the substructures' boundary DOF and an
+   `Assembly` has no substructure behind it, so there is no way to add a third. The
+   fix is to carry the boundary DOF identity through an assembly rather than to
+   rewrite the scatter-add, which already does not care how many components it is
+   given. And the real blocker is still the *mesher*, item 1 — nothing yet cuts a
+   ship into components worth joining, so this has the join and no pieces.
 3. **A zone's edge is still clamped.** `zone.hpp` §5 item 1 and `promotion.hpp`
    are unchanged by this file's arrival: the two-way coupling needs something that
    drives interface DOF from the surrounding structure instead of pinning them.
