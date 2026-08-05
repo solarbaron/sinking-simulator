@@ -29,6 +29,13 @@ warning means the signal is degrading.
 An incremental build cannot see a warning in a file it did not recompile, which
 is why `full` configures a throwaway build directory and compiles everything.
 
+**And a build cannot see a warning its optimisation level does not produce.** Every
+gate compiles `RelWithDebInfo`; GCC's `-Waggressive-loop-optimizations` needs `-O3`,
+and it sat on `reduction.cpp`'s triangular solves for as long as they existed —
+a signed loop counter it could not bound, so it reasoned `n` might be `INT_MAX` and
+the indexing would then be undefined. `full` now builds the engine at `-O3` as well,
+which costs 6 s. Tools and tests are still not covered there.
+
 ## Conventions
 
 - **SI units everywhere**, no exceptions. Angles in radians except at display

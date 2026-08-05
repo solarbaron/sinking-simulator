@@ -58,28 +58,39 @@ bool cholesky(std::vector<double>& a, int n) {
     return true;
 }
 
+// Both triangular solves count in `std::size_t` rather than `int`, and that is not
+// only tidiness: with a signed counter GCC cannot bound the trip count, so at `-O3`
+// it reasons that `n` might be `INT_MAX`, that `b[i]` would then run past any
+// allocation, and warns that "iteration 2147483647 invokes undefined behavior"
+// -- `-Waggressive-loop-optimizations`, on the inlined call from
+// `generalisedEigen`. An unsigned counter bounded by the same value used to index
+// leaves it nothing to prove. It also deletes a wall of casts.
+//
+// The warning did not fire in any gate, because `verify.sh` builds
+// `RelWithDebInfo` and this needs `-O3`. **Warnings are failures here, so a
+// warning that only exists in a configuration no gate compiles is a blind spot,
+// not a curiosity** -- see the note in `CLAUDE.md`.
+
 // L y = b, in place, with `l` a lower-triangular factor from `cholesky`.
 void forwardSolve(const std::vector<double>& l, int n, double* b) {
-    for (int i = 0; i < n; ++i) {
+    if (n <= 0) return;
+    const std::size_t size = static_cast<std::size_t>(n);
+    for (std::size_t i = 0; i < size; ++i) {
         double s = b[i];
-        for (int k = 0; k < i; ++k)
-            s -= l[static_cast<std::size_t>(i) * static_cast<std::size_t>(n) +
-                   static_cast<std::size_t>(k)] * b[k];
-        b[i] = s / l[static_cast<std::size_t>(i) * static_cast<std::size_t>(n) +
-                     static_cast<std::size_t>(i)];
+        for (std::size_t k = 0; k < i; ++k) s -= l[i * size + k] * b[k];
+        b[i] = s / l[i * size + i];
     }
 }
 
 // L^T x = y, in place.
 void backwardSolve(const std::vector<double>& l, int n, double* b) {
-    for (int ii = n; ii > 0; --ii) {
-        const int i = ii - 1;
+    if (n <= 0) return;
+    const std::size_t size = static_cast<std::size_t>(n);
+    for (std::size_t ii = size; ii > 0; --ii) {
+        const std::size_t i = ii - 1;
         double s = b[i];
-        for (int k = i + 1; k < n; ++k)
-            s -= l[static_cast<std::size_t>(k) * static_cast<std::size_t>(n) +
-                   static_cast<std::size_t>(i)] * b[k];
-        b[i] = s / l[static_cast<std::size_t>(i) * static_cast<std::size_t>(n) +
-                     static_cast<std::size_t>(i)];
+        for (std::size_t k = i + 1; k < size; ++k) s -= l[k * size + i] * b[k];
+        b[i] = s / l[i * size + i];
     }
 }
 

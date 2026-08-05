@@ -95,6 +95,37 @@ rm -rf build-verify
 build_into build-verify
 rm -rf build-verify
 
+# ...and a build cannot see a warning its optimisation level does not produce.
+#
+# Everything above compiles `RelWithDebInfo`. GCC's `-Waggressive-loop-optimizations`
+# needs `-O3`, and it was sitting on `reduction.cpp`'s triangular solves for as long
+# as they existed: with a signed loop counter it cannot bound the trip count, so it
+# reasons `n` might be `INT_MAX` and the indexing would then be undefined. Warnings
+# are failures here, so a warning no gate ever compiles is a blind spot rather than
+# a curiosity.
+#
+# Engine only, and that is a deliberate trade: it is where the numerics live and
+# where the optimiser has something to reason about, and it costs ~6 s where the
+# whole tree would cost far more. Tools and tests are not covered at -O3.
+section "optimiser warnings (-O3 sees what RelWithDebInfo does not)"
+rm -rf build-o3
+if cmake -S . -B build-o3 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+         -DCMAKE_CXX_FLAGS="-O3" >/dev/null 2>&1; then
+  o3log="$(mktemp)"
+  if ninja -C build-o3 shipsim_engine >"$o3log" 2>&1; then
+    o3warnings="$(grep -cE 'warning:' "$o3log" || true)"
+    [ "$o3warnings" -eq 0 ] && pass "engine built warning-clean at -O3" \
+                            || { fail "$o3warnings warning(s) at -O3"; grep -E 'warning:' "$o3log" | head -5; }
+  else
+    fail "the -O3 engine build failed"
+    grep -E 'error:' "$o3log" | head -5
+  fi
+  rm -f "$o3log"
+else
+  fail "cmake configure failed for build-o3"
+fi
+rm -rf build-o3
+
 section "GPU tools"
 # These must skip, not fail, on a machine without Vulkan — the suite has to stay
 # runnable in CI, which is where it is worth the most.
