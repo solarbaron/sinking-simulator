@@ -757,6 +757,21 @@ which says the fix earns its place.
    path nothing and would remove the largest single obstacle to a float one. That
    is a change to `solid_shell.cpp` and it should be made and validated against the
    existing 207 assertions *before* any more GPU work.
+
+   **Two things decide whether it is safe, and neither is the scaling itself.**
+   `Kua` has to be scaled with `Kaa` or the condensation is no longer the same
+   operator — scaling column *j* of G by *s* and α*ⱼ* by 1/*s* leaves `G α`
+   unchanged, which is why it is exact, but only if every place α appears agrees on
+   *s*. And **α is persistent per-element state**: `ElementPlasticState` carries the
+   enhanced parameters between steps, so a scale that is recomputed differently on
+   any step silently reinterprets the history already stored.
+
+   Both fall out if the scale is taken from the **rest** configuration and cached —
+   which is exactly where `RestForms` now lives. The `(h/t)⁴` conditioning is a
+   property of the element's shape, not of its current deformation, so a rest-based
+   scale is constant for the element's life, consistent for the stored α by
+   construction, and free. Deriving it from the *current* configuration would be
+   the version that looks equivalent and is not.
 3. **If a float kernel is still wanted after that, keep alpha in double.** The EAS
    block is 7×7. Even at Pascal's 1/32 fp64 rate it is a small share of the kernel,
    and it is the only part that has been shown to need the digits.
