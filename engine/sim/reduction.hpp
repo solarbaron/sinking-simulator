@@ -185,6 +185,10 @@
 //     statement about *one* subspace, and it is only true when both matrices are
 //     projected onto it.
 //
+// (§8 adds one term to this: a stiffener condensed onto the plating's degrees of
+// freedom brings mass that no element carries, and it is lumped onto the same
+// diagonal for the same reasons.)
+//
 // The mass matrix itself is **row-sum lumped**, matching Tier 2, and that is a
 // choice with consequences worth stating. In its favour: `zone.hpp`'s explicit
 // solver lumps, so the reduced region and the zone that replaces it agree about
@@ -259,6 +263,9 @@
 //     a substructure that turns through a finite angle -- a capsizing ship, a
 //     detached section -- is outside its validity, unlike the co-rotational Tier-2
 //     element.
+//   * **`checkValidity` reads the elements only, so an attached member's own
+//     stress is not in the utilisation** -- see §8. A stiffened region is reported
+//     by its plating, and the plating is the softer half.
 //   * **It is stale the moment anything changes.** Thinning, tearing or a moved
 //     boundary changes K, so the reduction must be rebuilt. It is a one-off cost,
 //     not a per-step one, but it is not free.
@@ -307,6 +314,91 @@
 // of freedom are 92% of the reduced model either way. An interface twice as large
 // costs four times as much to build and twice as much to store, which is the
 // argument for cutting a substructure at a bulkhead rather than around a patch.
+//
+// --- 8. Stiffness and mass the elements do not carry ----------------------------
+//
+// A `HexMesh` is elements, and **not everything structural is an element**. The
+// case this exists for is the one `constraint.hpp` builds: an eccentric stiffener
+// is represented as axial fibres tied to the plating and *condensed onto the
+// plating's own degrees of freedom*, so it has no nodes and no elements of its
+// own. A substructure that only ever looked at the mesh therefore reduced a
+// stiffened patch as **bare plating** -- measured, before this section existed, at
+// 3e-16 relative to an element-only assembly, while one 200 x 10 flat bar across a
+// 0.6 m patch was worth 7.9% of its displacement field. Longitudinals carry a
+// large share of a hull girder, so that error is not a patch-scale curiosity: it
+// is wrong in the unsafe direction for any Tier-1 model of real ship structure.
+//
+// `Attachment` closes it. It is deliberately expressed in `solidshell::DofBlock`
+// and a nodal mass array rather than in `constraint::Stiffening`, for two reasons:
+// the substructure has no business knowing what a stiffener is, and `DofBlock` is
+// already exactly what `solidshell::solveStatic` takes -- so the static reference
+// a test compares against is the *same* description of the *same* physics, not a
+// second one that could disagree. `constraint::stiffnessBlocks` and
+// `constraint::lumpFiberMass` produce the two fields between them.
+//
+// **Three things had to be got right, and each is a silent failure otherwise.**
+//
+//   1. **The sparsity pattern.** The CSR is built from element node adjacency, and
+//      a block ties degrees of freedom that no single element need share. The
+//      lookup is a binary search that, on a column the pattern does not have,
+//      returns the slot of the *next* one -- so an unchecked scatter would land a
+//      stiffener's stiffness on a neighbouring degree of freedom and produce a
+//      plausible field that is quietly wrong. The blocks are therefore folded into
+//      the adjacency *before* the pattern is built, and every scatter checks that
+//      the slot it found is the slot it asked for.
+//   2. **The bandwidth.** `solidshell::BandedSpd::add` drops anything outside the
+//      band it was given, without a word. The band here is taken from the
+//      assembled pattern rather than estimated from the elements, so folding the
+//      blocks in above fixes this too -- and the interior renumbering sees them,
+//      which it would not if the blocks were scattered after the fact. That it
+//      worked is checked rather than argued: the banded fill counts what fell
+//      outside the band and refuses the substructure if anything did.
+//
+//      **How far outside the band a block actually reaches is worth knowing,
+//      because the obvious answer is wrong.** A fibre from
+//      `constraint::addStiffener` spans two *consecutive* stations of a seam, and
+//      consecutive stations are corners of the same element -- so at mesh
+//      resolution every entry a stiffener contributes is already in the pattern
+//      and the band does not move at all (measured: 41 to 41 on the test plate).
+//      It moves when the member is modelled *coarser* than the plating it sits on:
+//      a station every second node takes the same plate 41 to 65. That is the case
+//      the tests use, because a test built only on the default meshing would have
+//      proved nothing about any of this.
+//   3. **Mass.** A block is stiffness alone; the steel it stands for weighs
+//      something. Leaving it out gives a model that is stiffer *and no heavier*,
+//      so every frequency comes out high -- and frequencies are most of what this
+//      tier is for. So the mass is taken as well, lumped onto the same diagonal as
+//      the elements' (§4), which is also what `zone::Solver` does with
+//      `constraint::lumpFiberMass` -- the two therefore agree about inertia at the
+//      moment of promotion rather than disagreeing. A substructure given stiffness
+//      and no mass says so in `problems()`.
+//
+// **What is given up, and it is `constraint.hpp`'s measurement rather than a new
+// one.** The eccentric tie's consistent condensed mass `T^T M T` puts a *negative*
+// mass on one of the two through-thickness nodes for any weight outside [0, 1] --
+// -7.83 m against +8.83 m for a 200 mm bar on 12 mm plating -- so the fibre mass is
+// split equally over the pair instead. The total is exact and the rotary inertia
+// about the seam is not represented. Tier 1 is implicit and could integrate a
+// negative diagonal entry where Tier 2 could not, but taking the consistent mass
+// here and the lumped one there would make the two tiers disagree about the
+// inertia of the same steel, which is the disagreement §4 exists to avoid.
+//
+// **And what it does not reach.** `checkValidity` walks the elements, so an
+// attached member's own stress is not in the peak von Mises -- a stiffened region
+// is judged by its plating. The stiffener makes the plating *less* utilised, so
+// the promotion trigger moves later on both counts, which is the same direction
+// §6 already warns about for a truncated basis. Measured on the stiffened
+// cantilever in the tests: 58.2 MPa reported against 65.2 MPa in the member, a
+// utilisation of 0.164 where the true one is 0.184.
+//
+// **One result from validating this is worth carrying, because it is not the
+// expected one.** A stiffener stiff enough holds its own line still, and that line
+// then becomes a *node* of the first mode: on the test plate the 200 x 10 bar
+// raises the first frequency by 307% while its own mass moves that same frequency
+// by 0.015%. The mass is not negligible -- 13.7% on the worst of the first twelve
+// modes -- but a single-frequency check would have concluded it did not matter,
+// and on a member the panel can actually bend with (60 x 6) the first frequency
+// lands within 4.5% of what `scantlings::stiffenedSection` predicts.
 //
 // SI units, body frame per CLAUDE.md.
 #pragma once
@@ -371,13 +463,53 @@ std::vector<std::uint32_t> nodesPinned(const solidshell::HexMesh& mesh);
 
 // --- The substructure ----------------------------------------------------------
 
+// Stiffness and mass that belong to the component but not to any of its elements:
+// a stiffener condensed onto the plating it is welded to, and the steel that
+// stiffener is made of. See §8 for what this is for and what it costs.
+//
+// Both fields come ready-made from `constraint.{hpp,cpp}`:
+//
+//     const constraint::RestFibers forms = constraint::restFibers(stiffening, mesh.position);
+//     reduction::Attachment attached;
+//     attached.stiffness = constraint::stiffnessBlocks(stiffening, mesh.position, forms,
+//                                                      material.youngsModulus);
+//     attached.mass.assign(mesh.nodeCount(), 0.0);
+//     constraint::lumpFiberMass(stiffening, forms, material.density, attached.mass);
+//
+// **`mass` is per node, not per degree of freedom**, which is the convention
+// `constraint::lumpFiberMass` and `zone::Solver` already use; a wrongly sized
+// array is refused rather than read short, because an array three times too long
+// would otherwise assemble a plausible model with two thirds of the steel missing.
+// Empty means no attached mass, which is a defensible choice for a pure stiffness
+// tie and is reported so it cannot be an oversight.
+struct Attachment {
+    std::vector<solidshell::DofBlock> stiffness;
+    std::vector<double> mass;  // kg per node, added to the row-sum lumped diagonal
+
+    bool empty() const { return stiffness.empty() && mass.empty(); }
+};
+
 // The full finite element model of one component, assembled once, partitioned, and
 // factored on its interior. Holds a **reference** to the mesh: it must outlive the
 // substructure, in the same way `zone::Solver` holds its `Patch`.
 class Substructure {
 public:
+    // Elements alone. Delegates to the constructor below with an empty
+    // `Attachment`, so there is exactly one assembly path and "no attachment
+    // reduces to what this always did" is a property of the code rather than a
+    // promise a test has to keep checking -- though `tests/test_reduction.cpp`
+    // checks it anyway, bit for bit, because that is the negative control for
+    // everything §8 adds.
     Substructure(const solidshell::HexMesh& mesh, const StructuralMaterial& material,
                  const std::vector<std::uint32_t>& interfaceNodes,
+                 solidshell::Formulation form = solidshell::Formulation::SolidShell);
+    // Elements plus whatever else the component carries. See §8. The `Attachment`
+    // is **consumed here, not held** -- unlike the mesh, which is a reference --
+    // because its blocks are scattered into the same store the elements go into and
+    // there is nothing left to refer back to. It therefore need not outlive the
+    // call, and changing it afterwards changes nothing.
+    Substructure(const solidshell::HexMesh& mesh, const StructuralMaterial& material,
+                 const std::vector<std::uint32_t>& interfaceNodes, const Attachment& attached,
                  solidshell::Formulation form = solidshell::Formulation::SolidShell);
     ~Substructure();
     Substructure(Substructure&&) noexcept;
@@ -394,6 +526,12 @@ public:
     std::size_t interiorCount() const;
     std::size_t halfBandwidth() const;  // of K_ii after the interior renumbering
     double assemblySeconds() const;
+
+    // What the `Attachment` contributed. `attachedMass` is the sum of the array
+    // that was handed over, so a caller can check the steel it meant to add is the
+    // steel `totalMass()` grew by.
+    std::size_t attachedBlocks() const;
+    double attachedMass() const;  // kg
 
     // Global DOF index (3 * node + axis) of each boundary / interior DOF, in the
     // order the reduced model uses. `boundaryDof()` is what a caller couples

@@ -104,30 +104,40 @@
 // in the stiff direction, which is the unsafe one. Closing that means a reduction
 // built from a tangent operator the Tier-2 explicit solver does not form.
 //
-// --- 4. What Tier 1 cannot see at all: the stiffeners ---------------------------
+// --- 4. The stiffeners, and what a coupling has to hand over --------------------
 //
-// This is larger than it looks and it is not about damage. A
-// `reduction::Substructure` is built from a `solidshell::HexMesh` and a material.
 // A zone under `zone::Stiffeners::Modelled` carries its members as
 // `constraint::Stiffening` -- fibres condensed onto the plating's own DOF, with no
-// nodes and no elements of their own. **So the substructure a coupling builds from
-// a stiffened patch is the bare plating**, and `tests/test_coupling.cpp` measures
-// exactly that: the substructure's operator matches an element-only assembly to
-// 3e-16 relative, while one 200x10 flat bar across a 0.6 m patch is worth 7.9% of
-// its displacement field.
+// nodes and no elements of their own. A `reduction::Substructure` built from the
+// mesh and a material therefore reduced a stiffened patch as **the bare plating**,
+// and one 200x10 flat bar across a 0.6 m patch is worth 7.9% of its displacement
+// field, so that was not a rounding.
 //
-// The fix is named rather than done, because it belongs in `reduction.cpp` and
-// wants its own validation against a monolithic stiffened plate:
-// `constraint::stiffnessBlocks` already produces precisely the
-// `solidshell::DofBlock` list `solidshell::solveStatic` takes, and what is missing
-// is a `Substructure` that accepts extra blocks and scatters them into the same
-// CSR it assembles the elements into.
+// **It is closed, and the shape of the fix is worth knowing because the coupling
+// has to do something about it.** `reduction::Attachment` (`reduction.hpp` §8)
+// takes exactly the `solidshell::DofBlock` list `constraint::stiffnessBlocks`
+// already produces and exactly the nodal mass `constraint::lumpFiberMass` already
+// lumps. The substructure folds both into the one CSR and the one lumped diagonal
+// it assembles the elements into, so the bandwidth, the interior renumbering and
+// the reduction all carry the stiffener with nothing added downstream.
+//
+// **The caller has to hand it over.** A substructure built from a stiffened patch
+// with no `Attachment` is still the bare plating, to the last bit -- that is
+// asserted in `tests/test_coupling.cpp` as the negative control, next to the
+// measurement that the same patch *with* one reproduces `solveStatic`'s own
+// stiffened field to 4e-14 of it. Nothing in `couple()` reaches into a
+// `zone::Patch` to find its `stiffening`, because a `Substructure` is built by the
+// caller and a coupling is handed two that already exist.
 //
 // Separately, and unchanged: `constraint.hpp` gives a fibre no damage variable and
 // never deletes it, so "this longitudinal is gone" does not exist to be read --
 // `promotion.hpp` §5 records the same gap for Tier 0. A zone whose plating has
 // torn out from under a longitudinal reports the plating and keeps the member.
-// That one is a failure criterion for the fibres, not coupling machinery.
+// That one is a failure criterion for the fibres, not coupling machinery. It has
+// grown a second edge now that Tier 1 can see the member: `withoutTornElements`
+// hands back a mesh with elements removed and renumbered, and an `Attachment` built
+// against the *original* numbering does not survive that -- it has to be rebuilt
+// from the fibres against the damaged mesh, which nothing here does yet.
 //
 // --- 5. Where the exactness stops ------------------------------------------------
 //

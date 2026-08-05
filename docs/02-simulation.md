@@ -1874,7 +1874,11 @@ named: the standard cutoff at twice the band of interest buys **0.6% inside the
 10 Hz hull-girder band and 8% up to 20 Hz**, and five or six times the band is
 what buys a part in ten thousand. The pass that assembles two substructures now
 exists (`assemble`, §below), and there is now something worth joining — a zone and
-the plating round it, §*Tier-1 to Tier-2 coupling*. What does not exist is a mesher
+the plating round it, §*Tier-1 to Tier-2 coupling*. It can also now see a
+**stiffener**, which it could not until recently and which matters more than a
+patch-scale figure suggests: a longitudinal has no nodes and no elements of its
+own, so a substructure that only read the mesh reduced stiffened plating as bare
+plating, and a hull girder is mostly longitudinals. What does not exist is a mesher
 that can produce a whole-*ship* substructure, so "everything away from damage stays
 here forever" is still the plan rather than the code.
 
@@ -3329,6 +3333,89 @@ concentration, so the recovered peak comes out **under**-predicted — 9.25 MPa
 against the full model's 11.08 MPa with Guyan alone, converging to 11.01 MPa with
 64 modes. `checkValidity` is a trigger for promotion, not a strength check.
 
+#### Stiffness and mass the elements do not carry
+
+A `HexMesh` is elements, and **not everything structural is an element**. A
+stiffener is represented as axial fibres tied to the plating and condensed onto
+the plating's own DOF (`constraint.hpp`), so it has nodes nowhere and elements
+nowhere, and a substructure that only looked at the mesh reduced a stiffened patch
+as **bare plating** — measured at 3e-16 relative to an element-only assembly,
+while one 200 × 10 flat bar across a 0.6 m patch is worth 7.9% of its displacement
+field. Longitudinals carry a large share of a hull girder, so any whole-ship model
+built on that would have been wrong in the unsafe direction.
+
+`reduction::Attachment` is a `std::vector<solidshell::DofBlock>` and a nodal mass
+array — exactly what `constraint::stiffnessBlocks` and `constraint::lumpFiberMass`
+already produce, and exactly what `solidshell::solveStatic` already takes, so the
+static reference a test compares against is the *same* description of the same
+physics rather than a second one that could disagree. The old constructor
+delegates to the new one with an empty `Attachment`, so "no attachment is what
+this always did" is one code path rather than a promise — asserted bit for bit
+anyway, because it is the negative control for everything here.
+
+**Three things had to be right, and each fails silently otherwise.**
+
+- **The sparsity pattern.** The CSR is built from element node adjacency and a
+  block ties DOF no single element need share. The lookup is a binary search that
+  on a missing column returns the slot of the *next* one, so an unchecked scatter
+  lands a stiffener's stiffness on a neighbouring DOF — a plausible field, quietly
+  wrong, which is worse than dropping it. The blocks are folded into the adjacency
+  *before* the pattern is sized, and every scatter checks the slot it found is the
+  slot it asked for.
+- **The bandwidth.** `BandedSpd::add` drops anything outside its band without a
+  word. The band here is taken from the assembled pattern rather than estimated
+  from the elements, so folding the blocks in fixes this too — and the interior
+  renumbering sees them, which it would not if the blocks were scattered
+  afterwards. Measured: fibres between adjacent mesh stations sit inside one
+  element and change the band not at all (41 → 41), while a stiffener modelled
+  every second station takes it 41 → 65. The banded fill counts what fell outside
+  the band and refuses the substructure if anything did, so "the pattern covers it
+  by construction" is a measurement.
+- **Mass.** A block is stiffness alone. Without the steel the model is stiffer and
+  no heavier and every frequency comes out high, which is most of what this tier is
+  for. It is lumped onto the same diagonal as the elements' — which is also what
+  `zone::Solver` does, so the two tiers agree about inertia at the moment of
+  promotion. A substructure given stiffness and no mass says so in `problems()`.
+
+**Validated against closed forms, not against itself.** Prescribe
+`u_x = (ε + κz)x` and nothing else: every fibre lies along x and the tie puts the
+point at offset `e` at `(ε + κe)x` exactly, so what the attachment adds to
+`uᵀKu` is `E L (ε²A + 2εκS + κ²I)` — the profile's area, first moment and second
+moment about the plate mid-surface. Those three come from
+`scantlings::profileSection`, computed from rectangle dimensions and owing nothing
+to fibres; the second is cross-checked against `stiffenedSection` by the parallel
+axis theorem and the first against `smearedThickness`. **Measured: 2.2e-13
+relative.** Both `ε` and `κ` are non-zero because with either alone the cross term
+`S` drops out, and `S` is the only quantity that knows which side of the plate the
+web is on. Statically, the reduced stiffened model reproduces
+`solidshell::solveStatic` with the same blocks to **5e-10** of the peak on a
+stiffened plate and to **4e-14** on the stiffened patch a coupling drives, in both
+cases against a bare-plating answer 7.9%–99% away.
+
+**What it gives up, measured.** The fibre mass is split equally over the
+through-thickness pair rather than condensed, because `TᵀMT` is *negative* on one
+node of any eccentric tie (`constraint.hpp`), so about the seam the model carries
+6.8e-4 kg m² for a 200 × 10 bar where its own eccentricity carries 2.1e-1 — a
+factor of **312**, all of it. Tier 1 is implicit and could integrate a negative
+diagonal where Tier 2 could not, but taking the consistent mass here and the
+lumped one there would make the two tiers disagree about the inertia of the same
+steel. And `checkValidity` walks the elements, so an attached member's own stress
+is not in the utilisation: a stiffened region is judged by its plating, and the
+stiffener makes the plating *less* utilised, so the promotion trigger moves later
+on both counts.
+
+**One result worth having, because it is not the obvious one.** On the test plate
+the 200 × 10 bar raises the first frequency by **307%** and its own mass moves
+that same frequency by **0.015%** — because a member that stiff makes its own line
+a *node* of the first mode, which becomes plate bending beside a seam that does not
+move. The mass is not negligible; it is 13.7% on the worst of the first twelve
+modes, and every one of the twelve falls when it is added, none by more than the
+worst nodal mass ratio allows. On a 60 × 6 member — one the panel can actually bend
+with — the first frequency lands within **4.5%** of `√(I_stiffened/I_plate ÷
+m_ratio)` from `stiffenedSection`, where a smeared panel of identical area and mass
+is out by **2.5×**. That is the factor-of-130 Steiner argument `scantlings.hpp` §1
+makes, arriving as a frequency.
+
 #### What it does not do yet
 
 1. **There is no whole-ship Tier-1 model.** The reduction takes a `HexMesh`, and
@@ -3372,8 +3459,13 @@ against the full model's 11.08 MPa with Guyan alone, converging to 11.01 MPa wit
 3. ~~**A zone's edge is still clamped.**~~ **Done** — `coupling.{hpp,cpp}`,
    §*Tier-1 to Tier-2 coupling* below. What remains is that a reduced model cannot
    represent a zone that has *yielded* without tearing, which is item 6 there.
-4. **Stiffeners are still not meshed**, inherited from `zone.hpp` §3 — the
-   substructure is as good as the mesh it is given.
+4. ~~**Stiffeners are invisible**, inherited from `zone.hpp` §3 — the substructure
+   is as good as the mesh it is given.~~ **Done** — `reduction::Attachment`,
+   §*Stiffness and mass the elements do not carry* above. Still true, and it is a
+   real limit rather than a rounding: a stiffener is *condensed*, not meshed, so
+   its own stress is not in `checkValidity`'s utilisation and its rotary inertia
+   about the seam is not in `M`. The substructure is still as good as what it is
+   given — it just can now be given more than a mesh.
 5. **No damping.** `M_r` and `K_r` are what comes out; a modal damping ratio or a
    Rayleigh pair is a caller's to add, and there is no measurement here that sets
    one.
@@ -3536,27 +3628,52 @@ wrong by 10⁹ times that tolerance.
    forms no tangent operator, so between first yield and first tear the
    surroundings are told the zone is stiffer than it is — the unsafe direction.
    Closing it needs a reduction built from a tangent the solver does not form.
-2. **Tier 1 cannot see the stiffeners at all**, damaged or otherwise, and this is
-   larger than the gap it was expected to be. A `reduction::Substructure` is built
-   from a `HexMesh` and a material; a zone under `Stiffeners::Modelled` carries its
+2. **A stiffener has to be handed to Tier 1 explicitly, and a caller who does not
+   still gets the bare plating.** A zone under `Stiffeners::Modelled` carries its
    members as `constraint::Stiffening` — fibres condensed onto the plating's own
-   DOF, with no nodes and no elements of their own — so the substructure a coupling
-   builds from a stiffened patch is **the bare plating, to the last bit**
-   (measured: its operator matches an element-only assembly to 3e-16 relative).
-   One 200 × 10 flat bar across a 0.6 m patch is worth **7.9%** of its displacement
-   field, so this is not a rounding.
+   DOF, with no nodes and no elements of their own — so a `reduction::Substructure`
+   built from the mesh and a material alone is **the bare plating, to the last
+   bit** (measured: its operator matches an element-only assembly to 3e-16
+   relative). One 200 × 10 flat bar across a 0.6 m patch is worth **7.9%** of its
+   displacement field, so that was never a rounding, and it is why the fix below
+   exists.
 
-   The fix is small and named: `constraint::stiffnessBlocks` already produces
-   exactly the `solidshell::DofBlock` list that `solveStatic` takes and that a
-   substructure would need, so what is missing is a `Substructure` constructor that
-   accepts extra blocks and scatters them into the same CSR — a change to
-   `reduction.cpp`, with its own validation against a monolithic stiffened plate.
+   `reduction::Attachment` (`reduction.hpp` §8) closes it: the same
+   `solidshell::DofBlock` list `constraint::stiffnessBlocks` already produces, plus
+   the nodal mass `constraint::lumpFiberMass` already lumps, folded into the one
+   CSR and the one lumped diagonal the elements go into — so the sparsity pattern,
+   the bandwidth, the interior renumbering and the reduction carry the member with
+   nothing added downstream. Measured on a stiffened plate: the attachment adds
+   exactly the profile's area, first moment and second moment about the plate
+   mid-surface, to **2.2e-13** of the closed form, checked against
+   `scantlings::profileSection` and cross-checked against `stiffenedSection`; the
+   reduced model reproduces `solveStatic`'s own stiffened field to **4e-14** of it,
+   where the bare plating is twelve orders further away. What it does *not* do is
+   find the fibres by itself — the caller assembles the `Attachment`, because a
+   `Substructure` is built by the caller and a coupling is handed two that already
+   exist.
+
+   Two things that fold into that and are worth having written down. **The
+   stiffener's rotary inertia about the seam is given up**, because the fibre mass
+   is split equally over the through-thickness pair rather than condensed —
+   `constraint.hpp` records why (`T^T M T` is negative on one node of any eccentric
+   tie), and the price is measured: about the seam, the model carries 6.8e-4 kg m²
+   for that member where its own eccentricity would carry 2.1e-1, a factor of
+   **312**. And **a stiffener stiff enough is a node line of the first mode**: on
+   the plate above, the 200 × 10 bar raises the first frequency by 307% but its own
+   mass moves it by 0.015%, because the first mode has become plate bending beside
+   a seam that does not move. The fibre mass is worth 13.7% on the worst of the
+   first twelve, and on a 60 × 6 member — one the panel can actually bend with —
+   the first frequency lands within 4.5% of what `stiffenedSection` predicts, where
+   a smeared panel of identical area and mass is out by 2.5×.
 
    Separately, and unchanged: `constraint.hpp` gives a fibre no damage variable and
    never deletes it, so "this longitudinal is gone" does not exist to be read —
    `promotion.hpp` records the same gap for Tier 0. That one is a **failure
    criterion for the fibres**, not coupling machinery, and it stays blocked until
-   the fibres have one.
+   the fibres have one. It has a second edge now: `withoutTornElements` renumbers,
+   and an `Attachment` built against the original numbering does not survive that,
+   so a torn stiffened zone needs its fibres rebuilt against the damaged mesh.
 3. **It is a static coupling.** The assembled solve is `K x = f`; there is no
    co-simulation, no shared time integration and no attempt to run a reduced
    surrounding forward alongside an explicit zone. For a collision that is the
