@@ -149,36 +149,43 @@
 //
 // The patch is cut out of a ship, so its edge is a lie either way. Free lets it
 // translate away under the first load; clamped is too stiff, because the plating
-// outside the zone really does pull in. Clamped is chosen, and **the price is paid
-// in zone size rather than in a tuned spring stiffness**: the boundary error is a
-// Saint-Venant effect that decays away from the edge, so growing the radius makes
-// it go away and the convergence is measurable. `tests/test_zone.cpp` measures it.
-// An elastic edge with a stiffness standing for the surrounding structure would be
-// softer and closer, and it would also be a coefficient no measurement sets --
-// which is the argument `solid_shell.hpp` uses against hourglass control.
+// outside the zone really does pull in. Clamped is the default, and **the price is
+// paid in zone size rather than in a tuned spring stiffness**: the boundary error
+// is a Saint-Venant effect that decays away from the edge, so growing the radius
+// makes it go away and the convergence is measurable. `tests/test_zone.cpp`
+// measures it. An elastic edge with a stiffness standing for the surrounding
+// structure would be softer and closer, and it would also be a coefficient no
+// measurement sets -- which is the argument `solid_shell.hpp` uses against
+// hourglass control.
 //
 // The consequence to keep in mind: **a zone one bay wide is a clamped bay**, which
 // is the same idealisation `indentation.hpp` makes, and a zone five bays wide is
 // not. That is deliberate -- it is what makes the two models comparable at radius
 // one and different at radius five.
 //
+// **There is now a third option, and it is neither a bound nor a coefficient.**
+// `HexMesh::prescribed` says what value a pinned DOF takes, and the solver below
+// honours it: a perimeter DOF whose prescribed value is non-zero is *driven* there
+// rather than held at the meshed position. `coupling.hpp` fills that array from a
+// Tier-1 reduced model of the structure round the patch, so the edge follows what
+// the rest of the ship is doing. Clamped is then the special case "the surroundings
+// said zero", which is what makes the two paths one path.
+//
+// The static path already read `prescribed`; the explicit one ignored it, silently,
+// which meant a boundary condition set on a patch was honoured or dropped depending
+// on which solver saw it. Both read it now.
+//
 // --- 5. What this does not do yet ---------------------------------------------
 //
-//  1. **No coupling to Tier 1.** What does exist is coupling to Tier 0, in
-//     `promotion.{hpp,cpp}`: it decides when a patch deserves a zone, hands the
-//     zone the girder's stress as a `Preload` below, and turns what tore back into
-//     a section the beam can read. The boundary is still fixed -- the patch's edge
-//     is clamped and nothing outside it moves in response to what happens inside --
-//     so the coupling is one way per solve.
-//
-//     The **reduction** the two-way version needs now exists:
-//     `reduction.{hpp,cpp}` will take this patch's own mesh, treat its clamped
-//     perimeter as an interface (`reduction::nodesPinned`) and hand back a reduced
-//     pair whose boundary DOF are kept exactly. What is still missing is the
-//     *coupling*: something that drives those interface DOF from the surrounding
-//     structure instead of pinning them, and a matching pass that ties two
-//     substructures' interfaces together. Until that exists the edge is clamped,
-//     and `zone.cpp` is unchanged by the reduction's arrival.
+//  1. **Coupling to Tier 1 is static and elastic on the way back.**
+//     `coupling.{hpp,cpp}` now drives the perimeter from a Craig-Bampton model of
+//     the structure round the patch, and hands a torn zone back to that model as a
+//     mesh with the dead elements removed, so the surroundings feel the damage.
+//     What it does *not* carry back is plastic softening short of a tear: a
+//     reduction is linear (`reduction.hpp` §6) and this solver forms no tangent
+//     operator, so between first yield and first tear the surroundings are told
+//     the zone is stiffer than it is. Coupling to Tier 0 is unchanged and remains
+//     the path `promotion.{hpp,cpp}` owns.
 //  2. **The indenter is kinematic and rigid.** Nodes inside a rectangular footprint
 //     are driven at a prescribed velocity; there is no contact search, no friction,
 //     no release, and the striking body does not crush. A prescribed motion cannot
@@ -188,8 +195,11 @@
 //     keeps its mass. The hole is therefore the deleted area, which this reports as
 //     whole panels because that is what `breachesFromFailedPanels` consumes -- see
 //     `SolveParams::tearFraction`.
-//  4. **No GPU path**, and no rate dependence in the material, so the resistance is
-//     under-predicted by the 10-30% steel gains at collision strain rates.
+//  4. **The GPU path is slower than the CPU one** -- `engine/gpu/zone_gpu.{hpp,cpp}`,
+//     whose state comes back through `Solver::adopt` below -- and there is no rate
+//     dependence in the material, so the resistance is under-predicted by the
+//     10-30% steel gains at collision strain rates. This item said "no GPU path"
+//     while the same file named `gpu::ZoneGpuSolver` fifty lines further down.
 //
 // SI units, body frame per CLAUDE.md.
 #pragma once
@@ -457,6 +467,19 @@ struct SolveParams {
     // to an identity.
     bool plastic = true;
 
+    // Seconds over which a driven perimeter -- `Patch::mesh.prescribed`, which
+    // `coupling.hpp` writes -- rises from the meshed position to its full value.
+    // Zero imposes it on the first step.
+    //
+    // The ramp is a **smoothstep**, not the linear one `Indenter::rampTime` uses,
+    // and the difference is not cosmetic. An indenter's linear ramp ends in a real
+    // velocity discontinuity because a striking body genuinely arrives travelling;
+    // a boundary drive is a statement about where the surrounding structure *is*,
+    // so a velocity step at either end of it is purely numerical and rings the
+    // patch for the rest of the run. `3s^2 - 2s^3` starts and ends at zero
+    // velocity, so nothing is excited that the drive did not ask for.
+    double edgeRamp = 0.0;  // s
+
     double damping = 1.0;   // velocity multiplier per step; 1.0 is none
     double timestep = 0.0;  // s; 0 takes `solidshell::criticalTimestep` over the patch
     double timestepSafety = 0.9;
@@ -537,8 +560,16 @@ struct SolveResult {
     // for, and an account that did not subtract it would report the solver
     // inventing 5 kJ on its first step.
     double initialStrainEnergy = 0;  // J
+    // What a driven perimeter put in, by the same reckoning as the indenter's
+    // `work`: the impulse needed to hold each driven DOF on the boundary's motion,
+    // times that motion. Kept separate from `work` because `work` answers "what did
+    // the indenter spend" and a coupled zone has a second agent on it; zero without
+    // a drive, so the balance below is unchanged for every case that has none.
+    double boundaryWork = 0;         // J
+    int drivenEdgeDof = 0;           // DOF the perimeter drive actually moves
     double energyResidual() const {
-        return work - ((strainEnergy - initialStrainEnergy) + dissipation + kinetic + dampingLoss);
+        return (work + boundaryWork) -
+               ((strainEnergy - initialStrainEnergy) + dissipation + kinetic + dampingLoss);
     }
 
     int yieldedElements = 0;
@@ -709,6 +740,14 @@ private:
     std::vector<std::uint32_t> adjacencyOffset_, adjacencyEntry_;  // node -> element corner
     std::vector<std::uint32_t> driven_;   // node indices the indenter holds
     std::vector<std::uint8_t>  pinned_;   // per node
+    // The driven perimeter. `edgeDof_` is the pinned DOF with a non-zero prescribed
+    // value; `edgeFree_` is the velocity each pinned DOF *would* have taken this
+    // step, which is what the boundary's reaction -- and therefore its work -- is
+    // measured against. Both empty when nothing is driven, which is the test the
+    // step loop branches on.
+    std::vector<std::uint32_t> edgeDof_;
+    std::vector<double> edgeFree_;
+    double edgeFraction(double time) const;
     bool done_ = false;
 };
 

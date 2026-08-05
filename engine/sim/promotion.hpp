@@ -19,13 +19,24 @@
 //      `zone::Preload`.
 //
 // Where the three-tier plan in `02-simulation.md` §3 says a zone couples to Tier-1
-// through retained interface DOF, this couples it to Tier-0 through a section:
-// cruder, and the honest thing available. `reduction.{hpp,cpp}` now builds the
-// Craig-Bampton reduced models themselves -- boundary DOF kept exactly, so they are
-// couplable by construction -- but nothing yet drives a zone's edge from one, and
-// **this file is unchanged by their arrival**. Everything below was written so that
-// inserting Tier-1 replaces the coupling and not the criterion, and that is still
-// the work outstanding.
+// through retained interface DOF, this couples it to Tier-0 through a section.
+// **That coupling now exists -- `coupling.{hpp,cpp}` -- and this file is still
+// unchanged by it, which is what it was written for.** The two are not the same
+// coupling wearing different clothes and neither replaces the other:
+//
+//   * Tier 0 reads a **thickness** and nothing else, so damage goes back to it as
+//     a thinner ship (§5) and `hullGirderSection` needs no new model.
+//   * Tier 1 reads a **mesh**, so damage goes back to it as the elements that
+//     tore, deleted. A thickness knockdown is not even expressible there: a
+//     solid-shell carries its thickness in the positions of its nodes, so thinning
+//     a zone moves the very interface nodes it is coupled through, by (t - t')/2
+//     -- 1.2 mm for a 20% knockdown on 12 mm plating, measured, against a
+//     coincidence tolerance of 1e-9 m. `coupling.hpp` §3 has the argument in full.
+//
+// So the section reduction below is Tier 0's answer, permanently, and not a
+// placeholder for the interface one. What is still outstanding is the *criterion*
+// side: nothing here yet consults a Tier-1 model when deciding what to promote,
+// and `reduction::checkValidity` is the trigger that would.
 //
 // --- 1. Cost is the whole design ----------------------------------------------
 //

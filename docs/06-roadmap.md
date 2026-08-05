@@ -352,15 +352,18 @@ The longest and highest-risk phase.
   **Tier-0 answer it reads** is 167 ms, of which 137 ms is the Smith sweep — so it
   is reviewed at a cadence and explicitly not every tick.
 
-  The coupling still goes to a *section* rather than to retained interface DOF,
-  and it is one way per solve: the patch's edge stays clamped and nothing outside
-  it responds. The Craig–Bampton **reduction** exists, and two reduced components
-  now **assemble** at a shared interface (`matchBoundaries`, `assemble`, validated
-  against the same plate meshed in one piece to 2.6e-5 on the first four elastic
-  modes at twelve modes a side). What is still missing is the coupling to Tier 2 —
-  nothing drives a zone's interface DOF from a reduced model — and the *mesher*:
-  nothing yet cuts a ship into components worth assembling, so synthesis has the
-  join but no pieces. The section
+  The coupling to **Tier 0** still goes to a *section* rather than to retained
+  interface DOF, and that is right for a beam: `hullGirderSection` reads a
+  thickness and nothing else. The coupling to **Tier 1** now exists beside it —
+  `engine/sim/coupling.{hpp,cpp}`, `02-simulation.md` §3 — and is exact: a zone's
+  perimeter is driven from a Craig–Bampton model of the plating round it and a
+  torn zone goes back as a mesh with the dead elements deleted. Against the same
+  plate meshed and solved in one piece, the coupled zone reproduces the monolithic
+  punch reaction exactly and its displacement field to **1.06e-15 m of a 2.0e-4 m
+  peak**, at 0, 4 and 12 modes alike, where the clamped zone it replaces is **74%**
+  out and 433× too stiff. What is still missing is the *mesher*: nothing yet cuts a
+  ship into hold-sized components, so synthesis still has more join than pieces.
+  The section
   reduction also carries plating only, because the zone meshed plating only — a collision that opens
   fourteen bays leaves their longitudinals at full strength, which is the
   un-conservative direction. The multi-point constraint that blocked it now exists

@@ -753,6 +753,17 @@ Solver::Solver(const Patch& patch, const plasticity::Material& material, const S
     if (punchPresent && driven_.empty())
         result_.problems.push_back("the indenter's footprint contains no free node");
 
+    // The driven perimeter. A pinned DOF whose prescribed value is zero is a
+    // clamp and takes the cheap path; one with a value follows the surrounding
+    // structure -- see `zone.hpp` §4 and `coupling.hpp`. Testing the value rather
+    // than carrying a separate flag is not a shortcut: a DOF driven to exactly
+    // zero *is* a clamp, in position, in velocity and in the work it does.
+    for (std::size_t d = 0; d < nodes * 3 && d < patch.mesh.prescribed.size(); ++d)
+        if (pinned_[d] && patch.mesh.prescribed[d] != 0.0)
+            edgeDof_.push_back(static_cast<std::uint32_t>(d));
+    result_.drivenEdgeDof = static_cast<int>(edgeDof_.size());
+    if (!edgeDof_.empty()) edgeFree_.assign(nodes * 3, 0.0);
+
     result_.timestep = params_.timestep > 0
                            ? params_.timestep
                            : patch.criticalTimestep * (params_.timestepSafety / 0.9);
@@ -980,6 +991,20 @@ void Solver::accumulateEnergy() {
     result_.strainEnergy = strain + fiberEnergy_;
 }
 
+// How much of a driven perimeter's displacement is imposed at `time`. Smoothstep,
+// so both ends of the ramp are at zero velocity -- see `SolveParams::edgeRamp`.
+//
+// The lower clamp is unreachable from the only call site, which passes
+// `result_.time + dt` and `result_.time` starts at zero and only rises; mutation
+// testing confirms that removing it changes nothing. It stays because this reads
+// as a pure function of time, and a smoothstep that returned a negative fraction
+// for a negative argument would drive the boundary the wrong way.
+double Solver::edgeFraction(double time) const {
+    if (!(params_.edgeRamp > 0)) return 1.0;
+    const double s = std::min(1.0, std::max(0.0, time / params_.edgeRamp));
+    return s * s * (3.0 - 2.0 * s);
+}
+
 bool Solver::step() {
     if (done_) return false;
     const double dt = result_.timestep;
@@ -992,6 +1017,15 @@ bool Solver::step() {
         for (int k = 0; k < 3; ++k) {
             const std::size_t d = node * 3 + static_cast<std::size_t>(k);
             if (pinned_[d]) {
+                // The velocity this DOF would have taken if nothing held it. It is
+                // discarded on the next line, so a driven edge has to take its copy
+                // here; what the boundary applies is the difference, exactly as the
+                // punch's impulse is the difference for a node it grips.
+                if (!edgeFree_.empty()) {
+                    double freeVelocity = velocity_[d];
+                    if (mass_[node] > 0) freeVelocity += force_[d] / mass_[node] * dt;
+                    edgeFree_[d] = freeVelocity;
+                }
                 velocity_[d] = 0.0;
                 continue;
             }
@@ -1006,6 +1040,30 @@ bool Solver::step() {
         }
         for (double& v : velocity_) v *= params_.damping;
         result_.dampingLoss += before * (1.0 - params_.damping * params_.damping);
+    }
+
+    // The driven perimeter, after the damping and before the punch. After the
+    // damping because the boundary's motion is imposed rather than computed and
+    // scaling it would be scaling the surrounding ship's answer; before the punch
+    // only for reading, since `driven_` excludes every pinned node and the two sets
+    // cannot overlap.
+    //
+    // The target is taken from the **meshed** position rather than from `rest_`: a
+    // `Preload` moves the rest configuration out from under the mesh, and a drive
+    // measured from there would carry the pre-load's own displacement field into
+    // the boundary condition. It is the same trap `restFibers` and the element
+    // forms above each record.
+    if (!edgeDof_.empty()) {
+        const double fraction = edgeFraction(result_.time + dt);
+        for (std::uint32_t dof : edgeDof_) {
+            const std::size_t d = dof;
+            const std::size_t node = d / 3;
+            const double target =
+                (patch_->mesh.position[d] + patch_->mesh.prescribed[d] * fraction - position_[d]) /
+                dt;
+            result_.boundaryWork += mass_[node] * (target - edgeFree_[d]) * target;
+            velocity_[d] = target;
+        }
     }
 
     // The punch. Its speed rises over `rampTime` and is constant after; the impulse

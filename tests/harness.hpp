@@ -56,6 +56,7 @@ void runBucklingTests();
 void runCollapseTests();
 void runCollisionTests();
 void runConstraintTests();
+void runCouplingTests();
 void runGirderTests();
 void runIndentationTests();
 void runHullFormTests();
