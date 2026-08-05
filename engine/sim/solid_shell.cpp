@@ -1110,6 +1110,13 @@ void BandedSpd::solve(std::vector<double>& rightHandSide) const {
 bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formulation form,
                  const std::vector<double>& load, std::vector<double>& displacement,
                  std::string* problem) {
+    static const std::vector<DofBlock> none;
+    return solveStatic(mesh, material, form, none, load, displacement, problem);
+}
+
+bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formulation form,
+                 const std::vector<DofBlock>& extra, const std::vector<double>& load,
+                 std::vector<double>& displacement, std::string* problem) {
     const std::size_t nodes = mesh.nodeCount();
     const std::size_t elements = mesh.elementCount();
 
@@ -1155,6 +1162,23 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
         }
         if (any) band = std::max(band, hi - lo);
     }
+    // The extra blocks widen the band on the same rule. Leaving them out would
+    // silently drop every entry that fell outside it, which reads as a slightly
+    // soft answer rather than as a missing term.
+    for (const DofBlock& block : extra) {
+        std::size_t lo = free, hi = 0;
+        bool any = false;
+        for (std::uint32_t global : block.dof) {
+            if (global >= nodes * 3) continue;
+            const std::ptrdiff_t d = map[global];
+            if (d < 0) continue;
+            const std::size_t u = static_cast<std::size_t>(d);
+            lo = std::min(lo, u);
+            hi = std::max(hi, u);
+            any = true;
+        }
+        if (any) band = std::max(band, hi - lo);
+    }
 
     BandedSpd system(free, band);
     std::vector<double> rhs(free, 0.0);
@@ -1187,6 +1211,26 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
                     // tolerance the patch test had to live with.
                     rhs[static_cast<std::size_t>(rowDof)] -= value * displacement[dof[qq]];
                 }
+            }
+        }
+    }
+
+    for (const DofBlock& block : extra) {
+        const std::size_t n = block.dof.size();
+        if (block.stiffness.size() < n * n) continue;
+        for (std::size_t p = 0; p < n; ++p) {
+            if (block.dof[p] >= nodes * 3) continue;
+            const std::ptrdiff_t rowDof = map[block.dof[p]];
+            if (rowDof < 0) continue;
+            for (std::size_t qq = 0; qq < n; ++qq) {
+                if (block.dof[qq] >= nodes * 3) continue;
+                const std::ptrdiff_t colDof = map[block.dof[qq]];
+                const double value = block.stiffness[p * n + qq];
+                if (colDof >= 0)
+                    system.add(static_cast<std::size_t>(rowDof), static_cast<std::size_t>(colDof),
+                               value);
+                else
+                    rhs[static_cast<std::size_t>(rowDof)] -= value * displacement[block.dof[qq]];
             }
         }
     }

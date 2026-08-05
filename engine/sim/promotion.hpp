@@ -229,11 +229,17 @@
 //     and not "monotone".
 //
 // **What the reduction does not carry**, in the un-conservative direction and
-// worth being loud about: the zone meshes plating only (`zone.hpp` §3), so the
-// stiffeners running through a torn panel are left at full strength. A collision
-// that opens fourteen bays of side shell has certainly destroyed the longitudinals
-// in them, and `reduce()` will not say so. It needs the multi-point constraint
-// that would let the zone mesh a web in the first place.
+// worth being loud about: the stiffeners running through a torn panel are left at
+// full strength. A collision that opens fourteen bays of side shell has certainly
+// destroyed the longitudinals in them, and `reduce()` will not say so.
+//
+// The multi-point constraint this used to wait on now exists -- `constraint.hpp`,
+// and `zone::Stiffeners::Modelled` meshes the member -- so a zone can have webs in
+// it. What is still missing is on the *other* side: a fibre yields and hardens but
+// carries no damage variable and is never deleted, so there is no "this
+// longitudinal is gone" for `reduce()` to read even when the plating around it has
+// torn. Closing this means giving the fibres a failure criterion, not building
+// more constraint machinery.
 //
 // The other thing it does not carry is that a **dented** panel is far weaker in
 // compression than a merely thinner one, because the dent is an initial
