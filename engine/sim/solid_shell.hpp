@@ -65,13 +65,25 @@
 // --- What this is in double, when fem.cpp is in float -------------------------
 //
 // `fem.hpp` uses flat float arrays because its CPU reference and its GLSL compute
-// kernel have to operate on bit-identical std430 layouts. There is no GPU kernel
-// for this element yet, and the things that establish an element is *correct* --
-// the patch test, rigid-body invariance, the rank of the element stiffness -- are
-// exact identities. In float their noise floor sits at 1e-6, which is the same
-// order as the defects they exist to catch. So the element is formulated in
-// double; a float GPU path can be derived from it the way `fem_gpu.cpp` was
-// derived from `fem.cpp`, and will have its own reproducibility bound (§2).
+// kernel have to operate on bit-identical std430 layouts. The things that
+// establish an element is *correct* -- the patch test, rigid-body invariance, the
+// rank of the element stiffness -- are exact identities, and in float their noise
+// floor sits at 1e-6, the same order as the defects they exist to catch. So the
+// element is formulated in double.
+//
+// **There is now a float GPU path -- `engine/gpu/zone_gpu.{hpp,cpp}` -- and the
+// measurement it produced belongs here rather than only there.** Float is *not*
+// sufficient for this element as formulated, and the reason is a property of the
+// formulation and not of the GPU: `Kaa = int G^T C G dV`, the enhanced-strain
+// block condensed out of every element, mixes modes that are not commensurate.
+// The three thickness modes carry E_zeta,zeta so their columns of G are scaled by
+// the Voigt transform's `1/t^2` -- 2.8e4 for 12 mm plating -- while the in-plane
+// modes are scaled by `1/h^2`, of order ten. Kaa inherits the square of the ratio,
+// so **kappa(Kaa) ~ (h/t)^4 ~ 1e7 on perfectly ordinary plating**, and float's
+// seven digits leave none in alpha. Equilibrating Kaa before factoring recovers
+// most of it and is what the shader does; the better fix is to normalise the
+// enhanced modes here, which is a free basis change and would cost the double path
+// nothing. `07-fem-spike-findings.md` §8 has the measurements.
 //
 // Body frame and SI units per CLAUDE.md.
 #pragma once
@@ -114,6 +126,63 @@ enum class Formulation {
 };
 const char* name(Formulation form);
 
+// --- The step-invariant half of an element --------------------------------------
+//
+// **Everything an element derives from its rest configuration, computed once.**
+//
+// The strain-displacement matrices, the enhanced-strain interpolation, the Gauss
+// weights and the rest Jacobian are functions of the *undeformed* geometry alone.
+// An explicit solve never moves the rest configuration, so recomputing them every
+// step is pure waste -- and it is not a small share of the bill. Measured by
+// running the ferry's own side patch both ways, a punch into 192 elements for
+// 6 608 steps: **2.01x end to end on one worker** (5.48 s against 2.73 s) and
+// 1.64x on 23, for a **bit-identical** answer. Per element the elastoplastic
+// update falls from 7.18 µs to 3.06 µs.
+//
+// It is worth being explicit about why this went unnoticed, because the shape of
+// the mistake is reusable: the per-element cost was *measured* (7.3 µs, recorded
+// in `02-simulation.md` §3) and the measurement was correct. What was never asked
+// is which part of that 7.3 µs depended on the state being advanced. A cost model
+// built from a correct total can still point at the wrong optimisation.
+//
+// **And the first two attempts to size it were both wrong in the same direction.**
+// A standalone micro-benchmark and an in-situ `steady_clock` pair both reported
+// 4.2 µs of a 4.3 µs update -- 97% -- and the in-situ pair contradicted itself
+// arithmetically, its two sub-timers summing to more than the phase containing
+// them. The A/B on the real run says 51%. `07-fem-spike-findings.md` §8 records it,
+// because "time the real tick rather than extrapolating" arriving a second time is
+// worth writing down.
+//
+// `fem.cpp`'s tetrahedron has had this all along: `TetMesh::restInverse` and
+// `restVolume` are exactly this object for a linear tet, and `tet_forces.comp`
+// reads them out of a buffer rather than rebuilding them. The solid-shell simply
+// never grew the equivalent.
+//
+// **Size looked like the trade and measurement says it is not.** 12.0 kB per
+// element in double, against the 4.6 kB per-element stiffness `02-simulation.md`
+// §3 measures an L3 cliff for at ~6 500 elements -- so a crossover was expected at
+// ~2 500. There is none. The cache still wins **1.62x at 17 800 elements and
+// 214 MB**, four times past this machine's last-level cache, because the
+// arithmetic it removes is 2.2 µs per element per step while streaming 12 kB at
+// the saturated 29 GB/s that section measures is 0.41 µs. Five to one in the
+// cache's favour even entirely from DRAM.
+struct RestForms {
+    double b[kGauss][6][kDof];    // strain-displacement, Cartesian, after ANS
+    double g[kGauss][6][kEas];    // enhanced-strain interpolation, Cartesian
+    double weight[kGauss];        // 2x2x2 Gauss weight times det J
+    // (dX/dxi)^-1 at the element centre, row-major. The polar decomposition needs
+    // it every step and it is the same matrix every step; this is the solid-shell's
+    // `TetMesh::restInverse`.
+    double restJacobianInverse[9];
+    int  easCount = 0;
+    bool ok = false;
+};
+
+// Fill `out` from an element's rest node positions. False -- and `out.ok` false --
+// on an inverted or degenerate element, the same condition `elementStiffness`
+// declines to work on.
+bool computeRestForms(const double rest[kDof], Formulation form, RestForms& out);
+
 // --- One element --------------------------------------------------------------
 //
 // `nodes` is always 8 nodes x 3 coordinates, node-major, in the ordering above.
@@ -147,6 +216,12 @@ void gaussVolumes(const double nodes[kDof], double out[kGauss]);
 // Rotation carried by the element: the polar factor of the deformation gradient at
 // the element centre. Column-major 3x3, matching fem.cpp's M3 layout.
 void elementRotation(const double rest[kDof], const double current[kDof], double out[9]);
+// The same rotation from a pre-computed `RestForms`, which spares the rest
+// element's Jacobian and its inverse. **Bit-identical** to the call above -- the
+// cached matrix is the one that call would have formed -- and `tests/test_solid_shell.cpp`
+// asserts the identity rather than a tolerance, because anything looser would hide
+// a stale or transposed cache.
+void elementRotation(const RestForms& forms, const double current[kDof], double out[9]);
 
 // Co-rotational internal force. `out` is the force the element applies **to its
 // nodes**, the same sign convention as `fem::tetForces`, so a caller accumulates
@@ -155,6 +230,9 @@ void elementRotation(const double rest[kDof], const double current[kDof], double
 // used with a linear material.
 void internalForce(const double stiffness[kDof * kDof], const double rest[kDof],
                    const double current[kDof], double out[kDof]);
+// The same, off a pre-computed `RestForms`. Bit-identical to the call above.
+void internalForce(const RestForms& forms, const double stiffness[kDof * kDof],
+                   const double rest[kDof], const double current[kDof], double out[kDof]);
 
 // Largest stable explicit step for this element on its own: safety * 2/omega_max,
 // with omega_max the largest eigenvalue of the lumped-mass generalised problem,
@@ -256,6 +334,18 @@ struct PlasticUpdate {
 // about than by a state that silently stopped advancing. Check `converged`.
 PlasticUpdate elementPlasticUpdate(const double rest[kDof], const double current[kDof],
                                   const plasticity::Material& material, Formulation form,
+                                  ElementPlasticState& state, double force[kDof],
+                                  double stress[kGauss * 6] = nullptr);
+
+// The same update off a pre-computed `RestForms`, which is what an explicit solver
+// wants: the forms are 97% of the cost above and none of it depends on `current`.
+// **Bit-identical** to the call above -- same arithmetic, same order, on the same
+// numbers -- which is the property that makes the cache safe to switch on and off,
+// and which `tests/test_solid_shell.cpp` asserts on every output including the
+// committed plastic history.
+PlasticUpdate elementPlasticUpdate(const RestForms& forms, const double rest[kDof],
+                                  const double current[kDof],
+                                  const plasticity::Material& material,
                                   ElementPlasticState& state, double force[kDof],
                                   double stress[kGauss * 6] = nullptr);
 

@@ -37,6 +37,7 @@ void runDeviceTests();
 void runOffscreenTests();
 void runOceanTests();
 void runHullRenderTests();
+void runZoneGpuTests();
 void runPngTests();
 void runPropulsionTests();
 void runRadiationTests();

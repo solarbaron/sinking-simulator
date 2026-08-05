@@ -141,7 +141,8 @@ if(Vulkan_FOUND AND GLSLC)
   set(SHADER_OUT ${CMAKE_BINARY_DIR}/shaders)
   file(MAKE_DIRECTORY ${SHADER_OUT})
   set(SPV_FILES)
-  foreach(SHADER tet_forces.comp node_integrate.comp mesh.vert mesh.frag ocean.vert ocean.frag
+  foreach(SHADER tet_forces.comp node_integrate.comp solidshell_forces.comp
+                 solidshell_integrate.comp mesh.vert mesh.frag ocean.vert ocean.frag
                  hull.vert hull.frag)
     add_custom_command(
       OUTPUT ${SHADER_OUT}/${SHADER}.spv
@@ -165,8 +166,16 @@ if(Vulkan_FOUND AND GLSLC)
   target_link_libraries(shipsim_engine PUBLIC Vulkan::Vulkan)
   target_compile_definitions(shipsim_engine PUBLIC SHIPSIM_HAS_VULKAN=1)
   target_sources(shipsim_tests PRIVATE tests/test_device.cpp tests/test_offscreen.cpp
-                                       tests/test_ocean.cpp tests/test_hull_render.cpp)
+                                       tests/test_ocean.cpp tests/test_hull_render.cpp
+                                       tests/test_zone_gpu.cpp engine/gpu/zone_gpu.cpp)
+  set_source_files_properties(engine/gpu/zone_gpu.cpp PROPERTIES
+    COMPILE_OPTIONS "-Wno-missing-field-initializers")
   target_compile_definitions(shipsim_tests PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}")
+  # The GLSL source, not the compiled SPIR-V: `test_zone_gpu.cpp` reads the shader's
+  # own declared buffer strides back out and checks them against the element's, so
+  # the two files cannot drift apart silently.
+  target_compile_definitions(shipsim_tests PRIVATE
+    SHIPSIM_SHADER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/engine/gpu/shaders")
   # The shipped material set is data, read at runtime rather than compiled in, so
   # the tests need to be told where it lives. Source directory, not build: it is
   # an input like the shaders' GLSL, not an artefact.
@@ -193,6 +202,16 @@ if(Vulkan_FOUND AND GLSLC)
   target_compile_definitions(ram_view PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}"
     SHIPSIM_MATERIAL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/engine/gpu/materials")
   target_compile_options(ram_view PRIVATE -Wall -Wextra)
+
+  # The Tier-2 zone on the GPU, against the CPU double reference on the same
+  # patch. A tool rather than a unit test for the same reason `zone_probe` is: it
+  # costs core-minutes on the CPU side of the comparison.
+  add_executable(zone_gpu_probe tools/zone_gpu_probe/main.cpp engine/gpu/zone_gpu.cpp
+                 game/prototype/ferry.cpp)
+  add_dependencies(zone_gpu_probe shipsim_shaders)
+  target_link_libraries(zone_gpu_probe PRIVATE shipsim_engine Vulkan::Vulkan)
+  target_compile_definitions(zone_gpu_probe PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}")
+  target_compile_options(zone_gpu_probe PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
 
   add_executable(fem_spike tools/fem_spike/main.cpp engine/gpu/fem_gpu.cpp)
   add_dependencies(fem_spike shipsim_shaders)

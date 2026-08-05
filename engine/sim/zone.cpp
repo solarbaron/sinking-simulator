@@ -20,7 +20,11 @@ using solidshell::kNodes;
 
 // Per-element cost, from the measurements in `02-simulation.md` §3. Used only to
 // predict; `SolveResult::microsecondsPerElementStep` is what actually happened.
-constexpr double kPlasticMicroseconds = 7.3;
+// 3.1 rather than the 7.3 `02-simulation.md` §3 first published: the step-invariant
+// element forms are now built once at promotion rather than every step, which is
+// the whole of the difference. Measured both ways on the same element, 7.18 µs
+// against 3.06.
+constexpr double kPlasticMicroseconds = 3.1;
 constexpr double kElasticMicroseconds = 0.273;
 
 // --- Welding -------------------------------------------------------------------
@@ -578,9 +582,23 @@ Solver::Solver(const Patch& patch, const plasticity::Material& material, const S
         stiffness_.assign(elements * kDof * kDof, 0.0);
     }
 
+    // The step-invariant half of every element, formed once. See
+    // `SolveParams::cacheRestForms`: this is half of the per-step element kernel
+    // and it is a function of `rest_`, which nothing after this point moves.
+    result_.cachedRestForms = params_.cacheRestForms;
+    if (result_.cachedRestForms) forms_.resize(elements);
+
     for (std::size_t e = 0; e < elements; ++e) {
         double nodePosition[kDof];
         patch.mesh.gather(e, rest_, nodePosition);
+        // From `rest_`, not from `position_`. Without a `Preload` the two are the
+        // same array and any mistake here is invisible; with one they differ by the
+        // pre-strain, and forms built from the deformed configuration would silently
+        // give every element the wrong B. Mutation testing found this exact edit
+        // surviving the whole suite.
+        if (result_.cachedRestForms)
+            solidshell::computeRestForms(nodePosition, solidshell::Formulation::SolidShell,
+                                         forms_[e]);
         double lumped[kNodes];
         solidshell::elementMass(nodePosition, patch.material.density, lumped);
         for (int a = 0; a < kNodes; ++a)
@@ -653,6 +671,11 @@ Solver::Solver(const Patch& patch, const plasticity::Material& material, const S
     result_.dissipation = 0.0;
     accumulateEnergy();
     result_.initialStrainEnergy = result_.strainEnergy;
+    // The priming evaluation above is a promotion cost, like the stiffness
+    // formation and the power iteration beside it, and counting it as a step would
+    // put one element pass into a profile whose whole purpose is the *per-step*
+    // ratio. Zeroed here so `profile` means "the run" and nothing else.
+    result_.profile = SolveResult::Profile{};
 }
 
 // The pre-load, as an initial strain rather than an initial stress.
@@ -696,15 +719,34 @@ void Solver::applyPreload() {
     }
 }
 
+namespace {
+// One clock read. Named so the profiling calls read as measurements rather than
+// as bookkeeping.
+inline std::chrono::steady_clock::time_point tick() {
+    return std::chrono::steady_clock::now();
+}
+inline double since(std::chrono::steady_clock::time_point& mark) {
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - mark).count();
+    mark = now;
+    return seconds;
+}
+}  // namespace
+
 void Solver::computeForces() {
     const std::size_t elements = patch_->elementCount();
+    auto mark = tick();
     const auto body = [&](std::size_t e) {
         double rest[kDof], current[kDof];
         patch_->mesh.gather(e, rest_, rest);
         patch_->mesh.gather(e, position_, current);
         double* out = &elementForce_[e * kDof];
         if (!params_.plastic) {
-            solidshell::internalForce(&stiffness_[e * kDof * kDof], rest, current, out);
+            if (result_.cachedRestForms)
+                solidshell::internalForce(forms_[e], &stiffness_[e * kDof * kDof], rest, current,
+                                          out);
+            else
+                solidshell::internalForce(&stiffness_[e * kDof * kDof], rest, current, out);
             return;
         }
         if (plastic_[e].torn) {
@@ -718,9 +760,15 @@ void Solver::computeForces() {
             dissipation_[e] = 0.0;
             return;
         }
-        const solidshell::PlasticUpdate update = solidshell::elementPlasticUpdate(
-            rest, current, material_, solidshell::Formulation::SolidShell, plastic_[e], out,
-            &elementStress_[e * kGauss * 6]);
+        const solidshell::PlasticUpdate update =
+            result_.cachedRestForms
+                ? solidshell::elementPlasticUpdate(forms_[e], rest, current, material_,
+                                                   plastic_[e], out,
+                                                   &elementStress_[e * kGauss * 6])
+                : solidshell::elementPlasticUpdate(rest, current, material_,
+                                                   solidshell::Formulation::SolidShell,
+                                                   plastic_[e], out,
+                                                   &elementStress_[e * kGauss * 6]);
         dissipation_[e] = update.dissipation;
     };
 
@@ -731,6 +779,7 @@ void Solver::computeForces() {
     } else {
         for (std::size_t e = 0; e < elements; ++e) body(e);
     }
+    result_.profile.element += since(mark);
 
     const std::size_t nodes = patch_->nodeCount();
     for (std::size_t node = 0; node < nodes; ++node) {
@@ -754,6 +803,7 @@ void Solver::computeForces() {
         }
         result_.tornElements = torn;
     }
+    result_.profile.gather += since(mark);
 }
 
 void Solver::accumulateEnergy() {
@@ -787,7 +837,10 @@ void Solver::accumulateEnergy() {
             patch_->mesh.gather(e, rest_, rest);
             patch_->mesh.gather(e, position_, current);
             double rotation[9];
-            solidshell::elementRotation(rest, current, rotation);
+            if (result_.cachedRestForms)
+                solidshell::elementRotation(forms_[e], current, rotation);
+            else
+                solidshell::elementRotation(rest, current, rotation);
             double u[kDof];
             for (int a = 0; a < kNodes; ++a)
                 for (int i = 0; i < 3; ++i) {
@@ -812,6 +865,7 @@ bool Solver::step() {
     const Indenter& punch = params_.indenter;
 
     computeForces();
+    auto mark = tick();
 
     for (std::size_t node = 0; node < patch_->nodeCount(); ++node)
         for (int k = 0; k < 3; ++k) {
@@ -858,8 +912,10 @@ bool Solver::step() {
     result_.penetration += speed * dt;
     result_.time += dt;
     ++result_.steps;
+    result_.profile.integrate += since(mark);
 
     accumulateEnergy();
+    result_.profile.energy += since(mark);
 
     if (params_.historyStride > 0 && result_.steps % params_.historyStride == 0)
         result_.history.push_back({result_.time, result_.penetration, result_.force, result_.work,
@@ -876,6 +932,7 @@ bool Solver::step() {
         result_.problems.push_back("stopped at maxSteps with the indenter at " +
                                    std::to_string(result_.penetration) + " m");
     }
+    result_.profile.other += since(mark);
     return !done_;
 }
 
@@ -930,6 +987,37 @@ const SolveResult& Solver::run() {
         elementSteps > 0 ? result_.wallSeconds * 1e6 / elementSteps : 0.0;
     collectTorn();
     return result_;
+}
+
+void Solver::adopt(const std::vector<double>& position, const std::vector<double>& velocity,
+                   const std::vector<solidshell::ElementPlasticState>& state, int steps,
+                   double time, double penetration, double work, double dissipation) {
+    if (position.size() == position_.size()) position_ = position;
+    if (velocity.size() == velocity_.size()) velocity_ = velocity;
+    if (params_.plastic && state.size() == plastic_.size()) plastic_ = state;
+    result_.steps = steps;
+    result_.time = time;
+    result_.penetration = penetration;
+    result_.work = work;
+    result_.dissipation = dissipation;
+    // The stress the energy account needs is not carried across -- it is a function
+    // of the state, so it is recomputed here through the same path every CPU step
+    // uses. That also leaves `result_.tornElements` correct.
+    //
+    // **On a copy of the history, because `elementPlasticUpdate` commits.** Running
+    // it to recover the stress would otherwise advance every integration point by a
+    // further increment -- small, but a point sitting just under its damage limit
+    // would be tipped over it by the act of being read, and the adopted state would
+    // no longer be the state that was adopted. Found by writing the test that says
+    // adopting a run's own output reproduces that run.
+    const std::vector<solidshell::ElementPlasticState> committed = plastic_;
+    computeForces();
+    plastic_ = committed;
+    result_.dissipation = dissipation;
+    accumulateEnergy();
+    collectTorn();
+    done_ = true;
+    result_.completed = true;
 }
 
 void Solver::translate(const Vec3& velocity) {

@@ -487,3 +487,282 @@ failed by 1.6% and looked like a constitutive bug. It was §6 limit 1: the eleme
 was distorted by moving one face's node alone, making it *warped*, and the warped
 patch test fails in proportion to the warp. Distorted prismatically instead — the
 same offset on a node and the one above it — it is exact.
+
+---
+
+## 8. A GPU element solver for the solid-shell — **built, and it does not pay**
+
+`engine/gpu/zone_gpu.{hpp,cpp}`, `engine/gpu/shaders/solidshell_forces.comp` and
+`solidshell_integrate.comp`, driven by `tools/zone_gpu_probe`. The Phase 3 item
+`06-roadmap.md` named, following the tet back-end as instructed.
+
+The kernel exists, it is correct on the closed forms available to it, and **it is
+between 1.5× and 4× slower than the 24-thread CPU at every zone size that is
+affordable to solve.** The float answer also stops tracking the double one long
+before a run finishes. Both are measurements and both are reported here rather
+than being worked around, because the second one decides whether this element
+belongs on a GPU at all.
+
+The most useful thing that came out of the work is none of that: it is what the
+profiling found on the way in.
+
+### The profile first, and it changed the job
+
+**Amdahl's law decides an accelerator, and the kernel's peak throughput does
+not.** So before any Vulkan, `zone::Solver` was instrumented per phase and run on
+the ferry's own side patch — 192 elements, 450 nodes, a 2 m punch driven 0.048 m
+in 6 608 steps, `tools/zone_probe --radius=2.5`:
+
+| phase | one worker | 23 workers |
+|---|---|---|
+| element evaluation | **98.5%** | 93.9% |
+| CSR nodal gather | 0.3% | 1.4% |
+| integration | 0.2% | 0.8% |
+| energy accounting | 1.0% | 3.9% |
+
+So the tet pattern does apply: this is an element-dominated explicit loop and not
+a direct solve. **But half of that 98.5% was work that did not have to happen at
+all.**
+
+`elementPlasticUpdate` began by calling `computeForms(rest, …)`, rebuilding the
+element's strain-displacement matrices, its enhanced-strain interpolation, its
+Gauss weights and its rest Jacobian — every step, for every element, from the
+*rest* configuration, which an explicit solve never moves. Hoisting them into a
+`solidshell::RestForms` formed once at promotion:
+
+| | uncached | cached | |
+|---|---|---|---|
+| 192 elements, 1 worker | 5.48 s | **2.73 s** | 2.01× |
+| 192 elements, 23 workers | 1.48 s | **0.90 s** | 1.64× |
+| 17 800 elements, 23 workers | 21.12 s | **13.03 s** | 1.62× |
+
+**The two answers are bit-identical** — same arithmetic, same order, on the same
+numbers — asserted on every reported quantity and on every node position rather
+than compared to a tolerance, in `tests/test_solid_shell.cpp` and
+`tests/test_zone.cpp`.
+
+Two things are worth carrying forward.
+
+**The tet has always had this.** `fem.cpp` uploads `TetMesh::restInverse` and
+`restVolume` and `tet_forces.comp` reads them out of a buffer. The solid-shell
+simply never grew the equivalent, and nobody noticed because the per-element cost
+*was* measured — 7.3 µs, recorded in `02-simulation.md` §3, and correct. What was
+never asked is which part of that 7.3 µs depended on the state being advanced. **A
+cost model built from a correct total can still point at the wrong optimisation.**
+
+**The obvious memory objection does not bite, and that was measured rather than
+argued.** The cache is 12.0 kB per element against the 4.6 kB per-element
+stiffness whose L3 cliff `02-simulation.md` §3 puts at ~6 500 elements, so the
+expectation was a crossover at ~2 500. There is none: the cache still wins 1.62×
+at 17 800 elements and 214 MB, four times past this machine's last-level cache,
+because the arithmetic it removes is 2.2 µs per element per step while streaming
+12 kB at the saturated 29 GB/s that section measures is 0.41 µs. Five to one in
+the cache's favour even entirely from DRAM.
+
+> **A correction to how this was first measured, because the mistake is the
+> reusable part.** Two instruments — a standalone micro-benchmark of
+> `computeForms`, and a `steady_clock` pair wrapped round the call *in situ* —
+> both said it was 4.2 µs of a 4.3 µs element update, i.e. **97%**, and the
+> in-situ pair contradicted itself on arithmetic (its two sub-timers summed to
+> more than the phase containing them). The A/B on the real run says 51%. The
+> micro-benchmark measured a loop-invariant call on a hot cache and the in-situ
+> timer measured a call the compiler could no longer inline. **Only the A/B on the
+> real run was right**, which is `CLAUDE.md`'s "timing the real tick instead of
+> extrapolating" arriving a second time. The 97% figure was believed for about an
+> hour and would have gone into this document.
+
+### What the kernel does, and what lives on the device
+
+One invocation per element, forces to a per-element slot, a companion node kernel
+gathering them over the CSR adjacency in a fixed order — the tet's structure
+exactly, and for the same reason: no float atomics, and a summation order fixed by
+the mesh rather than by warp scheduling.
+
+Per element the device holds 1 505 floats of `RestForms`, 24 force slots and 129
+floats of state: eight integration points of plastic strain, back stress,
+accumulated plastic strain and damage, **plus the seven enhanced parameters**. The
+EAS variables are per-element internal state and they are condensed inside the
+element every step, by a Newton on `∫GᵀσdV = 0` with a 7×7 Cholesky in the shader
+— the CPU's algorithm, in float. They are read as a warm start and written back,
+and never cross the bus. Plasticity is **in scope** and is the reason the kernel is
+the size it is; it is also the only version worth building, since the elastic
+element is 0.27 µs against the elastoplastic 7.3.
+
+The RestForms hoist is what made the kernel tractable at all: the ANS/EAS geometry
+pipeline never has to exist in GLSL, which is the part of this element hardest to
+verify.
+
+### Throughput, end to end on the real patch
+
+Not element-updates per second. Wall time for a whole run of the same patch, the
+same steps, the same punch — CPU on 23 threads in double, GPU on a 1070 Ti in
+float:
+
+| elements | steps | CPU wall | GPU wall | GPU / CPU | GPU µs per element-step |
+|---|---|---|---|---|---|
+| 192 | 5 505 | 0.70 s | 2.79 s | **0.25×** | 2.6 |
+| 768 | 5 505 | 1.80 s | 4.35 s | **0.41×** | 1.03 |
+| 3 072 | 5 505 | 6.19 s | 9.11 s | **0.68×** | 0.54 |
+| 8 192 | 1 500 | 6.63 s | 27.53 s | **0.24×** | 2.24 |
+| 16 384 | 1 000 | 9.29 s | 40.30 s | **0.23×** | 2.46 |
+
+It improves with occupancy to 3 072 elements and then **gets worse again**, which
+is the shape that identifies the cause. One thread per element needs about five
+hundred floats of thread-private, dynamically indexed state — two copies of eight
+integration points of history, a 6×6 algorithmic tangent, a 7×7 Kaa and its
+factor, and four 24-vectors. Pascal has 255 registers per thread, so all of it
+spills to local memory, which is global memory with an L2 in front; past ~3 000
+elements the spill working set leaves the 2 MB L2 and every access is a DRAM
+round trip.
+
+> **The tet's mapping does not carry over, and that is the finding.** A linear tet
+> is twelve degrees of freedom and no history: its whole state fits in registers,
+> which is why `tet_forces.comp` reaches 450–670 M element-updates/s. A solid-shell
+> with EAS and eight points of plastic history is two orders of magnitude more
+> live state. "One invocation per element" is not the neutral choice it looks
+> like — it is the choice that decides whether the kernel runs out of registers.
+
+The design to try next is **one workgroup per element**: eight or thirty-two
+threads cooperating over the Gauss points, with the history, the tangent and Kaa
+in shared memory rather than in registers. That is a different kernel, not a
+tuning pass, and it should be costed before it is written — which is what this
+section is for.
+
+### Precision — float is not enough, and where it fails is specific
+
+Two defects and one unresolved gap, in the order they were found.
+
+**1. Absolute ship coordinates in float are fatal, and the fix is free.** The
+element works on `u = Rᵀx − X`, a difference of node positions. A side patch on
+this ferry sits at (0, −9.9, 8), so |x| ≈ 13 m, where float's 24-bit mantissa
+resolves 1 × 10⁻⁶ m — and the displacements of the first thousand steps are
+10⁻⁵ m. The difference is then computed from two numbers agreeing in six of their
+seven digits. Measured: node positions 4.3 × 10⁻⁷ m apart after a **single** step.
+Solving about the patch centroid puts every coordinate inside the zone radius and
+costs nothing, because the shift is common to `rest` and `position`; it improved
+the work agreement at 1 000 steps by **190×** (5.9 × 10⁻² to 3.1 × 10⁻⁴).
+
+**2. The enhanced-strain condensation has no correct digits in float.** Kaa is
+`∫GᵀCG dV`, and the enhanced modes are not commensurate: the three thickness modes
+carry `E_ζζ` so their columns of G are scaled by the Voigt transform's `1/t²` —
+2.8 × 10⁴ for 12 mm plating — while the in-plane modes are scaled by `1/h²`, of
+order ten. Kaa inherits the square of the ratio, so **κ(Kaa) ≈ (h/t)⁴ ≈ 10⁷** on a
+perfectly ordinary 0.6 m × 12 mm plate element. Float has seven digits; the
+symptom is not noise but an alpha with none of them. Measured at 100 steps, where
+the two node fields still agreed to 1.4 × 10⁻⁶ m and no point had yielded, the
+GPU's enhanced parameters were **exactly zero** — the residual gate fired on the
+first iteration and left them at their warm start — while the CPU's were
+3.9 × 10⁻⁸.
+
+Jacobi equilibration of Kaa in the shader (solve for `Dα` with `D = √diag Kaa`,
+exact in exact arithmetic, and within a factor of seven of the best diagonal
+scaling by van der Sluis) recovers the peak: 3.935 × 10⁻⁸ against the CPU's
+3.911 × 10⁻⁸, 0.6%. It does **not** recover every element — the worst element's
+alpha is still out by more than its own magnitude.
+
+**3. The run-scale divergence is unresolved, and the negative control is what
+says so.** Over a full 5 505-step run the float kernel ends 28% high in plastic
+dissipation and **tears 60 elements where the double reference tears none**:
+
+| after 5 505 steps | CPU double | GPU float | relative |
+|---|---|---|---|
+| work in | 1.1579 MJ | 1.1610 MJ | 2.7 × 10⁻³ |
+| plastic dissipation | 1.1114 MJ | 1.4214 MJ | **2.8 × 10⁻¹** |
+| torn elements | 0 | **60** | — |
+| worst node position | — | 1.88 × 10⁻² m | 39% of the 0.048 m travelled |
+| peak equivalent plastic strain | 0.0625 | out by 0.0329 | 53% |
+
+The obvious reading is §2's: an explicit scheme at the CFL limit amplifies float
+rounding in the modes at its stability boundary, so of course the two part
+company. **That reading is wrong here, and the control that shows it is cheap.**
+Perturbing the *double* solver's mesh by 2 × 10⁻⁷ m — the size of the float
+representation error — and running the identical 5 505 steps moves the dissipation
+by 9.6 × 10⁻⁷ relative, the peak plastic strain by 3.2 × 10⁻⁵, and tears nothing.
+So this problem does **not** amplify a perturbation of that size by anything like
+five orders of magnitude, and the divergence is not a seeded chaotic one. It is
+per-step float error, injected 5 505 times, and it is **biased** — the float run
+always dissipates *more*, because noise acts as an imperfection that seeds strain
+localisation earlier.
+
+Whether what remains is float being genuinely insufficient or a residual defect in
+the kernel is **not settled**, and this section says so rather than picking the
+flattering answer. What is settled is that the kernel is not usable for the
+question a zone exists to answer: its output is *which panels tore*, and it tears
+sixty where the reference tears none.
+
+### What mutation testing found
+
+Eighteen mutants, each a single plausible edit, across the cached element forms,
+the zone's use of them, the host's buffer layout and the two shaders. The first
+pass killed six; **every one of the survivors was a hole in the suite except two**,
+and one of them was a defect sitting in the tree.
+
+- **A defect, and it was live.** `zone::Solver`'s constructor could build the
+  cached forms from `position_` instead of `rest_` and pass the entire suite.
+  Without a `Preload` the two are the same array, so the mistake is invisible; with
+  one they differ by the pre-strain and every element gets the wrong B. The mutant
+  was left applied in the tree by a harness accident for the better part of an hour
+  and nothing noticed. The bit-identity test now runs a second time **with a
+  pre-load on**, which is the only condition that separates the two arrays, and
+  asserts the pre-load moved the answer so the case cannot become the case above it.
+- **The device suite asked only whether the plate moved and yielded**, so five
+  shader mutants survived it: a wrong `sqrt(2/3)`, a lost engineering-shear factor
+  of two in the yield norm, a transposed rest Jacobian, a host-side state offset,
+  and skipping the Kaa equilibration. A short GPU-against-CPU comparison on the
+  integral quantities kills four of them.
+- **The transposed rest Jacobian needed a sheared mesh.** On the axis-aligned
+  rectangular plate the fixture used, the rest Jacobian is diagonal and a transpose
+  is not a change — the same trap `CLAUDE.md` records for the mass lumping and the
+  pressure load. The fixture is sheared now, in y only so the element stays
+  prismatic through its thickness.
+- **`elementRotation` off refused forms** returned a matrix of zeros rather than the
+  identity, and nothing asked.
+- **`Solver::adopt` shipped with no test at all**, on the caller's own path, in a
+  change whose headline feature was well covered. Writing one found that it
+  *advanced* the state it was adopting: recovering the stress runs
+  `elementPlasticUpdate`, which commits, so a point sitting just under its damage
+  limit would be tipped over it by the act of being read. It runs on a copy now.
+
+The suite went from 6 002 to 6 062 checks and from 6 to 15 kills of 18.
+
+**Two survivors, and both are findings rather than gaps.**
+
+`kRoot23` can be wrong by 0.4% — a 0.8% error in the yield radius — and no test
+sees it, because the float path's own agreement with the double reference is
+5.8 × 10⁻² on the plastic dissipation after four hundred steps of a barely-yielded
+plate. **The instrument is less precise than the error it would have to catch.**
+That is the same statement as the precision section above, arrived at from the
+other direction, and it is the clearest single argument that this kernel cannot be
+validated to the standard the CPU element was.
+
+Keeping the enhanced modes on a degraded element is *behaviourally* equivalent
+here, though not provably so: the equilibration's positive-diagonal check refuses
+to factor a rank-deficient Kaa and leaves alpha at the warm start, which the step
+of the first failure already zeroed. It is argued equivalent rather than shown to
+be, and the argument depends on a guard added for an unrelated reason — which is
+worth knowing if that guard is ever removed.
+
+Two deliberate controls behaved as controls should: dropping the *cached* call in
+the elastic path in favour of the uncached one survives, which is the bit-identity
+claim being true rather than a hole; and dropping the equilibration is killed,
+which says the fix earns its place.
+
+### What to do about it
+
+1. **Keep the `RestForms` hoist.** It is 2× on the CPU, free, and bit-identical.
+   It is the one part of this work that is unambiguously worth having.
+2. **Fix the conditioning in the element, not in the shader.** The enhanced modes
+   are a basis and their scaling is a free choice; normalising each column of G by
+   its own natural scale makes Kaa O(1) and is exact, so it costs the double CPU
+   path nothing and would remove the largest single obstacle to a float one. That
+   is a change to `solid_shell.cpp` and it should be made and validated against the
+   existing 207 assertions *before* any more GPU work.
+3. **If a float kernel is still wanted after that, keep alpha in double.** The EAS
+   block is 7×7. Even at Pascal's 1/32 fp64 rate it is a small share of the kernel,
+   and it is the only part that has been shown to need the digits.
+4. **Re-map the kernel to a workgroup per element** before measuring throughput
+   again. The current numbers measure register spilling, not the element.
+
+Until 2 and 4 are done, **the CPU is the faster and the more trustworthy path for
+Tier 2**, and the honest statement of this item's status is that the pattern
+applies, the kernel was built to it, and the element does not fit the mapping.

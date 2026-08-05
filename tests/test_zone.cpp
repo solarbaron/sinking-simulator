@@ -1315,10 +1315,13 @@ void testTheCostEstimateIsAFunctionOfTheRightThings() {
                0.5 * zone::estimatedCost(coarse), 0.02 * zone::estimatedCost(coarse));
     expectTrue("and the two thicknesses really do differ in step",
                stout.criticalTimestep > 1.8 * coarse.criticalTimestep);
-    // And the elastic path is cheaper by the ratio the measurements say.
-    expectNear("the elastic path is 27 times cheaper, as measured",
+    // And the elastic path is cheaper by the ratio the measurements say. The
+    // plastic figure moved from 7.3 µs to 3.1 when the step-invariant element forms
+    // stopped being rebuilt every step, so this ratio moved from 27 to 11 -- the
+    // elastic path barely uses those forms, so only one of the two numbers changed.
+    expectNear("the elastic path is 11 times cheaper, as measured",
                zone::estimatedCost(coarse, true) / zone::estimatedCost(coarse, false),
-               7.3 / 0.273, 0.1);
+               3.1 / 0.273, 0.1);
     expectTrue("an empty patch costs nothing", zone::estimatedCost(zone::Patch{}) == 0.0);
 }
 
@@ -1370,6 +1373,181 @@ void testStiffenersHoldOnlyWhatTheyReach() {
                 static_cast<long long>(full.stiffenerNodes) + 9LL);
 }
 
+
+// The rest forms are cached for the life of a solve, which is a 2x cost decision
+// and must be no other kind of decision at all. Everything the solver reports has
+// to come back bit for bit the same with the cache off.
+//
+// Two guards against a vacuous pass. The patch has to have **deformed and torn**,
+// because an undisturbed patch agrees with anything; and the run has to be long
+// enough that the state has moved many times, because a cache that is stale rather
+// than wrong agrees on the first step and diverges later.
+void testTheRestFormsCacheChangesNothing() {
+    std::printf("\n   the cached rest forms, against rebuilding them every step\n");
+    // The same small, thin strip `testTearingReportsPanelIndicesForBreach` uses,
+    // driven past first tear -- so the comparison covers the element-deletion path,
+    // the dropped enhanced modes and the in-step retry, which are the parts of the
+    // element that a merely-deforming patch never reaches.
+    const StructuralMesh strip = flatStrip(0.6, 0.3, 0.006, 3, 1);
+    const zone::Patch patch = zone::buildPatch(strip, {0.05, 0, 0}, flatParams(2));
+
+    struct Answer {
+        std::vector<double> position;
+        zone::SolveResult result;
+    };
+    const auto drive = [&](bool cache, bool preload = false) {
+        zone::SolveParams solve;
+        solve.cacheRestForms = cache;
+        if (preload) {
+            // A real pre-strain: 120 MPa of the ship's own hogging stress through
+            // the patch, which is a third of yield and moves `rest_` away from
+            // `position_` by ~6e-4 of every coordinate.
+            solve.preload.stress = 120.0e6;
+            solve.preload.gradient = 8.0e6;
+            solve.preload.reference = 0.0;
+        }
+        solve.indenter.halfLength = 0.03;
+        solve.indenter.halfWidth = 0.08;
+        solve.indenter.speed = 20.0;
+        solve.indenter.rampTime = 5.0e-4;
+        solve.indenter.stopAt = 0.07;
+        zone::Solver solver(patch, plasticity::shipSteel(), solve);
+        Answer answer;
+        answer.result = solver.run();
+        answer.position = solver.position();
+        return answer;
+    };
+
+    const Answer cached = drive(true);
+    const Answer rebuilt = drive(false);
+    // And the same again **with a pre-load**, which is the only condition under
+    // which the rest configuration and the initial position differ. Without one
+    // they are the same array, and building the cached forms from the wrong one of
+    // the two is then invisible -- mutation testing found exactly that edit
+    // surviving the whole suite, and this is what closes it.
+    const Answer preloadedCache = drive(true, true);
+    const Answer preloadedRebuild = drive(false, true);
+    expectTrue("the cache reports itself on", cached.result.cachedRestForms);
+    expectTrue("and off", !rebuilt.result.cachedRestForms);
+    expectEqualCount("both runs took the same number of steps",
+                     static_cast<std::size_t>(cached.result.steps),
+                     static_cast<std::size_t>(rebuilt.result.steps));
+
+    bool identical = cached.result.force == rebuilt.result.force &&
+                     cached.result.peakForce == rebuilt.result.peakForce &&
+                     cached.result.work == rebuilt.result.work &&
+                     cached.result.strainEnergy == rebuilt.result.strainEnergy &&
+                     cached.result.dissipation == rebuilt.result.dissipation &&
+                     cached.result.kinetic == rebuilt.result.kinetic &&
+                     cached.result.tornElements == rebuilt.result.tornElements;
+    double moved = 0;
+    for (std::size_t i = 0; i < cached.position.size(); ++i) {
+        identical = identical && cached.position[i] == rebuilt.position[i];
+        moved = std::max(moved, std::abs(cached.position[i] - patch.mesh.position[i]));
+    }
+    expectTrue("caching the rest forms is bit-identical to rebuilding them", identical);
+
+    bool preloadedIdentical =
+        preloadedCache.result.work == preloadedRebuild.result.work &&
+        preloadedCache.result.dissipation == preloadedRebuild.result.dissipation &&
+        preloadedCache.result.strainEnergy == preloadedRebuild.result.strainEnergy &&
+        preloadedCache.result.tornElements == preloadedRebuild.result.tornElements;
+    for (std::size_t i = 0; i < preloadedCache.position.size(); ++i)
+        preloadedIdentical =
+            preloadedIdentical && preloadedCache.position[i] == preloadedRebuild.position[i];
+    expectTrue("and bit-identical under a pre-load, where rest and position differ",
+               preloadedIdentical);
+    // Guard: the pre-load has to have actually moved the rest configuration, or the
+    // case above is the case below it wearing a hat.
+    expectTrue("and the pre-load stored energy, so rest really did move",
+               preloadedCache.result.initialStrainEnergy > 0.0);
+    expectTrue("and moved the answer, so it was not a no-op",
+               preloadedCache.result.work != cached.result.work);
+    std::printf("     %d steps, %.4f m of travel, %d element(s) torn, peak %.2f MN\n",
+                cached.result.steps, moved, cached.result.tornElements,
+                cached.result.peakForce / 1e6);
+    expectTrue("and the run deformed the patch, so there was something to compare",
+               moved > 1e-3);
+    expectTrue("and tore it, so the element-deletion path was compared too",
+               cached.result.tornElements > 0);
+}
+
+// `Solver::adopt` exists so a state computed elsewhere -- a GPU run -- is read by
+// the energy account, the tearing rules and the panel reporting that are already
+// validated, rather than by a second copy of them. It shipped with no test of its
+// own, on the caller's path, which is the failure `CLAUDE.md` records as "asking
+// what in the diff was not exercised".
+//
+// The statement it has to satisfy is an identity, not a tolerance: adopting the
+// state a run *did* produce must reproduce that run's own report.
+void testAdoptingAStateReproducesTheRunThatMadeIt() {
+    std::printf("\n   adopting a state computed elsewhere\n");
+    const StructuralMesh strip = flatStrip(0.6, 0.3, 0.006, 3, 1);
+    const zone::Patch patch = zone::buildPatch(strip, {0.05, 0, 0}, flatParams(2));
+
+    zone::SolveParams solve;
+    solve.indenter.halfLength = 0.03;
+    solve.indenter.halfWidth = 0.08;
+    solve.indenter.speed = 20.0;
+    solve.indenter.rampTime = 5.0e-4;
+    solve.indenter.stopAt = 0.07;
+    zone::Solver ran(patch, plasticity::shipSteel(), solve);
+    const zone::SolveResult& original = ran.run();
+
+    zone::Solver fresh(patch, plasticity::shipSteel(), solve);
+    fresh.adopt(ran.position(), ran.velocity(), ran.elementState(), original.steps, original.time,
+                original.penetration, original.work, original.dissipation);
+    const zone::SolveResult& adopted = fresh.result();
+
+    std::printf("     %d steps, %d torn, strain %.4f MJ; adopted reports %d torn, %.4f MJ\n",
+                original.steps, original.tornElements, original.strainEnergy / 1e6,
+                adopted.tornElements, adopted.strainEnergy / 1e6);
+    expectEqual("adopting reports the same step count",
+                static_cast<long long>(adopted.steps), static_cast<long long>(original.steps));
+    expectTrue("and the same torn element count", adopted.tornElements == original.tornElements);
+    expectEqualCount("and the same torn panels", adopted.tornPanels.size(),
+                     original.tornPanels.size());
+    // The strain energy agrees closely but **not bit for bit**, and the reason is a
+    // property of `step()` rather than of `adopt()`: a step runs
+    // computeForces -> integrate -> accumulateEnergy, so the energy a run finishes
+    // with is the stress from *before* its last integration, one step stale against
+    // the positions it also reports. `adopt` recomputes it from the positions it was
+    // handed, so it is the un-stale version of the same quantity. A tolerance of one
+    // step's worth is the honest statement; equality would be asserting a defect.
+    expectTrue("and a strain energy within one step of it",
+               std::abs(adopted.strainEnergy - original.strainEnergy) <
+                   0.05 * std::abs(original.strainEnergy));
+    expectTrue("and the same torn area", adopted.tornArea == original.tornArea);
+    bool samePosition = true;
+    for (std::size_t i = 0; i < ran.position().size(); ++i)
+        samePosition = samePosition && fresh.position()[i] == ran.position()[i];
+    expectTrue("and holds the positions it was given", samePosition);
+    // Guards. A run that neither moved nor tore makes every line above vacuous, and
+    // a `fresh` that had happened to reach the same state on its own would too --
+    // it has taken no steps at all, so its strain energy before adopting is the
+    // pre-load's, which here is zero.
+    expectTrue("the run tore something, so the tearing path was reproduced",
+               original.tornElements > 0);
+    expectTrue("and stored strain energy, so the quadrature had something to do",
+               original.strainEnergy > 0.0);
+    // And adopting must not *advance* the state it was given: the plastic history
+    // comes back exactly as handed over, not one increment further on. Recovering
+    // the stress runs the element update, which commits, so this is a real hazard
+    // and not a hypothetical -- a point just under its damage limit would be tipped
+    // over it by the act of being read.
+    bool historyUntouched = true;
+    for (std::size_t e = 0; e < patch.elementCount(); ++e)
+        for (int gp = 0; gp < solidshell::kGauss; ++gp)
+            historyUntouched =
+                historyUntouched &&
+                fresh.elementState()[e].point[gp].equivalentPlasticStrain ==
+                    ran.elementState()[e].point[gp].equivalentPlasticStrain &&
+                fresh.elementState()[e].point[gp].damage ==
+                    ran.elementState()[e].point[gp].damage;
+    expectTrue("and adopting does not advance the history it was handed",
+               historyUntouched);
+}
+
 }  // namespace
 
 void runZoneTests() {
@@ -1392,4 +1570,6 @@ void runZoneTests() {
     testNodalNormalsAreAreaWeighted();
     testTheCostEstimateIsAFunctionOfTheRightThings();
     testStiffenersHoldOnlyWhatTheyReach();
+    testTheRestFormsCacheChangesNothing();
+    testAdoptingAStateReproducesTheRunThatMadeIt();
 }

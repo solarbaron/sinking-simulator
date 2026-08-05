@@ -56,6 +56,15 @@ struct Options {
     // is what it did before `promotion.hpp` existed. Here so the pre-load's effect
     // at ship scale is a measurement rather than a claim.
     bool noPreload = false;
+    // Keep the step-invariant element forms, or rebuild them every step. Here as a
+    // switch because it is a 2x cost decision whose two answers must agree to the
+    // last bit, and the only way to say that is to run both.
+    std::string formsCache = "auto";
+    // Mesh and solve at the requested point even when the promotion criterion
+    // declines. The criterion holds an element budget, so it is the thing that
+    // stops a cost sweep from reaching the sizes the budget exists to refuse --
+    // which are exactly the sizes a cost sweep wants.
+    bool force = false;
 };
 
 bool parse(int argc, char** argv, Options& o) {
@@ -72,6 +81,8 @@ bool parse(int argc, char** argv, Options& o) {
         else if (const char* v = value("height")) o.height = std::atof(v);
         else if (const char* v = value("sub")) o.subdivision = std::atoi(v);
         else if (const char* v = value("threads")) o.threads = std::atoi(v);
+        else if (const char* v = value("forms-cache")) o.formsCache = v;
+        else if (a == "--force") o.force = true;
         else if (a == "--elastic") o.elastic = true;
         else if (a == "--no-preload") o.noPreload = true;
         else {
@@ -145,16 +156,23 @@ int main(int argc, char** argv) {
             std::printf("         panel %d, %s, score %.2f: %s\n", c.panel,
                         sim::promotion::name(c.trigger), c.score, c.why.c_str());
     }
-    if (promoter.active().empty()) {
+    if (promoter.active().empty() && !options.force) {
         std::printf("nothing promoted: the criterion did not fire\n");
         return 1;
     }
 
     // --- 1. Mesh the zone the criterion asked for ------------------------------
-    const sim::promotion::Active& zone = promoter.active().front();
     sim::zone::MeshParams mesh = criterion.mesh;
-    mesh.role = zone.role;
-    const sim::zone::Patch patch = sim::zone::buildPatch(structure, zone.impact, mesh);
+    sim::Vec3 meshAt = impact;
+    if (!promoter.active().empty()) {
+        const sim::promotion::Active& zone = promoter.active().front();
+        mesh.role = zone.role;
+        meshAt = zone.impact;
+    } else {
+        std::printf("forced : the criterion declined and --force meshed at the impact"
+                    " point anyway\n");
+    }
+    const sim::zone::Patch patch = sim::zone::buildPatch(structure, meshAt, mesh);
     if (patch.empty()) {
         std::printf("no zone: nothing to promote at that impact point\n");
         for (const std::string& problem : patch.problems) std::printf("       ! %s\n",
@@ -201,6 +219,7 @@ int main(int argc, char** argv) {
 
     sim::zone::SolveParams solve;
     solve.plastic = !options.elastic;
+    solve.cacheRestForms = options.formsCache != "never";
     solve.preload = options.noPreload ? sim::zone::Preload{} : preload.preload;
     solve.jobs = &jobs;
     solve.indenter.halfLength = 1.0;   // m along the ship
@@ -240,11 +259,42 @@ int main(int argc, char** argv) {
                     s.tornElements, membrane(shortSpan, s.penetration, false) / 1e6,
                     membrane(longSpan, s.penetration, false) / 1e6);
 
-    std::printf("\nsolve  : %d steps in %.2f s wall on %u workers, %.2f us/element/step\n",
+    std::printf("\nsolve  : %d steps in %.2f s wall on %u workers, %.2f us/element/step,"
+                " rest forms %s\n",
                 result.steps, result.wallSeconds,
                 options.threads > 0 ? static_cast<unsigned>(options.threads)
                                     : core::JobSystem::defaultWorkerCount(),
-                result.microsecondsPerElementStep);
+                result.microsecondsPerElementStep,
+                result.cachedRestForms ? "cached" : "rebuilt each step");
+    // A bit-exact digest of the answer. Two solver configurations that claim to be
+    // the same arithmetic have to produce the same bits, and a printed force to two
+    // decimals cannot say so -- the hex is what makes the claim checkable from a
+    // shell. `%a` is exact for a double.
+    std::printf("digest : force %a peak %a work %a strain %a plastic %a kinetic %a"
+                " torn %d steps %d\n",
+                result.force, result.peakForce, result.work, result.strainEnergy,
+                result.dissipation, result.kinetic, result.tornElements, result.steps);
+
+    // Where the time went. **This is the number that decides whether an
+    // accelerator is worth building**, because Amdahl's law bounds what moving one
+    // phase can buy however fast the replacement is. The element kernel's share is
+    // the ceiling on a GPU element solver that leaves the rest on the CPU.
+    {
+        const sim::zone::SolveResult::Profile& p = result.profile;
+        const double total = p.total();
+        const auto share = [&](double s) { return total > 0 ? 100.0 * s / total : 0.0; };
+        std::printf("profile: %.2f s accounted of %.2f s wall\n", total, result.wallSeconds);
+        std::printf("         element   %8.3f s  %5.1f%%   (per-element force / return map)\n",
+                    p.element, share(p.element));
+        std::printf("         gather    %8.3f s  %5.1f%%   (CSR nodal gather + per-element"
+                    " reduction)\n", p.gather, share(p.gather));
+        std::printf("         integrate %8.3f s  %5.1f%%   (velocity, punch, position)\n",
+                    p.integrate, share(p.integrate));
+        std::printf("         energy    %8.3f s  %5.1f%%   (strain + kinetic energy"
+                    " accumulation)\n", p.energy, share(p.energy));
+        std::printf("         other     %8.3f s  %5.1f%%\n", p.other, share(p.other));
+    }
+
     std::printf("energy : in %.3f MJ = strain %.4f + plastic %.3f + kinetic %.4f"
                 "  (residual %+.2f%%)\n",
                 result.work / 1e6, result.strainEnergy / 1e6, result.dissipation / 1e6,

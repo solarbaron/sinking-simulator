@@ -1,0 +1,104 @@
+#version 450
+// One invocation per node: gather the element forces incident on it and advance
+// velocity and position by symplectic Euler, then hold the nodes the punch has.
+//
+// The gather runs over a CSR adjacency built once on the CPU. Summation order is
+// therefore fixed by the mesh, not by which warp happened to finish first -- the
+// same property node_integrate.comp exists for, and the reason zone.cpp gathers
+// rather than scattering.
+//
+// The punch is applied here rather than in a third kernel because it is a
+// *velocity* condition on a handful of nodes, and the impulse it has to apply to
+// hold a node **is** the resisting force -- taking it that way keeps the node's own
+// inertia in the account, which is what makes the energy balance close.
+//
+// What comes back is the accumulated **work**, not a per-step force. Two reasons,
+// and the second is the load-bearing one. A per-step force would need a readback
+// per step, which throws away the whole point of recording a thousand steps into
+// one command buffer. And `07-fem-spike-findings.md` §2 records that comparing two
+// solvers on a peak nodal quantity reads over 200% difference and means nothing,
+// because an explicit scheme has no accuracy at all in the modes near its
+// stability limit: **use integral or low-frequency quantities to compare solvers,
+// never the max norm**. Work is the integral quantity here.
+//
+// The accumulation is an integer atomic on a fixed-point representation. A float
+// atomic would make the answer depend on which warp finished first, which is
+// exactly the property the CSR gather exists to protect.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0)          buffer Positions  { float position[]; };
+layout(std430, binding = 1)          buffer Velocities { float velocity[]; };
+layout(std430, binding = 2) readonly buffer Masses     { float mass[]; };
+layout(std430, binding = 3) readonly buffer Pinned     { uint  pinned[]; };   // 3 per node
+layout(std430, binding = 7) readonly buffer ElemForce  { float elementForce[]; };
+layout(std430, binding = 8) readonly buffer AdjOffset  { uint  adjacencyOffset[]; };
+layout(std430, binding = 9) readonly buffer AdjEntry   { uint  adjacencyEntry[]; };
+layout(std430, binding = 12) readonly buffer Driven    { uint  driven[]; };
+layout(std430, binding = 13)         buffer Accumulator { int  accumulated[]; };
+
+layout(push_constant) uniform Params {
+    float dt;
+    float mu;
+    float kappa;
+    float yieldStrength;
+    float strengthCoefficient;
+    float referenceStrain;
+    float hardeningExponent;
+    float kinematicModulus;
+    float triaxialitySensitivity;
+    float referenceTriaxiality;
+    float cutoffTriaxiality;
+    float punchSpeed;
+    float axisX, axisY, axisZ;
+    uint  nodeCount;
+    uint  elementCount;
+    uint  drivenCount;
+} params;
+
+// Units per joule in the fixed-point work accumulator. A ferry-scale zone run puts
+// in ~1.5 MJ, so 100 units per joule is 1.5e8 against a 32-bit signed accumulator's
+// 2.1e9 -- room to spare, at a resolution of 10 mJ against per-step contributions
+// of order 100 J. The host asserts the headroom rather than trusting it.
+const float kWorkScale = 100.0;
+
+void main() {
+    const uint n = gl_GlobalInvocationID.x;
+    if (n >= params.nodeCount) return;
+
+    vec3 force = vec3(0.0);
+    const uint begin = adjacencyOffset[n];
+    const uint end = adjacencyOffset[n + 1u];
+    for (uint k = begin; k < end; ++k) {
+        const uint entry = adjacencyEntry[k];
+        const uint o = (entry / 8u) * 24u + (entry % 8u) * 3u;
+        force += vec3(elementForce[o], elementForce[o + 1u], elementForce[o + 2u]);
+    }
+
+    vec3 v = vec3(velocity[n * 3u], velocity[n * 3u + 1u], velocity[n * 3u + 2u]);
+    const float m = mass[n];
+    for (int k = 0; k < 3; ++k) {
+        if (pinned[n * 3u + uint(k)] != 0u) v[k] = 0.0;
+        else if (m > 0.0) v[k] += force[k] / m * params.dt;
+    }
+
+    // The punch grips: a driven node is held to it rather than released, which is
+    // right for a monotonic push and wrong for rebound. `drivenCount` entries, so a
+    // linear scan is over a handful of nodes and not over the mesh.
+    const vec3 axis = vec3(params.axisX, params.axisY, params.axisZ);
+    for (uint i = 0u; i < params.drivenCount; ++i) {
+        if (driven[i] != n) continue;
+        const float along = dot(v, axis);
+        const float change = -params.punchSpeed - along;
+        v += change * axis;
+        // work = force * speed * dt with force = -impulse/dt, so the dt cancels and
+        // this node's share is -(m dv) * speed. Exactly the CPU's expression with
+        // the same cancellation done by hand.
+        atomicAdd(accumulated[0], int(-(m * change) * params.punchSpeed * kWorkScale));
+        break;
+    }
+
+    const vec3 p = vec3(position[n * 3u], position[n * 3u + 1u], position[n * 3u + 2u]) + v * params.dt;
+    velocity[n * 3u] = v.x; velocity[n * 3u + 1u] = v.y; velocity[n * 3u + 2u] = v.z;
+    position[n * 3u] = p.x; position[n * 3u + 1u] = p.y; position[n * 3u + 2u] = p.z;
+}

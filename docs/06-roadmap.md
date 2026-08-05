@@ -360,9 +360,45 @@ The longest and highest-risk phase.
   **Mesh-splitting fracture is not**: a failed integration point is deleted, and the
   maximum principal direction it returns — the plane a tear would open on — has no
   consumer yet
-- GPU element solver — not started for solid-shell. The Phase 0 spike has a
-  Vulkan compute back-end for tets (`07-fem-spike-findings.md`), which is the
-  pattern to follow
+- **GPU element solver for the solid-shell** — built, measured, and **the CPU is
+  still the faster path**. `engine/gpu/zone_gpu.{hpp,cpp}` plus
+  `solidshell_forces.comp` and `solidshell_integrate.comp`, following the tet back
+  end's pattern exactly: one invocation per element, forces to per-element slots, a
+  CSR gather in a fixed order, every substep in one command buffer. EAS internal
+  variables and eight Gauss points of plastic history are device-resident and the
+  seven enhanced parameters are condensed in the shader each step. The full account
+  is `07-fem-spike-findings.md` §8; three things belong here.
+
+  **The profile came first and it changed the job.** Element evaluation is 98.5% of
+  a Tier-2 solve on one worker, so the pattern does apply — but half of that was
+  `computeForms` rebuilding each element's strain-displacement matrices from its
+  *rest* configuration every step, which an explicit solve never moves. Hoisting
+  them into a `solidshell::RestForms` is **2.0× on the CPU for bit-identical
+  answers**, at every zone size from 192 to 17 800 elements. The tet has always had
+  this — it uploads `restInverse` and `restVolume` — and the solid-shell simply
+  never grew the equivalent. The per-element cost *was* measured and was right; what
+  was never asked is which part of it depended on the state being advanced.
+
+  **The kernel is 0.23–0.68× the 24-thread CPU**, end to end on the real patch, and
+  it gets *worse* past 3 000 elements. One thread per element needs ~500 floats of
+  dynamically indexed private state — two copies of the plastic history, a 6×6
+  tangent, a 7×7 Kaa and its factor — which Pascal spills to local memory. **The
+  tet's mapping does not carry over**: a linear tet has twelve DOF and no history
+  and fits in registers, which is the whole reason it reaches 450 M
+  element-updates/s. One workgroup per element is the design to try, and it is a
+  different kernel rather than a tuning pass.
+
+  **Float is not sufficient for this element as formulated.** Two defects were found
+  and fixed — absolute ship coordinates in float lose the displacement to
+  cancellation (solve about the patch centroid: 190× better), and Kaa must be
+  equilibrated before it is factored, because the enhanced modes' G columns differ
+  by `1/t²` against `1/h²` and κ(Kaa) ≈ (h/t)⁴ ≈ 10⁷ on ordinary plating. Even
+  after both, a 5 505-step run ends 28% high in plastic dissipation and **tears 60
+  elements where the double reference tears none**. That is not the explicit
+  scheme's known sensitivity: perturbing the *double* solver's mesh by the same
+  2 × 10⁻⁷ m moves the dissipation by 10⁻⁶ and tears nothing. The next step is to
+  normalise the enhanced modes in `solid_shell.cpp` — a free basis change that would
+  fix the conditioning for both paths — before any more GPU work
 - ~~FEM → flooding coupling (a tear becomes an orifice)~~ — done:
   `engine/sim/breach.hpp`, measured in `02-simulation.md` §3. Failed panels become
   merged `Opening`s whose area, position and connectivity come from the structure,

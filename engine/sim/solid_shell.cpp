@@ -178,15 +178,12 @@ void enhancedM(double xi, double eta, double zta, double m[6][kEas]) {
     m[3][6] = eta;
 }
 
-// Everything an element's stiffness, stress and mass need, evaluated once.
-struct Forms {
-    double b[kGauss][6][kDof];
-    double g[kGauss][6][kEas];
-    double weight[kGauss];  // Gauss weight times det J
-    double shape[kGauss][kNodes];
-    int easCount;
-    bool ok;
-};
+// `RestForms` is everything an element's stiffness, stress and internal force
+// need, and it is public because it is also the whole of what an explicit solver
+// should be caching. The shape functions are wanted only by `elementMass`, which
+// runs once per element per solve, so they are an optional out-parameter rather
+// than 512 bytes an element carried for the life of a zone.
+using Shape = double[kGauss][kNodes];
 
 // ANS sampling points. Transverse shear (Dvorkin-Bathe):
 //   2E_23 (eta-zeta) is taken constant in eta and linear in xi, from (xi, eta) =
@@ -237,7 +234,8 @@ void sampleAns(const double nodes[kDof], double zeta, bool shear, bool thickness
     }
 }
 
-void computeForms(const double nodes[kDof], Formulation form, Forms& out) {
+void computeForms(const double nodes[kDof], Formulation form, RestForms& out,
+                  Shape* shape = nullptr) {
     const Cures cures = curesFor(form);
     out.easCount = cures.enhanced ? kEas : 0;
     out.ok = true;
@@ -250,6 +248,11 @@ void computeForms(const double nodes[kDof], Formulation form, Forms& out) {
         out.ok = false;
         return;
     }
+    // The polar decomposition wants exactly this matrix every step, and
+    // `elementRotation` re-derives it every step. Keeping it here is what lets the
+    // cached path be bit-identical rather than merely equivalent.
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) out.restJacobianInverse[i * 3 + j] = a0[i][j];
     double t0[6][6];
     voigtTransform(a0, t0);
 
@@ -276,9 +279,10 @@ void computeForms(const double nodes[kDof], Formulation form, Forms& out) {
         }
         out.weight[gp] = det;  // 2x2x2 Gauss weights are all 1
 
-        for (int n = 0; n < kNodes; ++n)
-            out.shape[gp][n] = 0.125 * (1.0 + xi * kXi[n]) * (1.0 + eta * kEta[n]) *
-                               (1.0 + zta * kZta[n]);
+        if (shape != nullptr)
+            for (int n = 0; n < kNodes; ++n)
+                (*shape)[gp][n] = 0.125 * (1.0 + xi * kXi[n]) * (1.0 + eta * kEta[n]) *
+                                  (1.0 + zta * kZta[n]);
 
         double bn[6][kDof];
         naturalB(p, bn);
@@ -332,7 +336,7 @@ struct Blocks {
     int easCount;
 };
 
-void computeBlocks(const Forms& f, const double c[6][6], Blocks& out) {
+void computeBlocks(const RestForms& f, const double c[6][6], Blocks& out) {
     out.easCount = f.easCount;
     std::fill(std::begin(out.kuu), std::end(out.kuu), 0.0);
     std::fill(std::begin(out.kua), std::end(out.kua), 0.0);
@@ -451,7 +455,7 @@ const char* name(Formulation form) {
 void elementStiffness(const double nodes[kDof], const StructuralMaterial& material,
                       Formulation form, double out[kDof * kDof]) {
     std::fill(out, out + kDof * kDof, 0.0);
-    Forms forms;
+    RestForms forms;
     computeForms(nodes, form, forms);
     if (!forms.ok) return;
 
@@ -480,7 +484,7 @@ void elementStress(const double nodes[kDof], const double displacement[kDof],
                    const StructuralMaterial& material, Formulation form,
                    double out[kGauss * 6]) {
     std::fill(out, out + kGauss * 6, 0.0);
-    Forms forms;
+    RestForms forms;
     computeForms(nodes, form, forms);
     if (!forms.ok) return;
 
@@ -522,16 +526,17 @@ void elementStress(const double nodes[kDof], const double displacement[kDof],
 
 void elementMass(const double nodes[kDof], double density, double out[kNodes]) {
     std::fill(out, out + kNodes, 0.0);
-    Forms forms;
-    computeForms(nodes, Formulation::Displacement, forms);
+    RestForms forms;
+    Shape shape;
+    computeForms(nodes, Formulation::Displacement, forms, &shape);
     if (!forms.ok) return;
     for (int gp = 0; gp < kGauss; ++gp)
-        for (int a = 0; a < kNodes; ++a) out[a] += density * forms.weight[gp] * forms.shape[gp][a];
+        for (int a = 0; a < kNodes; ++a) out[a] += density * forms.weight[gp] * shape[gp][a];
 }
 
 void gaussVolumes(const double nodes[kDof], double out[kGauss]) {
     std::fill(out, out + kGauss, 0.0);
-    Forms forms;
+    RestForms forms;
     // The weights are geometry, so the formulation is irrelevant and the cheapest
     // one is used. `weight` already carries det J times the 2x2x2 Gauss weight of 1.
     computeForms(nodes, Formulation::Displacement, forms);
@@ -539,15 +544,18 @@ void gaussVolumes(const double nodes[kDof], double out[kGauss]) {
     for (int gp = 0; gp < kGauss; ++gp) out[gp] = forms.weight[gp];
 }
 
-void elementRotation(const double rest[kDof], const double current[kDof], double out[9]) {
-    Point r, c;
-    evaluate(rest, 0.0, 0.0, 0.0, r);
+bool computeRestForms(const double rest[kDof], Formulation form, RestForms& out) {
+    computeForms(rest, form, out);
+    return out.ok;
+}
+
+namespace {
+// The half of `elementRotation` that is not the rest element's Jacobian: shared by
+// the cached and uncached entry points so there is one polar decomposition here
+// and not two that could drift apart.
+void rotationFrom(const double restInv[3][3], const double current[kDof], double out[9]) {
+    Point c;
     evaluate(current, 0.0, 0.0, 0.0, c);
-    double restInv[3][3];
-    if (invert3(r.jac, restInv) == 0.0) {
-        for (int i = 0; i < 9; ++i) out[i] = (i % 4 == 0) ? 1.0 : 0.0;
-        return;
-    }
     double f[3][3];
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j) {
@@ -561,12 +569,36 @@ void elementRotation(const double rest[kDof], const double current[kDof], double
     for (int col = 0; col < 3; ++col)
         for (int row = 0; row < 3; ++row) out[col * 3 + row] = rot[row][col];
 }
+}  // namespace
 
-void internalForce(const double stiffness[kDof * kDof], const double rest[kDof],
-                   const double current[kDof], double out[kDof]) {
-    double r[9];
-    elementRotation(rest, current, r);
+void elementRotation(const RestForms& forms, const double current[kDof], double out[9]) {
+    if (!forms.ok) {
+        for (int i = 0; i < 9; ++i) out[i] = (i % 4 == 0) ? 1.0 : 0.0;
+        return;
+    }
+    double restInv[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) restInv[i][j] = forms.restJacobianInverse[i * 3 + j];
+    rotationFrom(restInv, current, out);
+}
 
+void elementRotation(const double rest[kDof], const double current[kDof], double out[9]) {
+    Point r;
+    evaluate(rest, 0.0, 0.0, 0.0, r);
+    double restInv[3][3];
+    if (invert3(r.jac, restInv) == 0.0) {
+        for (int i = 0; i < 9; ++i) out[i] = (i % 4 == 0) ? 1.0 : 0.0;
+        return;
+    }
+    rotationFrom(restInv, current, out);
+}
+
+namespace {
+// The co-rotational force off a rotation that has already been formed. Both
+// `internalForce` overloads route through it, so there is one expression of
+// `f = -R K (R^T x - X)` rather than two that could drift apart.
+void internalForceFrom(const double r[9], const double stiffness[kDof * kDof],
+                       const double rest[kDof], const double current[kDof], double out[kDof]) {
     // u = R^T x - X, node by node.
     double u[kDof];
     for (int a = 0; a < kNodes; ++a)
@@ -588,6 +620,21 @@ void internalForce(const double stiffness[kDof * kDof], const double rest[kDof],
             for (int k = 0; k < 3; ++k) s += r[k * 3 + i] * ku[a * 3 + k];  // R (K u)
             out[a * 3 + i] = -s;
         }
+}
+}  // namespace
+
+void internalForce(const double stiffness[kDof * kDof], const double rest[kDof],
+                   const double current[kDof], double out[kDof]) {
+    double r[9];
+    elementRotation(rest, current, r);
+    internalForceFrom(r, stiffness, rest, current, out);
+}
+
+void internalForce(const RestForms& forms, const double stiffness[kDof * kDof],
+                   const double rest[kDof], const double current[kDof], double out[kDof]) {
+    double r[9];
+    elementRotation(forms, current, r);
+    internalForceFrom(r, stiffness, rest, current, out);
 }
 
 // --- Plasticity and tearing ---------------------------------------------------
@@ -617,7 +664,7 @@ void elementSize(const double nodes[kDof], double* inPlane, double* thickness) {
     }
     if (!(area > 0.0)) return;
 
-    Forms forms;
+    RestForms forms;
     computeForms(nodes, Formulation::Displacement, forms);
     if (!forms.ok) return;
     double volume = 0.0;
@@ -643,18 +690,26 @@ PlasticUpdate elementPlasticUpdate(const double rest[kDof], const double current
                                    const plasticity::Material& material, Formulation form,
                                    ElementPlasticState& state, double force[kDof],
                                    double stress[kGauss * 6]) {
+    RestForms forms;
+    computeForms(rest, form, forms);
+    return elementPlasticUpdate(forms, rest, current, material, state, force, stress);
+}
+
+PlasticUpdate elementPlasticUpdate(const RestForms& forms, const double rest[kDof],
+                                   const double current[kDof],
+                                   const plasticity::Material& material,
+                                   ElementPlasticState& state, double force[kDof],
+                                   double stress[kGauss * 6]) {
     PlasticUpdate result;
     std::fill(force, force + kDof, 0.0);
     if (stress != nullptr) std::fill(stress, stress + kGauss * 6, 0.0);
 
-    Forms forms;
-    computeForms(rest, form, forms);
     if (!forms.ok) return result;
 
     // Co-rotated displacement: the plastic history lives in the material frame, so
     // a finite rotation must not touch it. u = R^T x - X, as `internalForce`.
     double r[9];
-    elementRotation(rest, current, r);
+    elementRotation(forms, current, r);
     double u[kDof];
     for (int a = 0; a < kNodes; ++a)
         for (int i = 0; i < 3; ++i) {

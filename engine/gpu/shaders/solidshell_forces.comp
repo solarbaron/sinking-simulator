@@ -1,0 +1,543 @@
+#version 450
+// One invocation per solid-shell element: co-rotational elasticity, J2 plasticity
+// with ductile failure, and the seven enhanced assumed strains condensed out --
+// producing the eight nodal force vectors this element contributes.
+//
+// **Deliberately mirrors sim::solidshell::elementPlasticUpdate and
+// sim::plasticity::update term for term**, in the same order, so the two can be
+// diffed element by element. Where the CPU takes a branch this takes the same one;
+// where the CPU iterates to a tolerance this iterates to the float equivalent of
+// it, and the difference is documented rather than silent (see kEnhancedWorkTol).
+//
+// Forces are written to a per-element slot rather than scattered into nodes. The
+// companion node kernel gathers them, which needs no float atomics and -- more
+// importantly -- fixes the summation order, so the result is reproducible. Same
+// reasoning as tet_forces.comp, and the same requirement.
+//
+// **What is NOT here, and why that matters.** The strain-displacement matrices B,
+// the enhanced interpolation G, the Gauss weights and the rest Jacobian are
+// functions of the undeformed element alone. They are formed once on the CPU as a
+// sim::solidshell::RestForms and read from a buffer, exactly as tet_forces.comp
+// reads restInv and restVolume. That is not only a throughput decision: rebuilding
+// them here would need the whole ANS/EAS geometry pipeline in GLSL, which is the
+// part of the element hardest to verify and the part that would have made this
+// kernel untrustworthy.
+
+layout(local_size_x = 32) in;
+
+// std430, all float unless stated. Layouts match the host in zone_gpu.cpp.
+layout(std430, binding = 0) readonly  buffer Positions  { float position[]; };
+layout(std430, binding = 4) readonly  buffer Indices    { uint  index[]; };      // 8 per element
+layout(std430, binding = 5) readonly  buffer Forms      { float forms[]; };      // kFormStride each
+layout(std430, binding = 6) readonly  buffer RestPos    { float restPosition[]; };
+layout(std430, binding = 7) writeonly buffer ElemForce  { float elementForce[]; };  // 24 each
+layout(std430, binding = 10)          buffer PlasticSt  { float plastic[]; };    // kStateStride each
+// Per element: [0] the run's accumulated plastic dissipation, [1] the torn flag.
+// The dissipation is a **running total per element**, not per step: each element
+// owns its own slot, so it needs no atomic, and summing over elements once at
+// readback is a fixed order. A single global accumulator would have needed an
+// atomic per element per step contending on one word.
+layout(std430, binding = 11)           buffer ElemOut   { float elementOut[]; }; // 2 each
+
+layout(push_constant) uniform Params {
+    float dt;
+    float mu;             // shear modulus
+    float kappa;          // bulk modulus
+    float yieldStrength;  // sigma_y(0)
+    float strengthCoefficient;   // Swift K
+    float referenceStrain;       // Swift eps_0
+    float hardeningExponent;     // Swift n
+    float kinematicModulus;
+    float triaxialitySensitivity;
+    float referenceTriaxiality;
+    float cutoffTriaxiality;
+    float punchSpeed;
+    float axisX, axisY, axisZ;
+    uint  nodeCount;
+    uint  elementCount;
+    uint  drivenCount;
+} params;
+
+const int  kNodes = 8;
+const int  kDof = 24;
+const int  kEas = 7;
+const int  kGauss = 8;
+// b[8][6][24] + g[8][6][7] + weight[8] + restJacobianInverse[9]
+const uint kFormB = 0u;
+const uint kFormG = 1152u;
+const uint kFormW = 1488u;
+const uint kFormJ = 1496u;
+const uint kFormStride = 1505u;
+// per Gauss point: plasticStrain[6], backStress[6], eps_p, damage, failed
+const uint kPointStride = 15u;
+// 8 points, then enhanced[7], failureStrain, torn
+const uint kStateEnhanced = 120u;
+const uint kStateFailure = 127u;
+const uint kStateTorn = 128u;
+const uint kStateStride = 129u;
+
+const float kRoot23 = 0.816496580927726f;
+
+// The CPU converges the enhanced-strain Newton on the correction's **energy**
+// against the element's yield energy, at 1e-16 of it -- which is below what float
+// can represent at all (eps = 1.2e-7). Chasing it here would spin to the iteration
+// cap on every element and still not converge, so the tolerance is the float
+// equivalent: 1e-7 of the same scale. `zone_gpu.cpp` measures what that costs
+// against the double reference rather than assuming it is nothing.
+const float kEnhancedWorkTol = 1.0e-9f;
+// ||r|| is not a scale-free measure -- the CPU says so at length and uses 1e-12 of
+// the same scale, which float cannot represent as a *relative* quantity but can as
+// this absolute one. It is deliberately far below anything that fires in practice:
+// at 1e-7 it fired on the first iteration of every lightly loaded element and left
+// alpha at its warm start of zero, which is the enhanced modes switched off.
+const float kResidualTol = 1.0e-12f;
+const int   kMaxIterations = 12;
+
+float flowStress(float p) {
+    p = max(0.0f, p);
+    return params.strengthCoefficient * pow(params.referenceStrain + p, params.hardeningExponent);
+}
+float flowSlope(float p) {
+    p = max(0.0f, p);
+    return params.strengthCoefficient * params.hardeningExponent *
+           pow(params.referenceStrain + p, params.hardeningExponent - 1.0f);
+}
+
+// ||dev sigma||^2 with the engineering-shear convention: entries 3..5 are tensor
+// components here (this is a stress), so they count twice. Dropping that 2 gives a
+// yield surface that is no longer isotropic while still passing every uniaxial
+// test -- the same trap plasticity.hpp records.
+float tensorNormSquared(float v[6]) {
+    return v[0] * v[0] + v[1] * v[1] + v[2] * v[2] +
+           2.0f * (v[3] * v[3] + v[4] * v[4] + v[5] * v[5]);
+}
+
+struct Point {
+    float plasticStrain[6];
+    float backStress[6];
+    float equivalentPlasticStrain;
+    float damage;
+    bool  failed;
+};
+
+struct Returned {
+    float stress[6];
+    float tangent[36];
+    float dissipation;
+    bool  yielded;
+    bool  failedNow;
+};
+
+// sim::plasticity::update, with the tangent always formed -- the enhanced-strain
+// Newton above needs it and nothing else calls this.
+Returned returnMap(float strain[6], float failureStrain, inout Point st) {
+    Returned r;
+    r.dissipation = 0.0f;
+    r.yielded = false;
+    r.failedNow = false;
+    for (int i = 0; i < 6; ++i) r.stress[i] = 0.0f;
+    for (int i = 0; i < 36; ++i) r.tangent[i] = 0.0f;
+    if (st.failed) return r;
+
+    const float mu = params.mu, kappa = params.kappa;
+
+    float elastic[6];
+    for (int i = 0; i < 6; ++i) elastic[i] = strain[i] - st.plasticStrain[i];
+    const float volumetric = elastic[0] + elastic[1] + elastic[2];
+    const float pressure = kappa * volumetric;
+
+    float trial[6];
+    for (int i = 0; i < 3; ++i) {
+        trial[i] = 2.0f * mu * (elastic[i] - volumetric / 3.0f);
+        trial[3 + i] = mu * elastic[3 + i];
+    }
+    float relative[6];
+    for (int i = 0; i < 6; ++i) relative[i] = trial[i] - st.backStress[i];
+    const float relativeNorm = sqrt(tensorNormSquared(relative));
+
+    const float yieldRadius = kRoot23 * flowStress(st.equivalentPlasticStrain);
+    const float excess = relativeNorm - yieldRadius;
+
+    if (!(excess > 0.0f)) {
+        for (int i = 0; i < 3; ++i) {
+            r.stress[i] = pressure + trial[i];
+            r.stress[3 + i] = trial[3 + i];
+        }
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j)
+                r.tangent[i * 6 + j] = kappa + 2.0f * mu * ((i == j ? 1.0f : 0.0f) - 1.0f / 3.0f);
+            r.tangent[(3 + i) * 6 + (3 + i)] = mu;
+        }
+        return r;
+    }
+
+    // Consistency. g is decreasing, g(0) = excess > 0, and the no-hardening bound
+    // brackets the root -- so the loop is entered from above and bisection is only
+    // the fallback. Same structure as the CPU, with a float tolerance.
+    const float linearPart = 2.0f * mu + (2.0f / 3.0f) * params.kinematicModulus;
+    float lo = 0.0f, hi = excess / linearPart;
+    float gamma = hi;
+    for (int it = 0; it < 30; ++it) {
+        const float accumulated = st.equivalentPlasticStrain + kRoot23 * gamma;
+        const float residual = relativeNorm - linearPart * gamma - kRoot23 * flowStress(accumulated);
+        if (residual > 0.0f) lo = gamma; else hi = gamma;
+        if (abs(residual) <= 1.0e-7f * yieldRadius) break;
+        const float slope = -linearPart - (2.0f / 3.0f) * flowSlope(accumulated);
+        float next = gamma - residual / slope;
+        if (!(next > lo && next < hi)) next = 0.5f * (lo + hi);
+        if (abs(next - gamma) <= 1.0e-7f * gamma) { gamma = next; break; }
+        gamma = next;
+    }
+
+    float direction[6];
+    for (int i = 0; i < 6; ++i) direction[i] = relative[i] / relativeNorm;
+
+    float plasticIncrement[6];
+    for (int i = 0; i < 3; ++i) {
+        plasticIncrement[i] = gamma * direction[i];
+        plasticIncrement[3 + i] = 2.0f * gamma * direction[3 + i];
+    }
+    for (int i = 0; i < 3; ++i) {
+        r.stress[i] = pressure + trial[i] - 2.0f * mu * gamma * direction[i];
+        r.stress[3 + i] = trial[3 + i] - 2.0f * mu * gamma * direction[3 + i];
+    }
+    float back[6], effective[6];
+    for (int i = 0; i < 6; ++i) {
+        back[i] = st.backStress[i] + (2.0f / 3.0f) * params.kinematicModulus * gamma * direction[i];
+        effective[i] = r.stress[i] - back[i];
+    }
+
+    r.yielded = true;
+    float dissipation = 0.0f;
+    for (int i = 0; i < 6; ++i) dissipation += effective[i] * plasticIncrement[i];
+    r.dissipation = dissipation;
+
+    for (int i = 0; i < 6; ++i) {
+        st.plasticStrain[i] += plasticIncrement[i];
+        st.backStress[i] = back[i];
+    }
+    const float dEps = kRoot23 * gamma;
+    st.equivalentPlasticStrain += dEps;
+
+    // Damage, off the returned stress's own invariants.
+    float deviator[6];
+    const float mean = (r.stress[0] + r.stress[1] + r.stress[2]) / 3.0f;
+    for (int i = 0; i < 3; ++i) { deviator[i] = r.stress[i] - mean; deviator[3 + i] = r.stress[3 + i]; }
+    const float q = sqrt(1.5f * tensorNormSquared(deviator));
+    const float eta = q > 0.0f ? mean / q : 0.0f;
+    // Below the cutoff voids close rather than grow and the critical strain is
+    // infinite, so no damage accumulates at all.
+    if (eta > params.cutoffTriaxiality) {
+        const float critical =
+            failureStrain * exp(-params.triaxialitySensitivity * (eta - params.referenceTriaxiality));
+        if (critical > 0.0f) st.damage += dEps / critical;
+    }
+
+    if (st.damage >= 1.0f) {
+        st.damage = 1.0f;
+        st.failed = true;
+        r.failedNow = true;
+        for (int i = 0; i < 6; ++i) r.stress[i] = 0.0f;
+        for (int i = 0; i < 36; ++i) r.tangent[i] = 0.0f;
+        return r;
+    }
+
+    const float theta = 1.0f - 2.0f * mu * gamma / relativeNorm;
+    const float plasticModulus = flowSlope(st.equivalentPlasticStrain) + params.kinematicModulus;
+    const float thetaBar = 1.0f / (1.0f + plasticModulus / (3.0f * mu)) - (1.0f - theta);
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j)
+            r.tangent[i * 6 + j] =
+                kappa + 2.0f * mu * theta * ((i == j ? 1.0f : 0.0f) - 1.0f / 3.0f);
+        r.tangent[(3 + i) * 6 + (3 + i)] = mu * theta;
+    }
+    for (int i = 0; i < 6; ++i)
+        for (int j = 0; j < 6; ++j)
+            r.tangent[i * 6 + j] -= 2.0f * mu * thetaBar * direction[i] * direction[j];
+    return r;
+}
+
+// Rotation part of F by Higham's Newton iteration, as tet_forces.comp. The CPU
+// runs to a 1e-16 fixed point, which float cannot reach; six iterations is past
+// float's fixed point for any non-inverted element, and quadratic convergence
+// means the residual is at the rounding floor well before that.
+mat3 polarRotation(mat3 f) {
+    mat3 r = f;
+    for (int i = 0; i < 6; ++i) r = 0.5 * (r + transpose(inverse(r)));
+    return r;
+}
+
+void main() {
+    const uint e = gl_GlobalInvocationID.x;
+    if (e >= params.elementCount) return;
+
+    const uint fb = e * kFormStride;
+    const uint sb = e * kStateStride;
+
+    float rest[kDof], current[kDof];
+    for (int a = 0; a < kNodes; ++a) {
+        const uint n = index[e * uint(kNodes) + uint(a)];
+        for (int k = 0; k < 3; ++k) {
+            rest[a * 3 + k] = restPosition[n * 3u + uint(k)];
+            current[a * 3 + k] = position[n * 3u + uint(k)];
+        }
+    }
+
+    // Already torn: output-identical to running the update, since every point
+    // returns no stress and no dissipation, and it saves the whole kernel for the
+    // rest of a dead element's life. The same short circuit zone.cpp takes.
+    if (plastic[sb + kStateTorn] != 0.0f) {
+        for (int i = 0; i < kDof; ++i) elementForce[e * uint(kDof) + uint(i)] = 0.0f;
+        elementOut[e * 2u + 1u] = 1.0f;   // the running dissipation total stands
+        return;
+    }
+
+    // --- The co-rotational frame -------------------------------------------------
+    //
+    // dN_a/dxi at the element centre is 0.125 times the node's own natural
+    // coordinate, so the current Jacobian at the centre is one 3x8x3 contraction
+    // and needs no shape-function evaluation.
+    const float nx[kNodes] = float[](-1., 1., 1., -1., -1., 1., 1., -1.);
+    const float ny[kNodes] = float[](-1., -1., 1., 1., -1., -1., 1., 1.);
+    const float nz[kNodes] = float[](-1., -1., -1., -1., 1., 1., 1., 1.);
+    float jc[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int k = 0; k < 3; ++k) {
+            float s = 0.0f;
+            for (int a = 0; a < kNodes; ++a) {
+                const float dN = 0.125f * (k == 0 ? nx[a] : (k == 1 ? ny[a] : nz[a]));
+                s += dN * current[a * 3 + i];
+            }
+            jc[i][k] = s;
+        }
+    mat3 f;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < 3; ++k) s += jc[i][k] * forms[fb + kFormJ + uint(k * 3 + j)];
+            f[j][i] = s;  // GLSL mat3 is column-major: f[col][row]
+        }
+    const mat3 rot = polarRotation(f);
+    // r[i * 3 + k] is row i, column k, matching the CPU's row-major `r`.
+    float r[9];
+    for (int i = 0; i < 3; ++i)
+        for (int k = 0; k < 3; ++k) r[i * 3 + k] = rot[k][i];
+
+    float u[kDof];
+    for (int a = 0; a < kNodes; ++a)
+        for (int i = 0; i < 3; ++i) {
+            float s = 0.0f;
+            for (int k = 0; k < 3; ++k) s += r[i * 3 + k] * current[a * 3 + k];
+            u[a * 3 + i] = s - rest[a * 3 + i];
+        }
+
+    // --- The enhanced strains ----------------------------------------------------
+
+    Point start[kGauss];
+    for (int gp = 0; gp < kGauss; ++gp) {
+        const uint p = sb + uint(gp) * kPointStride;
+        for (int i = 0; i < 6; ++i) {
+            start[gp].plasticStrain[i] = plastic[p + uint(i)];
+            start[gp].backStress[i] = plastic[p + 6u + uint(i)];
+        }
+        start[gp].equivalentPlasticStrain = plastic[p + 12u];
+        start[gp].damage = plastic[p + 13u];
+        start[gp].failed = plastic[p + 14u] != 0.0f;
+    }
+
+    // An element that has lost a point drops its enhanced modes and finishes its
+    // life as the ANS hex: r(alpha) = 0 is a statement about a continuum and an
+    // element with a dead point is not one. Same rule, same reason, as the CPU.
+    bool degraded = false;
+    for (int gp = 0; gp < kGauss; ++gp) degraded = degraded || start[gp].failed;
+    int easCount = degraded ? 0 : kEas;
+
+    float volume = 0.0f;
+    for (int gp = 0; gp < kGauss; ++gp) volume += forms[fb + kFormW + uint(gp)];
+    const float scale = params.yieldStrength * volume;
+    const float failureStrain = plastic[sb + kStateFailure];
+
+    float alpha[kEas];
+    for (int k = 0; k < kEas; ++k) alpha[k] = easCount > 0 ? plastic[sb + kStateEnhanced + uint(k)] : 0.0f;
+
+    Point trialState[kGauss];
+    float gaussStress[kGauss * 6];
+    float dissipation = 0.0f;
+    int failedPoints = 0;
+
+    // Two attempts at most: the second is entered only when a point died inside
+    // this step, which is precisely the step in which Kaa was losing rank while the
+    // Newton was solving on it.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
+            float residual[kEas];
+            float kaa[kEas * kEas];
+            for (int k = 0; k < kEas; ++k) residual[k] = 0.0f;
+            for (int k = 0; k < kEas * kEas; ++k) kaa[k] = 0.0f;
+            dissipation = 0.0f;
+            failedPoints = 0;
+
+            for (int gp = 0; gp < kGauss; ++gp) {
+                const uint bb = fb + kFormB + uint(gp) * 144u;
+                const uint gb = fb + kFormG + uint(gp) * 42u;
+                float strain[6];
+                for (int i = 0; i < 6; ++i) {
+                    float s = 0.0f;
+                    for (int j = 0; j < kDof; ++j) s += forms[bb + uint(i * kDof + j)] * u[j];
+                    for (int k = 0; k < easCount; ++k)
+                        s += forms[gb + uint(i * kEas + k)] * alpha[k];
+                    strain[i] = s;
+                }
+                trialState[gp] = start[gp];
+                const Returned got = returnMap(strain, failureStrain, trialState[gp]);
+                for (int i = 0; i < 6; ++i) gaussStress[gp * 6 + i] = got.stress[i];
+                dissipation += forms[fb + kFormW + uint(gp)] * got.dissipation;
+                if (trialState[gp].failed) ++failedPoints;
+
+                if (easCount == 0) continue;
+                const float w = forms[fb + kFormW + uint(gp)];
+                for (int k = 0; k < easCount; ++k) {
+                    float s = 0.0f;
+                    for (int i = 0; i < 6; ++i) s += forms[gb + uint(i * kEas + k)] * got.stress[i];
+                    residual[k] += w * s;
+                }
+                // Kaa accumulated inside the Gauss loop so only one 6x6 tangent is
+                // ever live -- eight of them would not fit in a Pascal thread.
+                for (int p = 0; p < easCount; ++p)
+                    for (int qq = 0; qq < easCount; ++qq) {
+                        float s = 0.0f;
+                        for (int i = 0; i < 6; ++i) {
+                            float cg = 0.0f;
+                            for (int m = 0; m < 6; ++m)
+                                cg += got.tangent[i * 6 + m] * forms[gb + uint(m * kEas + qq)];
+                            s += forms[gb + uint(i * kEas + p)] * cg;
+                        }
+                        kaa[p * kEas + qq] += w * s;
+                    }
+            }
+
+            if (easCount == 0) break;
+
+            float norm = 0.0f;
+            for (int k = 0; k < easCount; ++k) norm += residual[k] * residual[k];
+            if (sqrt(norm) <= kResidualTol * scale) break;
+
+            // **Kaa is equilibrated before it is factored, and in float that is the
+            // difference between seven correct digits in alpha and none.**
+            //
+            // The enhanced modes are not commensurate. The three thickness modes
+            // carry E_zeta,zeta, so their columns of G are scaled by the Voigt
+            // transform's 1/t^2 -- 2.8e4 for the 12 mm plating in a ferry zone --
+            // while the in-plane modes are scaled by 1/h^2, of order 10. Kaa
+            // inherits the square of the ratio, so its condition number is ~1e7 on a
+            // perfectly ordinary plate element. Double has sixteen digits and can
+            // pay that; float has seven and cannot, and the symptom is not noise but
+            // an alpha with **no correct digits at all** -- measured against the CPU
+            // at 100 steps, where the two node fields still agreed to 1.4e-6 m and
+            // the enhanced parameters differed by 100% of their own magnitude.
+            //
+            // Jacobi equilibration -- solve for D alpha with D = sqrt(diag Kaa) --
+            // is exact in exact arithmetic, so it changes nothing the CPU would
+            // compute, and by van der Sluis's theorem it leaves the condition number
+            // within a factor of seven of the best any diagonal scaling could give.
+            // The CPU does not need it and does not do it; this is a float
+            // accommodation and it is written here rather than there for that
+            // reason.
+            float d[kEas];
+            bool ok = true;
+            for (int i = 0; i < easCount; ++i) {
+                const float diagonal = kaa[i * kEas + i];
+                if (!(diagonal > 0.0f)) { ok = false; break; }
+                d[i] = 1.0f / sqrt(diagonal);
+            }
+            if (!ok) break;
+            for (int i = 0; i < easCount; ++i)
+                for (int j = 0; j < easCount; ++j) kaa[i * kEas + j] *= d[i] * d[j];
+
+            // Cholesky on the equilibrated Kaa, mirroring solveSmall. A non-positive
+            // pivot means the element has no stiffness left, which is a state to
+            // leave rather than to iterate on.
+            float l[kEas * kEas];
+            for (int k = 0; k < kEas * kEas; ++k) l[k] = 0.0f;
+            for (int i = 0; i < easCount && ok; ++i)
+                for (int j = 0; j <= i; ++j) {
+                    float s = kaa[i * kEas + j];
+                    for (int k = 0; k < j; ++k) s -= l[i * kEas + k] * l[j * kEas + k];
+                    if (i == j) {
+                        if (!(s > 0.0f)) { ok = false; break; }
+                        l[i * kEas + i] = sqrt(s);
+                    } else {
+                        l[i * kEas + j] = s / l[j * kEas + j];
+                    }
+                }
+            if (!ok) break;
+            float delta[kEas];
+            for (int k = 0; k < easCount; ++k) delta[k] = -residual[k] * d[k];
+            for (int i = 0; i < easCount; ++i) {
+                float s = delta[i];
+                for (int k = 0; k < i; ++k) s -= l[i * kEas + k] * delta[k];
+                delta[i] = s / l[i * kEas + i];
+            }
+            for (int i = easCount - 1; i >= 0; --i) {
+                float s = delta[i];
+                for (int k = i + 1; k < easCount; ++k) s -= l[k * kEas + i] * delta[k];
+                delta[i] = s / l[i * kEas + i];
+            }
+            for (int k = 0; k < easCount; ++k) delta[k] *= d[k];
+
+            // Converge on the correction's energy, not on ||r||: the enhanced
+            // thickness modes carry E_zeta,zeta so their columns of G are scaled by
+            // 1/t^2, and Kaa by the square of it. delta . r is joules and
+            // sigma_y * V is the element's yield energy, so the ratio is
+            // dimensionless however the modes are normalised.
+            float work = 0.0f;
+            for (int k = 0; k < easCount; ++k) work += delta[k] * residual[k];
+            if (abs(work) <= kEnhancedWorkTol * scale) break;
+            for (int k = 0; k < easCount; ++k) alpha[k] += delta[k];
+        }
+
+        bool diedThisStep = false;
+        for (int gp = 0; gp < kGauss; ++gp) diedThisStep = diedThisStep || trialState[gp].failed;
+        if (!(diedThisStep && easCount > 0)) break;
+        easCount = 0;
+        for (int k = 0; k < kEas; ++k) alpha[k] = 0.0f;
+    }
+
+    // --- Commit ------------------------------------------------------------------
+
+    for (int gp = 0; gp < kGauss; ++gp) {
+        const uint p = sb + uint(gp) * kPointStride;
+        for (int i = 0; i < 6; ++i) {
+            plastic[p + uint(i)] = trialState[gp].plasticStrain[i];
+            plastic[p + 6u + uint(i)] = trialState[gp].backStress[i];
+        }
+        plastic[p + 12u] = trialState[gp].equivalentPlasticStrain;
+        plastic[p + 13u] = trialState[gp].damage;
+        plastic[p + 14u] = trialState[gp].failed ? 1.0f : 0.0f;
+    }
+    // All seven, not just easCount of them: a degraded element must report zeros
+    // rather than the values it had before it started tearing.
+    for (int k = 0; k < kEas; ++k) plastic[sb + kStateEnhanced + uint(k)] = alpha[k];
+    const bool torn = failedPoints == kGauss;
+    plastic[sb + kStateTorn] = torn ? 1.0f : 0.0f;
+    elementOut[e * 2u] += dissipation;
+    elementOut[e * 2u + 1u] = torn ? 1.0f : 0.0f;
+
+    float internalF[kDof];
+    for (int j = 0; j < kDof; ++j) internalF[j] = 0.0f;
+    for (int gp = 0; gp < kGauss; ++gp) {
+        const uint bb = fb + kFormB + uint(gp) * 144u;
+        const float w = forms[fb + kFormW + uint(gp)];
+        for (int j = 0; j < kDof; ++j) {
+            float s = 0.0f;
+            for (int i = 0; i < 6; ++i) s += forms[bb + uint(i * kDof + j)] * gaussStress[gp * 6 + i];
+            internalF[j] += w * s;
+        }
+    }
+    for (int a = 0; a < kNodes; ++a)
+        for (int i = 0; i < 3; ++i) {
+            float s = 0.0f;
+            for (int k = 0; k < 3; ++k) s += r[k * 3 + i] * internalF[a * 3 + k];
+            elementForce[e * uint(kDof) + uint(a * 3 + i)] = -s;
+        }
+}
