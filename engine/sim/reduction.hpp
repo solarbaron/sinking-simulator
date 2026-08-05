@@ -455,6 +455,25 @@ std::vector<std::uint32_t> nodesNearPlanes(const solidshell::HexMesh& mesh,
                                            const std::vector<Plane>& planes,
                                            double tolerance = 1e-9);
 
+// A bandwidth-reducing permutation of a node adjacency graph: reverse Cuthill-McKee
+// from a George-Liu pseudo-peripheral start. `order[i]` is the node that belongs at
+// position `i`, and every node appears once.
+//
+// It is used here on the interior partition, and it is exposed because
+// `section.hpp` needs the same thing for a different reason --
+// `solidshell::solveStatic` numbers its free degrees of freedom in the **mesh's own
+// order** and has no renumbering pass at all, so a section mesher has to arrive with
+// a good one or pay a hundredfold in the factorisation. A second copy of this would
+// be a second place the two could disagree.
+//
+// **It is not unconditionally better than the numbering it replaces**, which is
+// measured rather than assumed: 59 against 41 on one test mesh and 83 against 53 on
+// a ferry patch, against 89 to 173 and 137 to 341 on two others. Both callers
+// therefore compare it against what they already had and keep the narrower, which is
+// free -- a bandwidth is one pass over the adjacency.
+std::vector<std::uint32_t> bandwidthReducingOrder(
+    const std::vector<std::vector<std::uint32_t>>& adjacency);
+
 // Nodes any of whose DOF the mesh pins. A `zone::buildPatch` patch arrives with
 // its perimeter clamped, and that perimeter is exactly the set of nodes the
 // plating outside the patch holds -- so this turns a Tier-2 patch into a
@@ -768,8 +787,19 @@ struct Assembly {
 // **There is now a pair worth assembling**, which there was not when the note
 // above was written: `coupling.{hpp,cpp}` joins a Tier-2 zone to the plating round
 // it and drives the zone's perimeter from the result. Two components is exactly
-// enough for that, so the three-component limit is no longer the binding one. The
-// mesher still is: nothing yet cuts a *ship* into hold-sized components.
+// enough for that, so the three-component limit is no longer the binding one.
+//
+// **And the mesher exists now too** -- `section.{hpp,cpp}` cuts a region between two
+// transverse planes and hands it over with `nodesNearPlanes`' interface and an
+// `Attachment` of its longitudinals. What it cannot do is weld a junction, so a
+// hold of the reference ferry arrives as seven disconnected pieces; that is a
+// property of `makeStructuralMesh`, which shares no corner between two panel roles,
+// and of the solid-shell, whose node pair carries one thickness direction where a
+// corner has two. The consequence for this file is worth knowing before reducing
+// one: the section's lowest fixed-interface frequency is its *decks*' -- 0.78 Hz on
+// that hold, against 3.46 Hz for the shell alone -- so the 20 Hz `cutoffFrequency`
+// below asks for 178 modes, takes 275 s, and does not converge. Guyan is 6 s and is
+// exactly right at the interface.
 Assembly assemble(const Reduction& a, const Reduction& b, const InterfaceMap& map);
 
 // Natural frequencies of an assembled model, rad/s ascending, with the listed

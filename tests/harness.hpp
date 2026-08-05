@@ -43,6 +43,7 @@ void runPropulsionTests();
 void runRadiationTests();
 void runRollDampingTests();
 void runScantlingTests();
+void runSectionTests();
 void runSchedulerTests();
 void runPlasticityTests();
 void runPromotionTests();
