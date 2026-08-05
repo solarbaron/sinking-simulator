@@ -54,11 +54,10 @@
 // touch a corner rather than of the ship. Leaving the junction open costs neither
 // -- see §2.
 //
-// What would close one honestly is a tie between two plates' node pairs, or a
-// small element filling the corner. `constraint.hpp`'s own header already names
-// the first as the missing case -- "a node on one side lands inside a face on the
-// other ... that case is real and will arrive with a whole-ship mesher". It has
-// arrived. It is not built here.
+// What closes one honestly is a tie between two plates' node pairs, and **that is
+// now built -- see §5**, which is where the numbers this section quotes for an
+// unjoined section stop being what the file delivers and start being its negative
+// control.
 //
 // --- 2. What the junctions cost, which is not what it looks like ----------------
 //
@@ -86,12 +85,13 @@
 //     that restraint decays. A one-bay section would have shown almost nothing.
 //   * **The lowest fixed-interface frequency**, which is what Tier 1 is for and
 //     which turns out to be the sharper instrument on a real ship. On the
-//     reference ferry's hold between x = -7.2 m and x = 19.2 m the whole section's
-//     first fixed-interface mode is **0.7785 Hz**; the decks *on their own* are
-//     0.7785 Hz, to four figures, and the shell on its own is 3.4600 Hz. The
-//     softest thing in the section is a 26 m deck held on two edges instead of
+//     reference ferry's hold between x = -7.2 m and x = 19.2 m the whole *unjoined*
+//     section's first fixed-interface mode is **0.7785 Hz**; the decks *on their
+//     own* are 0.7785 Hz, to four figures, and the shell on its own is 1.6999 Hz.
+//     The softest thing in the section is a 26 m deck held on two edges instead of
 //     four, and adding the shell it should be welded to changes it by nothing at
-//     all. That is the junctions' cost stated as a number.
+//     all. That is the junctions' cost stated as a number, and §5 is what moves it:
+//     tied, the same section is 2.3026 Hz.
 //
 // --- 3. Thickness seams: taper, do not stop -------------------------------------
 //
@@ -186,6 +186,149 @@
 // `modes = 0` -- is 6.2 s and is exactly right at the interface for any static load.
 // A substructure softer than the ship it is part of is a sign that the section is
 // not yet a component, not a reason to keep more modes.
+//
+// --- 5. The junction tie: joining the plates without welding them ----------------
+//
+// A free-edge node lying on another surface is **tied** to the point of that
+// surface it lands in. Three constraints per extruded node, one per axis, over the
+// eight mesh nodes of the master face:
+//
+//     u[slave] = sum_a N_a(xi, eta) * [ (1-w) u[bottom_a] + w u[top_a] ]
+//
+// -- bilinear in the master face's two in-plane coordinates, and through its
+// thickness by exactly the weight `constraint.hpp` §1 derives. The slave keeps no
+// unknown of its own: `solidshell::solveStatic` and `reduction::Substructure` both
+// scatter through the transformation, so the matrix they factor **is** `T^T K T`
+// and there is no penalty stiffness anywhere.
+//
+// **The tie is not a weld and the difference is the whole point.** A weld merges
+// two node pairs into one, which has one thickness direction where two plates at an
+// angle need two, and pays for it in steel -- §1's 9.4% of `EA`. A tie moves no
+// node and merges nothing: the mesh it produces has the same nodes in the same
+// places, the same elements, the same mass, still four surfaces on the box, and one
+// connected component. `surfaces` counts what shares nodes; `components` counts what
+// is joined; before this the two were the same question.
+//
+// **A `DofBlock` cannot express it, and finding out why is the load-bearing part.**
+// `constraint.hpp` eliminates a stiffener fibre with a `Tie` and hands the result to
+// `reduction::Attachment::stiffness`, and that works because a fibre's endpoints are
+// *not mesh nodes*: they have no rows, so `T^T K T` over the masters is the whole of
+// what the fibre contributes and adding a block is exact. A junction ties a node
+// that **is** a mesh node, with elements of its own. Eliminating it means rewriting
+// rows that already exist, and no amount of added stiffness redirects a row. So the
+// constraint is carried as data -- `solidshell::Mpc`, in
+// `reduction::Attachment::constrained` -- and applied by the assembler.
+//
+// --- What it does, on the box, where every quantity has a closed form -------------
+//
+//     corners      components   EA        EI        GJ / Bredt
+//     ---------------------------------------------------------
+//     cut               4       1.000000  1.000000    0.083
+//     welded            1       0.905788  0.911115    0.966
+//     tied              1       1.000000  1.002158    1.099
+//
+// The tied mesh is the only one that is **both** exact in `EA` and closed in
+// torsion. `1.099` is not an overshoot of Bredt: a closed cell does not stop having
+// the open section's own `sum s t^3 / 3`, and `1.000 + 0.083` is what the two
+// together predict.
+//
+// `EI` costs 0.216% at one element per panel and that is a **consistency error, not
+// the formulation**: at a butt corner the tied node sits half a plate thickness past
+// the end of the other plate's mid-surface, so the tie extrapolates a bilinear
+// approximation to a quadratic transverse contraction. It falls 2.16e-3, 2.85e-4,
+// 8.62e-5 over a threefold refinement. Clamping the tie onto the face instead would
+// trade it for an `O(t)` error that refinement cannot reach, which is why the
+// overshoot is bounded rather than forbidden -- `SectionParams::junctionOvershoot`.
+//
+// --- And on the ferry, where the fixed-interface frequency is the instrument ------
+//
+// The hold between x = -7.2 m and x = 19.2 m, at one element per panel:
+//
+//     untied: 7 components, 369.6 m of free edge lying on plating it is not joined
+//             to, first fixed-interface mode **0.7785 Hz** -- which is the decks'
+//             own 0.7785 Hz to four figures, because the shell contributes nothing.
+//     tied:   1 component, 309.6 m of that edge joined, first fixed-interface mode
+//             **2.3026 Hz** -- above the decks' 0.7785 *and* the shell's 1.6999,
+//             which is what a joined structure does.
+//
+// `GJ` goes 3.6165e12 to 5.2388e12 N m^2, +44.9%. `A_eff` moves +0.19% and `I_eff`
+// +0.12%, which is the same local consistency error the box shows and is why §2's
+// warning stands: **neither of those two could have told you the junction was
+// open.**
+//
+// The 60 m that stays open is the nodes on a cut plane. An interface degree of
+// freedom is what a reduction keeps *exactly* and what `applyBeamLoad` prescribes;
+// a degree of freedom cannot be both prescribed and derived, so those are counted in
+// `junctionsOnInterface` and left. On an eleven-bay section that is two stations of
+// twelve.
+//
+// --- What it costs, which is the band ---------------------------------------------
+//
+// A tie couples nodes that no element edge joins, and the numbering has to know:
+//
+//     ferry hold        DOF half-bandwidth   banded solve
+//     ------------------------------------------------------
+//     untied                    146              0.16 s
+//     tied, ordering blind    10 769            (dense)
+//     tied, ordering aware     1 520              5.34 s
+//
+// The ordering is chosen by comparing three candidates, and it is scored on the
+// *tied* graph -- element edges plus tie edges -- because an ordering scored on the
+// sub-quads alone is scored on a graph the solver does not have. That is worth a
+// factor of seven. What is left is real: joining a section's decks to its shell
+// closes the cross-section into a tube with internal webs, and a wavefront that used
+// to sweep one flat sheet now has to cross a deck. `Substructure`'s interior band
+// goes 125 to 455 and its Craig-Bampton 6.0 s to 57.7 s. At subdivision 2 the banded
+// static solve goes 1.1 s to 149 s, which is why `tools/section_probe` runs its
+// resolution sweep untied.
+//
+// --- What the tie cannot do ------------------------------------------------------
+//
+//   * **Chains are refused, not composed.** A node whose master is itself a slave --
+//     three surfaces meeting at a point -- is left untied and counted, because a
+//     chain resolved silently is a modelling error that assembles.
+//   * **The weights are a partition of unity but not always positive.** A face
+//     overshoot `d` puts `-d/2` on a master, and a real junction's 9 mm gap makes the
+//     through-thickness weight 1.69 rather than 0.5. The condensed mass is `T^T M T`
+//     row-summed, so a negative weight is a negative share of the slave's steel;
+//     `reduction::Substructure` refuses a non-positive nodal mass and is the backstop.
+//     Unlike `constraint.hpp`'s eccentric fibre there is nothing to give up here --
+//     the fibre *extrapolates* and has to abandon its first moment, while a junction
+//     interpolates and keeps it.
+//   * **The moment transfer is only as good as the master element.** A plate's
+//     rotation about the junction line is carried into the other plate's *in-plane*
+//     displacement gradient, which for a bilinear element is the element's own
+//     average slope. Membrane continuity -- the shear flow torsion needs -- is
+//     transmitted exactly; the edge moment is transmitted to `O(h)`.
+//
+// --- What mutation testing left standing ------------------------------------------
+//
+// Thirty-two single edits across this file, `solid_shell.cpp` and `reduction.cpp`;
+// thirty are killed. **The two that are not are equivalent on every input this
+// repository has, and saying which is more useful than a score:**
+//
+//   * **Deleting the chain refusal changes nothing**, because no input here produces
+//     a chain: the "already a master" skip absorbs the second side of every junction,
+//     on the box, on a box with a deck through it, on one with a bracket at the
+//     corner, and on the ferry. The check is kept because the *consequence* of a
+//     chain is not local -- `solidshell::DofExpansion` refuses the whole set and the
+//     section stops reducing -- and a mesher that would rather say "this junction is
+//     open" than emit one is the honest half of that. Both refusals are tested
+//     directly, in `tests/test_solid_shell.cpp` and `tests/test_reduction.cpp`.
+//   * **Running the projection for one iteration instead of twenty-four changes
+//     nothing**, to the last digit of `|sum w X - X_slave|` on the ferry's own warped
+//     plating. Gauss-Newton from the face centre lands in one step on a face that is
+//     flat, and every sub-quad here is flat enough. The loop is kept because a
+//     genuinely warped master face is a property of a *finer* mesher, not of this
+//     one, and the cost is twenty-three iterations of a 2x2 solve per junction node.
+//
+// The run also found something older than any of this: `reduction::Substructure`'s
+// `totalMass()` and `stiffnessTimes()` read past the end of arrays the constructor
+// never sized when the substructure **refused**, which was reachable from an
+// inverted element long before a constraint existed. It surfaced as a segmentation
+// fault three tests downstream of the mutant that provoked it -- which is why the
+// mutation harness has to look at the *exit code* and not only at the failure lines,
+// something its first version got wrong and scored eight false survivors on.
 //
 // SI units, body frame per CLAUDE.md.
 #pragma once
@@ -283,6 +426,27 @@ struct SectionParams {
     // have until the mesh exists; 25 mm is more than the thickest plate on the
     // reference ship, whose bilge strake is 15.5 mm.
     double junctionTolerance = 0.025;  // m
+
+    // Tie every free-edge node that lands on another surface to that surface. See
+    // §5. Off is the negative control the junction measurements are made against,
+    // and it is what this file did before the tie existed.
+    bool junctions = true;
+
+    // How far outside a master face, in the face's own natural coordinates, a tied
+    // point may land. Zero would refuse every L-junction: two plates butting at a
+    // corner have each other's mid-surface *ending* at the corner line, so a node
+    // half a plate thickness the other side of it is outside the last face by
+    // `t / (2 h)` -- 2% of a half-metre element on 10 mm plating. It is small and
+    // it is not zero, and clamping it instead would tie a node at `z` to the field
+    // at `z + t/2`, which loses exactly the lever arm `EI` is made of.
+    //
+    // The bound matters because a tie that extrapolates has a **negative weight**,
+    // and a negative weight means a negative share of the slave's mass on that
+    // master. The worst negative weight of a bilinear face at overshoot `d` is
+    // `-d/2`, so this is also the guarantee that the condensed mass stays positive
+    // -- `reduction::Substructure` checks it and would refuse the section rather
+    // than integrate it.
+    double junctionOvershoot = 0.25;
 };
 
 // A meshed section: the elements, what they came from, how well they joined up,
@@ -365,6 +529,27 @@ struct Section {
     // Zero is a section whose only free edges are genuinely free.
     double junctionEdges = 0;   // m
     double worstJunctionGap = 0;  // m, the furthest such an edge was from it
+
+    // --- The junction tie, see §5 ------------------------------------------------
+    //
+    // How much of `junctionEdges` is joined after all: an edge both of whose nodes
+    // were tied into the surface they were lying on. `junctionEdges - tiedEdges` is
+    // what is still carrying no shear.
+    double tiedEdges = 0;  // m
+    int    junctionTies = 0;      // mid-surface nodes tied, so `2 x` mesh nodes
+    // Free-edge nodes on another surface that could **not** be tied, and why. A
+    // node whose master would itself be a slave is refused rather than chained: see
+    // `solidshell::DofExpansion`. So is one on a cut plane -- the interface is
+    // prescribed and a prescribed degree of freedom cannot also be a function of
+    // others -- and one whose master face is further outside than
+    // `SectionParams::junctionOvershoot`.
+    int    junctionsChained = 0, junctionsOnInterface = 0, junctionsOutsideFace = 0;
+    // The largest overshoot outside a master face, in that face's own natural
+    // coordinates, and the largest through-thickness weight any tie used. Both
+    // bound how negative a master's share of the slave's mass can be, which is the
+    // one way this formulation can produce something an integrator cannot use.
+    double worstJunctionOvershoot = 0;
+    double worstJunctionWeight = 0;
 
     int straddlingPanels = 0;   // panels a cut plane passed through, and dropped
     int membersAttached = 0;    // members that contributed fibres

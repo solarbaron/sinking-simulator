@@ -104,6 +104,62 @@ double distanceSquaredToTriangle(const Vec3& p, const Vec3& a, const Vec3& b, co
     return length2(ap - ab * v - ac * w);
 }
 
+// The four bilinear shape functions of a quad wound
+// (-1,-1) (+1,-1) (+1,+1) (-1,+1), which is the order a sub-quad's corners are
+// emitted in. They sum to one everywhere, inside the face and outside it, which is
+// what makes a tie built on them reproduce a rigid translation exactly.
+void bilinear(double xi, double eta, double out[4]) {
+    out[0] = 0.25 * (1 - xi) * (1 - eta);
+    out[1] = 0.25 * (1 + xi) * (1 - eta);
+    out[2] = 0.25 * (1 + xi) * (1 + eta);
+    out[3] = 0.25 * (1 - xi) * (1 + eta);
+}
+
+// Where a point sits in a sub-quad's own coordinates: the (xi, eta) minimising the
+// distance to the bilinear surface through its four corners, by Gauss-Newton on
+// `dX/dxi . (X - p) = 0`.
+//
+// **Not clamped to the face**, and that is deliberate. A deck edge lands inside a
+// shell face and comes back with |xi|, |eta| <= 1; two plates butting at a corner
+// put a node half a plate thickness past the end of the other's mid-surface, and
+// the honest answer there is a small extrapolation rather than a point moved onto
+// the boundary. `SectionParams::junctionOvershoot` is what bounds it. Bilinear
+// interpolation reproduces a linear field exactly at any (xi, eta), inside or out,
+// so the tie stays exact for the plane-sections field either way -- what the
+// overshoot costs is the sign of a weight, not the accuracy of the tie.
+struct FaceCoordinate {
+    double xi = 0, eta = 0;
+    double distance = 0;   // m from the point to the surface it landed on
+    double overshoot = 0;  // how far outside [-1, 1] the worse coordinate is
+};
+
+FaceCoordinate projectOntoQuad(const Vec3& p, const Vec3& a, const Vec3& b, const Vec3& c,
+                               const Vec3& d) {
+    FaceCoordinate out;
+    for (int iteration = 0; iteration < 24; ++iteration) {
+        double n[4];
+        bilinear(out.xi, out.eta, n);
+        const Vec3 x = a * n[0] + b * n[1] + c * n[2] + d * n[3];
+        const Vec3 dxi = ((b - a) * (1 - out.eta) + (c - d) * (1 + out.eta)) * 0.25;
+        const Vec3 deta = ((d - a) * (1 - out.xi) + (c - b) * (1 + out.xi)) * 0.25;
+        const Vec3 r = x - p;
+        const double g0 = dot(dxi, r), g1 = dot(deta, r);
+        const double h00 = dot(dxi, dxi), h01 = dot(dxi, deta), h11 = dot(deta, deta);
+        const double det = h00 * h11 - h01 * h01;
+        if (!(std::abs(det) > 0)) break;  // a degenerate quad has no coordinates
+        const double stepXi = -(h11 * g0 - h01 * g1) / det;
+        const double stepEta = -(h00 * g1 - h01 * g0) / det;
+        out.xi += stepXi;
+        out.eta += stepEta;
+        if (std::abs(stepXi) + std::abs(stepEta) < 1e-15) break;
+    }
+    double n[4];
+    bilinear(out.xi, out.eta, n);
+    out.distance = length(a * n[0] + b * n[1] + c * n[2] + d * n[3] - p);
+    out.overshoot = std::max(0.0, std::max(std::abs(out.xi), std::abs(out.eta)) - 1.0);
+    return out;
+}
+
 // A union-find over sub-quads, for the connected component count. It is not a
 // diagnostic in the ordinary sense: a component touching neither cut plane is a
 // mechanism in `K_ii`, and `reduction::Substructure` will *not* catch it -- its
@@ -356,6 +412,11 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
     // not available to a section.
     std::vector<Vec3> nodeNormal(mid.size(), Vec3{0, 0, 0});
     std::vector<double> nodeThickness(mid.size(), 0.0), nodeWeight(mid.size(), 0.0);
+    // Which surface a node belongs to. Single-valued by construction -- the weld
+    // classes above are keyed on the surface, so a node is only ever reached by
+    // sub-quads of one -- and the junction tie needs it to refuse to tie a free
+    // edge to its own plating.
+    std::vector<int> nodeSurface(mid.size(), -1);
     for (const SubQuad& q : quads) {
         const Vec3 raw = quadNormal(mid[q.node[0]], mid[q.node[1]], mid[q.node[2]], mid[q.node[3]]);
         const double area = quadArea(mid[q.node[0]], mid[q.node[1]], mid[q.node[2]], mid[q.node[3]]);
@@ -369,11 +430,186 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
             nodeNormal[node] += oriented;
             nodeThickness[node] += thickness * area;
             nodeWeight[node] += area;
+            nodeSurface[node] = q.surface;
         }
     }
     for (std::size_t i = 0; i < mid.size(); ++i) {
         nodeNormal[i] = normalize(nodeNormal[i]);
         if (nodeWeight[i] > 0) nodeThickness[i] /= nodeWeight[i];
+    }
+
+    // --- Element edges, and which of them nothing is on the other side of ----------
+    //
+    // Computed here rather than with the rest of the topology because the junction
+    // tie below needs it, and the tie has to be *paired* before the nodes are
+    // numbered: a tie couples two nodes no element edge joins, and an ordering
+    // chosen without knowing that is an ordering chosen for the wrong graph. It
+    // cost the ferry hold a DOF half-bandwidth of 10 769 against 149 to find out.
+    std::map<std::pair<std::uint32_t, std::uint32_t>, int> edgeUse;
+    for (const SubQuad& q : quads)
+        for (int e = 0; e < 4; ++e) {
+            const std::uint32_t a = q.node[static_cast<std::size_t>(e)];
+            const std::uint32_t b = q.node[static_cast<std::size_t>((e + 1) % 4)];
+            if (a == b) continue;
+            ++edgeUse[{std::min(a, b), std::max(a, b)}];
+        }
+
+    // Which mid-surface nodes lie on a cut plane. The interface is chosen on the
+    // **mid-surface** and both extruded nodes of a pair taken, which is exact.
+    // Choosing it on the nodes instead -- which is what `reduction::nodesNearPlanes`
+    // at its default tolerance does -- keeps only the node of each pair that
+    // happened to land on the plane wherever the plating's normal leans out of the
+    // transverse direction, and half an interface is not a cut, it is a hinge.
+    std::vector<std::uint8_t> onPlane(mid.size(), 0u);
+    for (std::uint32_t i = 0; i < mid.size(); ++i) {
+        const bool aft = std::abs(mid[i].x - params.xFrom) <= params.planeTolerance;
+        const bool forward = std::abs(mid[i].x - params.xTo) <= params.planeTolerance;
+        if (aft || forward) onPlane[i] = aft ? 1u : 2u;
+    }
+
+    // A grid over the sub-quads, so that "which other surface is this node lying
+    // on" is a local search. Shared by the junction tie below and by the free-edge
+    // census much further down, because the two have to agree about what counts as
+    // lying on another surface or the census would report an edge as unjoined that
+    // the tie had just joined.
+    const double cell = 1.0;
+    std::map<std::array<long long, 3>, std::vector<std::size_t>> bucket;
+    const auto cellOf = [&](double v) { return static_cast<long long>(std::floor(v / cell)); };
+    for (std::size_t k = 0; k < quads.size(); ++k) {
+        Vec3 lo = mid[quads[k].node[0]], hi = lo;
+        for (int c = 1; c < 4; ++c) {
+            const Vec3& p = mid[quads[k].node[c]];
+            lo = Vec3{std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
+            hi = Vec3{std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
+        }
+        for (long long ix = cellOf(lo.x - params.junctionTolerance);
+             ix <= cellOf(hi.x + params.junctionTolerance); ++ix)
+            for (long long iy = cellOf(lo.y - params.junctionTolerance);
+                 iy <= cellOf(hi.y + params.junctionTolerance); ++iy)
+                for (long long iz = cellOf(lo.z - params.junctionTolerance);
+                     iz <= cellOf(hi.z + params.junctionTolerance); ++iz)
+                    bucket[{ix, iy, iz}].push_back(k);
+    }
+
+    // --- The junction tie, section 5, paired ---------------------------------------
+    //
+    // A free-edge node lying on another surface is tied to the point of that surface
+    // it lands in: bilinear in the master face's two in-plane coordinates, and
+    // through the master's thickness by the weight `constraint.hpp` §1 derives.
+    // Eight masters, three constraints -- one per axis -- and the slave keeps no
+    // unknown of its own.
+    //
+    // **This is not a weld and the difference is the whole point.** A weld merges
+    // the two node pairs into one, which has one thickness direction where two
+    // plates at an angle need two, and pays for it in steel: 9.4% of `EA` on the
+    // box. A tie leaves both pairs where they are and moves no geometry at all; it
+    // constrains the deck's *displacement* to the shell's, which is what a weld does
+    // physically.
+    //
+    // The pairing happens here and the constraints are written after the numbering,
+    // because the numbering has to see them.
+    struct PairedTie {
+        std::uint32_t slave;    // mid-surface node
+        std::size_t quad[2];    // the master face each of its two extruded nodes landed in
+        double xi[2], eta[2];   // where in that face
+    };
+    std::vector<PairedTie> paired;
+    std::vector<std::uint8_t> tieRole(mid.size(), 0u);  // 1 slave, 2 master
+    if (params.junctions) {
+        std::vector<std::uint8_t> onFreeEdge(mid.size(), 0u);
+        for (const auto& [edge, count] : edgeUse) {
+            if (count != 1) continue;
+            onFreeEdge[edge.first] = 1u;
+            onFreeEdge[edge.second] = 1u;
+        }
+        // Ascending mid-surface order, so which side of a junction becomes the slave
+        // is a property of the mesh rather than of a map's iteration.
+        for (std::uint32_t i = 0; i < mid.size(); ++i) {
+            if (!onFreeEdge[i] || nodeWeight[i] <= 0) continue;
+            // The two mesh nodes of the pair, and the two faces they land in --
+            // separately, because they are a plate thickness apart along the
+            // *master's* in-plane direction and their difference is exactly what
+            // carries this plate's rotation about the junction line into the other's
+            // own surface slope. Tying both to one point would clamp that rotation.
+            const Vec3 through[2] = {mid[i] - nodeNormal[i] * (0.5 * nodeThickness[i]),
+                                     mid[i] + nodeNormal[i] * (0.5 * nodeThickness[i])};
+            PairedTie tie{i, {quads.size(), quads.size()}, {0, 0}, {0, 0}};
+            FaceCoordinate landed[2];
+            for (int face = 0; face < 2; ++face) {
+                auto found = bucket.find(
+                    {cellOf(through[face].x), cellOf(through[face].y), cellOf(through[face].z)});
+                if (found == bucket.end()) continue;
+                for (std::size_t k : found->second) {
+                    const SubQuad& q = quads[k];
+                    if (q.surface == nodeSurface[i]) continue;  // its own plating
+                    const FaceCoordinate at =
+                        projectOntoQuad(through[face], mid[q.node[0]], mid[q.node[1]],
+                                        mid[q.node[2]], mid[q.node[3]]);
+                    if (at.distance > params.junctionTolerance) continue;
+                    // The face the point is most *inside* wins, not the nearest one.
+                    // Along a butt corner several faces are the same distance away
+                    // and only one of them contains the point; picking by distance
+                    // alone would extrapolate off the end of a neighbour.
+                    if (tie.quad[face] == quads.size() ||
+                        at.overshoot < landed[face].overshoot - 1e-12 ||
+                        (at.overshoot < landed[face].overshoot + 1e-12 &&
+                         at.distance < landed[face].distance)) {
+                        tie.quad[face] = k;
+                        landed[face] = at;
+                    }
+                }
+            }
+            if (tie.quad[0] == quads.size() || tie.quad[1] == quads.size()) continue;
+            if (onPlane[i] != 0u) {
+                ++section.junctionsOnInterface;
+                continue;
+            }
+            if (landed[0].overshoot > params.junctionOvershoot ||
+                landed[1].overshoot > params.junctionOvershoot) {
+                ++section.junctionsOutsideFace;
+                continue;
+            }
+            // Already the master side of a junction made from the other plate. The
+            // joint is closed -- one constraint joins two edges -- and adding a
+            // second tie the other way round would be the same statement twice, in a
+            // form `solidshell::DofExpansion` would have to refuse as a chain.
+            if (tieRole[i] == 2u) continue;
+            // A master of mine is already somebody's slave. That **is** a chain, and
+            // it is refused rather than composed: the mesher would rather leave a
+            // junction open and say so than resolve one silently.
+            bool chained = false;
+            for (int face = 0; face < 2 && !chained; ++face)
+                for (std::uint32_t node : quads[tie.quad[face]].node)
+                    chained = chained || tieRole[node] == 1u;
+            if (chained) {
+                ++section.junctionsChained;
+                continue;
+            }
+            for (int face = 0; face < 2; ++face) {
+                tie.xi[face] = landed[face].xi;
+                tie.eta[face] = landed[face].eta;
+                section.worstJunctionOvershoot =
+                    std::max(section.worstJunctionOvershoot, landed[face].overshoot);
+                for (std::uint32_t node : quads[tie.quad[face]].node) tieRole[node] = 2u;
+            }
+            tieRole[i] = 1u;
+            paired.push_back(tie);
+            ++section.junctionTies;
+        }
+        if (section.junctionsChained > 0)
+            report(std::to_string(section.junctionsChained) +
+                   " junction nodes could not be tied because a master of theirs is already a"
+                   " slave: chained constraints are refused rather than composed, so those"
+                   " junctions are still open");
+        if (section.junctionsOnInterface > 0)
+            report(std::to_string(section.junctionsOnInterface) +
+                   " junction nodes lie on a cut plane and were left untied: the interface is"
+                   " prescribed, and a prescribed degree of freedom cannot also be a function of"
+                   " others");
+        if (section.junctionsOutsideFace > 0)
+            report(std::to_string(section.junctionsOutsideFace) +
+                   " junction nodes land further outside a master face than"
+                   " SectionParams::junctionOvershoot allows and were left untied");
     }
 
     // --- Node numbering -----------------------------------------------------------
@@ -413,13 +649,30 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
             for (std::uint32_t r = 0; r < byPosition.size(); ++r) out[byPosition[r]] = r;
             return out;
         };
+        // **The spread is taken over the tied graph, not over the element graph.** An
+        // element with a tied corner reaches that corner's eight masters, which are on
+        // another surface entirely, so an ordering scored on the sub-quads alone is
+        // scored on a graph the solver does not have. Measured on the ferry hold: the
+        // tie takes the assembled DOF half-bandwidth from 149 to 10 769 -- essentially
+        // dense on 14 040 degrees of freedom -- unless the numbering is chosen knowing
+        // about it.
+        const auto reachOf = [&](const std::vector<std::uint32_t>& order, std::uint32_t node,
+                                 std::uint32_t& lo, std::uint32_t& hi) {
+            lo = std::min(lo, order[node]);
+            hi = std::max(hi, order[node]);
+        };
+        std::vector<std::vector<std::uint32_t>> tiedTo(mid.size());
+        for (const PairedTie& tie : paired)
+            for (int face = 0; face < 2; ++face)
+                for (std::uint32_t node : quads[tie.quad[face]].node)
+                    tiedTo[tie.slave].push_back(node);
         const auto spreadOf = [&](const std::vector<std::uint32_t>& order) {
             std::size_t worst = 0;
             for (const SubQuad& q : quads) {
                 std::uint32_t lo = order[q.node[0]], hi = lo;
-                for (int c = 1; c < 4; ++c) {
-                    lo = std::min(lo, order[q.node[c]]);
-                    hi = std::max(hi, order[q.node[c]]);
+                for (int c = 0; c < 4; ++c) {
+                    reachOf(order, q.node[c], lo, hi);
+                    for (std::uint32_t master : tiedTo[q.node[c]]) reachOf(order, master, lo, hi);
                 }
                 worst = std::max(worst, static_cast<std::size_t>(hi - lo));
             }
@@ -428,15 +681,21 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
         std::vector<std::vector<std::uint32_t>> adjacency(mid.size());
         {
             std::set<std::pair<std::uint32_t, std::uint32_t>> seen;
+            const auto join = [&](std::uint32_t a, std::uint32_t b) {
+                if (a == b || !seen.insert({std::min(a, b), std::max(a, b)}).second) return;
+                adjacency[a].push_back(b);
+                adjacency[b].push_back(a);
+            };
             for (const SubQuad& q : quads)
                 for (int e = 0; e < 4; ++e)
-                    for (int f = e + 1; f < 4; ++f) {
-                        const std::uint32_t a = q.node[static_cast<std::size_t>(e)];
-                        const std::uint32_t b = q.node[static_cast<std::size_t>(f)];
-                        if (a == b || !seen.insert({std::min(a, b), std::max(a, b)}).second) continue;
-                        adjacency[a].push_back(b);
-                        adjacency[b].push_back(a);
-                    }
+                    for (int f = e + 1; f < 4; ++f)
+                        join(q.node[static_cast<std::size_t>(e)], q.node[static_cast<std::size_t>(f)]);
+            // The tie's own edges, so the Cuthill-McKee sweep crosses a junction the
+            // way it crosses an element and numbers the two surfaces together instead
+            // of one after the other.
+            for (const PairedTie& tie : paired)
+                for (int face = 0; face < 2; ++face)
+                    for (std::uint32_t node : quads[tie.quad[face]].node) join(tie.slave, node);
         }
         std::vector<std::uint32_t> cuthill(mid.size());
         {
@@ -577,22 +836,16 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
 
     // --- The interface: the two cut planes -----------------------------------------
     //
-    // Chosen on the **mid-surface** and both extruded nodes of a pair taken, which is
-    // exact. Choosing it on the nodes instead -- which is what
-    // `reduction::nodesNearPlanes` at its default tolerance does -- keeps only the
-    // node of each pair that happened to land on the plane wherever the plating's
-    // normal leans out of the transverse direction, and half an interface is not a
-    // cut, it is a hinge.
+    // `onPlane` was decided on the mid-surface further up, before the numbering; this
+    // is the same set written out in the numbering's own terms, both extruded nodes
+    // of every pair.
     section.mesh.fixed.assign(section.mesh.nodeCount() * 3, 0u);
     section.mesh.prescribed.assign(section.mesh.nodeCount() * 3, 0.0);
-    std::vector<std::uint8_t> onPlane(mid.size(), 0u);
     for (std::uint32_t i = 0; i < mid.size(); ++i) {
-        const bool aft = std::abs(mid[i].x - params.xFrom) <= params.planeTolerance;
-        const bool forward = std::abs(mid[i].x - params.xTo) <= params.planeTolerance;
-        if (!aft && !forward) continue;
-        onPlane[i] = aft ? 1u : 2u;
+        if (onPlane[i] == 0u) continue;
         const auto low = static_cast<std::uint32_t>(rank[i]) * 2;
-        std::vector<std::uint32_t>& into = aft ? section.aftNodes : section.forwardNodes;
+        std::vector<std::uint32_t>& into =
+            onPlane[i] == 1u ? section.aftNodes : section.forwardNodes;
         into.push_back(low);
         into.push_back(low + 1);
         section.interfaceNodes.push_back(low);
@@ -605,15 +858,66 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
         report("one of the cut planes carries no nodes, so the section is attached to the ship"
                " at one end only and its reduction has no interface to be exact at");
 
-    // --- Topology: components, free edges, and junctions that did not weld ----------
+    // --- The junction tie, written out ---------------------------------------------
+    //
+    // The pairing is above; this turns each pair into three constraints per extruded
+    // node, one per axis, over the eight mesh nodes of the master face. The weights
+    // are `N_a(xi, eta)` times the through-thickness split `constraint::tieWeight`
+    // gives, and they sum to one -- so a rigid translation of the whole section is
+    // reproduced exactly, and so is a rigid rotation, because bilinear interpolation
+    // of a linear field is that field.
+    for (const PairedTie& tie : paired) {
+        const std::size_t low = static_cast<std::size_t>(rank[tie.slave]) * 2;
+        for (int face = 0; face < 2; ++face) {
+            const SubQuad& q = quads[tie.quad[face]];
+            double shape[4];
+            bilinear(tie.xi[face], tie.eta[face], shape);
+            Vec3 surface{0, 0, 0}, normal{0, 0, 0};
+            double thickness = 0;
+            for (int a = 0; a < 4; ++a) {
+                surface += mid[q.node[a]] * shape[a];
+                normal += nodeNormal[q.node[a]] * shape[a];
+                thickness += nodeThickness[q.node[a]] * shape[a];
+            }
+            normal = normalize(normal);
+            const Vec3 at = mid[tie.slave] +
+                            nodeNormal[tie.slave] * ((face == 0 ? -0.5 : 0.5) *
+                                                     nodeThickness[tie.slave]);
+            const double weight = constraint::tieWeight(dot(at - surface, normal), thickness);
+            section.worstJunctionWeight = std::max(
+                section.worstJunctionWeight, std::max(std::abs(weight), std::abs(1.0 - weight)));
+            for (int k = 0; k < 3; ++k) {
+                solidshell::Mpc mpc;
+                mpc.slave = static_cast<std::uint32_t>(
+                    (low + static_cast<std::size_t>(face)) * 3 + static_cast<std::size_t>(k));
+                mpc.master.reserve(8);
+                mpc.weight.reserve(8);
+                for (int a = 0; a < 4; ++a) {
+                    const auto pair = static_cast<std::uint32_t>(rank[q.node[a]]) * 2;
+                    mpc.master.push_back(pair * 3 + static_cast<std::uint32_t>(k));
+                    mpc.weight.push_back(shape[a] * (1.0 - weight));
+                    mpc.master.push_back((pair + 1) * 3 + static_cast<std::uint32_t>(k));
+                    mpc.weight.push_back(shape[a] * weight);
+                }
+                section.attachment.constrained.push_back(std::move(mpc));
+            }
+        }
+        for (int face = 0; face < 2; ++face)
+            for (std::uint32_t node : quads[tie.quad[face]].node)
+                connected.join(static_cast<int>(tie.slave), static_cast<int>(node));
+    }
 
-    std::map<std::pair<std::uint32_t, std::uint32_t>, int> edgeUse;
+    // --- Topology: components, free edges, and junctions that are still open --------
+
+    // Which surface each free edge belongs to, so the census does not report an edge
+    // as sitting on its own plating.
+    std::map<std::pair<std::uint32_t, std::uint32_t>, int> edgeSurface;
     for (const SubQuad& q : quads)
         for (int e = 0; e < 4; ++e) {
             const std::uint32_t a = q.node[static_cast<std::size_t>(e)];
             const std::uint32_t b = q.node[static_cast<std::size_t>((e + 1) % 4)];
             if (a == b) continue;
-            ++edgeUse[{std::min(a, b), std::max(a, b)}];
+            edgeSurface[{std::min(a, b), std::max(a, b)}] = q.surface;
         }
 
     // Components, compacted to 0..components-1 and recorded per node. A caller has
@@ -667,68 +971,49 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
     // Free edges, and how many of them are lying on another surface they are not
     // joined to. A grid over the sub-quads keeps the search local; a free edge is
     // only interesting when it is *not* on a cut plane, because those are the cut.
-    {
-        const double cell = 1.0;
-        std::map<std::array<long long, 3>, std::vector<std::size_t>> bucket;
-        const auto cellOf = [&](double v) { return static_cast<long long>(std::floor(v / cell)); };
-        for (std::size_t k = 0; k < quads.size(); ++k) {
-            Vec3 lo = mid[quads[k].node[0]], hi = lo;
-            for (int c = 1; c < 4; ++c) {
-                const Vec3& p = mid[quads[k].node[c]];
-                lo = Vec3{std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
-                hi = Vec3{std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
+    for (const auto& [edge, count] : edgeUse) {
+        if (count != 1) continue;
+        if (onPlane[edge.first] && onPlane[edge.second] &&
+            onPlane[edge.first] == onPlane[edge.second])
+            continue;  // this edge is the cut
+        const double span = length(mid[edge.second] - mid[edge.first]);
+        section.freeEdgeLength += span;
+        const Vec3 centre = (mid[edge.first] + mid[edge.second]) * 0.5;
+        const int own = edgeSurface[edge];
+        double nearest = 1e300;
+        auto found = bucket.find({cellOf(centre.x), cellOf(centre.y), cellOf(centre.z)});
+        if (found != bucket.end())
+            for (std::size_t k : found->second) {
+                if (quads[k].surface == own) continue;
+                const Vec3& a = mid[quads[k].node[0]];
+                const Vec3& b = mid[quads[k].node[1]];
+                const Vec3& c = mid[quads[k].node[2]];
+                const Vec3& d = mid[quads[k].node[3]];
+                nearest = std::min(nearest, distanceSquaredToTriangle(centre, a, b, c));
+                nearest = std::min(nearest, distanceSquaredToTriangle(centre, a, c, d));
             }
-            for (long long ix = cellOf(lo.x - params.junctionTolerance);
-                 ix <= cellOf(hi.x + params.junctionTolerance); ++ix)
-                for (long long iy = cellOf(lo.y - params.junctionTolerance);
-                     iy <= cellOf(hi.y + params.junctionTolerance); ++iy)
-                    for (long long iz = cellOf(lo.z - params.junctionTolerance);
-                         iz <= cellOf(hi.z + params.junctionTolerance); ++iz)
-                        bucket[{ix, iy, iz}].push_back(k);
-        }
-        // Which surface each free edge belongs to, so the census does not report an
-        // edge as sitting on its own plating.
-        std::map<std::pair<std::uint32_t, std::uint32_t>, int> edgeSurface;
-        for (const SubQuad& q : quads)
-            for (int e = 0; e < 4; ++e) {
-                const std::uint32_t a = q.node[static_cast<std::size_t>(e)];
-                const std::uint32_t b = q.node[static_cast<std::size_t>((e + 1) % 4)];
-                if (a == b) continue;
-                edgeSurface[{std::min(a, b), std::max(a, b)}] = q.surface;
-            }
-        for (const auto& [edge, count] : edgeUse) {
-            if (count != 1) continue;
-            if (onPlane[edge.first] && onPlane[edge.second] &&
-                onPlane[edge.first] == onPlane[edge.second])
-                continue;  // this edge is the cut
-            const double span = length(mid[edge.second] - mid[edge.first]);
-            section.freeEdgeLength += span;
-            const Vec3 centre = (mid[edge.first] + mid[edge.second]) * 0.5;
-            const int own = edgeSurface[edge];
-            double nearest = 1e300;
-            auto found = bucket.find({cellOf(centre.x), cellOf(centre.y), cellOf(centre.z)});
-            if (found != bucket.end())
-                for (std::size_t k : found->second) {
-                    if (quads[k].surface == own) continue;
-                    const Vec3& a = mid[quads[k].node[0]];
-                    const Vec3& b = mid[quads[k].node[1]];
-                    const Vec3& c = mid[quads[k].node[2]];
-                    const Vec3& d = mid[quads[k].node[3]];
-                    nearest = std::min(nearest, distanceSquaredToTriangle(centre, a, b, c));
-                    nearest = std::min(nearest, distanceSquaredToTriangle(centre, a, c, d));
-                }
-            const double gap = nearest < 1e300 ? std::sqrt(nearest) : 1e300;
-            if (gap <= params.junctionTolerance) {
-                section.junctionEdges += span;
-                section.worstJunctionGap = std::max(section.worstJunctionGap, gap);
-            }
+        const double gap = nearest < 1e300 ? std::sqrt(nearest) : 1e300;
+        if (gap <= params.junctionTolerance) {
+            section.junctionEdges += span;
+            section.worstJunctionGap = std::max(section.worstJunctionGap, gap);
+            // An edge is joined when **both** of its nodes take part in a tie, on
+            // either side of it. Both, because a tie is a statement about a node and
+            // one end tied leaves the edge free to open at the other -- counting a
+            // half-tied edge would make `tiedEdges` reach `junctionEdges` on a
+            // section stitched at every other station. Either side, because one
+            // constraint joins *two* edges: at a butt corner the flange's edge nodes
+            // are the slaves and the side plate's are the masters, and reporting only
+            // the slaves would call four closed corners half-open.
+            if (tieRole[edge.first] != 0u && tieRole[edge.second] != 0u)
+                section.tiedEdges += span;
         }
     }
-    if (section.junctionEdges > 0)
-        report(std::to_string(section.junctionEdges) +
+    if (section.junctionEdges - section.tiedEdges > 1e-9)
+        report(std::to_string(section.junctionEdges - section.tiedEdges) + " m of " +
+               std::to_string(section.junctionEdges) +
                " m of free element edge lies within " + std::to_string(params.junctionTolerance) +
-               " m of another surface's plating without being joined to it: those are the"
-               " junctions this mesher cannot weld, and they carry no shear");
+               " m of another surface's plating without being joined to it: those junctions"
+               " carry no shear");
 
     // --- The members ---------------------------------------------------------------
     //
@@ -911,6 +1196,21 @@ Applied stiffnessTimes(const Section& section, const StructuralMaterial& materia
             out.energy += 0.5 * u[block.dof[i]] * sum;
         }
     }
+    // A junction tie eliminates its slave, so the force `K u` lands on a degree of
+    // freedom the solved system does not have. It belongs to the masters, by the
+    // transpose of the constraint -- exactly as `constraint::applyTiedForce`
+    // distributes a fibre's force -- and until it is moved there the reaction at the
+    // forward plane is short by whatever the junction next to it carries. **The
+    // energy needs no such correction**: `u` already satisfies the constraint, so
+    // `0.5 u^T K u` is `0.5 u_r^T T^T K T u_r` term for term.
+    // No master is ever a slave -- `solidshell::DofExpansion` refuses a chain -- so
+    // one pass distributes everything and nothing cascades.
+    for (const solidshell::Mpc& mpc : section.attachment.constrained) {
+        const double carried = out.force[mpc.slave];
+        for (std::size_t a = 0; a < mpc.master.size(); ++a)
+            out.force[mpc.master[a]] += mpc.weight[a] * carried;
+        out.force[mpc.slave] = 0.0;
+    }
     return out;
 }
 
@@ -957,13 +1257,21 @@ BeamResponse applyBeamLoad(const Section& section, const StructuralMaterial& mat
     }
     std::vector<std::uint32_t> restrained;
     {
+        // A tied node has no unknown of its own, so pinning one says nothing and
+        // `solveStatic` refuses it outright rather than letting the pin and the tie
+        // both claim the same degree of freedom. The rigid-body restraints therefore
+        // go on nodes the solve still owns.
+        std::vector<std::uint8_t> tied(mesh.nodeCount(), 0u);
+        for (const solidshell::Mpc& mpc : section.attachment.constrained)
+            tied[mpc.slave / 3] = 1u;
+
         const int components = std::max(section.components, 1);
         std::vector<int> anchorOf(static_cast<std::size_t>(components), -1);
         std::vector<int> leverOf(static_cast<std::size_t>(components), -1);
         std::vector<double> armOf(static_cast<std::size_t>(components), 0.0);
         for (std::uint32_t node = 0; node < mesh.nodeCount(); ++node) {
             const int component = section.componentOf[node];
-            if (component < 0) continue;
+            if (component < 0 || tied[node]) continue;
             const auto slot = static_cast<std::size_t>(component);
             if (anchorOf[slot] < 0) {
                 anchorOf[slot] = static_cast<int>(node);
@@ -1006,7 +1314,8 @@ BeamResponse applyBeamLoad(const Section& section, const StructuralMaterial& mat
     const std::vector<double> zeroLoad(mesh.nodeCount() * 3, 0.0);
     std::string problem;
     if (!solidshell::solveStatic(mesh, material, solidshell::Formulation::SolidShell,
-                                 section.attachment.stiffness, zeroLoad, displacement, &problem)) {
+                                 section.attachment.stiffness, section.attachment.constrained,
+                                 zeroLoad, displacement, &problem)) {
         out.problem = problem;
         return out;
     }
@@ -1062,7 +1371,8 @@ TorsionResponse applyTwist(const Section& section, const StructuralMaterial& mat
     const std::vector<double> zeroLoad(mesh.nodeCount() * 3, 0.0);
     std::string problem;
     if (!solidshell::solveStatic(mesh, material, solidshell::Formulation::SolidShell,
-                                 section.attachment.stiffness, zeroLoad, displacement, &problem)) {
+                                 section.attachment.stiffness, section.attachment.constrained,
+                                 zeroLoad, displacement, &problem)) {
         out.problem = problem;
         return out;
     }

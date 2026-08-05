@@ -501,11 +501,24 @@ std::vector<std::uint32_t> nodesPinned(const solidshell::HexMesh& mesh);
 // would otherwise assemble a plausible model with two thirds of the steel missing.
 // Empty means no attached mass, which is a defensible choice for a pure stiffness
 // tie and is reported so it cannot be an oversight.
+// **`constrained` is not more stiffness, and that is the whole distinction.** A
+// `DofBlock` adds rows; a `solidshell::Mpc` *removes* one, rewriting it as a
+// weighted sum of others. The eccentric stiffener needs the first because its
+// fibre endpoints are not mesh nodes; a junction between two plates needs the
+// second because the node it ties **is** a mesh node with elements of its own, and
+// no amount of added stiffness can redirect a row that already exists (see
+// `solid_shell.hpp`, and `section.hpp` §5 for the measurement that settled it).
+//
+// A constrained degree of freedom is neither boundary nor interior: it has no
+// unknown. Naming an interface degree of freedom is therefore refused -- the
+// interface is what a reduction keeps *exactly*, and a kept degree of freedom that
+// is secretly a function of others is not kept.
 struct Attachment {
     std::vector<solidshell::DofBlock> stiffness;
     std::vector<double> mass;  // kg per node, added to the row-sum lumped diagonal
+    std::vector<solidshell::Mpc> constrained;
 
-    bool empty() const { return stiffness.empty() && mass.empty(); }
+    bool empty() const { return stiffness.empty() && mass.empty() && constrained.empty(); }
 };
 
 // The full finite element model of one component, assembled once, partitioned, and
@@ -791,15 +804,23 @@ struct Assembly {
 //
 // **And the mesher exists now too** -- `section.{hpp,cpp}` cuts a region between two
 // transverse planes and hands it over with `nodesNearPlanes`' interface and an
-// `Attachment` of its longitudinals. What it cannot do is weld a junction, so a
-// hold of the reference ferry arrives as seven disconnected pieces; that is a
-// property of `makeStructuralMesh`, which shares no corner between two panel roles,
-// and of the solid-shell, whose node pair carries one thickness direction where a
-// corner has two. The consequence for this file is worth knowing before reducing
-// one: the section's lowest fixed-interface frequency is its *decks*' -- 0.78 Hz on
-// that hold, against 3.46 Hz for the shell alone -- so the 20 Hz `cutoffFrequency`
-// below asks for 178 modes, takes 275 s, and does not converge. Guyan is 6 s and is
-// exactly right at the interface.
+// `Attachment` of its longitudinals. It cannot *weld* a junction -- a hold of the
+// reference ferry arrives as seven disconnected surfaces, because
+// `makeStructuralMesh` shares no corner between two panel roles and the solid-shell's
+// node pair carries one thickness direction where a corner has two -- so it **ties**
+// them instead, through `Attachment::constrained`. The consequence for this file is
+// worth knowing before reducing one: untied, the section's lowest fixed-interface
+// frequency is its *decks*' own, 0.7785 Hz on that hold against 1.6999 Hz for the
+// shell alone, and the 20 Hz `cutoffFrequency` below then asks for 178 modes, takes
+// 275 s and does not converge. Tied it is 2.3026 Hz, which is above both pieces, and
+// the interior band goes 125 to 455. Guyan is exactly right at the interface either
+// way.
+//
+// (The figure here read **3.46 Hz** for the shell alone until the tool that
+// `docs/02-simulation.md` §3 says produced it was re-run. No combination of
+// subdivision or member setting reproduces it; the run gives 1.6999 Hz with the
+// stiffeners and 0.1524 Hz without. Nothing tests a comment, and this file's own
+// table of what has gone wrong here records that lesson twice already.)
 Assembly assemble(const Reduction& a, const Reduction& b, const InterfaceMap& map);
 
 // Natural frequencies of an assembled model, rad/s ascending, with the listed

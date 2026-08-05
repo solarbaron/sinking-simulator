@@ -589,6 +589,10 @@ struct Substructure::Impl {
     std::vector<std::uint32_t> boundary, interior;  // global DOF, in reduced order
     std::vector<std::int32_t> interiorSlot;         // global DOF -> interior index, or -1
 
+    // What each degree of freedom stands for. Identity unless the `Attachment`
+    // constrained it; an eliminated one is in neither partition.
+    solidshell::DofExpansion expansion;
+
     std::size_t band = 0;
     std::unique_ptr<solidshell::BandedSpd> factor;
     bool ready = false;
@@ -695,13 +699,43 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
     s.attachedBlocks = attached.stiffness.size();
     for (double m : attached.mass) s.attachedMass += m;
 
+    // --- The constraints, and what a node stands for once they are applied ---
+    s.expansion = solidshell::DofExpansion(s.dofs, attached.constrained);
+    if (!s.expansion.ok()) {
+        s.problems.push_back(s.expansion.problem());
+        return;
+    }
+    // Node granularity for the adjacency below: the CSR gives every row of a node
+    // the same length, so a node's reach is the union over its three axes.
+    std::vector<std::vector<std::uint32_t>> nodeMasters(s.nodes);
+    for (std::size_t n = 0; n < s.nodes; ++n) {
+        for (int k = 0; k < 3; ++k) {
+            const auto d = static_cast<std::uint32_t>(n * 3 + static_cast<std::size_t>(k));
+            for (const solidshell::DofExpansion::Term* t = s.expansion.begin(d);
+                 t != s.expansion.end(d); ++t)
+                nodeMasters[n].push_back(t->dof / 3);
+        }
+        std::sort(nodeMasters[n].begin(), nodeMasters[n].end());
+        nodeMasters[n].erase(std::unique(nodeMasters[n].begin(), nodeMasters[n].end()),
+                             nodeMasters[n].end());
+    }
+
     // --- Node adjacency, then the CSR pattern over its degrees of freedom ---
+    //
+    // The adjacency is over what each node *expands to*, not over the nodes the
+    // element names, because that is what the scatter below will touch. An element
+    // with a constrained corner couples its other seven nodes to that corner's
+    // masters, which are eight nodes on another surface entirely -- so the pattern
+    // has to carry a coupling no element edge exists for.
     std::vector<std::vector<std::uint32_t>> nodeAdjacency(s.nodes);
     for (std::size_t e = 0; e < elements; ++e)
         for (int a = 0; a < kNodes; ++a) {
             const std::uint32_t na = mesh.index[e * kNodes + static_cast<std::size_t>(a)];
-            for (int b = 0; b < kNodes; ++b)
-                nodeAdjacency[na].push_back(mesh.index[e * kNodes + static_cast<std::size_t>(b)]);
+            for (int b = 0; b < kNodes; ++b) {
+                const std::uint32_t nb = mesh.index[e * kNodes + static_cast<std::size_t>(b)];
+                for (std::uint32_t p : nodeMasters[na])
+                    for (std::uint32_t q : nodeMasters[nb]) nodeAdjacency[p].push_back(q);
+            }
         }
     // The attachment joins the adjacency *here*, before the pattern is sized, not
     // as an afterthought once it exists. Everything downstream is derived from
@@ -714,7 +748,10 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
     // superset of what it needs and costs a handful of structural zeros.
     for (const solidshell::DofBlock& block : attached.stiffness)
         for (std::uint32_t p : block.dof)
-            for (std::uint32_t q : block.dof) nodeAdjacency[p / 3].push_back(q / 3);
+            for (std::uint32_t q : block.dof)
+                for (std::uint32_t pm : nodeMasters[p / 3])
+                    for (std::uint32_t qm : nodeMasters[q / 3])
+                        nodeAdjacency[pm].push_back(qm);
     for (auto& list : nodeAdjacency) {
         std::sort(list.begin(), list.end());
         list.erase(std::unique(list.begin(), list.end()), list.end());
@@ -744,6 +781,42 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
     // instead of a claim: delete the adjacency fold above and this fires.
     std::size_t patternMisses = 0;
     s.massDiag.assign(s.dofs, 0.0);
+    // One scatter for elements and blocks alike, expanded through the constraints,
+    // so the matrix assembled **is** `T^T K T` rather than `K` with a correction
+    // bolted on beside it. With nothing constrained every expansion is one term of
+    // weight one and this is the loop it always was.
+    const auto scatter = [&](std::uint32_t row, std::uint32_t column, double value) {
+        for (const solidshell::DofExpansion::Term* p = s.expansion.begin(row);
+             p != s.expansion.end(row); ++p)
+            for (const solidshell::DofExpansion::Term* q = s.expansion.begin(column);
+                 q != s.expansion.end(column); ++q) {
+                const std::size_t slot = s.csrSlot(p->dof, q->dof);
+                if (slot >= s.value.size()) {
+                    ++patternMisses;
+                    continue;
+                }
+                s.value[slot] += p->weight * q->weight * value;
+            }
+    };
+    // The mass of an eliminated degree of freedom goes to its masters by the same
+    // weights. `T^T M T` is not diagonal, and its row sums for one slave are
+    // `weight[a] * m`, which sum to `m` exactly when the weights do -- so total mass
+    // is preserved for any constraint and the lumping is the row sum, as everywhere
+    // else here. **Unlike `constraint::lumpFiberMass` there is usually nothing to
+    // give up:** an eccentric fibre extrapolates *far* -- a weight of 8.83 for a
+    // 200 mm bar on 12 mm plating -- so its consistent row sums are `-7.83 m` and
+    // `+8.83 m` and the mass has to be split equally instead, giving up the first
+    // moment. A junction tie interpolates a point in a face, so its weights are
+    // near a convex combination and the row sums keep the first moment as well as
+    // the total. **Near, not always**: a face overshoot of `d` puts `-d/2` on a
+    // master, and the reference ferry's 9 mm junction gap makes a through-thickness
+    // weight 1.69 rather than 0.5. So this is not an argument that the diagonal
+    // stays positive -- the check below is, and it is why it is a check.
+    const auto lump = [&](std::uint32_t d, double m) {
+        for (const solidshell::DofExpansion::Term* t = s.expansion.begin(d);
+             t != s.expansion.end(d); ++t)
+            s.massDiag[t->dof] += t->weight * m;
+    };
     std::vector<double> ke(static_cast<std::size_t>(kDof) * kDof);
     for (std::size_t e = 0; e < elements; ++e) {
         double nodePos[kDof];
@@ -757,22 +830,16 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
                 dof[a * 3 + k] = n * 3 + static_cast<std::uint32_t>(k);
         }
         for (int p = 0; p < kDof; ++p)
-            for (int q = 0; q < kDof; ++q) {
-                const std::size_t slot = s.csrSlot(dof[p], dof[q]);
-                if (slot >= s.value.size()) {
-                    ++patternMisses;
-                    continue;
-                }
-                s.value[slot] += ke[static_cast<std::size_t>(p) * kDof + static_cast<std::size_t>(q)];
-            }
+            for (int q = 0; q < kDof; ++q)
+                scatter(dof[p], dof[q],
+                        ke[static_cast<std::size_t>(p) * kDof + static_cast<std::size_t>(q)]);
 
         double lumped[kNodes];
         solidshell::elementMass(nodePos, material.density, lumped);
         for (int a = 0; a < kNodes; ++a) {
             const std::uint32_t n = mesh.index[e * kNodes + static_cast<std::size_t>(a)];
             for (int k = 0; k < 3; ++k)
-                s.massDiag[n * 3 + static_cast<std::size_t>(k)] +=
-                    lumped[a];
+                lump(n * 3 + static_cast<std::uint32_t>(k), lumped[a]);
         }
     }
 
@@ -780,14 +847,8 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
     for (const solidshell::DofBlock& block : attached.stiffness) {
         const std::size_t n = block.dof.size();
         for (std::size_t p = 0; p < n; ++p)
-            for (std::size_t q = 0; q < n; ++q) {
-                const std::size_t slot = s.csrSlot(block.dof[p], block.dof[q]);
-                if (slot >= s.value.size()) {
-                    ++patternMisses;
-                    continue;
-                }
-                s.value[slot] += block.stiffness[p * n + q];
-            }
+            for (std::size_t q = 0; q < n; ++q)
+                scatter(block.dof[p], block.dof[q], block.stiffness[p * n + q]);
     }
     // Like the band check further down, this cannot fire while the adjacency fold
     // above is right, and mutation testing confirms no single edit reaches it. It
@@ -808,14 +869,22 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
     // the element mass above is: an isotropic point mass, which is what a lumped
     // mass matrix means.
     for (std::size_t n = 0; n < attached.mass.size(); ++n)
-        for (int k = 0; k < 3; ++k) s.massDiag[n * 3 + static_cast<std::size_t>(k)] += attached.mass[n];
+        for (int k = 0; k < 3; ++k)
+            lump(static_cast<std::uint32_t>(n * 3 + static_cast<std::size_t>(k)), attached.mass[n]);
 
-    for (std::size_t d = 0; d < s.dofs; ++d)
+    for (std::size_t d = 0; d < s.dofs; ++d) {
+        // An eliminated degree of freedom carries no mass because it has no unknown;
+        // its steel has gone to its masters above. Everything else must have some,
+        // and a *negative* diagonal is the failure a constraint with a negative
+        // weight would produce -- an extrapolating tie -- so the test is `> 0` on
+        // the live degrees of freedom rather than `!= 0`.
+        if (s.expansion.eliminated(static_cast<std::uint32_t>(d))) continue;
         if (!(s.massDiag[d] > 0.0)) {
             s.problems.push_back("node " + std::to_string(d / 3) +
                                  " carries no lumped mass: the element around it is degenerate");
             return;
         }
+    }
 
     // --- Partition ---
     std::vector<std::uint8_t> isInterface(s.nodes, 0);
@@ -826,9 +895,31 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
         }
         isInterface[n] = 1;
     }
+    // The interface is what a reduction keeps exactly, so a boundary degree of
+    // freedom that is secretly a weighted sum of others is not kept -- and a caller
+    // who tied one would get a reduced model whose boundary silently has fewer
+    // unknowns than it names. Refused rather than dropped.
+    for (std::uint32_t n : interfaceNodes)
+        for (int k = 0; k < 3; ++k)
+            if (s.expansion.eliminated(n * 3 + static_cast<std::uint32_t>(k))) {
+                s.problems.push_back("interface node " + std::to_string(n) +
+                                     " has a degree of freedom eliminated by a constraint; the"
+                                     " interface is kept exactly and cannot be a function of"
+                                     " something else");
+                return;
+            }
+    // A node every one of whose degrees of freedom is eliminated is in neither
+    // partition: it is not an unknown at all. Leaving it in the interior would put
+    // an empty row in K_ii and the factorisation would find a zero pivot.
+    const auto live = [&](std::size_t n) {
+        for (int k = 0; k < 3; ++k)
+            if (!s.expansion.eliminated(static_cast<std::uint32_t>(n * 3 + static_cast<std::size_t>(k))))
+                return true;
+        return false;
+    };
     std::vector<std::uint32_t> interiorNodes;
     for (std::size_t n = 0; n < s.nodes; ++n)
-        if (!isInterface[n]) interiorNodes.push_back(static_cast<std::uint32_t>(n));
+        if (!isInterface[n] && live(n)) interiorNodes.push_back(static_cast<std::uint32_t>(n));
     for (std::size_t n = 0; n < s.nodes; ++n)
         if (isInterface[n])
             for (int k = 0; k < 3; ++k)
@@ -934,6 +1025,7 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
         const std::uint32_t node = interiorNodes[local];
         for (int k = 0; k < 3; ++k) {
             const std::uint32_t d = node * 3 + static_cast<std::uint32_t>(k);
+            if (s.expansion.eliminated(d)) continue;
             s.interiorSlot[d] = static_cast<std::int32_t>(s.interior.size());
             s.interior.push_back(d);
         }
@@ -1025,15 +1117,26 @@ const solidshell::HexMesh& Substructure::mesh() const { return *impl_->mesh; }
 const StructuralMaterial& Substructure::material() const { return impl_->material; }
 solidshell::Formulation Substructure::formulation() const { return impl_->form; }
 
+// **The two accessors below are bounded by what was actually built, not by
+// `nodes`, and that is a fix rather than a nicety.** Every early `return` in the
+// constructor -- an inverted element, a malformed `Attachment`, a constraint that
+// does not compose -- leaves `nodes` and `dofs` set from the mesh while `massDiag`
+// and the CSR are still empty, so a caller that reads a refused substructure
+// instead of checking `ready()` used to run off the front of an empty vector.
+// Mutation testing found it, as a **segmentation fault three tests after** the
+// mutant it was chasing, and it was reachable long before any constraint existed.
+// A caller who ignores `ready()` now gets a zero, which is wrong and says so, in
+// place of a read of address zero.
 double Substructure::totalMass() const {
     double total = 0.0;
-    for (std::size_t n = 0; n < impl_->nodes; ++n) total += impl_->massDiag[n * 3];
+    for (std::size_t n = 0; n * 3 < impl_->massDiag.size(); ++n) total += impl_->massDiag[n * 3];
     return total;
 }
 
 void Substructure::stiffnessTimes(const std::vector<double>& x, std::vector<double>& y) const {
     const Impl& s = *impl_;
     y.assign(s.dofs, 0.0);
+    if (s.rowStart.size() != s.dofs + 1) return;
     for (std::size_t row = 0; row < s.dofs; ++row) {
         double sum = 0.0;
         for (std::size_t k = s.rowStart[row]; k < s.rowStart[row + 1]; ++k)

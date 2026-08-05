@@ -1107,6 +1107,84 @@ void BandedSpd::solve(std::vector<double>& rightHandSide) const {
     }
 }
 
+DofExpansion::DofExpansion(std::size_t dofCount, const std::vector<Mpc>& constrained) {
+    isSlave_.assign(dofCount, 0u);
+    std::vector<std::size_t> width(dofCount, 1);
+    for (std::size_t c = 0; c < constrained.size(); ++c) {
+        const Mpc& mpc = constrained[c];
+        const std::string where = "constraint " + std::to_string(c);
+        if (mpc.slave >= dofCount) {
+            ok_ = false;
+            problem_ = where + " eliminates degree of freedom " + std::to_string(mpc.slave) +
+                       ", which is not in a system of " + std::to_string(dofCount);
+            return;
+        }
+        if (mpc.master.size() != mpc.weight.size() || mpc.master.empty()) {
+            ok_ = false;
+            problem_ = where + " has " + std::to_string(mpc.master.size()) + " masters and " +
+                       std::to_string(mpc.weight.size()) + " weights";
+            return;
+        }
+        if (isSlave_[mpc.slave]) {
+            ok_ = false;
+            problem_ = where + " eliminates degree of freedom " + std::to_string(mpc.slave) +
+                       " a second time; a degree of freedom has one expansion or none";
+            return;
+        }
+        for (std::uint32_t m : mpc.master) {
+            if (m >= dofCount) {
+                ok_ = false;
+                problem_ = where + " names master degree of freedom " + std::to_string(m) +
+                           ", which is not in a system of " + std::to_string(dofCount);
+                return;
+            }
+            if (m == mpc.slave) {
+                ok_ = false;
+                problem_ = where + " names its own slave " + std::to_string(m) + " as a master";
+                return;
+            }
+        }
+        isSlave_[mpc.slave] = 1u;
+        width[mpc.slave] = mpc.master.size();
+        ++eliminated_;
+    }
+    // A second pass, because "is this master a slave" is only answerable once every
+    // slave is known -- checking it as the constraints arrive would accept a chain
+    // written in one order and refuse the same chain written in the other.
+    for (const Mpc& mpc : constrained)
+        for (std::uint32_t m : mpc.master)
+            if (isSlave_[m]) {
+                ok_ = false;
+                problem_ = "degree of freedom " + std::to_string(m) +
+                           " is both a master and a slave: chained constraints are refused rather"
+                           " than composed, because a chain resolved silently is a modelling error"
+                           " that assembles";
+                return;
+            }
+
+    start_.assign(dofCount + 1, 0);
+    for (std::size_t d = 0; d < dofCount; ++d) start_[d + 1] = start_[d] + width[d];
+    term_.assign(start_[dofCount], Term{0, 0.0});
+    for (std::size_t d = 0; d < dofCount; ++d)
+        if (!isSlave_[d]) term_[start_[d]] = Term{static_cast<std::uint32_t>(d), 1.0};
+    for (const Mpc& mpc : constrained) {
+        std::size_t at = start_[mpc.slave];
+        for (std::size_t a = 0; a < mpc.master.size(); ++a)
+            term_[at++] = Term{mpc.master[a], mpc.weight[a]};
+    }
+}
+
+void DofExpansion::recover(std::vector<double>& values) const {
+    for (std::size_t d = 0; d < isSlave_.size(); ++d) {
+        if (!isSlave_[d]) continue;
+        double sum = 0;
+        for (const Term* t = begin(static_cast<std::uint32_t>(d));
+             t != end(static_cast<std::uint32_t>(d)); ++t)
+            sum += t->weight * values[t->dof];
+        values[d] = sum;
+    }
+}
+
 bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formulation form,
                  const std::vector<double>& load, std::vector<double>& displacement,
                  std::string* problem) {
@@ -1117,6 +1195,14 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
 bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formulation form,
                  const std::vector<DofBlock>& extra, const std::vector<double>& load,
                  std::vector<double>& displacement, std::string* problem) {
+    static const std::vector<Mpc> none;
+    return solveStatic(mesh, material, form, extra, none, load, displacement, problem);
+}
+
+bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formulation form,
+                 const std::vector<DofBlock>& extra, const std::vector<Mpc>& constrained,
+                 const std::vector<double>& load, std::vector<double>& displacement,
+                 std::string* problem) {
     const std::size_t nodes = mesh.nodeCount();
     const std::size_t elements = mesh.elementCount();
 
@@ -1134,16 +1220,50 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
         }
     }
 
+    const DofExpansion expansion(nodes * 3, constrained);
+    if (!expansion.ok()) {
+        if (problem) *problem = expansion.problem();
+        return false;
+    }
+    for (std::size_t d = 0; d < nodes * 3; ++d)
+        if (expansion.eliminated(static_cast<std::uint32_t>(d)) && d < mesh.fixed.size() &&
+            mesh.fixed[d]) {
+            if (problem)
+                *problem = "degree of freedom " + std::to_string(d) +
+                           " is both prescribed by the mesh and eliminated by a constraint";
+            return false;
+        }
+
     displacement.assign(nodes * 3, 0.0);
     for (std::size_t d = 0; d < nodes * 3; ++d)
         if (d < mesh.fixed.size() && mesh.fixed[d]) displacement[d] = mesh.prescribed[d];
 
-    // Free DOF numbering, and the bandwidth that numbering actually delivers.
+    // Free DOF numbering, and the bandwidth that numbering actually delivers. An
+    // eliminated degree of freedom is not free and not prescribed: it has no
+    // unknown at all, and its row is carried by its masters.
     std::vector<std::ptrdiff_t> map(nodes * 3, -1);
     std::size_t free = 0;
     for (std::size_t d = 0; d < nodes * 3; ++d)
-        if (!(d < mesh.fixed.size() && mesh.fixed[d])) map[d] = static_cast<std::ptrdiff_t>(free++);
+        if (!(d < mesh.fixed.size() && mesh.fixed[d]) &&
+            !expansion.eliminated(static_cast<std::uint32_t>(d)))
+            map[d] = static_cast<std::ptrdiff_t>(free++);
     if (free == 0) return true;
+
+    // The reach of one global degree of freedom, after expansion: the free slots
+    // its row and column actually touch. A constrained one reaches its masters and
+    // not itself, which is what makes the band below cover the transformed system
+    // rather than the untransformed one.
+    const auto reach = [&](std::size_t global, std::size_t& lo, std::size_t& hi, bool& any) {
+        for (const DofExpansion::Term* t = expansion.begin(static_cast<std::uint32_t>(global));
+             t != expansion.end(static_cast<std::uint32_t>(global)); ++t) {
+            const std::ptrdiff_t d = map[t->dof];
+            if (d < 0) continue;
+            const auto u = static_cast<std::size_t>(d);
+            lo = std::min(lo, u);
+            hi = std::max(hi, u);
+            any = true;
+        }
+    };
 
     std::size_t band = 0;
     for (std::size_t e = 0; e < elements; ++e) {
@@ -1151,14 +1271,7 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
         bool any = false;
         for (int a = 0; a < kNodes; ++a) {
             const std::size_t n = mesh.index[e * kNodes + static_cast<std::size_t>(a)];
-            for (int i = 0; i < 3; ++i) {
-                const std::ptrdiff_t d = map[n * 3 + static_cast<std::size_t>(i)];
-                if (d < 0) continue;
-                const std::size_t u = static_cast<std::size_t>(d);
-                lo = std::min(lo, u);
-                hi = std::max(hi, u);
-                any = true;
-            }
+            for (int i = 0; i < 3; ++i) reach(n * 3 + static_cast<std::size_t>(i), lo, hi, any);
         }
         if (any) band = std::max(band, hi - lo);
     }
@@ -1170,20 +1283,47 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
         bool any = false;
         for (std::uint32_t global : block.dof) {
             if (global >= nodes * 3) continue;
-            const std::ptrdiff_t d = map[global];
-            if (d < 0) continue;
-            const std::size_t u = static_cast<std::size_t>(d);
-            lo = std::min(lo, u);
-            hi = std::max(hi, u);
-            any = true;
+            reach(global, lo, hi, any);
         }
         if (any) band = std::max(band, hi - lo);
     }
 
     BandedSpd system(free, band);
     std::vector<double> rhs(free, 0.0);
-    for (std::size_t d = 0; d < nodes * 3; ++d)
-        if (map[d] >= 0) rhs[static_cast<std::size_t>(map[d])] = d < load.size() ? load[d] : 0.0;
+    // A load applied at an eliminated degree of freedom is distributed to its
+    // masters by the transpose of the constraint, which is what keeps the virtual
+    // work identical -- the same statement `constraint::applyTiedForce` makes.
+    for (std::size_t d = 0; d < nodes * 3; ++d) {
+        const double f = d < load.size() ? load[d] : 0.0;
+        if (f == 0.0) continue;
+        for (const DofExpansion::Term* t = expansion.begin(static_cast<std::uint32_t>(d));
+             t != expansion.end(static_cast<std::uint32_t>(d)); ++t)
+            if (map[t->dof] >= 0) rhs[static_cast<std::size_t>(map[t->dof])] += t->weight * f;
+    }
+
+    // One scatter for both sources, so an element and a block cannot disagree about
+    // what a constrained degree of freedom means.
+    const auto scatter = [&](std::size_t row, std::size_t column, double value) {
+        for (const DofExpansion::Term* p = expansion.begin(static_cast<std::uint32_t>(row));
+             p != expansion.end(static_cast<std::uint32_t>(row)); ++p) {
+            const std::ptrdiff_t rowDof = map[p->dof];
+            if (rowDof < 0) continue;
+            for (const DofExpansion::Term* q = expansion.begin(static_cast<std::uint32_t>(column));
+                 q != expansion.end(static_cast<std::uint32_t>(column)); ++q) {
+                const std::ptrdiff_t colDof = map[q->dof];
+                const double term = p->weight * q->weight * value;
+                if (colDof >= 0) {
+                    system.add(static_cast<std::size_t>(rowDof), static_cast<std::size_t>(colDof),
+                               term);
+                } else {
+                    // Prescribed DOF move to the right-hand side exactly, rather
+                    // than through a penalty stiffness whose size would then be a
+                    // tolerance the patch test had to live with.
+                    rhs[static_cast<std::size_t>(rowDof)] -= term * displacement[q->dof];
+                }
+            }
+        }
+    };
 
     for (std::size_t e = 0; e < elements; ++e) {
         double nodePos[kDof];
@@ -1196,23 +1336,8 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
             const std::size_t n = mesh.index[e * kNodes + static_cast<std::size_t>(a)];
             for (int i = 0; i < 3; ++i) dof[a * 3 + i] = n * 3 + static_cast<std::size_t>(i);
         }
-        for (int p = 0; p < kDof; ++p) {
-            const std::ptrdiff_t rowDof = map[dof[p]];
-            if (rowDof < 0) continue;
-            for (int qq = 0; qq < kDof; ++qq) {
-                const std::ptrdiff_t colDof = map[dof[qq]];
-                const double value = ke[p * kDof + qq];
-                if (colDof >= 0) {
-                    system.add(static_cast<std::size_t>(rowDof), static_cast<std::size_t>(colDof),
-                               value);
-                } else {
-                    // Prescribed DOF move to the right-hand side exactly, rather
-                    // than through a penalty stiffness whose size would then be a
-                    // tolerance the patch test had to live with.
-                    rhs[static_cast<std::size_t>(rowDof)] -= value * displacement[dof[qq]];
-                }
-            }
-        }
+        for (int p = 0; p < kDof; ++p)
+            for (int qq = 0; qq < kDof; ++qq) scatter(dof[p], dof[qq], ke[p * kDof + qq]);
     }
 
     for (const DofBlock& block : extra) {
@@ -1220,17 +1345,9 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
         if (block.stiffness.size() < n * n) continue;
         for (std::size_t p = 0; p < n; ++p) {
             if (block.dof[p] >= nodes * 3) continue;
-            const std::ptrdiff_t rowDof = map[block.dof[p]];
-            if (rowDof < 0) continue;
             for (std::size_t qq = 0; qq < n; ++qq) {
                 if (block.dof[qq] >= nodes * 3) continue;
-                const std::ptrdiff_t colDof = map[block.dof[qq]];
-                const double value = block.stiffness[p * n + qq];
-                if (colDof >= 0)
-                    system.add(static_cast<std::size_t>(rowDof), static_cast<std::size_t>(colDof),
-                               value);
-                else
-                    rhs[static_cast<std::size_t>(rowDof)] -= value * displacement[block.dof[qq]];
+                scatter(block.dof[p], block.dof[qq], block.stiffness[p * n + qq]);
             }
         }
     }
@@ -1243,6 +1360,7 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
     system.solve(rhs);
     for (std::size_t d = 0; d < nodes * 3; ++d)
         if (map[d] >= 0) displacement[d] = rhs[static_cast<std::size_t>(map[d])];
+    expansion.recover(displacement);
     return true;
 }
 

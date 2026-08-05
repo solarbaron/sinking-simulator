@@ -61,6 +61,7 @@
 
 using namespace sim;
 using namespace sim::solidshell;
+using testing::expectEqual;
 using testing::expectNear;
 using testing::expectTrue;
 
@@ -2022,6 +2023,201 @@ void testEnhancedBasisScalingCannotChangeTheElement() {
     expectTrue("rescaling the enhanced basis cannot change the element", difference < 1e-8 * norm);
 }
 
+// --- Multi-point constraints ------------------------------------------------------
+//
+// `DofExpansion` is the whole of what an assembler has to understand about a
+// constraint, so it is tested on its own before anything is solved through it.
+// Every refusal here is a modelling error that would otherwise assemble into a
+// plausible matrix.
+
+void testDofExpansionRefusesWhatItCannotCompose() {
+    const auto refuses = [&](const std::string& what, const std::vector<solidshell::Mpc>& set) {
+        const solidshell::DofExpansion expansion(12, set);
+        expectTrue(what + " is refused", !expansion.ok());
+        expectTrue(what + " says why", !expansion.problem().empty());
+    };
+    refuses("a slave outside the system", {{12, {0}, {1.0}}});
+    refuses("a master outside the system", {{0, {12}, {1.0}}});
+    refuses("a weight count that does not match", {{0, {1, 2}, {1.0}}});
+    refuses("a constraint with no masters", {{0, {}, {}}});
+    refuses("a degree of freedom eliminated twice", {{0, {1}, {1.0}}, {0, {2}, {1.0}}});
+    refuses("a constraint that names its own slave", {{0, {0}, {1.0}}});
+    // Chained, written both ways round. The second order is the one a check made as
+    // the constraints arrive would accept, because when 3 is declared the slave of 6
+    // nothing yet knows 6 is a master.
+    refuses("a chain", {{3, {6}, {1.0}}, {6, {9}, {1.0}}});
+    refuses("the same chain in the other order", {{6, {9}, {1.0}}, {3, {6}, {1.0}}});
+
+    const solidshell::DofExpansion nothing(12, {});
+    expectTrue("no constraints is the identity", nothing.ok() && nothing.empty());
+    expectEqual("and eliminates nothing", static_cast<long long>(nothing.eliminatedCount()), 0);
+    for (std::uint32_t d = 0; d < 12; ++d) {
+        expectTrue("every degree of freedom stands for itself", !nothing.eliminated(d));
+        expectEqual("as one term", static_cast<long long>(nothing.end(d) - nothing.begin(d)), 1);
+        expectTrue("with weight one", nothing.begin(d)->dof == d && nothing.begin(d)->weight == 1.0);
+    }
+
+    // `recover` is what turns a solution over the free degrees of freedom back into
+    // one over the mesh's, and it is the half of the transformation a solver would
+    // still look right without: the free part would be correct and the tied node
+    // would sit at zero.
+    const solidshell::DofExpansion mixed(12, {{6, {0, 3}, {0.25, 0.75}}});
+    expectTrue("a well-formed set is accepted", mixed.ok());
+    expectEqual("and eliminates one degree of freedom",
+                static_cast<long long>(mixed.eliminatedCount()), 1);
+    std::vector<double> values(12, 0.0);
+    values[0] = 4.0;
+    values[3] = 8.0;
+    values[6] = -1.0;  // whatever was there is overwritten, not added to
+    mixed.recover(values);
+    expectNear("recover reads the slave off its masters", values[6], 0.25 * 4.0 + 0.75 * 8.0,
+               1e-15);
+}
+
+void testConstrainedSolveIsExactWhereTheConstraintIsTrue() {
+    // A patch test with a constraint through it. The plate's whole boundary is
+    // prescribed to a linear field; one interior node pair is then eliminated in
+    // favour of the two node pairs either side of it along x, with the weights that
+    // put it where it actually is. A linear field satisfies that constraint
+    // identically, so the constrained solve must return **exactly** the same answer
+    // as the unconstrained one -- which is the strongest statement available about a
+    // transformation, and it fails for any error in `T`, in `T^T`, or in the band.
+    constexpr int n = 4, nz = 3;
+    const int sy = n + 1, sz = nz + 1;
+    solidshell::HexMesh mesh = solidshell::makePlateMesh(1.0, 1.0, 0.3, n, n, nz);
+    const StructuralMaterial steel = ah36Steel();
+    // A general linear field: three normal strains, three shears, a rigid rotation
+    // and a translation, all at once -- the same field `runPatch` uses, and for the
+    // same reason.
+    const double gradient[3][3] = {{1.1e-4, 3.0e-5, -2.0e-5},
+                                   {-4.0e-5, 0.7e-4, 1.5e-5},
+                                   {2.5e-5, -1.0e-5, -0.9e-4}};
+    const double offset[3] = {1.0e-3, -2.0e-3, 3.0e-3};
+    const auto field = [&](std::size_t node, int axis) {
+        const double* p = &mesh.position[node * 3];
+        return gradient[axis][0] * p[0] + gradient[axis][1] * p[1] + gradient[axis][2] * p[2] +
+               offset[axis];
+    };
+    // The whole boundary is prescribed, the two through-thickness faces included:
+    // pinning only the in-plane perimeter would leave the top and bottom free, where
+    // a constant stress state has traction, and the linear field would stop being the
+    // exact solution.
+    int freeNodes = 0;
+    for (int i = 0; i <= n; ++i)
+        for (int j = 0; j <= n; ++j)
+            for (int k = 0; k <= nz; ++k) {
+                const auto node = static_cast<std::size_t>((i * sy + j) * sz + k);
+                if (i != 0 && i != n && j != 0 && j != n && k != 0 && k != nz) {
+                    ++freeNodes;
+                    continue;
+                }
+                for (int axis = 0; axis < 3; ++axis) mesh.pin(node, axis, field(node, axis));
+            }
+    expectTrue("the patch has free interior nodes to constrain", freeNodes >= 8);
+
+    const std::vector<double> noLoad(mesh.nodeCount() * 3, 0.0);
+    std::vector<double> free;
+    std::string problem;
+    expectTrue("the unconstrained patch solves: " + problem,
+               solidshell::solveStatic(mesh, steel, solidshell::Formulation::SolidShell, noLoad,
+                                       free, &problem));
+
+    // The interior node at (i, j, k) = (2, 2, 1), eliminated in favour of (1, 2, 1)
+    // and (3, 2, 1): it is exactly halfway between them on a regular grid, so the
+    // weights are a half each and a linear field satisfies the constraint
+    // identically.
+    const auto index = [&](int i, int j, int k) {
+        return static_cast<std::uint32_t>((i * sy + j) * sz + k);
+    };
+    std::vector<solidshell::Mpc> constrained;
+    for (int k = 0; k < 3; ++k)
+        constrained.push_back({index(2, 2, 1) * 3 + static_cast<std::uint32_t>(k),
+                               {index(1, 2, 1) * 3 + static_cast<std::uint32_t>(k),
+                                index(3, 2, 1) * 3 + static_cast<std::uint32_t>(k)},
+                               {0.5, 0.5}});
+    std::vector<double> tied;
+    expectTrue("the constrained patch solves: " + problem,
+               solidshell::solveStatic(mesh, steel, solidshell::Formulation::SolidShell, {},
+                                       constrained, noLoad, tied, &problem));
+
+    double worstFree = 0, worstTied = 0, scale = 0;
+    for (std::size_t node = 0; node < mesh.nodeCount(); ++node)
+        for (int k = 0; k < 3; ++k) {
+            const double want = field(node, k);
+            scale = std::max(scale, std::fabs(want));
+            worstFree = std::max(worstFree, std::fabs(free[node * 3 + static_cast<std::size_t>(k)] - want));
+            worstTied = std::max(worstTied, std::fabs(tied[node * 3 + static_cast<std::size_t>(k)] - want));
+        }
+    std::printf("     constrained patch: unconstrained %.2e m, constrained %.2e m, of %.2e m\n",
+                worstFree, worstTied, scale);
+    expectTrue("the unconstrained patch is exact", worstFree < 1e-12 * scale);
+    // The eliminated node is filled from its masters, so this also says `recover`
+    // ran: without it the tied node would sit at zero and this would be `scale`.
+    expectTrue("and so is the constrained one, because a linear field satisfies the tie",
+               worstTied < 1e-12 * scale);
+
+    // The vacuity guard, and it is the whole reason the test means anything: a
+    // constraint the exact solution does **not** satisfy has to change the answer.
+    // Tie the same node to the two either side with the weights swapped in a way
+    // that puts it a quarter of a bay off where it is.
+    for (auto& mpc : constrained) mpc.weight = {0.25, 0.75};
+    std::vector<double> wrong;
+    expectTrue("the off-centre constraint also solves",
+               solidshell::solveStatic(mesh, steel, solidshell::Formulation::SolidShell, {},
+                                       constrained, noLoad, wrong, &problem));
+    double moved = 0;
+    for (std::size_t d = 0; d < wrong.size(); ++d)
+        moved = std::max(moved, std::fabs(wrong[d] - tied[d]));
+    expectTrue("a constraint the exact field does not satisfy moves the answer",
+               moved > 1e-4 * scale);
+
+    // **A load applied at an eliminated degree of freedom has to go to its masters
+    // by the transpose of the constraint**, or the virtual work is not the same and
+    // the tied point silently carries nothing. Nothing above would see it: the patch
+    // is driven entirely by its boundary and its load vector is zero. So the load is
+    // put where only that path can carry it, and compared against the same load
+    // spread over the masters by hand -- which must give the identical field,
+    // because `f^T u` is the same number written two ways.
+    for (auto& mpc : constrained) mpc.weight = {0.5, 0.5};
+    std::vector<double> atSlave(mesh.nodeCount() * 3, 0.0), atMasters = atSlave;
+    for (int k = 0; k < 3; ++k) {
+        const double f = 1.0e4 * (k + 1);
+        atSlave[index(2, 2, 1) * 3 + static_cast<std::size_t>(k)] = f;
+        atMasters[index(1, 2, 1) * 3 + static_cast<std::size_t>(k)] = 0.5 * f;
+        atMasters[index(3, 2, 1) * 3 + static_cast<std::size_t>(k)] = 0.5 * f;
+    }
+    std::vector<double> pushedAtSlave, pushedAtMasters;
+    expectTrue("a load at the tied node solves",
+               solidshell::solveStatic(mesh, steel, solidshell::Formulation::SolidShell, {},
+                                       constrained, atSlave, pushedAtSlave, &problem));
+    expectTrue("and so does the same load at its masters",
+               solidshell::solveStatic(mesh, steel, solidshell::Formulation::SolidShell, {},
+                                       constrained, atMasters, pushedAtMasters, &problem));
+    double loadGap = 0, loadScale = 0;
+    for (std::size_t d = 0; d < pushedAtSlave.size(); ++d) {
+        loadScale = std::max(loadScale, std::fabs(pushedAtSlave[d] - tied[d]));
+        loadGap = std::max(loadGap, std::fabs(pushedAtSlave[d] - pushedAtMasters[d]));
+    }
+    std::printf("     load through the tie: two routes agree to %.2e m, having moved %.2e m\n",
+                loadGap, loadScale);
+    // The vacuity guard: the load has to have done something, or "the two agree" is
+    // a statement about two copies of the boundary-driven answer.
+    expectTrue("the load moved the plate", loadScale > 1e-8);
+    expectTrue("a load at a tied node is its masters' load", loadGap < 1e-12 * loadScale);
+
+    // And the two ways of saying "this degree of freedom is spoken for" may not both
+    // be used at once: the pin and the tie would each claim it and there is no
+    // reading of "both" that is not a guess.
+    solidshell::HexMesh clash = mesh;
+    clash.pin(index(2, 2, 1), 0, 0.0);
+    for (auto& mpc : constrained) mpc.weight = {0.5, 0.5};
+    std::vector<double> refused;
+    expectTrue("a degree of freedom both pinned and tied is refused",
+               !solidshell::solveStatic(clash, steel, solidshell::Formulation::SolidShell, {},
+                                        constrained, noLoad, refused, &problem));
+    expectTrue("and says so", problem.find("prescribed") != std::string::npos);
+}
+
 }  // namespace
 
 void runSolidShellTests() {
@@ -2045,4 +2241,6 @@ void runSolidShellTests() {
     testCostPerElement();
     testCachedRestFormsAreBitIdentical();
     testEnhancedBasisScalingCannotChangeTheElement();
+    testDofExpansionRefusesWhatItCannotCompose();
+    testConstrainedSolveIsExactWhereTheConstraintIsTrue();
 }

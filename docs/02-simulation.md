@@ -3461,7 +3461,8 @@ makes, arriving as a frequency.
    rewrite the scatter-add, which already does not care how many components it is
    given. The mesher that item 1 was waiting for now exists — `section.{hpp,cpp}` —
    so there are pieces to join; what stops a *whole-ship* model is the
-   three-component limit above and the unwelded junctions inside each piece.
+   three-component limit above. The junctions inside each piece are tied now — see
+   §*The junction tie* below.
 3. ~~**A zone's edge is still clamped.**~~ **Done** — `coupling.{hpp,cpp}`,
    §*Tier-1 to Tier-2 coupling* below. What remains is that a reduced model cannot
    represent a zone that has *yielded* without tearing, which is item 6 there.
@@ -3590,14 +3591,21 @@ Two things do see the junctions:
   held by the warping restraint of its own end planes rather than by torsion. A
   one-bay section would have shown almost nothing.
 - **The lowest fixed-interface frequency**, which is the sharper instrument on a real
-  ship. On the ferry's hold between x = −7.2 m and 19.2 m the whole section's first
-  fixed-interface mode is **0.7785 Hz**; the decks *on their own* are 0.7785 Hz to
-  four figures and the shell on its own is **3.4600 Hz**. The softest thing in the
-  section is a 26 m deck held on two edges instead of four, and adding the shell it
-  ought to be welded to changes it by nothing at all. (Both figures are bracketed by
-  `Substructure::eigenvaluesBelow`, an exact inertia count, because the subspace
-  iteration reports that it did not converge and a frequency it produced is not
-  evidence on its own.)
+  ship. On the ferry's hold between x = −7.2 m and 19.2 m the whole *unjoined*
+  section's first fixed-interface mode is **0.7785 Hz**; the decks *on their own* are
+  0.7785 Hz to four figures and the shell on its own is **1.6999 Hz**. The softest
+  thing in the section is a 26 m deck held on two edges instead of four, and adding
+  the shell it ought to be welded to changes it by nothing at all. Tied — see the
+  junction tie below — the same section is **2.3026 Hz**, above both pieces. (Every
+  figure is bracketed by `Substructure::eigenvaluesBelow`, an exact inertia count,
+  because the subspace iteration reports that it did not converge and a frequency it
+  produced is not evidence on its own.)
+
+  > **Correction.** This paragraph and `reduction.hpp` both read **3.4600 Hz** for
+  > the shell alone until `tools/section_probe` — the program this section says
+  > produced the figure — was re-run. It gives 1.6999 Hz, and no combination of
+  > subdivision or member setting reproduces 3.46. Nothing tests a comment; this is
+  > the fourth time that has cost this repository a published number.
 
 #### Against Tier 0, and what closes the gap
 
@@ -3759,13 +3767,10 @@ argued equivalent.** The ones worth recording:
 
 #### What it does not do
 
-1. **It cannot weld a junction**, for the two independent reasons above: the input
-   shares no corner across one, and a solid-shell node pair has one thickness
-   direction where a corner has two. What would close one honestly is a tie between
-   two plates' node pairs — the non-matching interface `constraint.hpp`'s header
-   already names as the missing case — or a small element filling the corner. Until
-   then a section is right for the hull girder's axial and bending stiffness and wrong
-   for torsion, transverse shear, and every frequency.
+1. **It cannot weld a junction** — it *ties* one instead. See the section below.
+   What remains untied is the junction nodes on a cut plane, 60 m of 370 on an
+   eleven-bay hold, because an interface degree of freedom is prescribed and cannot
+   also be derived.
 2. **It takes one material.** A section spanning two is meshed entirely as the first
    and says so; on this ship the weather deck's mild steel differs from AH36 in yield
    alone, so nothing the reduction reads is affected.
@@ -3778,6 +3783,152 @@ argued equivalent.** The ones worth recording:
    reaching a corner picks up node pairs whose directions are 90° apart. Twelve of
    this ship's members in a two-bay section; the alternative is a plausible wrong
    second moment.
+
+### The junction tie — **implemented**
+
+`solidshell::Mpc` and `solidshell::DofExpansion` in `engine/sim/solid_shell.{hpp,cpp}`,
+carried by `reduction::Attachment::constrained`, built by `section::buildSection`.
+Checked by `tests/test_solid_shell.cpp`, `tests/test_reduction.cpp` and
+`tests/test_section.cpp`. **The decks are attached to the shell.**
+
+A free-edge node lying on another surface is tied to the point of that surface it
+lands in — bilinear in the master face's two in-plane coordinates, and through its
+thickness by the weight `constraint.hpp` §1 derives:
+
+```
+u[slave] = Σ_a N_a(ξ, η) · [ (1−w) u[bottom_a] + w u[top_a] ]
+```
+
+Eight masters, three constraints per extruded node, and the slave keeps **no unknown
+of its own**: `solveStatic` and `Substructure` both scatter through the
+transformation, so the matrix they factor *is* `TᵀKT`. No penalty stiffness, no
+Lagrange multiplier, no tuned parameter — which matters, because a stiffness no
+measurement sets is precisely what `solid_shell.hpp` rejects hourglass control for.
+
+#### Why it could not be a `DofBlock`, which is the load-bearing finding
+
+`constraint.hpp` already eliminates an eccentric stiffener's fibre with a `Tie` and
+hands the result over as a `DofBlock` of extra stiffness. The obvious move was to do
+the same here, and it does not work. **A fibre's endpoints are not mesh nodes**: they
+have no rows of their own, so `TᵀKT` over the masters is the whole of what the fibre
+contributes and adding a block is exact. A junction ties a node that *is* a mesh
+node, with elements of its own — eliminating it means rewriting rows that already
+exist, and no amount of added stiffness redirects a row. So the constraint had to
+become something the assembler understands rather than something the assembler is
+handed.
+
+#### It is not a weld, and the difference is measurable
+
+A weld merges two node pairs into one, which has one thickness direction where two
+plates at an angle need two, and pays for it in steel. A tie moves no node: the same
+nodes in the same places, the same elements, the same mass, still four surfaces on
+the box — and one connected component. On the box girder, at one element per panel:
+
+| corners | components | `EA` | `EI` | `GJ` / Bredt | band |
+|---|---|---|---|---|---|
+| cut | 4 | 1.000000 | 1.000000 | 0.083 | 62 |
+| welded | 1 | 0.905788 | 0.911115 | 0.966 | 104 |
+| **tied** | **1** | **1.000000** | **1.002158** | **1.099** | **236** |
+
+The tied mesh is the only one that is *both* exact in `EA` and closed in torsion.
+`1.099` is not an overshoot of Bredt: a closed cell does not stop having the open
+section's own `Σ s t³/3`, and `1.000 + 0.083` is what the two together predict.
+
+`EI` costs 0.216% at one element per panel, and it is a **consistency error rather
+than the formulation**: at a butt corner the tied node sits half a plate thickness
+past the end of the other plate's mid-surface, so the tie extrapolates a bilinear
+approximation to a quadratic transverse contraction. Refining gives 2.16e-3, 2.85e-4,
+8.62e-5 — twenty-five fold over a threefold refinement. Clamping the tie onto the
+face instead would trade that for an `O(t)` error refinement cannot reach, which is
+why the overshoot is bounded rather than forbidden.
+
+#### On the ferry, where the fixed-interface frequency is the instrument
+
+The hold between x = −7.2 m and 19.2 m, one element per panel:
+
+| | components | free edge joined | `GJ` | first fixed mode |
+|---|---|---|---|---|
+| untied | 7 | 0 of 370 m | 3.6165e12 | 0.7785 Hz |
+| tied | **1** | **310 of 370 m** | **5.2388e12** | **2.3026 Hz** |
+
+0.7785 Hz is the decks' own frequency to four figures — adding the shell changed
+nothing, because in the model it was not attached. 2.3026 Hz is above the decks'
+0.7785 *and* the shell's 1.6999, which is what a joined structure does. `GJ` moves
++44.9%.
+
+`A_eff` moves +0.19% and `I_eff` +0.12%, the same local consistency error the box
+shows. **Neither could have told you the junction was open** — which is the whole
+point of the section above.
+
+#### What it cost the band, measured rather than assumed
+
+A tie couples nodes that no element edge joins, and the node numbering has to know:
+
+| ferry hold | DOF half-bandwidth | banded static solve |
+|---|---|---|
+| untied | 146 | 0.16 s |
+| tied, ordering scored on the element graph | 10 769 | (effectively dense) |
+| tied, ordering scored on the tied graph | 1 520 | 5.34 s |
+
+The mesher compares three candidate orderings and now scores them on the *tied*
+graph. That is worth a factor of seven. What is left is real: joining a section's
+decks to its shell closes the cross-section into a tube with internal webs, and a
+wavefront that used to sweep one flat sheet has to cross a deck. `Substructure`'s
+interior band goes 125 → 455 and its Craig-Bampton 6.0 s → 57.7 s; at subdivision 2
+the banded static solve goes 1.1 s → 149 s, which is why `tools/section_probe` runs
+its resolution sweep untied.
+
+#### What it refuses
+
+- **Chains.** A node whose master is itself a slave is left untied and counted.
+  Composing a chain silently is a modelling error that assembles.
+- **Interface degrees of freedom.** A reduction keeps its interface *exactly* and
+  `applyBeamLoad` prescribes it; a degree of freedom cannot be both prescribed and
+  derived. `Substructure` refuses a constrained boundary DOF outright.
+- **A face overshoot past `junctionOvershoot`.** The weights are a partition of unity
+  but a `d` overshoot puts `−d/2` on a master, and a negative weight is a negative
+  share of the slave's steel in `TᵀMT`. `Substructure`'s positive-nodal-mass check is
+  the backstop. Unlike the eccentric fibre there is nothing to give up: a fibre
+  *extrapolates* and must abandon its first moment, while a junction interpolates and
+  keeps it.
+- **A degree of freedom both pinned and tied.** Two claims on one unknown, refused by
+  `solveStatic`.
+
+#### What mutation testing said
+
+The recurring shape in this repository is an error that cancels when asked globally,
+and a junction tie has exactly that shape — so the tests that carry the weight ask
+about the tie *alone*:
+
+- The constraint set is checked as an algebraic object before anything is solved
+  through it: `Σ w = 1` to 1.1e-16 (a rigid translation is reproduced exactly) and
+  `Σ w X_master = X_slave` to 8.9e-16 m (so is a rigid rotation). A weight dropped,
+  mis-scaled or attached to the wrong axis dies here and nowhere else — an energy
+  comparison would report it as a small stiffness change.
+- The constrained patch test: a plate whose boundary is prescribed to a linear field,
+  with an interior node eliminated in favour of the two either side. A linear field
+  satisfies that constraint identically, so the answer must be **exactly** the
+  unconstrained one — 6.5e-18 m of 3.0e-3. Its vacuity guard is a constraint the exact
+  field does *not* satisfy, which must move the answer.
+- The substructure's interior must be in equilibrium on the field `solveStatic` found
+  through the same constraints — two independent assemblies of one operator — while
+  the unconstrained substructure is not, on the same field.
+- The band the mesher reports is rebuilt from the mesh and the constraints in the
+  test, because a reported band that does not cover the assembly is a decoration.
+
+Thirty-two mutants, thirty killed. The two that survive are equivalent on every
+input this repository has and are recorded as such in `section.hpp` §5: no geometry
+here produces a **chain**, and the projection's Gauss-Newton lands in one step on
+every face here because they are all flat enough.
+
+**The run also found a defect older than any of this.** `Substructure::totalMass()`
+and `stiffnessTimes()` read past the end of arrays the constructor never sized when
+the substructure *refused* — reachable from an inverted element long before a
+constraint existed, and reported to the caller who skips `ready()` as a read of
+address zero. It surfaced as a segmentation fault three tests downstream of the
+mutant that provoked it, which is also how the mutation harness was found to be
+wrong: its first version counted `FAIL` lines only, and a crash prints none, so it
+scored **eight false survivors**. A mutation runner has to look at the exit code.
 
 ### Tier-1 to Tier-2 coupling — **implemented**
 

@@ -2346,6 +2346,150 @@ void testAttachedMass() {
 
 }  // namespace
 
+// --- The constraint the attachment carries but does not add ------------------------
+//
+// `Attachment::constrained` eliminates degrees of freedom where
+// `Attachment::stiffness` adds them, and the two go into the same assembly. What
+// has to be true of it is that the substructure and `solveStatic` -- two entirely
+// separate assemblies of the same physics -- reach the same answer through it, and
+// that the eliminated degrees of freedom leave the partition rather than sitting in
+// it with an empty row.
+void testConstrainedSubstructure() {
+    std::printf("\n--- reduction: a substructure with a degree of freedom tied away ---\n");
+    const solidshell::HexMesh mesh = testPlate();
+    const StructuralMaterial steel = ah36Steel();
+    const int sy = kNy + 1;
+    const auto index = [&](int i, int j, int k) {
+        return static_cast<std::uint32_t>((i * sy + j) * 2 + k);
+    };
+
+    // An interior node pair tied to the pairs either side of it along x, halfway
+    // between them. Not a junction -- this file has no second surface -- but the
+    // same shape of constraint: a mesh node with elements of its own, eliminated.
+    reduction::Attachment tied;
+    for (int k = 0; k < 2; ++k)
+        for (int axis = 0; axis < 3; ++axis)
+            tied.constrained.push_back(
+                {index(4, 2, k) * 3 + static_cast<std::uint32_t>(axis),
+                 {index(3, 2, k) * 3 + static_cast<std::uint32_t>(axis),
+                  index(5, 2, k) * 3 + static_cast<std::uint32_t>(axis)},
+                 {0.5, 0.5}});
+
+    const Substructure bare(mesh, steel, endInterface(mesh));
+    const Substructure sub(mesh, steel, endInterface(mesh), tied);
+    expectTrue("the constrained substructure factors", sub.ready());
+    // An eliminated degree of freedom is in neither partition: it is not an unknown.
+    expectEqualCount("six degrees of freedom leave the partition",
+                     bare.boundaryCount() + bare.interiorCount(),
+                     sub.boundaryCount() + sub.interiorCount() + 6);
+    expectEqualCount("the boundary is untouched", sub.boundaryCount(), bare.boundaryCount());
+    // The steel does not vanish with the unknown: `T^T M T`'s row sums are the
+    // weights, which are a partition of unity, so the total is preserved exactly.
+    expectNear("and the mass they carried went to their masters", sub.totalMass(),
+               bare.totalMass(), 1e-9 * bare.totalMass());
+
+    // The strong statement: the operator the substructure assembled is the operator
+    // `solveStatic` assembles, on a problem with a real answer. Prescribe the two
+    // ends and relax the interior both ways.
+    solidshell::HexMesh driven = mesh;
+    for (std::uint32_t node : endInterface(mesh)) {
+        const double x = mesh.position[node * 3];
+        driven.pin(node, 0, 2e-4 * x);
+        driven.pin(node, 1, 0.0);
+        driven.pin(node, 2, 0.0);
+    }
+    const std::vector<double> noLoad(mesh.nodeCount() * 3, 0.0);
+    std::vector<double> field;
+    std::string problem;
+    expectTrue("the constrained plate solves: " + problem,
+               solidshell::solveStatic(driven, steel, solidshell::Formulation::SolidShell, {},
+                                       tied.constrained, noLoad, field, &problem));
+
+    // `K u` over the substructure, with `u` the field `solveStatic` found. Every
+    // interior row must be in equilibrium -- that is what says the two assemblies
+    // are the same matrix -- and the eliminated rows must be exactly empty.
+    std::vector<double> reaction;
+    sub.stiffnessTimes(field, reaction);
+    double worstInterior = 0, worstEliminated = 0, boundaryScale = 0;
+    for (std::uint32_t d : sub.interiorDof()) worstInterior = std::max(worstInterior, std::fabs(reaction[d]));
+    for (const solidshell::Mpc& mpc : tied.constrained)
+        worstEliminated = std::max(worstEliminated, std::fabs(reaction[mpc.slave]));
+    for (std::uint32_t d : sub.boundaryDof())
+        boundaryScale = std::max(boundaryScale, std::fabs(reaction[d]));
+    std::printf("     interior residual %.2e N, eliminated rows %.2e N, boundary reaction %.2e N\n",
+                worstInterior, worstEliminated, boundaryScale);
+    expectTrue("the drive loaded the substructure", boundaryScale > 1e3);
+    expectTrue("the substructure's interior is in equilibrium on solveStatic's field",
+               worstInterior < 1e-9 * boundaryScale);
+    expectTrue("and an eliminated row is empty, not merely small", worstEliminated == 0.0);
+
+    // The vacuity guard: the *bare* substructure is not in equilibrium on that
+    // field, so "in equilibrium" is a statement about the constraint having been
+    // assembled and not about the field being trivial.
+    std::vector<double> bareReaction;
+    bare.stiffnessTimes(field, bareReaction);
+    double worstBare = 0;
+    for (std::uint32_t d : bare.interiorDof())
+        worstBare = std::max(worstBare, std::fabs(bareReaction[d]));
+    expectTrue("where the unconstrained operator is not", worstBare > 1e-3 * boundaryScale);
+
+    // **A node with only *one* axis eliminated is still an interior node**, and it
+    // is the case that tells the two places the partition is filtered apart: the
+    // node-level filter keeps it, so the per-degree-of-freedom skip has to drop the
+    // one axis. A junction tie never produces one -- it eliminates all three -- so
+    // without this the per-axis skip is dead code that looks alive.
+    {
+        reduction::Attachment oneAxis;
+        oneAxis.constrained.push_back({index(4, 2, 0) * 3,
+                                       {index(3, 2, 0) * 3, index(5, 2, 0) * 3}, {0.5, 0.5}});
+        const Substructure partial(mesh, steel, endInterface(mesh), oneAxis);
+        expectTrue("a partially constrained node still factors", partial.ready());
+        expectEqualCount("and gives up exactly the one degree of freedom",
+                         bare.boundaryCount() + bare.interiorCount(),
+                         partial.boundaryCount() + partial.interiorCount() + 1);
+        expectNear("keeping its mass", partial.totalMass(), bare.totalMass(),
+                   1e-9 * bare.totalMass());
+    }
+
+    // Reading a substructure that **refused** must not run off the end of what the
+    // constructor never built. Every early return leaves `nodeCount()` set from the
+    // mesh while the mass and the sparsity pattern are still empty, and a caller who
+    // skips `ready()` used to get a read of address zero. Mutation testing found it,
+    // as a segmentation fault three tests downstream of the mutant it was chasing,
+    // and it was reachable from an inverted element long before any constraint
+    // existed.
+    {
+        reduction::Attachment selfReferential;
+        selfReferential.constrained.push_back({0, {0}, {1.0}});
+        const Substructure refused(mesh, steel, endInterface(mesh), selfReferential);
+        expectTrue("a self-referential constraint is refused", !refused.ready());
+        expectTrue("and it still reports its node count", refused.nodeCount() > 0);
+        expectNear("its mass reads zero rather than reading out of bounds", refused.totalMass(),
+                   0.0, 0.0);
+        std::vector<double> probe(refused.dofCount(), 1.0), out;
+        refused.stiffnessTimes(probe, out);
+        expectEqualCount("and its operator is the zero operator", out.size(), refused.dofCount());
+        double any = 0;
+        for (double v : out) any = std::max(any, std::fabs(v));
+        expectNear("with nothing in it", any, 0.0, 0.0);
+    }
+
+    // Refusals. Both are modelling errors that would otherwise assemble.
+    {
+        reduction::Attachment onInterface;
+        onInterface.constrained.push_back({endInterface(mesh).front() * 3, {index(3, 2, 0) * 3},
+                                           {1.0}});
+        const Substructure refused(mesh, steel, endInterface(mesh), onInterface);
+        expectTrue("a constrained interface degree of freedom is refused", !refused.ready());
+    }
+    {
+        reduction::Attachment chained = tied;
+        chained.constrained.push_back({index(3, 2, 0) * 3, {index(2, 2, 0) * 3}, {1.0}});
+        const Substructure refused(mesh, steel, endInterface(mesh), chained);
+        expectTrue("and so is a chain", !refused.ready());
+    }
+}
+
 void runReductionTests() {
     std::printf("\n=== Tier-1 reduction (Craig-Bampton) ===\n");
     testDenseEigensolver();
@@ -2360,4 +2504,5 @@ void runReductionTests() {
     testTwoComponentsAssembleIntoTheWhole();
     testAttachedStiffness();
     testAttachedMass();
+    testConstrainedSubstructure();
 }
