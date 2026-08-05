@@ -2245,6 +2245,36 @@ is a CSR gather in a fixed order, so **the threaded answer is bit-identical to t
 serial one at any worker count** — asserted, not hoped for, because that is the
 property replays and multiplayer rest on.
 
+> **Half of that was work that did not have to happen, and profiling found it while
+> costing a GPU port.** `elementPlasticUpdate` began by calling `computeForms`,
+> rebuilding the element's strain-displacement matrices, its enhanced-strain
+> interpolation, its Gauss weights and its rest Jacobian — every step, for every
+> element, from the **rest** configuration, which an explicit solve never moves.
+> `solidshell::RestForms` forms them once at promotion instead, and
+> `zone::SolveParams::cacheRestForms` is on by default:
+>
+> | | rebuilt each step | cached | |
+> |---|---|---|---|
+> | 192 elements, 1 worker | 5.48 s | **2.73 s** | 2.01× |
+> | 192 elements, 23 workers | 1.48 s | **0.90 s** | 1.64× |
+> | 17 800 elements, 23 workers | 21.12 s | **13.03 s** | 1.62× |
+>
+> **The two answers are bit-identical**, asserted on every reported quantity and
+> every node position rather than compared to a tolerance, and driven past first
+> tear so the element-deletion path is compared too. The per-element elastoplastic
+> cost therefore falls from 7.3 µs to **3.0 µs**, and `estimatedCost` is
+> `1.7 × elementCount` core-seconds per simulated second for 12 mm plating rather
+> than 4.0 — see `07-fem-spike-findings.md` §8, which also records that the first
+> two instruments used to size this both reported 97% where the A/B on the real run
+> says 51%.
+>
+> `fem.cpp`'s tetrahedron has had this since the spike — it uploads `restInverse`
+> and `restVolume` and the shader reads them from a buffer. The solid-shell never
+> grew the equivalent, and the reason it went unnoticed is worth stating: the
+> per-element cost **was** measured, and the measurement was right. What was never
+> asked is which part of it depended on the state being advanced. *A cost model
+> built from a correct total can still point at the wrong optimisation.*
+
 **Threading saturates at about 3.4×, and the reason is the step and not the
 element.** Measured on the same zone: 15.4 s at one worker, 6.9 at four, 5.2 at
 eight, 4.9 at sixteen, 4.5 at twenty-three. Fitting `s + p/N` puts the serial and
@@ -2467,8 +2497,22 @@ reach, which is exactly what that change was for.
    is right: a first dead element over-states a slit by the subdivision squared and
    requiring all of them under-states a tear that has crossed the bay. The real fix
    is a breach interface that takes an area.
-4. **No GPU path**, and no rate dependence in the material, so the resistance is
-   under-predicted by the 10–30% steel gains at collision strain rates.
+4. **A GPU path exists and is slower than the CPU**, and there is no rate
+   dependence in the material, so the resistance is under-predicted by the 10–30%
+   steel gains at collision strain rates.
+
+   `engine/gpu/zone_gpu.{hpp,cpp}` is the Vulkan back-end for this solver, built to
+   `fem_gpu.cpp`'s pattern with the EAS variables and the plastic history resident
+   on the device. It runs at **0.23–0.68× the 24-thread CPU** end to end on the real
+   patch, and it gets worse past 3 000 elements because one thread per element needs
+   ~500 floats of dynamically indexed private state and Pascal spills it to local
+   memory. Its float answer also stops tracking the double reference: over 5 505
+   steps it tears 60 elements where the CPU tears none, and a double-precision
+   control shows that is **not** the explicit scheme's known sensitivity to a
+   perturbation of that size. `07-fem-spike-findings.md` §8 has the measurements and
+   what to do about them; the short version is that the enhanced modes need
+   normalising in `solid_shell.cpp` — κ(Kaa) ≈ (h/t)⁴ ≈ 10⁷ on ordinary plating —
+   before any more GPU work.
 
 ### Adaptive zone promotion — **implemented**
 

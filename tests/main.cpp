@@ -34,6 +34,7 @@ int main() {
     runOffscreenTests();
     runOceanTests();
     runHullRenderTests();
+    runZoneGpuTests();
 #elif defined(SHIPSIM_HAS_VULKAN)
     std::printf("\n--- vulkan device ---\n     skipped under ThreadSanitizer"
                 " (driver is not instrumented)\n");

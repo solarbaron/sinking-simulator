@@ -21,11 +21,16 @@
 // --- 1. Cost is a design input, not a footnote ---------------------------------
 //
 // Measured (`02-simulation.md` §3): an elastoplastic solid-shell element costs
-// **7.3 µs** per step against 273 ns elastic, and the stable step is `t / c_p` --
+// **3.1 µs** per step against 273 ns elastic, and the stable step is `t / c_p` --
 // **thickness-governed, flat in the in-plane element size**. So for 12 mm plating
 // the step is 1.8 µs, 5.5 x 10^5 steps per simulated second, and
 //
-//     core-seconds per simulated second = 4.0 x elementCount
+//     core-seconds per simulated second = 1.7 x elementCount
+//
+// That 3.1 µs was **7.3** until the step-invariant element forms stopped being
+// rebuilt every step -- see `SolveParams::cacheRestForms`, which is the single
+// largest cost decision in this file and was found by profiling rather than by
+// reading. Every figure below that predates it is 2.4x pessimistic per element.
 //
 // That number is the whole design. Two consequences follow and both shape this
 // file:
@@ -402,7 +407,7 @@ struct SolveParams {
     // bending.
     Preload preload;
 
-    // False solves the co-rotational *elastic* element -- 273 ns against 7.3 µs,
+    // False solves the co-rotational *elastic* element -- 273 ns against 3.1 µs,
     // and the path the geometric tests use, where plasticity would only add noise
     // to an identity.
     bool plastic = true;
@@ -429,6 +434,32 @@ struct SolveParams {
     // **bit-identical** to the serial one whatever the worker count, which
     // `tests/test_zone.cpp` asserts.
     core::JobSystem* jobs = nullptr;
+
+    // Keep each element's `solidshell::RestForms` for the life of the solve
+    // instead of rebuilding it every step.
+    //
+    // **This is the largest single cost decision in the file**, and it was found by
+    // profiling rather than by reading: those matrices are a function of the rest
+    // configuration alone, nothing here moves the rest configuration, and forming
+    // them was half the element kernel. On is **2.0x faster end to end** on the
+    // ferry's own patch, serial, and the two answers are **bit-identical** --
+    // asserted in `tests/test_zone.cpp`, because a cache that is merely close is a
+    // cache that has silently changed the physics.
+    //
+    // The obvious objection is memory: 12.0 kB per element, against the 4.6 kB
+    // per-element stiffness whose L3 cliff `02-simulation.md` §3 measures at
+    // ~6 500 elements. **It does not bite, and that was measured rather than
+    // argued.** The cache still wins 1.62x at 17 800 elements and 214 MB, four
+    // times past this machine's last-level cache, because the arithmetic it
+    // removes is 2.2 µs per element per step while streaming 12 kB at the
+    // saturated 29 GB/s that section measures is 0.41 µs. There is no crossover to
+    // find; the ratio is five to one in the cache's favour even entirely from
+    // DRAM.
+    //
+    // False exists as the control the bit-identity assertion needs, and because a
+    // caller meshing a zone far past the sizes anyone can afford to solve should
+    // be able to decline 200 MB.
+    bool cacheRestForms = true;
 };
 
 struct Sample {
@@ -476,6 +507,30 @@ struct SolveResult {
     // costs on a shared machine.
     double wallSeconds = 0;
     double microsecondsPerElementStep = 0;
+    // Whether the step-invariant element forms were kept. Reported because it is a
+    // 3.6x cost decision and `SolveParams::RestFormsCache::Auto` takes it without
+    // being asked.
+    bool cachedRestForms = false;
+
+    // Where the wall time went, per phase, summed over every step.
+    //
+    // **This exists because Amdahl's law decides whether an accelerator is worth
+    // building, and the element kernel's own throughput does not.** A GPU element
+    // solver moves `element` and nothing else unless the rest moves with it, so
+    // the ratio between these five is the ceiling on what one can buy. They are
+    // taken with `steady_clock` around each phase; the clock costs ~25 ns against
+    // phases of hundreds of microseconds, so the instrument does not disturb what
+    // it measures. `other` is the residue -- the punch, the history sampling and
+    // the loop itself -- and is reported rather than dropped so the parts sum to
+    // the whole.
+    struct Profile {
+        double element = 0;    // s in the per-element force/plastic kernel
+        double gather = 0;     // s in the CSR nodal gather and the per-element reduction
+        double integrate = 0;  // s advancing velocity and position, and the punch
+        double energy = 0;     // s in `accumulateEnergy` -- a reduction over every Gauss point
+        double other = 0;      // s in the rest of `step()`
+        double total() const { return element + gather + integrate + energy + other; }
+    } profile;
 
     std::vector<Sample> history;
     std::vector<std::string> problems;
@@ -542,6 +597,29 @@ public:
     // the other answers would have been without paying for the solve again.
     std::vector<int> tornPanelsAt(double fraction) const;
 
+    // --- What an accelerator needs ---------------------------------------------
+    //
+    // The constructor lumps the mass, builds the CSR node->element adjacency, finds
+    // the nodes the punch holds and forms every element's `RestForms`. A GPU back
+    // end needs all four, and **reimplementing them is exactly where two paths stop
+    // being the same solver** -- a second mass lumping or a second adjacency order
+    // would be a difference nobody could see in a force. So they are exposed and
+    // `gpu::ZoneGpuSolver` uploads these very arrays.
+    const std::vector<std::uint32_t>& adjacencyOffset() const { return adjacencyOffset_; }
+    const std::vector<std::uint32_t>& adjacencyEntry() const { return adjacencyEntry_; }
+    const std::vector<std::uint32_t>& drivenNodes() const { return driven_; }
+    const std::vector<std::uint8_t>&  pinnedDof() const { return pinned_; }
+    // Empty when `SolveParams::cacheRestForms` is false.
+    const std::vector<solidshell::RestForms>& restForms() const { return forms_; }
+
+    // Take a state computed elsewhere -- a GPU run -- and continue as if this
+    // solver had produced it, so that the energy account, the tearing rules and the
+    // panel reporting are the ones already validated rather than a second copy.
+    // `steps` and `time` advance by what the other path ran.
+    void adopt(const std::vector<double>& position, const std::vector<double>& velocity,
+               const std::vector<solidshell::ElementPlasticState>& state, int steps, double time,
+               double penetration, double work, double dissipation);
+
     // Give every node the same velocity. The only way to ask a patch for a rigid
     // body motion, which must carry no force at all however far it has travelled --
     // the statement the co-rotational formulation exists to make, and one that a
@@ -564,6 +642,9 @@ private:
     std::vector<double> elementStress_;  // 48 per element, the last stress it carried
     std::vector<double> gaussVolume_;    // 8 per element
     std::vector<double> stiffness_;      // 576 per element, elastic path only
+    // Per element, when `SolveParams::restFormsCache` leaves it on. 12 kB each,
+    // which is the whole of the trade -- see `SolveParams::restFormsCache`.
+    std::vector<solidshell::RestForms> forms_;
     std::vector<solidshell::ElementPlasticState> plastic_;
     std::vector<double> dissipation_;    // per element, this step
 

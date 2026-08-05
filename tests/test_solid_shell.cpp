@@ -1691,6 +1691,187 @@ void testCostPerElement() {
                tetCost / shellCost > 1.0e3);
 }
 
+
+// --- The cached rest forms ------------------------------------------------------
+//
+// `RestForms` is a pure optimisation: it holds the part of an element that depends
+// only on its rest configuration, so that an explicit solver stops rebuilding it
+// every step. The whole claim is that it is **the same arithmetic on the same
+// numbers**, so the assertion is bit equality and not a tolerance. A tolerance
+// here would pass a cache that had transposed the rest Jacobian, or that had been
+// filled from the *deformed* geometry, which are the two ways this can be wrong.
+//
+// Three guards against a vacuous pass, each because the obvious version of this
+// test proves nothing:
+//
+//   * the element is **distorted, rotated and past yield**, so every term the
+//     cache carries is actually loaded. On an undeformed axis-aligned cube the
+//     rest Jacobian is a multiple of the identity, where a transposed cache is
+//     the same cache;
+//   * the rotation is asserted to be **genuinely a rotation and not the identity**,
+//     because a cached `restJacobianInverse` that came back as zeros would give
+//     F = 0, and a polar decomposition of zero returns without touching its input;
+//   * the plastic state is asserted to have **actually yielded and advanced**, so
+//     the history comparison has something in it to compare.
+void testCachedRestFormsAreBitIdentical() {
+    const plasticity::Material material = plasticity::shipSteel();
+    const StructuralMaterial steel = steelMaterial();
+
+    // A plate element of the proportions a zone meshes -- 0.6 m x 0.175 m of 12 mm
+    // plating -- distorted in all three directions so the Jacobian is not diagonal
+    // and the enhanced modes are not decoupled from it.
+    double rest[kDof];
+    const double cx[kNodes] = {0, 1, 1, 0, 0, 1, 1, 0};
+    const double cy[kNodes] = {0, 0, 1, 1, 0, 0, 1, 1};
+    const double cz[kNodes] = {0, 0, 0, 0, 1, 1, 1, 1};
+    for (int a = 0; a < kNodes; ++a) {
+        rest[a * 3 + 0] = cx[a] * 0.60 + 0.07 * cy[a];   // in-plane trapezoid
+        rest[a * 3 + 1] = cy[a] * 0.175;
+        rest[a * 3 + 2] = cz[a] * 0.012 + 0.004 * cx[a];  // and a slope through it
+    }
+
+    // Deform it: a finite rotation on top of a bending-and-stretching field, so the
+    // co-rotational frame is doing real work rather than returning the identity.
+    const double angle = 0.7;
+    const double c = std::cos(angle), sn = std::sin(angle);
+    double current[kDof];
+    for (int a = 0; a < kNodes; ++a) {
+        const double x = rest[a * 3 + 0], y = rest[a * 3 + 1], z = rest[a * 3 + 2];
+        const double dx = x * 1.02 + 0.9 * x * x;
+        const double dy = y * 0.995;
+        const double dz = z + 0.05 * x;
+        current[a * 3 + 0] = c * dx - sn * dz;
+        current[a * 3 + 1] = dy;
+        current[a * 3 + 2] = sn * dx + c * dz;
+    }
+
+    RestForms forms;
+    expectTrue("the rest forms build on a distorted element",
+               computeRestForms(rest, Formulation::SolidShell, forms));
+    expectTrue("and carry all seven enhanced modes", forms.easCount == kEas);
+
+    // 1. The rotation.
+    double direct[9], cached[9];
+    elementRotation(rest, current, direct);
+    elementRotation(forms, current, cached);
+    bool sameRotation = true;
+    for (int i = 0; i < 9; ++i) sameRotation = sameRotation && direct[i] == cached[i];
+    expectTrue("the cached rotation is bit-identical to the recomputed one", sameRotation);
+    // Guard: a cache full of zeros gives F = 0, whose polar factor comes back as
+    // whatever `polarRotation` was handed. The rotation has to be a real one.
+    double offDiagonal = 0, orthogonality = 0;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) {
+            double s = 0;
+            for (int k = 0; k < 3; ++k) s += cached[k * 3 + i] * cached[k * 3 + j];
+            orthogonality = std::max(orthogonality, std::abs(s - (i == j ? 1.0 : 0.0)));
+            if (i != j) offDiagonal = std::max(offDiagonal, std::abs(cached[j * 3 + i]));
+        }
+    expectTrue("and it is orthogonal", orthogonality < 1e-12);
+    expectTrue("and it is not the identity, so the comparison had a rotation in it",
+               offDiagonal > 0.5);
+
+    // 2. The elastic internal force.
+    double stiffness[kDof * kDof];
+    elementStiffness(rest, steel, Formulation::SolidShell, stiffness);
+    double forceDirect[kDof], forceCached[kDof];
+    internalForce(stiffness, rest, current, forceDirect);
+    internalForce(forms, stiffness, rest, current, forceCached);
+    bool sameForce = true;
+    double biggest = 0;
+    for (int i = 0; i < kDof; ++i) {
+        sameForce = sameForce && forceDirect[i] == forceCached[i];
+        biggest = std::max(biggest, std::abs(forceDirect[i]));
+    }
+    expectTrue("the cached elastic internal force is bit-identical", sameForce);
+    expectTrue("and the element was carrying a force worth comparing", biggest > 1.0e5);
+
+    // 3. The elastoplastic update, including the history it commits. Stepped
+    // several times, because a stale cache is indistinguishable from a fresh one on
+    // the first call -- the failure mode is a cache that stops matching once the
+    // state has moved.
+    ElementPlasticState stateDirect, stateCached;
+    initialisePlasticState(rest, material, stateDirect);
+    initialisePlasticState(rest, material, stateCached);
+    bool sameUpdate = true, sameHistory = true;
+    double peakPlasticStrain = 0;
+    int totalYielded = 0;
+    for (int step = 1; step <= 6; ++step) {
+        double moving[kDof];
+        const double fraction = static_cast<double>(step) / 6.0;
+        for (int i = 0; i < kDof; ++i) moving[i] = rest[i] + fraction * (current[i] - rest[i]);
+
+        double fA[kDof], fB[kDof], sA[kGauss * 6], sB[kGauss * 6];
+        const PlasticUpdate a =
+            elementPlasticUpdate(rest, moving, material, Formulation::SolidShell, stateDirect, fA, sA);
+        const PlasticUpdate b =
+            elementPlasticUpdate(forms, rest, moving, material, stateCached, fB, sB);
+        for (int i = 0; i < kDof; ++i) sameUpdate = sameUpdate && fA[i] == fB[i];
+        for (int i = 0; i < kGauss * 6; ++i) sameUpdate = sameUpdate && sA[i] == sB[i];
+        sameUpdate = sameUpdate && a.dissipation == b.dissipation &&
+                     a.iterations == b.iterations && a.yieldedPoints == b.yieldedPoints;
+        for (int k = 0; k < kEas; ++k)
+            sameHistory = sameHistory && stateDirect.enhanced[k] == stateCached.enhanced[k];
+        for (int gp = 0; gp < kGauss; ++gp) {
+            sameHistory = sameHistory && stateDirect.point[gp].equivalentPlasticStrain ==
+                                             stateCached.point[gp].equivalentPlasticStrain;
+            for (int i = 0; i < plasticity::kVoigt; ++i)
+                sameHistory = sameHistory &&
+                              stateDirect.point[gp].backStress[i] == stateCached.point[gp].backStress[i];
+            peakPlasticStrain =
+                std::max(peakPlasticStrain, stateCached.point[gp].equivalentPlasticStrain);
+        }
+        totalYielded += a.yieldedPoints;
+    }
+    expectTrue("the cached elastoplastic update is bit-identical, six steps in", sameUpdate);
+    expectTrue("and so is the history it commits", sameHistory);
+    // Guard: two elastic elements agree trivially. The comparison is only worth
+    // anything if the return map, the enhanced-strain Newton and the history were
+    // all exercised.
+    std::printf("     cached rest forms: %d yielded point-steps, peak eps_p %.4f, rotation"
+                " %.2f rad\n", totalYielded, peakPlasticStrain, angle);
+    expectTrue("and the element genuinely yielded, so the history had something in it",
+               totalYielded > 0 && peakPlasticStrain > 1.0e-3);
+
+    // 4. An inverted element is refused, the same condition `elementStiffness`
+    // declines to work on -- so a caller cannot cache nonsense and then solve on it.
+    double folded[kDof];
+    for (int i = 0; i < kDof; ++i) folded[i] = rest[i];
+    std::swap(folded[0], folded[3]);   // node 0 and node 1 exchange x
+    std::swap(folded[1], folded[4]);
+    RestForms bad;
+    expectTrue("an inverted element has no rest forms",
+               !computeRestForms(folded, Formulation::SolidShell, bad) && !bad.ok);
+    // And the rotation off refused forms is the **identity**, not whatever a polar
+    // decomposition of a zero matrix happens to leave behind. Mutation testing put
+    // this here: dropping the guard passed everything, and what it returns then is a
+    // matrix of zeros -- which an explicit solver would happily use as a rotation.
+    double refusedRotation[9];
+    elementRotation(bad, current, refusedRotation);
+    bool identity = true;
+    for (int i = 0; i < 9; ++i)
+        identity = identity && refusedRotation[i] == (i % 4 == 0 ? 1.0 : 0.0);
+    expectTrue("a rotation off refused forms is exactly the identity", identity);
+    // Guard: the good forms must give something that is *not* the identity, or the
+    // check above is satisfied by a function that ignores its argument.
+    double goodRotation[9];
+    elementRotation(forms, current, goodRotation);
+    bool differs = false;
+    for (int i = 0; i < 9; ++i)
+        differs = differs || std::abs(goodRotation[i] - (i % 4 == 0 ? 1.0 : 0.0)) > 0.1;
+    expectTrue("and a rotation off good forms is not", differs);
+
+    // And an update off refused forms is a no-op rather than nonsense.
+    ElementPlasticState after;
+    initialisePlasticState(rest, material, after);
+    double refusedForce[kDof];
+    const PlasticUpdate refused =
+        elementPlasticUpdate(bad, rest, current, material, after, refusedForce);
+    bool zeroed = !refused.converged;
+    for (int i = 0; i < kDof; ++i) zeroed = zeroed && refusedForce[i] == 0.0;
+    expectTrue("and an update off them returns no force rather than a wrong one", zeroed);
+}
+
 }  // namespace
 
 void runSolidShellTests() {
@@ -1712,4 +1893,5 @@ void runSolidShellTests() {
     testLockingDemonstration();
     testExplicitStabilityLimit();
     testCostPerElement();
+    testCachedRestFormsAreBitIdentical();
 }
