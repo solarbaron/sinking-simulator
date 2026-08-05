@@ -1402,17 +1402,27 @@ void testPrescribedSolveAndMeshSurgery() {
     }
 }
 
-// --- 6. What Tier 1 cannot see: the stiffeners -----------------------------------
+// --- 6. The stiffeners a coupling has to hand over --------------------------------
 //
-// A `reduction::Substructure` is built from a `HexMesh` and a material. A
-// `zone::Patch` under `Stiffeners::Modelled` carries its members as
+// A `zone::Patch` under `Stiffeners::Modelled` carries its members as
 // `constraint::Stiffening` -- fibres condensed onto the plating's own DOF, with no
-// nodes of their own and no elements. **They are therefore invisible to Tier 1**,
-// and a stiffened zone is handed to the surrounding model as bare plating.
+// nodes of their own and no elements. A `reduction::Substructure` built from the
+// mesh alone therefore reduced a stiffened patch as **bare plating**, and that is
+// still exactly what happens if the caller does not hand the fibres over: it is
+// asserted below, to the last bit, as the negative control.
 //
-// This is measured rather than asserted in prose, because nothing tests a comment
-// and because the size of the error is the whole question: if the fibres were
-// worth a per cent it would be a footnote.
+// What has changed is that there is now something to hand over.
+// `reduction::Attachment` takes the `DofBlock` list `constraint::stiffnessBlocks`
+// already produced and the nodal mass `constraint::lumpFiberMass` already lumped,
+// and `reduction.hpp` §8 is what it costs. `tests/test_reduction.cpp` validates the
+// physics against closed forms; what this test owns is the *coupling* half of it --
+// that the patch a zone hands over and the substructure a coupling builds from it
+// are the same structure, which is a statement about `zone::Patch` and
+// `reduction::Substructure` agreeing, not about either alone.
+//
+// The size of the error is measured rather than asserted in prose, because nothing
+// tests a comment and because if the fibres were worth a per cent it would be a
+// footnote.
 void testTierOneCannotSeeTheStiffeners() {
     std::printf("\n--- coupling: the stiffeners a reduced model does not carry ---\n");
     StructuralMesh stiffened = flatPlate();
@@ -1432,8 +1442,8 @@ void testTierOneCannotSeeTheStiffeners() {
 
     // The same mesh and the same load, solved with and without the fibres'
     // condensed stiffness. `solveStatic` takes exactly the `DofBlock` list
-    // `constraint::stiffnessBlocks` produces -- and `reduction::Substructure` takes
-    // no such list, which is the gap.
+    // `constraint::stiffnessBlocks` produces, and so now does
+    // `reduction::Substructure`.
     const constraint::RestFibers forms =
         constraint::restFibers(patch.stiffening, patch.mesh.position);
     expectTrue("the fibres have rest lengths", forms.ok);
@@ -1473,8 +1483,9 @@ void testTierOneCannotSeeTheStiffeners() {
                 100.0 * worst / peak, stiff, bare);
     expectTrue("the fibres are worth a great deal more than a rounding", worst > 0.05 * peak);
 
-    // And the substructure a coupling would build from the same patch carries none
-    // of it: its operator is the element assembly and nothing else, to the last
+    // The negative control, and it is the behaviour a caller still gets by saying
+    // nothing: a substructure built from the mesh alone carries none of the
+    // stiffener. Its operator is the element assembly and nothing else, to the last
     // bit. That is the measurement, not the argument.
     reduction::Substructure zoneSub(patch.mesh, steel(), reduction::nodesPinned(patch.mesh));
     expectTrue("the substructure factors", zoneSub.ready());
@@ -1492,11 +1503,112 @@ void testTierOneCannotSeeTheStiffeners() {
     // 1e-12, because the measurement is 3e-16 relative: the two are the *same*
     // assembly, not two well-agreeing ones, and a loose tolerance here would pass
     // on a substructure that carried a little of the stiffener.
-    expectTrue("and a Tier-1 substructure of a stiffened patch is the bare plating",
+    expectTrue("a Tier-1 substructure given no attachment is the bare plating",
                gap < 1e-12 * scale);
-    std::printf("     and the substructure a coupling builds from it is the plating alone, "
-                "to %.1e of %.3e N\n",
+    std::printf("     a substructure given no attachment is the plating alone, to %.1e of "
+                "%.3e N\n",
                 gap, scale);
+
+    // And with the attachment the coupling now has to hand over, the same
+    // substructure is the stiffened patch. Two checks, because they fail
+    // differently: the operator against the element assembly *plus* the blocks --
+    // which is a statement about the scatter -- and the reduced static answer
+    // against `solveStatic` on the stiffened mesh, which is a statement about the
+    // interior factorisation and is the one that would catch a fibre lost outside
+    // the band.
+    reduction::Attachment attached;
+    attached.stiffness = blocks;
+    attached.mass.assign(patch.nodeCount(), 0.0);
+    constraint::lumpFiberMass(patch.stiffening, forms, steel().density, attached.mass);
+    // The interface is the perimeter the patch arrives clamped on *plus* the punch
+    // nodes, which is the same rule §3 of `reduction.hpp` states and the same one
+    // `zoneInterface` above uses: a degree of freedom something outside the reduced
+    // model drives has to be in the reduced model to be driven.
+    std::vector<std::uint32_t> stiffInterface = reduction::nodesPinned(patch.mesh);
+    for (std::size_t n : punch) stiffInterface.push_back(static_cast<std::uint32_t>(n));
+    std::sort(stiffInterface.begin(), stiffInterface.end());
+    stiffInterface.erase(std::unique(stiffInterface.begin(), stiffInterface.end()),
+                         stiffInterface.end());
+    reduction::Substructure stiffSub(patch.mesh, steel(), stiffInterface, attached);
+    expectTrue("the stiffened substructure factors", stiffSub.ready());
+    expectEqualCount("and carries every fibre", stiffSub.attachedBlocks(),
+                     patch.stiffening.fiberCount());
+    expectNear("with the stiffener's own steel", stiffSub.totalMass() - zoneSub.totalMass(),
+               patch.stiffening.mass, 1e-9 * patch.stiffening.mass);
+
+    std::vector<double> withBlocks;
+    stiffSub.stiffnessTimes(probe, withBlocks);
+    std::vector<double> reference = elementsOnly;
+    for (const solidshell::DofBlock& block : blocks) {
+        const std::size_t n = block.dof.size();
+        for (std::size_t p = 0; p < n; ++p)
+            for (std::size_t q = 0; q < n; ++q)
+                reference[block.dof[p]] += block.stiffness[p * n + q] * probe[block.dof[q]];
+    }
+    double stiffGap = 0, blockScale = 0;
+    for (std::size_t d = 0; d < withBlocks.size(); ++d) {
+        stiffGap = std::max(stiffGap, std::fabs(withBlocks[d] - reference[d]));
+        blockScale = std::max(blockScale, std::fabs(reference[d] - elementsOnly[d]));
+    }
+    expectTrue("the blocks are worth something on this probe", blockScale > 0.01 * scale);
+    expectTrue("and with one it is the elements plus every block, to the last bit",
+               stiffGap < 1e-12 * scale);
+    std::printf("     with one it is the elements plus the fibres, to %.1e of %.3e N\n", stiffGap,
+                scale);
+
+    // The static answer, against the same `solveStatic` the field measurement above
+    // came from. Guyan is exact at the interface for any load, so this is an
+    // identity limited only by two independent factorisations of the same problem.
+    reduction::ReduceParams zero;
+    zero.modes = 0;
+    const reduction::Reduction guyan = reduction::craigBampton(stiffSub, zero);
+    expectTrue("the stiffened patch reduces", !guyan.empty());
+    std::vector<std::uint32_t> held;
+    std::vector<coupling::Prescribed> drive;
+    for (std::size_t b = 0; b < stiffSub.boundaryCount(); ++b) {
+        const std::uint32_t d = stiffSub.boundaryDof()[b];
+        if (mesh.fixed[d]) {
+            if (mesh.prescribed[d] == 0.0)
+                held.push_back(static_cast<std::uint32_t>(b));
+            else
+                drive.push_back({static_cast<std::uint32_t>(b), mesh.prescribed[d]});
+        }
+    }
+    expectTrue("the punch is a prescribed interface displacement", !drive.empty());
+    reduction::Assembly alone;
+    alone.boundary = guyan.boundary;
+    alone.modes = guyan.modes;
+    alone.stiffness = guyan.stiffness;
+    alone.mass = guyan.mass;
+    std::vector<double> state;
+    expectTrue("the driven reduced model solves",
+               coupling::prescribedStaticSolve(alone, std::vector<double>(), held, drive, state,
+                                               &problem));
+    const std::vector<double> recovered = reduction::recover(stiffSub, guyan, state);
+    double recoveredGap = 0, field = 0;
+    for (std::size_t d = 0; d < recovered.size(); ++d) {
+        recoveredGap = std::max(recoveredGap, std::fabs(recovered[d] - withFibres[d]));
+        field = std::max(field, std::fabs(withFibres[d]));
+    }
+    // 1e-12 of the peak, where the measurement is 4e-14 relative: the load is a
+    // prescribed interface displacement and nothing else, so there is no truncation
+    // error to hide behind and the floor is two independent factorisations of the
+    // same system -- the same reason the recovered surrounding field elsewhere in
+    // this file comes back at 7e-15 m.
+    //
+    // And the control that says what is being discriminated *from*: a substructure
+    // that had lost the fibres would recover the **bare** field, which is the 7.9%
+    // measured at the top of this test and twelve orders outside that tolerance.
+    double toBare = 0;
+    for (std::size_t d = 0; d < recovered.size(); ++d)
+        toBare = std::max(toBare, std::fabs(recovered[d] - withoutFibres[d]));
+    expectTrue("and the reduced stiffened patch is the stiffened patch",
+               recoveredGap < 1e-12 * field);
+    expectTrue("rather than the bare one, which is what it would be without the attachment",
+               toBare > 0.05 * field);
+    std::printf("     the reduced stiffened patch reproduces solveStatic's own field to %.1e m "
+                "of %.3e m, where the bare plating is %.1e m away\n",
+                recoveredGap, field, toBare);
 }
 
 }  // namespace

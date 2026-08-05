@@ -588,12 +588,24 @@ struct Substructure::Impl {
     std::unique_ptr<solidshell::BandedSpd> factor;
     bool ready = false;
     double assemblySeconds = 0;
+    std::size_t attachedBlocks = 0;
+    double attachedMass = 0;
     std::vector<std::string> problems;
 
-    std::size_t csrIndex(std::uint32_t row, std::uint32_t col) const {
-        const std::size_t lo = rowStart[row], hi = rowStart[row + 1];
-        const auto it = std::lower_bound(column.begin() + static_cast<std::ptrdiff_t>(lo),
-                                         column.begin() + static_cast<std::ptrdiff_t>(hi), col);
+    // The slot for (row, col), or `value.size()` when the pattern has no such
+    // entry. **The miss is reported rather than assumed away**: `lower_bound` on a
+    // column the row does not carry returns the slot of the next one, so an
+    // unchecked scatter would add an attached stiffener's term to a *neighbouring*
+    // degree of freedom -- a plausible field, silently wrong, which is worse than
+    // dropping it -- and on the last row it returns `value.size()`, which is a
+    // write past the end. Element scatters can never miss, which is why the
+    // unchecked form was safe while elements were all there was; an arbitrary
+    // `DofBlock` is why it is not any more. See §8 item 1.
+    std::size_t csrSlot(std::uint32_t row, std::uint32_t col) const {
+        const auto begin = column.begin() + static_cast<std::ptrdiff_t>(rowStart[row]);
+        const auto end = column.begin() + static_cast<std::ptrdiff_t>(rowStart[row + 1]);
+        const auto it = std::lower_bound(begin, end, col);
+        if (it == end || *it != col) return value.size();
         return static_cast<std::size_t>(it - column.begin());
     }
 };
@@ -601,6 +613,11 @@ struct Substructure::Impl {
 Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMaterial& material,
                            const std::vector<std::uint32_t>& interfaceNodes,
                            solidshell::Formulation form)
+    : Substructure(mesh, material, interfaceNodes, Attachment{}, form) {}
+
+Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMaterial& material,
+                           const std::vector<std::uint32_t>& interfaceNodes,
+                           const Attachment& attached, solidshell::Formulation form)
     : impl_(std::make_unique<Impl>()) {
     Impl& s = *impl_;
     const double started = now();
@@ -633,6 +650,46 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
             break;
         }
 
+    // --- The attachment, checked before anything is sized from it (§8) ---
+    //
+    // A block naming a degree of freedom this mesh does not have, or carrying too
+    // small a stiffness array, is refused rather than skipped. `solveStatic` skips
+    // -- it is a one-shot solve and the caller sees the answer -- but a
+    // substructure is built once and asked thousands of times, and the whole point
+    // of this section is that a stiffener which quietly does not arrive is
+    // indistinguishable from bare plating.
+    for (std::size_t b = 0; b < attached.stiffness.size(); ++b) {
+        const solidshell::DofBlock& block = attached.stiffness[b];
+        const std::size_t n = block.dof.size();
+        if (block.stiffness.size() < n * n) {
+            s.problems.push_back("attached block " + std::to_string(b) + " has " +
+                                 std::to_string(block.stiffness.size()) + " stiffness entries for " +
+                                 std::to_string(n) + " degrees of freedom, not " +
+                                 std::to_string(n * n));
+            return;
+        }
+        for (std::uint32_t d : block.dof)
+            if (d >= s.dofs) {
+                s.problems.push_back("attached block " + std::to_string(b) +
+                                     " names degree of freedom " + std::to_string(d) +
+                                     ", which is not in a mesh of " + std::to_string(s.dofs));
+                return;
+            }
+    }
+    if (!attached.mass.empty() && attached.mass.size() != s.nodes) {
+        s.problems.push_back("the attached mass is " + std::to_string(attached.mass.size()) +
+                             " long; it is one entry per node, so it must be " +
+                             std::to_string(s.nodes) + " or empty");
+        return;
+    }
+    if (!attached.stiffness.empty() && attached.mass.empty())
+        s.problems.push_back(
+            "attached stiffness with no attached mass: the reduced model is stiffer than the "
+            "plating but no heavier, so its frequencies come out high -- "
+            "`constraint::lumpFiberMass` is what fills this in");
+    s.attachedBlocks = attached.stiffness.size();
+    for (double m : attached.mass) s.attachedMass += m;
+
     // --- Node adjacency, then the CSR pattern over its degrees of freedom ---
     std::vector<std::vector<std::uint32_t>> nodeAdjacency(s.nodes);
     for (std::size_t e = 0; e < elements; ++e)
@@ -641,6 +698,18 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
             for (int b = 0; b < kNodes; ++b)
                 nodeAdjacency[na].push_back(mesh.index[e * kNodes + static_cast<std::size_t>(b)]);
         }
+    // The attachment joins the adjacency *here*, before the pattern is sized, not
+    // as an afterthought once it exists. Everything downstream is derived from
+    // this one list -- the CSR, the interior renumbering, and the bandwidth taken
+    // from the assembled pattern -- so a block that reaches outside the elements'
+    // own reach is carried by all three or by none of them. §8 items 1 and 2.
+    //
+    // Node granularity, because the CSR gives every row of a node the same length:
+    // a block naming one axis of a node gets the whole 3 x 3 sub-block, which is a
+    // superset of what it needs and costs a handful of structural zeros.
+    for (const solidshell::DofBlock& block : attached.stiffness)
+        for (std::uint32_t p : block.dof)
+            for (std::uint32_t q : block.dof) nodeAdjacency[p / 3].push_back(q / 3);
     for (auto& list : nodeAdjacency) {
         std::sort(list.begin(), list.end());
         list.erase(std::unique(list.begin(), list.end()), list.end());
@@ -662,6 +731,13 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
         }
 
     // --- Element stiffness and lumped mass ---
+    //
+    // Every scatter below goes through `csrSlot`, which returns `value.size()` on a
+    // pattern miss. The element scatters cannot miss -- the pattern is built from
+    // their own adjacency -- and are checked anyway, because the counter is what
+    // makes the attachment's "the pattern covers it by construction" a measurement
+    // instead of a claim: delete the adjacency fold above and this fires.
+    std::size_t patternMisses = 0;
     s.massDiag.assign(s.dofs, 0.0);
     std::vector<double> ke(static_cast<std::size_t>(kDof) * kDof);
     for (std::size_t e = 0; e < elements; ++e) {
@@ -676,9 +752,14 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
                 dof[a * 3 + k] = n * 3 + static_cast<std::uint32_t>(k);
         }
         for (int p = 0; p < kDof; ++p)
-            for (int q = 0; q < kDof; ++q)
-                s.value[s.csrIndex(dof[p], dof[q])] +=
-                    ke[static_cast<std::size_t>(p) * kDof + static_cast<std::size_t>(q)];
+            for (int q = 0; q < kDof; ++q) {
+                const std::size_t slot = s.csrSlot(dof[p], dof[q]);
+                if (slot >= s.value.size()) {
+                    ++patternMisses;
+                    continue;
+                }
+                s.value[slot] += ke[static_cast<std::size_t>(p) * kDof + static_cast<std::size_t>(q)];
+            }
 
         double lumped[kNodes];
         solidshell::elementMass(nodePos, material.density, lumped);
@@ -689,6 +770,41 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
                     lumped[a];
         }
     }
+
+    // --- The attachment's stiffness, into the same CSR the elements went into ---
+    for (const solidshell::DofBlock& block : attached.stiffness) {
+        const std::size_t n = block.dof.size();
+        for (std::size_t p = 0; p < n; ++p)
+            for (std::size_t q = 0; q < n; ++q) {
+                const std::size_t slot = s.csrSlot(block.dof[p], block.dof[q]);
+                if (slot >= s.value.size()) {
+                    ++patternMisses;
+                    continue;
+                }
+                s.value[slot] += block.stiffness[p * n + q];
+            }
+    }
+    // Like the band check further down, this cannot fire while the adjacency fold
+    // above is right, and mutation testing confirms no single edit reaches it. It
+    // is the executable form of the invariant that fold exists to establish, and
+    // the alternative to reporting a miss is a stiffener landing on a neighbouring
+    // degree of freedom, which is a field nothing downstream could tell from an
+    // answer.
+    if (patternMisses != 0) {
+        s.problems.push_back(
+            std::to_string(patternMisses) +
+            " stiffness entries had no slot in the sparsity pattern and were dropped; the "
+            "pattern does not cover what was assembled into it");
+        return;
+    }
+
+    // --- And its mass, onto the same lumped diagonal (§8 item 3) ---
+    // One entry per node, spread over that node's three translations, exactly as
+    // the element mass above is: an isotropic point mass, which is what a lumped
+    // mass matrix means.
+    for (std::size_t n = 0; n < attached.mass.size(); ++n)
+        for (int k = 0; k < 3; ++k) s.massDiag[n * 3 + static_cast<std::size_t>(k)] += attached.mass[n];
+
     for (std::size_t d = 0; d < s.dofs; ++d)
         if (!(s.massDiag[d] > 0.0)) {
             s.problems.push_back("node " + std::to_string(d / 3) +
@@ -833,12 +949,43 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
         }
     }
     s.factor = std::make_unique<solidshell::BandedSpd>(ni, s.band);
+    // **`BandedSpd::add` drops an entry outside the band without a word**, and an
+    // attached block can tie degrees of freedom no element shares -- which is
+    // precisely how a band computed from the elements alone ends up one short and
+    // the interior solve ends up quietly back at the bare plating. The band above
+    // is taken from the assembled pattern, which carries the blocks, so it covers
+    // them; this counts what was offered against what the band admits, so that
+    // "covers them" is measured rather than asserted.
+    //
+    // **Which means it cannot fire while the band above is right, and mutation
+    // testing says so rather than leaving it to be assumed**: no single edit to
+    // this file reaches it. Two together do -- a band capped at what the elements
+    // imply *and* this check deleted -- and the tests kill that combination as
+    // well, so what the check buys is a stated reason in `problems()` in place of
+    // what that mutant actually delivered, which was a segmentation fault three
+    // tests later. It is kept as the executable form of the invariant the band is
+    // chosen to satisfy, and it costs one comparison per stored entry.
+    std::size_t outsideBand = 0;
     for (std::size_t p = 0; p < ni; ++p) {
         const std::uint32_t row = s.interior[p];
         for (std::size_t k = s.rowStart[row]; k < s.rowStart[row + 1]; ++k) {
             const std::int32_t q = s.interiorSlot[s.column[k]];
-            if (q >= 0) s.factor->add(p, static_cast<std::size_t>(q), s.value[k]);
+            if (q < 0) continue;
+            const std::size_t qq = static_cast<std::size_t>(q);
+            if ((p > qq ? p - qq : qq - p) > s.band) {
+                ++outsideBand;
+                continue;
+            }
+            s.factor->add(p, qq, s.value[k]);
         }
+    }
+    if (outsideBand != 0) {
+        s.problems.push_back(std::to_string(outsideBand) +
+                             " interior stiffness entries fell outside the half bandwidth of " +
+                             std::to_string(s.band) +
+                             " and were dropped; the band does not cover the assembly");
+        s.factor.reset();
+        return;
     }
     if (!s.factor->factor()) {
         s.problems.push_back(
@@ -864,6 +1011,8 @@ std::size_t Substructure::boundaryCount() const { return impl_->boundary.size();
 std::size_t Substructure::interiorCount() const { return impl_->interior.size(); }
 std::size_t Substructure::halfBandwidth() const { return impl_->band; }
 double Substructure::assemblySeconds() const { return impl_->assemblySeconds; }
+std::size_t Substructure::attachedBlocks() const { return impl_->attachedBlocks; }
+double Substructure::attachedMass() const { return impl_->attachedMass; }
 const std::vector<std::uint32_t>& Substructure::boundaryDof() const { return impl_->boundary; }
 const std::vector<std::uint32_t>& Substructure::interiorDof() const { return impl_->interior; }
 const std::vector<double>& Substructure::mass() const { return impl_->massDiag; }

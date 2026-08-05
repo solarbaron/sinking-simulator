@@ -31,6 +31,7 @@
 // never excited, nor a convergence study whose first point is already converged.
 // Each of those is checked explicitly, with the negative control beside it.
 #include "engine/sim/reduction.hpp"
+#include "engine/sim/constraint.hpp"
 #include "engine/sim/scantlings.hpp"
 #include "engine/sim/solid_shell.hpp"
 #include "engine/sim/zone.hpp"
@@ -154,6 +155,65 @@ std::vector<double> fullFrequencies(const Substructure& sub,
     out.reserve(spectrum.value.size());
     for (double value : spectrum.value) out.push_back(std::sqrt(std::max(0.0, value)));
     return out;
+}
+
+// --- A stiffener on the test plate, for §8 ---------------------------------------
+//
+// `makePlateMesh` numbers the thickness index fastest, then y, then x -- its own
+// header says so and says why (the bandwidth). The node lookup below depends on
+// that, so `stiffenSeam` checks the coordinates of every node it picks rather than
+// trusting the formula: a renumbering would otherwise put the stiffener somewhere
+// else on the plate and every measurement here would still be self-consistent.
+std::uint32_t plateNode(int i, int j, int k) {
+    return static_cast<std::uint32_t>((i * (kNy + 1) + j) * 2 + k);
+}
+
+// One stiffener along the plate's own x direction at the row `j`, with a station
+// every `stride` mesh nodes. `stride > 1` is a stiffener modelled coarser than the
+// plating it sits on, which is the case whose fibres tie node pairs no single
+// element shares -- see §8 item 2, and the band it widens.
+constraint::Stiffening stiffenSeam(const solidshell::HexMesh& mesh,
+                                   const StructuralMaterial& material,
+                                   const StiffenerProfile& profile, int j, int stride,
+                                   bool axisAligned = true) {
+    constraint::SeamRun run;
+    run.sign = 1.0;  // the pair runs -z to +z here, so a web rising in +z is +1
+    for (int i = 0; i <= kNx; i += stride) {
+        const std::uint32_t bottom = plateNode(i, j, 0), top = plateNode(i, j, 1);
+        if (axisAligned) {
+            expectNear("the seam station is where the mesh numbering says",
+                       mesh.position[bottom * 3], kLx * static_cast<double>(i) / kNx, 1e-12);
+            expectNear("and on the row it was asked for", mesh.position[bottom * 3 + 1],
+                       kLy * static_cast<double>(j) / kNy, 1e-12);
+        }
+        expectNear("with the pair through the thickness", mesh.position[top * 3 + 2] -
+                                                              mesh.position[bottom * 3 + 2],
+                   kThickness, 1e-15);
+        run.bottom.push_back(bottom);
+        run.top.push_back(top);
+    }
+    constraint::Stiffening out;
+    out.material = material;
+    out.members = 1;
+    constraint::addStiffener(run, profile, kThickness, mesh.position, out);
+    return out;
+}
+
+// The `Attachment` a caller assembles from a `Stiffening`, which is the whole of
+// the integration §8 describes: two calls into `constraint.hpp` and nothing else.
+reduction::Attachment attachmentOf(const constraint::Stiffening& stiffening,
+                                   const solidshell::HexMesh& mesh,
+                                   const StructuralMaterial& material, bool withMass) {
+    const constraint::RestFibers forms = constraint::restFibers(stiffening, mesh.position);
+    expectTrue("every fibre has a rest length", forms.ok);
+    reduction::Attachment attached;
+    attached.stiffness = constraint::stiffnessBlocks(stiffening, mesh.position, forms,
+                                                     material.youngsModulus);
+    if (withMass) {
+        attached.mass.assign(mesh.nodeCount(), 0.0);
+        constraint::lumpFiberMass(stiffening, forms, material.density, attached.mass);
+    }
+    return attached;
 }
 
 double misesOf(const double* s) {
@@ -1738,6 +1798,552 @@ void testTwoComponentsAssembleIntoTheWhole() {
     }
 }
 
+// --- 11. Stiffness the elements do not carry (§8) ---------------------------------
+//
+// A stiffener is condensed onto the plating's degrees of freedom, so it has no
+// nodes and no elements and a substructure built from the mesh alone reduces a
+// stiffened patch as bare plating. `Attachment` is what closes that, and the
+// assertions here are almost all identities rather than tolerances:
+//
+//   * The **energy an attachment adds under a prescribed strain field is a closed
+//     form in the profile's area, first moment and second moment**, and those three
+//     come from `scantlings::profileSection` -- a different file, computing them
+//     from the rectangle dimensions, owing nothing to the fibres. That single
+//     measurement catches a wrong area, a wrong eccentricity *sign*, and a lost
+//     Steiner term, which is the failure `scantlings.hpp` §1 exists to prevent.
+//   * The **static answer is `solidshell::solveStatic` with the same blocks**: a
+//     different assembly, a different numbering and a different factorisation of
+//     the same physics, and Guyan is exact at the interface for any load.
+//   * The **negative control is bit equality**. An empty attachment must not be
+//     close to what a substructure did before this section existed; it must be the
+//     same bits, and it is, because both constructors are one code path.
+void testAttachedStiffness() {
+    std::printf("\n--- reduction: the stiffener the elements do not carry ---\n");
+    const solidshell::HexMesh mesh = testPlate();
+    const StructuralMaterial steel = ah36Steel();
+    const StiffenerProfile profile = flatBar(0.200, 0.010);
+    const constraint::Stiffening seam = stiffenSeam(mesh, steel, profile, kNy / 2, 1);
+    expectEqualCount("the seam carries two fibres per segment of a flat bar", seam.fiberCount(),
+                     static_cast<std::size_t>(2 * kNx));
+    expectNear("and covers the whole plate", seam.length, kLx, 1e-12);
+
+    const reduction::Attachment attached = attachmentOf(seam, mesh, steel, true);
+    const Substructure bare(mesh, steel, endInterface(mesh));
+    const Substructure sub(mesh, steel, endInterface(mesh), attached);
+    expectTrue("the attached substructure factors", sub.ready());
+    expectEqualCount("and carries one block per fibre", sub.attachedBlocks(), seam.fiberCount());
+
+    // --- The negative control, first, because everything else rests on it ---
+    //
+    // Not "close": the same bits. The unattached constructor delegates to the
+    // attached one with an empty `Attachment`, so there is a single assembly path
+    // and a difference of one ulp would mean the empty case had grown a branch of
+    // its own.
+    {
+        const Substructure empty(mesh, steel, endInterface(mesh), reduction::Attachment{});
+        expectEqual("an empty attachment leaves the bandwidth alone",
+                    static_cast<long long>(empty.halfBandwidth()),
+                    static_cast<long long>(bare.halfBandwidth()));
+        expectEqualCount("and the partition", empty.boundaryCount(), bare.boundaryCount());
+        std::vector<double> probe(bare.dofCount(), 0.0), fromEmpty, fromBare;
+        for (std::size_t d = 0; d < probe.size(); ++d)
+            probe[d] = 1e-6 * static_cast<double>((d * 37u) % 19u) - 9e-6;
+        empty.stiffnessTimes(probe, fromEmpty);
+        bare.stiffnessTimes(probe, fromBare);
+        double scale = 0;
+        bool identical = fromEmpty.size() == fromBare.size();
+        for (std::size_t d = 0; d < fromBare.size() && identical; ++d) {
+            scale = std::max(scale, std::fabs(fromBare[d]));
+            identical = fromEmpty[d] == fromBare[d];
+        }
+        expectTrue("the probe loads the operator", scale > 1.0);
+        expectTrue("an empty attachment is the bare operator to the last bit", identical);
+        bool sameMass = empty.mass().size() == bare.mass().size();
+        for (std::size_t d = 0; d < bare.mass().size() && sameMass; ++d)
+            sameMass = empty.mass()[d] == bare.mass()[d];
+        expectTrue("and the same mass to the last bit", sameMass);
+        expectNear("with nothing attached to report", empty.attachedMass(), 0.0, 0.0);
+        expectEqualCount("and no blocks", empty.attachedBlocks(), 0u);
+    }
+
+    // --- What the blocks are worth, in closed form ---
+    //
+    // Prescribe `u_x = (eps + kappa z) x` and nothing else. Every fibre lies along
+    // x, so the tie reads only `u_x`, and the tied point at offset `e` moves by
+    // `(eps + kappa e) x` **exactly** -- that is what `tieWeight` is defined to
+    // deliver. A fibre of area `A_j` over a span `L_j` then stores
+    // `E A_j L_j (eps + kappa e_j)^2` of `u^T K u`, so summed over the seam
+    //
+    //     u^T K_attached u - u^T K_bare u = E L (eps^2 A + 2 eps kappa S + kappa^2 I)
+    //
+    // with A, S and I the profile's area, first moment and second moment about the
+    // **plate mid-surface**. The plate's own contribution cancels between the two
+    // operators whatever its discretisation error, so this is an identity and not a
+    // convergence statement. `eps` and `kappa` are both non-zero on purpose: with
+    // either one alone the cross term S drops out, and S is the only quantity here
+    // that knows which side of the plate the web is on.
+    const ProfileSection section = profileSection(profile);
+    const double centroid = 0.5 * kThickness + section.centroid;
+    const double area = section.area;
+    const double firstMoment = section.area * centroid;
+    const double secondMoment = section.secondMoment + section.area * centroid * centroid;
+    {
+        // The same second moment out of `stiffenedSection`, which computes it about
+        // the *combined* neutral axis and therefore by a different route: the
+        // parallel axis theorem takes it back to the mid-surface, and the plate's
+        // own b t^3 / 12 comes off. Two files, two formulas, one number.
+        const StiffenedSection panel = stiffenedSection(profile, kThickness, kLy);
+        const double aboutMidSurface =
+            panel.secondMoment + panel.area * panel.neutralAxis * panel.neutralAxis;
+        const double plateOwn = kLy * kThickness * kThickness * kThickness / 12.0;
+        expectNear("the two section routines agree about the profile's second moment",
+                   aboutMidSurface - plateOwn, secondMoment, 1e-16 * secondMoment);
+        // And the axial one, against the smeared thickness the Tier-0 beam uses:
+        // t + A/s is the same statement as "the fibres carry A".
+        expectNear("and about its area, against the smeared thickness",
+                   (smearedThickness(kThickness, profile, kLy) - kThickness) * kLy, area,
+                   1e-15 * area);
+    }
+
+    const double kStrain = 1e-4, kCurvature = 1e-3;
+    {
+        std::vector<double> u(sub.dofCount(), 0.0), attachedForce, bareForce;
+        for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+            const double x = mesh.position[n * 3], z = mesh.position[n * 3 + 2];
+            u[n * 3] = (kStrain + kCurvature * z) * x;
+        }
+        sub.stiffnessTimes(u, attachedForce);
+        bare.stiffnessTimes(u, bareForce);
+        double added = 0, bareEnergy = 0;
+        for (std::size_t d = 0; d < u.size(); ++d) {
+            added += u[d] * (attachedForce[d] - bareForce[d]);
+            bareEnergy += u[d] * bareForce[d];
+        }
+        const double predicted =
+            steel.youngsModulus * seam.length *
+            (kStrain * kStrain * area + 2.0 * kStrain * kCurvature * firstMoment +
+             kCurvature * kCurvature * secondMoment);
+        // 1e-11 relative: the measurement is 2.2e-13, limited by the cancellation
+        // between two operators that agree to a part in sixteen everywhere the
+        // fibres are not. A per-cent tolerance would pass on a stiffener that had
+        // lost `I_own` -- 23% of this number -- or had its web on the wrong side,
+        // which moves it by 4 * eps * kappa * S.
+        expectNear("the attachment adds exactly the profile's A, S and I", added, predicted,
+                   1e-11 * predicted);
+        expectTrue("and it is not a rounding on top of the plating", added > 0.05 * bareEnergy);
+        std::printf("     prescribed strain %g + curvature %g: fibres add %.6e J, closed form "
+                    "%.6e (%.1e relative), %.1f%% of the plating's own\n",
+                    kStrain, kCurvature, added, predicted, std::fabs(added - predicted) / predicted,
+                    100.0 * added / bareEnergy);
+
+    }
+
+    // Per degree of freedom, against the blocks summed by hand. The energy above is
+    // one scalar and a dropped off-diagonal can cancel inside it -- two recent
+    // mutants in this repo died only when the suspect entry was asked about alone,
+    // both of them errors that cancelled when the model was asked globally.
+    //
+    // **Not the strain field**: a uniform fibre strain is in equilibrium at every
+    // interior station, so the two fibres meeting there cancel and only the ends of
+    // the seam carry force. The probe below is deliberately incoherent, so every
+    // degree of freedom a block can load is loaded and each can be checked on its
+    // own.
+    //
+    // It is run on the plate turned 45 degrees as well, and that is the check that
+    // carries the content. A bar has stiffness along its own axis and none across
+    // it (`constraint.hpp` §2), so on the axis-aligned seam every block is a
+    // rank-one form in the x components alone -- an assembly that transposed an
+    // axis, or that dropped one, would scatter zeros onto zeros and agree
+    // perfectly. Turned 45 degrees the same seam loads x and y equally, and the two
+    // are no longer interchangeable.
+    for (int turned = 0; turned < 2; ++turned) {
+        const solidshell::HexMesh plate = turned ? rotatedPlate() : testPlate();
+        const constraint::Stiffening line =
+            stiffenSeam(plate, steel, profile, kNy / 2, 1, turned == 0);
+        const reduction::Attachment blocks = attachmentOf(line, plate, steel, true);
+        const std::vector<std::uint32_t> interface =
+            turned ? rotatedEndInterface(plate) : endInterface(plate);
+        const Substructure on(plate, steel, interface, blocks);
+        const Substructure off(plate, steel, interface);
+        expectTrue("the substructure factors", on.ready() && off.ready());
+
+        std::vector<double> probe(on.dofCount(), 0.0), attachedForce, bareForce;
+        for (std::size_t d = 0; d < probe.size(); ++d)
+            probe[d] = 1e-6 * static_cast<double>((d * 41u) % 23u) - 1.1e-5;
+        on.stiffnessTimes(probe, attachedForce);
+        off.stiffnessTimes(probe, bareForce);
+
+        std::vector<double> byHand(probe.size(), 0.0);
+        for (const solidshell::DofBlock& block : blocks.stiffness) {
+            const std::size_t n = block.dof.size();
+            for (std::size_t p = 0; p < n; ++p)
+                for (std::size_t q = 0; q < n; ++q)
+                    byHand[block.dof[p]] += block.stiffness[p * n + q] * probe[block.dof[q]];
+        }
+        std::size_t loaded = 0;
+        double worst = 0, peak = 0;
+        for (double v : byHand) peak = std::max(peak, std::fabs(v));
+        for (std::size_t d = 0; d < probe.size(); ++d) {
+            worst = std::max(worst, std::fabs((attachedForce[d] - bareForce[d]) - byHand[d]));
+            if (std::fabs(byHand[d]) > 1e-6 * peak) ++loaded;
+        }
+        // Two nodes at each of the nine stations, times one axis flat and two
+        // turned. Asserted rather than counted at run time, because "however many
+        // it happened to load" would make the per-DOF check below vacuous exactly
+        // when a scatter had gone missing.
+        expectEqualCount("the fibres load one axis of the pair when the seam is axis aligned "
+                         "and two when it is not",
+                         loaded, static_cast<std::size_t>((turned ? 2 : 1) * 2 * (kNx + 1)));
+        expectTrue("every degree of freedom gets exactly its own share of the blocks",
+                   worst < 1e-9 * peak);
+        std::printf("     scatter%s: %zu degrees of freedom, each to %.2e N of %.3e N\n",
+                    turned ? " (seam at 45 degrees)" : "", loaded, worst, peak);
+    }
+
+    // --- The static answer, against a reference that owes nothing to this file ---
+    //
+    // `solidshell::solveStatic` takes the same `DofBlock` list, assembles it into
+    // its own banded system with its own free-DOF numbering, and factors it once.
+    // Guyan condensation is exact at the interface for any load (§1 property 1), so
+    // the two must agree to the conditioning of two independent solves -- and that
+    // is the assertion that would fail if any part of the attachment failed to
+    // reach `K_ii`, because `Psi` is `-K_ii^-1 K_ib` and nothing else.
+    //
+    // `stride` 2 is the case §8 item 2 is about: fibres spanning two elements tie
+    // node pairs that share no element, so the sparsity pattern has to grow and the
+    // band with it. It is checked that the band really did grow, because a case
+    // that did not need one would test nothing.
+    for (int stride : {1, 2}) {
+        const constraint::Stiffening run = stiffenSeam(mesh, steel, profile, kNy / 2, stride);
+        const reduction::Attachment attach = attachmentOf(run, mesh, steel, true);
+        const Substructure strided(mesh, steel, endInterface(mesh), attach);
+        expectTrue("the strided substructure factors", strided.ready());
+        if (stride > 1)
+            expectTrue("a fibre spanning two elements widens the band the elements imply",
+                       strided.halfBandwidth() > bare.halfBandwidth());
+        else
+            expectEqual("a fibre inside one element does not",
+                        static_cast<long long>(strided.halfBandwidth()),
+                        static_cast<long long>(bare.halfBandwidth()));
+
+        solidshell::HexMesh pinned = testPlate();
+        std::vector<double> load(strided.dofCount(), 0.0);
+        std::vector<std::uint32_t> held;
+        for (std::size_t b = 0; b < strided.boundaryCount(); ++b) {
+            const std::uint32_t d = strided.boundaryDof()[b];
+            if (mesh.position[(d / 3) * 3] < 0.5 * kLx) {
+                held.push_back(static_cast<std::uint32_t>(b));
+                pinned.pin(d / 3, static_cast<int>(d % 3), 0.0);
+            } else if (d % 3 == 2) {
+                load[d] = 1000.0;
+            }
+        }
+        std::vector<double> reference, withoutFibres;
+        std::string problem;
+        expectTrue("the stiffened plate solves",
+                   solidshell::solveStatic(pinned, steel, solidshell::Formulation::SolidShell,
+                                           attach.stiffness, load, reference, &problem));
+        expectTrue("and the bare one",
+                   solidshell::solveStatic(pinned, steel, solidshell::Formulation::SolidShell, load,
+                                           withoutFibres, &problem));
+        double peak = 0, barePeak = 0, stiffening = 0;
+        for (std::size_t d = 0; d < reference.size(); ++d) {
+            peak = std::max(peak, std::fabs(reference[d]));
+            barePeak = std::max(barePeak, std::fabs(withoutFibres[d]));
+            stiffening = std::max(stiffening, std::fabs(reference[d] - withoutFibres[d]));
+        }
+        expectTrue("the load moves the plate", peak > 1e-4);
+        // The vacuity guard the whole exercise exists for: without the stiffener
+        // the answer is the bare plating, and the difference must be a large
+        // fraction of the field rather than a correction to it.
+        expectTrue("and the stiffener is worth far more than a rounding of it",
+                   stiffening > 0.5 * barePeak);
+
+        ReduceParams zero;
+        zero.modes = 0;
+        const Reduction guyan = craigBampton(strided, zero);
+        std::vector<double> state;
+        expectTrue("the reduced stiffened model solves",
+                   reduction::staticSolve(guyan, reduction::reduceLoad(strided, guyan, load), held,
+                                          state, &problem));
+        const std::vector<double> u = reduction::recover(strided, guyan, state);
+        double worstBoundary = 0, worstInterior = 0;
+        for (std::size_t b = 0; b < strided.boundaryCount(); ++b) {
+            const std::uint32_t d = strided.boundaryDof()[b];
+            worstBoundary = std::max(worstBoundary, std::fabs(u[d] - reference[d]));
+        }
+        for (std::size_t p = 0; p < strided.interiorCount(); ++p) {
+            const std::uint32_t d = strided.interiorDof()[p];
+            worstInterior = std::max(worstInterior, std::fabs(u[d] - reference[d]));
+        }
+        // 1e-8 of the peak, where the measurement is 5e-10: a stiffened plate is an
+        // order worse conditioned than the bare one this file's other static test
+        // uses, and a looser tolerance would admit a model that had lost one fibre
+        // in sixteen -- which moves the answer by percent, not by 1e-8.
+        expectTrue("the reduced stiffened model reproduces the stiffened plate's interface",
+                   worstBoundary < 1e-8 * peak);
+        expectTrue("and its interior", worstInterior < 1e-8 * peak);
+        std::printf("     stride %d: band %zu -> %zu, stiffener moves the field %.1f%%, Guyan "
+                    "matches solveStatic to %.1e m of %.3e m\n",
+                    stride, bare.halfBandwidth(), strided.halfBandwidth(),
+                    100.0 * stiffening / barePeak, std::max(worstBoundary, worstInterior), peak);
+    }
+
+    // --- What the promotion trigger does not see --------------------------------
+    //
+    // `checkValidity` walks the elements, so an attached member's own stress is not
+    // in the peak von Mises. That is a sentence in §6 and §8, and nothing tests a
+    // sentence, so it is measured: the fibre stress is taken here from the
+    // recovered field through the same rank-one form `constraint::fiberStiffness`
+    // builds, and compared against what the trigger reports.
+    {
+        const constraint::RestFibers forms = constraint::restFibers(seam, mesh.position);
+        solidshell::HexMesh pinned = testPlate();
+        std::vector<double> load(sub.dofCount(), 0.0);
+        std::vector<std::uint32_t> held;
+        for (std::size_t b = 0; b < sub.boundaryCount(); ++b) {
+            const std::uint32_t d = sub.boundaryDof()[b];
+            if (mesh.position[(d / 3) * 3] < 0.5 * kLx) {
+                held.push_back(static_cast<std::uint32_t>(b));
+                pinned.pin(d / 3, static_cast<int>(d % 3), 0.0);
+            } else if (d % 3 == 2) {
+                load[d] = 1000.0;
+            }
+        }
+        ReduceParams params;
+        params.modes = 8;
+        const Reduction reduced = craigBampton(sub, params);
+        std::vector<double> state;
+        std::string problem;
+        expectTrue("the stiffened cantilever solves",
+                   reduction::staticSolve(reduced, reduction::reduceLoad(sub, reduced, load), held,
+                                          state, &problem));
+        const std::vector<double> u = reduction::recover(sub, reduced, state);
+        const reduction::Validity validity = reduction::checkValidity(sub, reduced, state);
+
+        double peakFibre = 0;
+        for (std::size_t i = 0; i < seam.fiberCount(); ++i) {
+            const double restLength = forms.length[i];
+            const constraint::FiberStiffness form = constraint::fiberStiffness(
+                seam.fiber[i], mesh.position, restLength, steel.youngsModulus);
+            if (!(form.scale > 0)) continue;
+            double elongation = 0;
+            for (int k = 0; k < 12; ++k) elongation += form.vector[k] * u[form.dof[k]];
+            peakFibre = std::max(peakFibre,
+                                 std::fabs(steel.youngsModulus * elongation / restLength));
+        }
+        expectTrue("the load stresses the plating", validity.peakVonMises > 1e6);
+        expectTrue("and the stiffener carries more of it than the plating does, unreported",
+                   peakFibre > validity.peakVonMises);
+        std::printf("     checkValidity reports %.2f MPa in the plating and cannot see the "
+                    "%.2f MPa in the member: utilisation %.3f against a true %.3f\n",
+                    1e-6 * validity.peakVonMises, 1e-6 * peakFibre, validity.utilisation,
+                    std::max(peakFibre, validity.peakVonMises) / steel.yieldStrength);
+    }
+
+    // --- What a malformed attachment does. Refused, not skipped: a stiffener that
+    // quietly does not arrive is indistinguishable from bare plating, which is the
+    // whole failure this section closes.
+    {
+        reduction::Attachment bad = attached;
+        bad.stiffness[0].dof[3] = static_cast<std::uint32_t>(sub.dofCount());
+        const Substructure refused(mesh, steel, endInterface(mesh), bad);
+        expectTrue("a block naming a degree of freedom the mesh does not have is refused",
+                   !refused.ready() && !refused.problems().empty());
+
+        reduction::Attachment short_ = attached;
+        short_.stiffness[0].stiffness.pop_back();
+        const Substructure refusedShort(mesh, steel, endInterface(mesh), short_);
+        expectTrue("and so is a block whose stiffness array is short",
+                   !refusedShort.ready() && !refusedShort.problems().empty());
+
+        reduction::Attachment wrongMass = attached;
+        wrongMass.mass.assign(mesh.nodeCount() * 3, 0.0);
+        const Substructure refusedMass(mesh, steel, endInterface(mesh), wrongMass);
+        expectTrue("and a mass array indexed by degree of freedom rather than by node",
+                   !refusedMass.ready() && !refusedMass.problems().empty());
+
+        const Substructure silent(mesh, steel, endInterface(mesh),
+                                  attachmentOf(seam, mesh, steel, false));
+        expectTrue("stiffness with no mass is allowed but not silent",
+                   silent.ready() && !silent.problems().empty());
+    }
+}
+
+// --- 12. And the steel it is made of (§8 item 3) ----------------------------------
+//
+// Stiffness without mass is a model that is stiffer and no heavier, so every
+// frequency comes out high -- and frequencies are most of what this tier is for.
+// What is asserted here is the mass identity, exactly, and the *direction and
+// bracket* of what it does to the spectrum, because both ends of that bracket are
+// rigorous statements about the discrete problem rather than eyeballed numbers.
+void testAttachedMass() {
+    std::printf("\n--- reduction: the stiffener's own inertia ---\n");
+    const solidshell::HexMesh mesh = testPlate();
+    const StructuralMaterial steel = ah36Steel();
+    const StiffenerProfile profile = flatBar(0.200, 0.010);
+    const constraint::Stiffening seam = stiffenSeam(mesh, steel, profile, kNy / 2, 1);
+    const ProfileSection section = profileSection(profile);
+
+    const Substructure bare(mesh, steel, endInterface(mesh));
+    const Substructure sub(mesh, steel, endInterface(mesh),
+                           attachmentOf(seam, mesh, steel, true));
+    const Substructure noMass(mesh, steel, endInterface(mesh),
+                              attachmentOf(seam, mesh, steel, false));
+
+    // The steel, in closed form: density times the profile's area times the length
+    // of seam the fibres cover. `profileSection` computes the area from the
+    // rectangle dimensions and knows nothing about fibres.
+    const double steelMass = steel.density * section.area * kLx;
+    expectNear("the attachment weighs the stiffener's own steel", sub.attachedMass(), steelMass,
+               1e-12 * steelMass);
+    expectNear("and the fibre builder agrees with it", seam.mass, steelMass, 1e-12 * steelMass);
+    expectNear("so the substructure's total mass is the plating plus the stiffener",
+               sub.totalMass(), bare.totalMass() + steelMass, 1e-12 * sub.totalMass());
+    expectTrue("which is not a rounding on the plating", steelMass > 0.2 * bare.totalMass());
+
+    // Through T, which is the statement that matters: a mass that reached the
+    // diagonal but not the reduction would pass the line above and fail this one.
+    // §1 property 2 -- a rigid translation of the reduced model reports the
+    // substructure's own mass, exactly.
+    {
+        ReduceParams params;
+        params.modes = 6;
+        const Reduction reduced = craigBampton(sub, params);
+        expectTrue("the stiffened reduction is usable", !reduced.empty());
+        const std::size_t n = static_cast<std::size_t>(reduced.size());
+        std::vector<double> rigid(n, 0.0);
+        for (std::size_t b = 0; b < sub.boundaryCount(); ++b)
+            if (sub.boundaryDof()[b] % 3 == 2) rigid[b] = 1.0;
+        double quadratic = 0;
+        for (std::size_t i = 0; i < n; ++i)
+            for (std::size_t j = 0; j < n; ++j) quadratic += rigid[i] * reduced.mass[i * n + j] * rigid[j];
+        expectNear("a rigid translation of the reduced model weighs plating plus stiffener",
+                   quadratic, bare.totalMass() + steelMass, 1e-9 * sub.totalMass());
+        std::printf("     reduced rigid translation: %.6f kg against %.6f kg\n", quadratic,
+                    bare.totalMass() + steelMass);
+    }
+
+    // What the equal split over the pair gives up, as a number rather than as a
+    // caveat. Rotate rigidly about the seam: the stiffener's steel is split over
+    // the through-thickness pair, so about that axis it carries `m (t/2)^2` -- the
+    // plate's own half thickness and nothing else -- where the real member carries
+    // `m d^2` about its own centroid, a hundred millimetres out. See §8 and
+    // `constraint.hpp`: the consistent condensation that *would* carry it puts a
+    // negative mass on one node of every eccentric pair.
+    {
+        const double seamY = kLy * static_cast<double>(kNy / 2) / kNy;
+        double lumped = 0, plating = 0;
+        for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+            const double dy = mesh.position[n * 3 + 1] - seamY, dz = mesh.position[n * 3 + 2];
+            lumped += sub.mass()[n * 3] * (dy * dy + dz * dz);
+            plating += bare.mass()[n * 3] * (dy * dy + dz * dz);
+        }
+        const double centroid = 0.5 * kThickness + section.centroid;
+        const double carried = steelMass * 0.25 * kThickness * kThickness;
+        const double real = steelMass * centroid * centroid;
+        expectNear("the stiffener's steel carries only the plate's half thickness about the seam",
+                   lumped - plating, carried, 1e-9 * carried);
+        // 312x, and the ratio is `(d / (t/2))^2` in closed form: what the model
+        // keeps of this member's rotary inertia is a third of a per cent of it.
+        expectNear("which is the square of the ratio of the two lever arms short of the member's",
+                   real / carried, (centroid / (0.5 * kThickness)) * (centroid / (0.5 * kThickness)),
+                   1e-9 * real / carried);
+        expectTrue("and that is a shortfall of orders, not of per cent", real > 100.0 * carried);
+        std::printf("     rotary inertia about the seam: the stiffener adds %.4e kg m^2 where its "
+                    "own eccentricity would add %.4e -- %.1fx, all of it given up\n",
+                    carried, real, real / carried);
+    }
+
+    // --- The spectrum. Both ends of the bracket are rigorous:
+    //
+    //   * `M` grows and `K` does not, so **every** eigenvalue falls or stays. Any
+    //     frequency that rose would mean the mass had landed somewhere it does not
+    //     belong.
+    //   * `M_with <= r M_without` entrywise on a diagonal mass, so no frequency
+    //     falls further than `1 / sqrt(r)`. `r` is measured here, not assumed.
+    //
+    // The guard against the vacuous version -- which is the version where no mass
+    // is added at all, and which sits exactly on the upper end of that bracket --
+    // is that at least one frequency must fall by more than a tenth.
+    {
+        std::vector<std::uint8_t> pinned(sub.dofCount(), 0);
+        for (int j = 0; j <= kNy; ++j)
+            for (int k = 0; k < 2; ++k)
+                for (int axis = 0; axis < 3; ++axis) pinned[plateNode(0, j, k) * 3 + axis] = 1;
+        const std::vector<double> withMass = fullFrequencies(sub, pinned);
+        const std::vector<double> without = fullFrequencies(noMass, pinned);
+        const std::vector<double> plain = fullFrequencies(bare, pinned);
+        double ratio = 0;
+        for (std::size_t d = 0; d < sub.dofCount(); ++d)
+            if (!pinned[d]) ratio = std::max(ratio, sub.mass()[d] / noMass.mass()[d]);
+        const double floorRatio = 1.0 / std::sqrt(ratio);
+
+        const std::size_t count = std::min<std::size_t>(12, withMass.size());
+        double worstDrop = 0;
+        bool everRose = false, everBelowFloor = false;
+        for (std::size_t i = 0; i < count; ++i) {
+            worstDrop = std::max(worstDrop, 1.0 - withMass[i] / without[i]);
+            if (withMass[i] > without[i] * (1.0 + 1e-12)) everRose = true;
+            if (withMass[i] < without[i] * floorRatio * (1.0 - 1e-12)) everBelowFloor = true;
+        }
+        expectTrue("no frequency rises when the stiffener's mass is added", !everRose);
+        expectTrue("and none falls further than the worst nodal mass ratio allows",
+                   !everBelowFloor);
+        expectTrue("the mass is not decoration: one of the first twelve falls by over a tenth",
+                   worstDrop > 0.10);
+        // And the stiffness is still the dominant effect, in the direction the
+        // section properties give: the panel's second moment about the mid-surface
+        // goes up by two orders, so the first frequency goes up, not down.
+        expectTrue("the stiffener still raises the first frequency", withMass[0] > 2.0 * plain[0]);
+        std::printf("     first frequency %.3f -> %.3f rad/s (bare -> stiffened); the fibre mass "
+                    "moves the first by %.3f%% and the worst of twelve by %.1f%% (floor %.1f%%)\n",
+                    plain[0], withMass[0], 100.0 * (1.0 - withMass[0] / without[0]),
+                    100.0 * worstDrop, 100.0 * (1.0 - floorRatio));
+    }
+
+    // A stiffener stiff enough to hold its own line still is a *node* of the first
+    // mode, which is why the first frequency above barely moved. On a member the
+    // panel can actually bend with, the whole stiffened section works and the first
+    // frequency lands where the beam idealisation says: `sqrt(I_ratio / m_ratio)`,
+    // both taken from `scantlings::stiffenedSection`. The **smeared** panel is the
+    // negative control -- it has the same area and the same mass and its second
+    // moment is `(t + A/s)^3 / t^3`, which is the factor of 130 `scantlings.hpp` §1
+    // rejects smearing for.
+    {
+        const StiffenerProfile modest = flatBar(0.060, 0.006);
+        const constraint::Stiffening line = stiffenSeam(mesh, steel, modest, kNy / 2, 1);
+        const Substructure stiffened(mesh, steel, endInterface(mesh),
+                                     attachmentOf(line, mesh, steel, true));
+        std::vector<std::uint8_t> pinned(sub.dofCount(), 0);
+        for (int j = 0; j <= kNy; ++j)
+            for (int k = 0; k < 2; ++k)
+                for (int axis = 0; axis < 3; ++axis) pinned[plateNode(0, j, k) * 3 + axis] = 1;
+        const double got = fullFrequencies(stiffened, pinned)[0] / fullFrequencies(bare, pinned)[0];
+
+        const StiffenedSection panel = stiffenedSection(modest, kThickness, kLy);
+        const double plateOwn = kLy * kThickness * kThickness * kThickness / 12.0;
+        const double aboutMidSurface =
+            panel.secondMoment + panel.area * panel.neutralAxis * panel.neutralAxis;
+        const double massRatio = stiffened.totalMass() / bare.totalMass();
+        const double predicted = std::sqrt(aboutMidSurface / plateOwn / massRatio);
+        const double smeared = smearedThickness(kThickness, modest, kLy) / kThickness;
+        const double smearedPrediction = std::sqrt(smeared * smeared * smeared / massRatio);
+
+        // 6%, where the measurement is 4.5%: an Euler beam of the full plate width
+        // against a two-dimensional plate carrying its stiffener on one line, so a
+        // few per cent is what a correct model gives. The tolerance is nowhere near
+        // wide enough to admit the smeared answer, which is the point.
+        expectNear("the first frequency lands where the stiffened section says", got, predicted,
+                   0.06 * predicted);
+        expectTrue("and nowhere near where a smeared panel would put it",
+                   got > 2.0 * smearedPrediction);
+        std::printf("     a 60x6 bar: first frequency x%.4f, stiffened section predicts x%.4f, a "
+                    "smeared plate of the same area predicts x%.4f\n",
+                    got, predicted, smearedPrediction);
+    }
+}
+
 }  // namespace
 
 void runReductionTests() {
@@ -1752,4 +2358,6 @@ void runReductionTests() {
     testValidity();
     testFerryPatch();
     testTwoComponentsAssembleIntoTheWhole();
+    testAttachedStiffness();
+    testAttachedMass();
 }
