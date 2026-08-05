@@ -419,8 +419,15 @@ private:
 // arbitrary set of global degrees of freedom (3 * node + axis). It exists because
 // `constraint.hpp` ties an eccentric stiffener to the plating and condenses it
 // onto the shell's own DOF, and a second assembly path for that would be a second
-// place the two could disagree. It is not stiffener-specific: an interface spring
-// coupling two substructures is the same shape.
+// place the two could disagree.
+//
+// It used to say here that "an interface spring coupling two substructures is the
+// same shape". It is, and **that is not what the interface coupling turned out to
+// want**: `coupling.{hpp,cpp}` joins Tier 1 to Tier 2 with no extra stiffness at
+// all, because a mesh split by element shares its interface nodes exactly and two
+// components meeting there have the same displacement rather than a spring between
+// them. A spring would need a stiffness, and a stiffness no measurement sets is
+// precisely what this file rejects hourglass control for.
 struct DofBlock {
     std::vector<std::uint32_t> dof;
     std::vector<double> stiffness;  // dof.size()^2, row-major, symmetric

@@ -270,7 +270,10 @@
 // Tier 2** -- `promotion.hpp` already owns that decision and `zone::buildPatch`
 // already meshes the result. The reduced model's job at that point is to stop
 // answering and hand over its interface displacements as the zone's boundary
-// condition; it must not be asked for the answer itself.
+// condition; it must not be asked for the answer itself. **Handing them over is
+// `coupling.{hpp,cpp}`**, which drives a `zone::Patch`'s perimeter from an
+// assembled reduced model and is exact for a linear zone -- the property below
+// being exactly why.
 //
 // One caveat on that warning, and it points the wrong way: the recovered stress is
 // only as good as the mode set. A truncated basis cannot represent a stress
@@ -622,9 +625,13 @@ struct Assembly {
 // to carry the boundary DOF identity its components had -- which global DOF of
 // which mesh each assembled boundary row *is* -- so that the same position match
 // can be run against it. The scatter-add underneath already does not care how many
-// components it is given. That is the next piece here, and it is smaller than the
-// mesher which is the actual blocker: nothing yet cuts a ship into components
-// worth assembling at all.
+// components it is given.
+//
+// **There is now a pair worth assembling**, which there was not when the note
+// above was written: `coupling.{hpp,cpp}` joins a Tier-2 zone to the plating round
+// it and drives the zone's perimeter from the result. Two components is exactly
+// enough for that, so the three-component limit is no longer the binding one. The
+// mesher still is: nothing yet cuts a *ship* into hold-sized components.
 Assembly assemble(const Reduction& a, const Reduction& b, const InterfaceMap& map);
 
 // Natural frequencies of an assembled model, rad/s ascending, with the listed

@@ -8,6 +8,17 @@
 // machinery Tier-1/Tier-2 interface coupling needs and does not exist yet". This
 // is that machinery, and §2 below is the stiffener built on it.
 //
+// **The half of that sentence about interface coupling turned out to be wrong, and
+// it is worth correcting where it was written rather than only where it was
+// disproved.** `coupling.{hpp,cpp}` couples Tier 1 to Tier 2 and uses none of this
+// file. A structure split by *element* has interface nodes that are literally the
+// same points, so the two components' shared DOF **are** one unknown and the
+// coupling is scatter-add -- exact, and with nothing to interpolate. A tie is what
+// a *non-matching* interface needs: two meshes at different resolutions either side
+// of a cut, where a node on one side lands inside a face on the other. That case is
+// real and will arrive with a whole-ship mesher; it had simply been assumed to be
+// this case.
+//
 // --- 1. The tie, and why no rotational degree of freedom is needed -------------
 //
 // A solid-shell has `kNodes == 8` and `kDof == 24`: **three translations per node

@@ -1872,18 +1872,21 @@ The cost saving on the same patch of the ferry's side is **2800×**, not 10⁻�
 "a few percent for the frequency range that matters" needs the frequency range
 named: the standard cutoff at twice the band of interest buys **0.6% inside the
 10 Hz hull-girder band and 8% up to 20 Hz**, and five or six times the band is
-what buys a part in ten thousand. The pass that assembles two substructures now exists
-(`assemble`, §below); what does not is a mesher that can produce a whole-ship
-substructure to feed it, so "everything away from damage stays here forever" is
-still the plan rather than the code — the join is built and there is nothing yet
-worth joining.
+what buys a part in ten thousand. The pass that assembles two substructures now
+exists (`assemble`, §below), and there is now something worth joining — a zone and
+the plating round it, §*Tier-1 to Tier-2 coupling*. What does not exist is a mesher
+that can produce a whole-*ship* substructure, so "everything away from damage stays
+here forever" is still the plan rather than the code.
 
 **Tier 2 — full nonlinear tet FEM, adaptive.** Around an impact, a fire, or a
 growing crack, a region is *promoted*: the reduced model is replaced by genuine
 3D tetrahedra at full resolution, coupled to the surrounding Tier-1 model through
 the retained interface DOF. Inside that region the physics is uncompromised —
 real stress tensors, real plasticity, real fracture. Budget 10⁵–10⁶ elements
-across all active zones.
+across all active zones. **The interface coupling is implemented**
+(`coupling.{hpp,cpp}`) and is exact for a linear zone; what it cannot yet carry
+back to Tier 1 is plastic softening short of a tear, because a reduction is linear
+and the Tier-2 explicit solver forms no tangent operator.
 
 This is not a compromise on the answer where the answer matters. A collision
 loads a 20 m stretch of side shell; the response of the bow 200 m away is linear
@@ -2679,13 +2682,16 @@ reach, which is exactly what that change was for.
 
 #### What it does not do yet
 
-1. **No coupling to Tier 1.** Coupling to Tier 0 does exist — see *Adaptive zone
-   promotion* below — but the patch's edge is still clamped and nothing outside it
-   responds to what happens inside, so it is one way per solve. The *reduction*
-   Tier 1 needs now exists (`reduction.{hpp,cpp}`) and will take this patch's own
-   mesh with its clamped perimeter as an interface; what is still missing is
-   something that drives those interface DOF from the surrounding structure
-   instead of pinning them.
+1. ~~**No coupling to Tier 1.**~~ **Done, and linear on the way back** —
+   `coupling.{hpp,cpp}`, §*Tier-1 to Tier-2 coupling*. The patch's perimeter is
+   driven from a Craig–Bampton model of the plating round it instead of being
+   clamped, and a torn zone goes back to that model as a mesh with the dead
+   elements deleted, so the surroundings feel the damage. What still does not go
+   back is **plastic softening short of a tear**: a reduction is linear by
+   construction and this solver forms no tangent operator, so between first yield
+   and first tear the surroundings are told the zone is stiffer than it is — in the
+   unsafe direction. Coupling to Tier 0 is unchanged and remains
+   `promotion.{hpp,cpp}`'s.
 2. **The indenter is kinematic and rigid** — a prescribed rectangular punch, no
    contact search, no friction, no release, and the striking body does not crush. A
    prescribed motion cannot run away, which is what makes it testable; a delivered
@@ -2768,10 +2774,15 @@ StructuralMesh  reduce(const StructuralMesh&, const SectionReduction&);
 
 A zone couples to Tier 0 through a *section* rather than through retained
 interface DOF. That is cruder than the plan above and it is the honest thing
-available; everything below is arranged so that inserting Craig–Bampton replaces
-the coupling and not the criterion. **The reduction itself now exists** — see
-*Tier 1* below — and this section is unchanged by it: nothing yet drives a zone's
-edge from a reduced model, which is the coupling rather than the reduction.
+available for the **beam**; everything below is arranged so that inserting
+Craig–Bampton replaces the coupling and not the criterion. That has now happened
+alongside rather than instead: `coupling.{hpp,cpp}` drives a zone's edge from a
+reduced model of the plating round it (§*Tier-1 to Tier-2 coupling*), and this
+section is unchanged by it, exactly as intended. The two answer different
+questions — Tier 0 wants a thinner ship for a section modulus, Tier 1 wants a
+displacement field at an interface — so they coexist rather than one replacing the
+other, and §*Tier-1 to Tier-2 coupling* records why the *thinner ship* shape does
+not transfer.
 
 #### The criterion: what Tier-2 adds, not what is worst
 
@@ -3358,9 +3369,9 @@ against the full model's 11.08 MPa with Guyan alone, converging to 11.01 MPa wit
    rewrite the scatter-add, which already does not care how many components it is
    given. And the real blocker is still the *mesher*, item 1 — nothing yet cuts a
    ship into components worth joining, so this has the join and no pieces.
-3. **A zone's edge is still clamped.** `zone.hpp` §5 item 1 and `promotion.hpp`
-   are unchanged by this file's arrival: the two-way coupling needs something that
-   drives interface DOF from the surrounding structure instead of pinning them.
+3. ~~**A zone's edge is still clamped.**~~ **Done** — `coupling.{hpp,cpp}`,
+   §*Tier-1 to Tier-2 coupling* below. What remains is that a reduced model cannot
+   represent a zone that has *yielded* without tearing, which is item 6 there.
 4. **Stiffeners are still not meshed**, inherited from `zone.hpp` §3 — the
    substructure is as good as the mesh it is given.
 5. **No damping.** `M_r` and `K_r` are what comes out; a modal damping ratio or a
@@ -3422,6 +3433,192 @@ adding a test: the interface check tested a node count and then collinearity, an
 changing the count threshold from three to two altered nothing, because two nodes
 are collinear and one is and none is. The count was dead. It survives only in the
 message, where it does tell a caller something the word "collinear" does not.
+
+### Tier-1 to Tier-2 coupling — **implemented**
+
+`engine/sim/coupling.{hpp,cpp}`, checked by `tests/test_coupling.cpp`. The piece
+that made the three tiers one system in the middle as well as at the bottom: **a
+zone's perimeter follows the reduced model round it instead of being clamped, and
+a torn zone goes back into that model so the surroundings feel it.**
+
+```cpp
+Coupling    couple(const Substructure& surroundings, const Reduction&,
+                   const Substructure& zone, const Reduction&, double tolerance = 1e-9);
+bool        prescribedStaticSolve(const Assembly&, load, held, prescribed, state, problem);
+EdgeDrive   edgeDrive(const Coupling&, const Substructure& zone, assembledState);
+std::size_t applyEdgeDrive(const EdgeDrive&, HexMesh&);
+DamagedMesh withoutTornElements(const zone::Patch&, const zone::Solver&);
+```
+
+#### It is exact, not close, and that is the whole design of the tests
+
+The coupling is `matchBoundaries` + `assemble` + a static solve + writing the
+interface displacement into `HexMesh::prescribed`. Nothing is approximated at any
+step: Guyan static condensation is exact at the interface for *any* load at *any*
+mode count, assembly is scatter-add, and a shared boundary DOF **is** one unknown.
+So a coupled zone does not approach the monolithic answer — it reproduces it.
+
+Measured on a 1.2 m square plate, 8 × 8 solid-shell elements, clamped rim, with a
+gripped punch pushed 200 µm into the middle quarter, against the same plate meshed
+and solved in one piece by `solveStatic`:
+
+| | punch reaction | the zone's field vs the whole plate's |
+|---|---|---|
+| monolithic (the reference) | 1 446 N | — |
+| zone clamped, as before | 625 671 N (**433×**) | 1.47e-4 m out, 74% of peak |
+| zone free | 0 N exactly | — |
+| **coupled**, 0 / 4 / 12 modes | 1 446 N, identical | **1.06e-15 m** of a 2.0e-4 m peak |
+
+Three things in that table are worth more than the agreement.
+
+**The free bound is exactly zero, and as a bracket it is vacuous.** A patch with
+nothing holding its edge, handed the same displacement at every gripped punch node,
+answers with a rigid translation: no strain, no reaction. So "the coupled force
+lies between free and clamped" is satisfied by any positive number and proves
+nothing. The bracket that carries content is the **edge-following ratio** — how
+much of the punch's travel the perimeter takes up — where both ends are exact
+closed forms rather than measurements: a clamped edge follows **0**, a free one
+follows **1**, and the plate's own answer is **0.737**. The coupled zone reproduces
+that to 1e-9.
+
+**Mode count buys nothing statically, and the test asserts that rather than a
+convergence.** This contradicts the natural expectation and it is the same
+property `reduction.hpp` §1 records: the reduction starts exact at the interface
+and stays there. A test that swept modes looking for improvement would have been
+measuring nothing — and a coupling that had quietly *lost* the property would
+still improve with modes and still look reasonable, which is why the assertion is
+invariance. The sweep carries its own guard that the modes were really kept
+(the assembled model grows by 2 × modes), or "adding modes changed nothing" would
+be a statement about a sweep that never added any.
+
+**The negative control is the model this replaces.** The clamped zone, measured
+with the same instrument, misses the monolithic field by 74% of its peak. Without
+that the 1e-15 agreement could have been measuring a well-converged mesh.
+
+The whole chain runs through the **explicit** Tier-2 solver too, not only the
+direct one: driven perimeter, prescribed punch, smoothstep ramp, damped to rest —
+it settles onto the monolithic field within **5.5e-5 of the peak**, where the
+clamped edge it replaces is 1.3e4 times further out.
+
+#### Direction 2: what a torn zone hands back, and why not a thinner ship
+
+`promotion.hpp` reports Tier-2 damage to Tier 0 as an **effective thickness**, and
+for a beam that is exactly right — `hullGirderSection` and everything downstream
+read a thickness and nothing else. **It is the wrong shape for Tier 1, and the
+reason is geometric.** A solid-shell carries its plate thickness in the *positions
+of its nodes*: mid-surface at zero, faces at ±t/2. Thinning a zone therefore moves
+every node it shares with the structure round it. Measured: a 20% knockdown on
+12 mm plating puts every interface node **1.200 mm** out of place — exactly
+(t − t′)/2, a closed form — and `matchBoundaries` at the 1e-9 tolerance a coupling
+uses then finds **zero** shared DOF. A thinned zone is not a modified component; it
+is a different component that no longer fits.
+
+What does transfer, exactly and with no remeshing, is **element deletion**. A torn
+element carries nothing, which is a statement about the stiffness assembly rather
+than about geometry, so `withoutTornElements` removes it, drops any node left with
+no element at all — an orphan is a zero stiffness row, and `reduction.hpp` §3
+records that the banded factorisation does *not* reliably catch one — and hands
+back a mesh whose surviving interface nodes are where they always were. Measured
+on the same plate with a corner element deleted, which orphans exactly its own
+corner: **90 of the 96 perimeter DOF still shared, worst gap 5.6e-17 m** — against
+zero shared and 1.2 mm for the thickness knockdown.
+
+And it is felt outside. The slit softens the plate by **15.1%**, the surrounding
+plating moves **8.7 µm** — 4.4% of the peak — and the recovered surrounding field
+matches the monolithic slit plate to **6.6e-15 m**. The control is the field a
+one-way coupling would still be reporting: the *intact* surroundings, which are
+wrong by 10⁹ times that tolerance.
+
+#### What it does not do yet
+
+1. **Plastic softening short of a tear does not go back.** A reduction is linear
+   (§*Tier 1*, what a reduced region cannot do) and the Tier-2 explicit solver
+   forms no tangent operator, so between first yield and first tear the
+   surroundings are told the zone is stiffer than it is — the unsafe direction.
+   Closing it needs a reduction built from a tangent the solver does not form.
+2. **Tier 1 cannot see the stiffeners at all**, damaged or otherwise, and this is
+   larger than the gap it was expected to be. A `reduction::Substructure` is built
+   from a `HexMesh` and a material; a zone under `Stiffeners::Modelled` carries its
+   members as `constraint::Stiffening` — fibres condensed onto the plating's own
+   DOF, with no nodes and no elements of their own — so the substructure a coupling
+   builds from a stiffened patch is **the bare plating, to the last bit**
+   (measured: its operator matches an element-only assembly to 3e-16 relative).
+   One 200 × 10 flat bar across a 0.6 m patch is worth **7.9%** of its displacement
+   field, so this is not a rounding.
+
+   The fix is small and named: `constraint::stiffnessBlocks` already produces
+   exactly the `solidshell::DofBlock` list that `solveStatic` takes and that a
+   substructure would need, so what is missing is a `Substructure` constructor that
+   accepts extra blocks and scatters them into the same CSR — a change to
+   `reduction.cpp`, with its own validation against a monolithic stiffened plate.
+
+   Separately, and unchanged: `constraint.hpp` gives a fibre no damage variable and
+   never deletes it, so "this longitudinal is gone" does not exist to be read —
+   `promotion.hpp` records the same gap for Tier 0. That one is a **failure
+   criterion for the fibres**, not coupling machinery, and it stays blocked until
+   the fibres have one.
+3. **It is a static coupling.** The assembled solve is `K x = f`; there is no
+   co-simulation, no shared time integration and no attempt to run a reduced
+   surrounding forward alongside an explicit zone. For a collision that is the
+   right first answer — the surroundings are quasi-static over a 0.13 s event —
+   but a whipping or slamming load is not, and nothing here would say so.
+4. **It couples two components and only two**, inherited from `assemble`. A zone
+   between two holds is three.
+5. **The interfaces must be node-coincident.** The split is by element, so the two
+   meshes share nodes and the coupling is an identity rather than an
+   interpolation. Two meshes at different resolutions either side of a cut would
+   need `constraint::Tie` — which exists — and a matching pass that finds a face
+   rather than a node. Nothing here needs it and nothing here has it.
+6. **A tear that reaches the perimeter is handled but not measured.** The zone
+   then loses interface nodes, the surroundings keep boundary DOF the zone no
+   longer shares, and `couple` counts them rather than refusing — which is
+   physically right, the plating really did tear away. There is no measurement of
+   what that does to the answer.
+
+#### What mutation testing found
+
+35 mutants, each a single plausible edit. 34 killed; one is argued equivalent.
+Nothing here was a defect in the code — which is worth saying plainly, because the
+usual result in this repo is that it was — but **eight were holes in the suite**,
+and seven of those were guards nothing reached:
+
+- **Three whole preconditions were dead weight.** A reduction that is not the
+  zone's, an assembled state of the wrong length, and the boundary conditions
+  carried across mesh surgery each had a guard, and removing the guard entirely
+  passed the whole suite. The middle one is not cosmetic: every index in a
+  `Coupling` is in range for the assembly it was built from, so a short state is a
+  read past the end of the *caller's* vector and a plausible drive on the other
+  side of it.
+- **A wrong answer can be collapsed by `std::unique`.** `carriedInterface` drops
+  an interface node the tear removed; a mutant that mapped it to whichever node
+  now sits at its place in the ordering survived, because asked over the whole
+  perimeter the wrong answer lands on a node that is in the list anyway and the
+  duplicate is removed. It dies when the orphan is asked about on its own. This is
+  the same shape as the defect the previous agent recorded — two springs to earth
+  that both went to zero and agreed perfectly.
+- **`applyEdgeDrive` never un-pinning** was untested because every caller in the
+  suite cleared the boundary conditions first. It matters exactly where a partly
+  matched interface is: the unmatched part has to stay clamped rather than go
+  quietly free.
+- **A repeated prescribed DOF** takes the last value rather than the sum, and
+  nothing named one twice.
+
+The one argued equivalent is the lower clamp in the boundary ramp's smoothstep:
+the only call site passes `result_.time + dt`, and `result_.time` starts at zero
+and only rises, so the clamp cannot bind. It stays, with the reasoning written
+where it is, because `edgeFraction` reads as a pure function of time.
+
+Two mutants are worth recording for what they did *not* need:
+
+- **Taking the drive's target from the rest configuration instead of the meshed
+  one** is invisible without a `Preload`, because without one the two arrays are
+  equal. The same edit in the same file has survived a whole suite before — it is
+  in `zone.cpp`'s own comments twice. The test that kills it drives a pre-loaded
+  patch in *x*, where the rest configuration has moved 1.22e-4 m, a third of the
+  travel.
+- **A linear ramp instead of the smoothstep** is killed by the energy account
+  rather than by any displacement: a velocity step at the end of the ramp rings
+  the patch, and the account notices before the field does.
 
 ### Solver
 

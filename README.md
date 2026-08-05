@@ -212,6 +212,19 @@ tear, buckle or rotate, so it also reports when it has stopped being valid and t
 region has to be promoted. Three published figures in the plan turned out to be
 optimistic and are corrected there.
 
+The middle tier now *drives* the fine one (`engine/sim/coupling.{hpp,cpp}`). A
+zone's perimeter used to be clamped — the plating outside it could not move,
+whatever happened inside — and it now follows a reduced model of the structure
+round it, with a torn zone handed back to that model as a mesh with the dead
+elements deleted so the surroundings feel the damage. Against the same plate meshed
+and solved in one piece, the coupled zone reproduces the monolithic answer to
+**10⁻¹⁵ m of a 2 × 10⁻⁴ m peak**, at zero modes and at twelve alike, where the
+clamped zone it replaces is 74% out and 433× too stiff. That it does not merely
+*approach* the monolithic answer is the point: static condensation is exact at an
+interface, so the coupling is an identity and is tested as one — and the natural
+convergence study, sweeping mode count for an improvement, would have measured
+nothing at all.
+
 The spike cost a day and moved an 18-engineer-month bet from assumed to measured,
 identifying one architectural change before any of that phase existed to rewrite.
 
