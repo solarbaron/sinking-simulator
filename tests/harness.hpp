@@ -45,6 +45,7 @@ void runScantlingTests();
 void runSchedulerTests();
 void runPlasticityTests();
 void runPromotionTests();
+void runReductionTests();
 void runSolidShellTests();
 void runSerialiseTests();
 void runShipFileTests();

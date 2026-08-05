@@ -18,11 +18,14 @@
 //   3. `preloadFor` -- the girder stress the zone starts from, as
 //      `zone::Preload`.
 //
-// Tier-1 (Craig-Bampton reduced models) does not exist. Where the three-tier plan
-// in `02-simulation.md` §3 says a zone couples to Tier-1 through retained
-// interface DOF, this couples it to Tier-0 through a section: cruder, and the
-// honest thing available. Everything below is written so that inserting Tier-1
-// later replaces the coupling and not the criterion.
+// Where the three-tier plan in `02-simulation.md` §3 says a zone couples to Tier-1
+// through retained interface DOF, this couples it to Tier-0 through a section:
+// cruder, and the honest thing available. `reduction.{hpp,cpp}` now builds the
+// Craig-Bampton reduced models themselves -- boundary DOF kept exactly, so they are
+// couplable by construction -- but nothing yet drives a zone's edge from one, and
+// **this file is unchanged by their arrival**. Everything below was written so that
+// inserting Tier-1 replaces the coupling and not the criterion, and that is still
+// the work outstanding.
 //
 // --- 1. Cost is the whole design ----------------------------------------------
 //

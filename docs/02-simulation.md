@@ -1861,12 +1861,19 @@ axis, second moment and section moduli at any cut, in 0.09 ms, taking membership
 from geometry rather than from element labels so nothing athwartships can leak
 into it.
 
-**Tier 1 — reduced 3D, always on.** The full 3D shell/solid model of the entire
-ship, condensed offline by **Craig–Bampton component mode synthesis**: retain the
-interface DOF plus the lowest few hundred fixed-interface normal modes, discard
-the rest. Reproduces the linear-elastic response of the full model to within a
-few percent for the frequency range that matters, at 10⁻⁵ of the cost. Everything
-away from damage stays here forever.
+**Tier 1 — reduced 3D. The reduction is implemented; the whole-ship model is
+not.** A 3D shell model of a region, condensed by **Craig–Bampton component mode
+synthesis**: retain the interface DOF plus the lowest few fixed-interface normal
+modes, discard the rest — `engine/sim/reduction.{hpp,cpp}`, below. Two figures in
+the plan this paragraph used to state are now measured and both were optimistic.
+The cost saving on the same patch of the ferry's side is **2800×**, not 10⁻⁵, and
+"a few percent for the frequency range that matters" needs the frequency range
+named: the standard cutoff at twice the band of interest buys **0.6% inside the
+10 Hz hull-girder band and 8% up to 20 Hz**, and five or six times the band is
+what buys a part in ten thousand. What does not exist yet is a mesher that can
+produce a whole-ship substructure, or the pass that assembles two of them, so
+"everything away from damage stays here forever" is still the plan rather than
+the code.
 
 **Tier 2 — full nonlinear tet FEM, adaptive.** Around an impact, a fire, or a
 growing crack, a region is *promoted*: the reduced model is replaced by genuine
@@ -2442,9 +2449,13 @@ reach, which is exactly what that change was for.
 
 #### What it does not do yet
 
-1. **No coupling to Tier 1**, which does not exist. Coupling to Tier 0 does — see
-   *Adaptive zone promotion* below — but the patch's edge is still clamped and
-   nothing outside it responds to what happens inside, so it is one way per solve.
+1. **No coupling to Tier 1.** Coupling to Tier 0 does exist — see *Adaptive zone
+   promotion* below — but the patch's edge is still clamped and nothing outside it
+   responds to what happens inside, so it is one way per solve. The *reduction*
+   Tier 1 needs now exists (`reduction.{hpp,cpp}`) and will take this patch's own
+   mesh with its clamped perimeter as an interface; what is still missing is
+   something that drives those interface DOF from the surrounding structure
+   instead of pinning them.
 2. **The indenter is kinematic and rigid** — a prescribed rectangular punch, no
    contact search, no friction, no release, and the striking body does not crush. A
    prescribed motion cannot run away, which is what makes it testable; a delivered
@@ -2511,10 +2522,12 @@ SectionReduction reactionOf(const StructuralMesh&, const zone::Patch&, const zon
 StructuralMesh  reduce(const StructuralMesh&, const SectionReduction&);
 ```
 
-Tier 1 does not exist, so a zone couples to Tier 0 through a *section* rather than
-through retained interface DOF. That is cruder than the plan above and it is the
-honest thing available; everything below is arranged so that inserting
-Craig–Bampton later replaces the coupling and not the criterion.
+A zone couples to Tier 0 through a *section* rather than through retained
+interface DOF. That is cruder than the plan above and it is the honest thing
+available; everything below is arranged so that inserting Craig–Bampton replaces
+the coupling and not the criterion. **The reduction itself now exists** — see
+*Tier 1* below — and this section is unchanged by it: nothing yet drives a zone's
+edge from a reduced model, which is the coupling rather than the reduction.
 
 #### The criterion: what Tier-2 adds, not what is worst
 
@@ -2791,11 +2804,360 @@ equivalent.
   the mesher ever starts clipping the tests will say so rather than the arithmetic
   quietly reappearing.
 
+### Tier 1: Craig–Bampton reduction — **implemented**
+
+`engine/sim/reduction.{hpp,cpp}`, checked by `tests/test_reduction.cpp`. The
+missing middle: Tier 0 is the whole ship as a beam and knows nothing about where
+stress goes within a section; Tier 2 is solid-shell elements over a patch at
+`4.0 × elementCount` core-seconds per simulated second. Nothing could give a
+structural answer for a whole hold, a superstructure, or the region between two
+bulkheads. This is what fills that gap.
+
+```cpp
+class  Substructure { ... };                              // K, M, the partition, K_ii factored
+Reduction craigBampton(const Substructure&, const ReduceParams& = {});
+std::vector<double> recover(const Substructure&, const Reduction&, const std::vector<double>&);
+bool   staticSolve(const Reduction&, load, held, state, std::string* problem = nullptr);
+Validity checkValidity(const Substructure&, const Reduction&, const std::vector<double>&);
+Eigenpairs symmetricEigen(const std::vector<double>&, int n);     // no third-party dependency
+Eigenpairs generalisedEigen(const std::vector<double>&, const std::vector<double>&, int n);
+```
+
+Partition the degrees of freedom into **boundary** (the interface the substructure
+shares with the rest of the ship) and **interior**. Keep every boundary DOF
+exactly; represent the interior by the static constraint modes
+`Ψ = −K_ii⁻¹ K_ib` plus the lowest `m` fixed-interface normal modes `Φ`. With
+`u = T x`, `x = [u_b ; q]`, `T = [[Ψ, Φ], [I, 0]]`, the reduced pair is
+
+```
+K_r = [[K_bb − K_bi K_ii⁻¹ K_ib,  0     ]      M_r = [[M_bb + ΨᵀM_iiΨ,  ΨᵀM_iiΦ]
+       [0,                        Λ     ]]            [ΦᵀM_iiΨ,         ΦᵀM_iiΦ]]
+```
+
+The `(b,q)` stiffness block is *identically* zero, not small:
+`K_biΦ + ΨᵀK_iiΦ = K_biΦ − K_biK_ii⁻¹K_iiΦ = 0`. It and the modal block `Λ` are
+stored as the closed forms they are, because computing `ΦᵀK_iiΦ` would be a
+noisier route to an eigenvalue already in hand. The modal *mass* block is the
+identity by the mass normalisation and is nevertheless computed, because it is
+cheap and because asserting on it is what says the eigenvectors really came back
+mass-normalised. The tests check all of it by forming `TᵀKT` and `TᵀMT` the long
+way.
+
+#### The properties are identities, and they are asserted as such
+
+- **Zero modes is Guyan static condensation, and static condensation is exact at
+  the interface** — for any load, at any mode count. Against
+  `solidshell::solveStatic` on the same problem the two agree to **2 × 10⁻¹⁰ m of
+  a 0.31 m** deflection, and **8 × 10⁻¹⁰ m of 0.027 m** on a real patch of the
+  ferry's curved side. What limits it is the conditioning of two independent
+  solves, not the reduction.
+- **This corrects the usual statement of that property.** "The static interface
+  response improves with mode count" is false: it starts exact and stays there.
+  Measured with the load moved *into* the interior, the interface error is
+  2.5 × 10⁻¹¹ m at zero modes and the same 2.5 × 10⁻¹¹ m at thirty-two. What the
+  modes buy is the **interior** recovery — 9.7 × 10⁻⁴ m of error at zero modes,
+  1.2 × 10⁻⁸ m at thirty-two — and dynamics.
+- **Rigid body modes survive exactly.** A rigid interface motion is the exact
+  static solution of the interior with no interior load, so `Ψ u_b` *is* the rigid
+  interior field — reproduced to 4 × 10⁻¹⁰ m of one metre. A free-free
+  substructure keeps exactly six zero eigenvalues, at 2 × 10⁻¹⁰ of the first
+  elastic one. Because the mass goes through the same `T`, a rigid translation of
+  the reduced model weighs what the substructure weighs and a rigid rotation
+  carries the full model's own rotary inertia.
+- **Reduced frequencies come down from above, monotonically.** Rayleigh–Ritz on a
+  subspace of the full space, and the subspaces nest, so a reduction can only
+  stiffen. The tests assert the *direction* — a reduction whose error had the
+  wrong sign would pass any "close enough" test and fail this one.
+- **Symmetry and definiteness carry over — but not the same definiteness for both
+  matrices.** `M_r` is positive *definite*, because `T` has full column rank and
+  `M` is a positive diagonal. `K_r` is positive **semi**-definite and for a
+  free-free substructure exactly six-fold singular: it being positive definite
+  would mean the rigid body modes had been lost. Both are symmetric to the last
+  bit because the analytically symmetric blocks are computed on one triangle and
+  mirrored — which makes the symmetry *check* vacuous on its own, so the test that
+  carries the content is the independent `TᵀKT`.
+
+#### Whether to reduce the mass too: yes, and the alternative is measurable
+
+Both matrices go through the same `T`, and the two things one might do instead are
+wrong in ways that can be shown rather than argued. Keeping `M_bb` alone — the
+"Guyan mass" a static condensation leaves — hands the model **12.5%** of the
+substructure's inertia on the test plate, so every frequency comes out high by the
+square root of the ratio. And projecting `K` through `T` while getting `M` from
+somewhere else loses the from-above property above, which is a statement about one
+subspace and only true when both matrices are projected onto it.
+
+The mass itself is **row-sum lumped**, matching Tier 2: the reduced region and the
+zone that replaces it then agree about inertia at the moment of promotion, a
+diagonal `M_ii` makes the fixed-interface eigenproblem a standard symmetric one,
+`M_bi` vanishes identically, and total mass and rigid translation are conserved
+exactly. The price is a slightly low rotary inertia in absolute terms, which
+touches nothing asserted here because every comparison is against the *same* full
+finite element model.
+
+There is a sharper statement available and it is what mutation testing forced:
+row-sum lumping is `m_a = ρ ∫N_a dV`, and since `Σ N_a x_a` is the isoparametric
+map, `Σ m_a x_a = ρ ∫x dV` **exactly** — the lumped masses sit at the meshed
+volume's own centre of gravity. On the ferry's curved, tapered plating that holds
+to **2 × 10⁻¹⁴ m**, where splitting each element's mass evenly is out by
+2 × 10⁻⁵ m.
+
+#### The eigensolvers, written rather than taken
+
+No third-party dependencies, for the same reason this repo has a hand-written PNG
+codec. Two, because the problems are different shapes:
+
+- **Dense**: Householder tridiagonalisation with the transform accumulated, then
+  implicit QL with Wilkinson shifts. Checked against the second-difference
+  operator, whose spectrum `2 − 2cos(kπ/(n+1))` and sine eigenvectors are exact:
+  eigenvalues to 10⁻¹³, eigenvectors to 10⁻¹², orthonormality to 10⁻¹³, and a
+  triply repeated eigenvalue resolved with an orthonormal eigenspace.
+- **Subspace iteration** for the fixed-interface modes, because only the lowest
+  `m` of several thousand are wanted. It iterates `X ← K_ii⁻¹M_iiX` on a block of
+  `q > m` vectors, using `solidshell::BandedSpd` for the factorisation.
+
+**Subspace iteration converges to the lowest modes; it does not prove it found
+them,** and a skipped mode is the silent failure here — the reduced model would
+still be symmetric, positive definite, and bound the full model from above, and
+simply be missing a mode. So the count is verified by a **Sturm sequence check**:
+an LDLᵀ factorisation of `K_ii − σM_ii` has exactly as many negative pivots as
+there are eigenvalues below `σ` (Sylvester's law of inertia), and `σ` between the
+last mode kept and the first discarded must give exactly `m`. The same inertia
+count makes a frequency cutoff an *exact* request answered before any eigenvector
+is computed.
+
+Two defects the tests found in the first version of that machinery, both of the
+kind that produce plausible numbers rather than a crash:
+
+- **The block goes numerically rank deficient.** Repeated multiplication by
+  `K_ii⁻¹M_ii` drives every column towards the lowest modes; on a 210-DOF interior
+  with a block of 200 the projected mass matrix stopped being positive definite,
+  the projected eigenproblem was refused, and *the whole reduction quietly fell
+  back to Guyan* with one line in `problems` to say so. The cure is to
+  re-orthogonalise the block in the mass inner product each iteration — two passes
+  of classical Gram–Schmidt — after which the projected mass matrix is the identity
+  by construction and there is no Cholesky left to fail. It is not free: it is what
+  takes the reduction of a 47-mode ferry patch from 0.33 s to 1.5 s.
+- **A failed eigensolve returned no pairs and the reduction read them anyway**,
+  which is a crash where the right answer is a Guyan reduction and a stated reason.
+
+#### How the interface is chosen, and what it costs
+
+The interface is every node the substructure shares with anything outside it, and
+that is a property of the cut rather than of the mesh, so the caller supplies it.
+`nodesNearPlanes` covers a region cut out between two bulkheads; `nodesPinned`
+turns a `zone::buildPatch` patch into a substructure whose interface is the
+clamped perimeter it already has. `HexMesh::fixed` is deliberately **ignored** —
+a substructure is a free component and what holds it is a constraint on the
+*reduced* model — and `problems()` says so, because a dropped constraint that is
+not reported is indistinguishable from one that was honoured.
+
+**The interface must restrain the interior, and the factorisation does not catch
+it when it does not.** `K_ii` is singular if the interface leaves a rigid body
+mode free, but a mechanism gives an exactly zero pivot in exact arithmetic and a
+tiny *positive* one in floating point, so `BandedSpd::factor` succeeds and the
+solve returns nonsense. It is a geometric precondition, so it is checked
+geometrically — at least three non-collinear nodes — before anything is factored,
+and the tolerance is scaled by the interface's own extent so that an interface
+collinear to within a rounding is refused too.
+
+**Cost is quadratic in the interface and linear in the interior**: `Ψ` is
+`n_i × n_b` dense and `ΨᵀM_iiΨ` is `O(n_i n_b²)`. That is the argument for cutting
+at a bulkhead — a transverse section is a thin ring of nodes — rather than around
+a patch, whose perimeter is a large fraction of it.
+
+#### Reverse Cuthill–McKee is not unconditionally better, measured
+
+The interior is solved banded and banded storage is `n(band+1)`, so the numbering
+the mesher happened to emit decides the memory and the factorisation time. RCM
+removes that dependence — except that with a minimum-degree start it came out
+**59 against 41** on the test plate and **83 against 53** on one ferry patch,
+*worse* than the numbering it replaced, while beating it 89 to 173 and 137 to 341
+on others. Two changes followed: the start is the George–Liu pseudo-peripheral
+node, and the result is compared against leaving the numbering alone and the
+narrower of the two kept. Comparing is free — a bandwidth is one pass over the
+adjacency — and it makes the ordering incapable of being a regression:
+
+| substructure | interior DOF | as meshed | RCM alone | chosen | banded store |
+|---|---|---|---|---|---|
+| test plate | 210 | 41 | 65 | **41** | 0.07 MB |
+| ferry patch, r = 2.5 m | 1038 | 173 | 71 | **71** | 0.60 MB |
+| ferry patch, r = 3 m | 1374 | 53 | 71 | **53** | 0.59 MB |
+| ferry patch, r = 5 m | 4182 | 341 | 119 | **119** | 4.0 MB |
+| ferry patch, r = 8 m | 8742 | 437 | 167 | **167** | 11.7 MB |
+
+The **reversal** in the name is measured to buy exactly nothing here: plain
+Cuthill–McKee gives the identical bandwidth on all five. What reversal reduces is
+the *profile*, and constant-band storage does not exploit a profile. It is kept
+because it costs one line and a skyline solver would want it, not because it was
+observed to help.
+
+#### How many modes buy what accuracy — measured, and the rule needs care
+
+On a 272-element patch of the ferry's own side (1902 DOF, 528 of them interface)
+with half the interface free, against a dense generalised eigensolve of the same
+full model:
+
+| modes | the fixed-interface cutoff it is | worst error, modes < 10 Hz | worst error, modes < 20 Hz | reduce |
+|---|---|---|---|---|
+| 0 (Guyan) | — | 3.9 × 10⁻² | 4.9 × 10⁻¹ | 0.11 s |
+| 2 | 16 Hz | 6.0 × 10⁻³ | 8.3 × 10⁻² | 0.12 s |
+| 5 | 24 Hz | 5.0 × 10⁻³ | 1.5 × 10⁻² | 0.19 s |
+| 10 | 34 Hz | 3.8 × 10⁻³ | 5.3 × 10⁻³ | 0.21 s |
+| 20 | 56 Hz | 5.7 × 10⁻⁴ | 1.9 × 10⁻³ | 0.50 s |
+| 47 | 116 Hz | 8.8 × 10⁻⁵ | 2.0 × 10⁻⁴ | 1.50 s |
+| 100 | 301 Hz | 3.7 × 10⁻⁶ | 8.3 × 10⁻⁶ | 5.20 s |
+
+Every one of those is *above* the full model's, and monotonically decreasing.
+
+**The trap is that the cutoff is a frequency of the fixed-interface problem and
+the band of interest is a frequency of the assembled one, and they are not the
+same spectrum.** With part of the interface free the assembled model is far softer
+than the fixed-interface one — first assembled mode 2.97 Hz against a first
+fixed-interface mode at 14.7 Hz — so the standard "cut off at twice the highest
+frequency of interest" keeps **two** modes here, not the dozens the assembled
+frequency count would suggest. Two modes is 0.6% inside the 10 Hz hull-girder band
+and 8% up to 20 Hz. **Five or six times the band, not twice, is what buys a part
+in ten thousand**, and the header says so beside the default rather than leaving
+"a few percent" to be discovered.
+
+The other end of the same measurement is what decides when to call this at all: a
+**small stiff substructure needs no modes**, because its first fixed-interface
+frequency is already above the band and Guyan condensation is exactly right at the
+interface however soft the load. `firstFixedFrequency` is computed and reported
+even when zero modes are kept, so "no modes were needed" is a number.
+
+#### Cost against the tiers either side, on the same plating
+
+| tier | what it covers | one-off | core-seconds per simulated second |
+|---|---|---|---|
+| **Tier 0** | the whole ship, as a beam | — | **0.10** (`hullGirder` 0.995 ms at 100 Hz) |
+| **Tier 1** | this patch, linear | 0.11 s to reduce (1.5 s at 47 modes) + 0.01 s to factor | **0.35–0.41** (1 ms implicit steps, 528–575 DOF) |
+| **Tier 2** | this patch, nonlinear | 8 ms to mesh | **1155** (`4.0 × elementCount`, 1.72 µs explicit steps) |
+
+**Tier 1 is 2800× cheaper than Tier 2 on the same plating** and about four times
+the cost of the beam that covers the entire ship. The explicit step is 1.72 µs and
+thickness-governed, so Tier 2 takes 580 000 steps where a linear implicit model
+takes a thousand — that ratio, not the matrix size, is where the three orders of
+magnitude come from.
+
+**The interface sets the running cost, not the mode count.** Going from 0 to 47
+modes moves a step from 350 µs to 409 µs, 17%, while the 528 interface DOF are 92%
+of the reduced model either way.
+
+#### What a reduced region cannot do, and what the caller must do instead
+
+**A reduced model is linear by construction and that cannot be worked around
+inside it.** `K` is formed once from the undeformed geometry and `Ψ`, `Φ` are a
+fixed subspace derived from it. So it **cannot yield** — no stress state to
+return-map, no plastic history, no path dependence; it **cannot tear, buckle or
+contact**; it **cannot rotate**, because the stiffness is small-strain in the
+global frame, unlike the co-rotational Tier-2 element; and it is **stale the
+moment anything changes**, because thinning or tearing changes `K` and the
+reduction has to be rebuilt.
+
+The tests assert that plainly rather than describing it: a load a thousand times
+larger gives a stress a thousand times larger, straight through 355 MPa without a
+word.
+
+What the caller must do is **promote the region to Tier 2** — `promotion.hpp`
+already owns that decision and `zone::buildPatch` already meshes the result — and
+the reduced model's job at that point is to stop answering and hand over its
+interface displacements as the zone's boundary condition. `checkValidity` is the
+trigger: it recovers the interior displacement, evaluates stresses through the
+same `solidshell::elementStress` Tier 2 uses, and reports the peak von Mises
+utilisation.
+
+**And the warning is late, not early**, which is the direction that matters and is
+measured rather than asserted: a truncated basis cannot represent a
+concentration, so the recovered peak comes out **under**-predicted — 9.25 MPa
+against the full model's 11.08 MPa with Guyan alone, converging to 11.01 MPa with
+64 modes. `checkValidity` is a trigger for promotion, not a strength check.
+
+#### What it does not do yet
+
+1. **There is no whole-ship Tier-1 model.** The reduction takes a `HexMesh`, and
+   the only mesher that produces one is `zone::buildPatch` — plating only, within
+   a radius, stopping at thickness seams. A hold-sized substructure is a mesher
+   problem, not a reduction problem, and it is the next piece.
+2. **Nothing assembles two substructures.** Boundary DOF are kept exactly and
+   listed in the global numbering, so a reduced model is couplable by
+   construction; what does not exist is the pass that matches two interfaces and
+   stacks the modal blocks. Component mode *synthesis* is still one component.
+3. **A zone's edge is still clamped.** `zone.hpp` §5 item 1 and `promotion.hpp`
+   are unchanged by this file's arrival: the two-way coupling needs something that
+   drives interface DOF from the surrounding structure instead of pinning them.
+4. **Stiffeners are still not meshed**, inherited from `zone.hpp` §3 — the
+   substructure is as good as the mesh it is given.
+5. **No damping.** `M_r` and `K_r` are what comes out; a modal damping ratio or a
+   Rayleigh pair is a caller's to add, and there is no measurement here that sets
+   one.
+
+#### What mutation testing found
+
+80 mutants, each a single plausible edit. The first pass ran 68 of them and killed
+52; of the sixteen that lived, one was the deliberate no-op kept as a control —
+because a harness that reports everything killed is reporting nothing — one was a
+mutant of mine that turned out to be a no-op by accident, and **every one of the
+remaining fourteen was either a hole in the suite or a defect in the code**. Two
+were defects: the rank-deficient subspace block and reverse Cuthill–McKee being
+worse than the numbering it replaced, both described above. The suite went from
+103 checks to 134, and the final pass kills 75 of 80 with four argued equivalent.
+
+- **The peak of a bent plate is very nearly a uniaxial stress at a free surface**,
+  so dropping the shear terms from von Mises changed nothing, and neither did
+  looking at one Gauss point instead of eight. The fix is a plate turned 45° —
+  the stress comes back in the *global* frame, so a stress along the plate is
+  equal parts `σ_xx`, `σ_yy` and `σ_xy` and dropping the shear halves it — under
+  an **eccentric** in-plane pull, which puts `4P/A` on the face it acts on and
+  `−2P/A` on the other so the `ζ = −1` Gauss points carry less than half the peak.
+  Both guards are asserted, not assumed.
+- **Row-sum lumping and volume/8 are identical on a uniform brick mesh**, so
+  nothing distinguished them. The centre-of-gravity identity above does, on the
+  ferry's own distorted plating, by nine orders of magnitude.
+- **A Cholesky that accepts a zero pivot looks like one that refuses it** unless
+  the zero is on the *last* diagonal: anywhere else the row below divides by it,
+  produces a NaN, and the very next pivot test rejects the matrix anyway.
+- **A wrong Wilkinson shift converges to the same answer** and only costs sweeps —
+  54 as written and 64 with the shift halved, where dropping it altogether does not
+  converge at all. The sweep count is deterministic, so it is asserted where a wall
+  clock could not be.
+- **A node count is not a second test for a degenerate interface.** Two nodes are
+  collinear; the count survives only in the message. And *nearly* collinear is the
+  case that matters, because exactly collinear is what a synthetic mesh produces
+  and a real one never does.
+- **A refusal is not enough without its reason**: a test that only checked
+  `problems()` was non-empty passed a Cholesky failure being reported as a QL
+  failure — and then passed again on `find("collinear")` matching inside
+  "non-**collinear**" in a different message.
+
+Four are argued **equivalent**, and saying why is the useful part. Counting
+non-positive rather than negative pivots in the inertia count cannot differ,
+because an exactly zero pivot is already perturbed to a positive tiny before the
+sign test reaches it. Dropping the reversal in RCM gives the identical bandwidth
+on all five test meshes, for the reason above. The guard that refuses an interior
+renumbering which did not cover every node is unreachable while the renumbering
+is correct — but it is what converts "only the first component is visited" from a
+silent half model into a reported one, so two mutants share one guard and the
+other one dies. And the branch that replaces a collapsed column in the subspace
+block is defence the suite never triggers, now that the orthogonalisation stops
+columns collapsing in the first place.
+
+A fifth is worth recording because it was killed by *deleting* code rather than by
+adding a test: the interface check tested a node count and then collinearity, and
+changing the count threshold from three to two altered nothing, because two nodes
+are collinear and one is and none is. The count was dead. It survives only in the
+message, where it does tell a caller something the word "collinear" does not.
+
 ### Solver
 
 Explicit central-difference time integration inside Tier 2 (standard for
 impact/fracture, no global stiffness matrix, trivially parallel). Tier 1 is
-implicit and cheap. Lumped mass matrix.
+implicit and cheap — measured at 0.35–0.41 core-seconds per simulated second at
+1 ms steps against Tier 2's 1155 on the same plating, because a linear model is
+unconditionally stable and takes a thousand steps where the explicit one takes
+580 000. Lumped mass matrix in both, so the two agree about inertia at the moment
+a region is promoted.
 
 GPU: the element loop is a good compute-shader workload — gather nodal state,
 compute deformation gradient, stress, internal force, write per-element forces,
