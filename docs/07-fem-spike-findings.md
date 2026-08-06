@@ -514,10 +514,21 @@ back-end as instructed.
 > `02-simulation.md` — each quoting the previous rather than the tool. That is
 > `CLAUDE.md`'s "nothing at all tests a comment", for the second time.
 
+> **And the last item on this section's own list has since been closed, as a negative.**
+> "Keep alpha in double" was item 3 of *What to do about it* and the only thing left to
+> try. It is built — five kernels from one source, `--eas=float|tight|solve|condense|
+> newton` — and it does not close the gap: the five land between 40 and 49 torn elements
+> at 768 where the reference is 32, the spread across the precisions is the size of the
+> gap they were meant to close, and it is not monotone in precision. It costs 5–10× on
+> the kernel, which undoes the remap. *Alpha in double — measured, and it is not what
+> was missing*, below, has the tables, the mechanism, and the two claims in item 3 that
+> turned out to be wrong.
+
 The kernel exists, it is correct on the closed forms available to it, and after the
 remap it is **1.26× to 2.43× the 23-worker CPU** end to end on the real patch. The
 float answer still stops tracking the double one long before a run finishes, and
-that — not throughput — is now the only thing standing between this kernel and use.
+that — not throughput — is what stands between this kernel and use. It is now known
+*not* to be the enhanced block's precision.
 
 The most useful thing that came out of the original work is neither: it is what the
 profiling found on the way in.
@@ -746,7 +757,7 @@ scaling by van der Sluis) recovers the peak: 3.935 × 10⁻⁸ against the CPU's
 3.911 × 10⁻⁸, 0.6%. It does **not** recover every element — the worst element's
 alpha is still out by more than its own magnitude.
 
-**3. The run-scale divergence is real, it is 26–34% on the dissipation, and it
+**3. The run-scale divergence is real, it is 27–34% on the dissipation, and it
 moves the torn count by a quarter to a half.** Over a full 5 505-step run:
 
 | after 5 505 steps, 192 elements | CPU double | GPU float | relative |
@@ -819,12 +830,20 @@ is why the original run could say nothing about it. At 768 and 3 072 elements th
 | | 768 elements | 3 072 elements |
 |---|---|---|
 | CPU double, torn | **32** | **162** |
-| GPU float, torn (workgroup) | 40 | 247 |
-| GPU float, torn (invocation) | 44 | 213 |
+| GPU float, torn (workgroup) | 40 → **41** | 247 → **248** |
+| GPU float, torn (invocation) | **44** | 213 → **241** |
 | **control: double, mesh jittered 2 × 10⁻⁷ m, torn** | **32** | **162** |
-| CPU dissipation | 1.5194 MJ | 1.2910 MJ |
-| GPU dissipation, relative | 2.6 × 10⁻¹ | 3.4 × 10⁻¹ |
-| control dissipation, relative | 7.7 × 10⁻³ | 5.6 × 10⁻⁴ |
+| CPU dissipation | 1.5194 → **1.5205** MJ | 1.2910 → **1.2963** MJ |
+| GPU dissipation, relative | 2.6 → **2.7** × 10⁻¹ | 3.4 × 10⁻¹ |
+| control dissipation, relative | 7.7 → **7.9** × 10⁻³ | 5.6 × 10⁻⁴ |
+
+> **The arrows are a correction, made when the table was re-run for the fp64 work below.**
+> Five of these cells do not reproduce — on today's tree, on a repeat, at any worker
+> count, or on `776d15e` itself. The bold figures are what the tool produces. Four of
+> the five are off by one element or 0.4%; the invocation mapping's 3 072-element count
+> is off by 28. See *First, the float baseline* below for how that was established.
+> Nothing in the argument moves, and the two cells it rests on — the reference and the
+> jittered control, 32 and 162 both — reproduce exactly.
 
 **The control tears exactly the reference's count at both sizes and the float
 kernel is 25% and 52% over it.** That is the argument, and it is much stronger than
@@ -842,6 +861,298 @@ earlier localisation is precisely what turns into extra torn elements.
 What is settled is that the kernel is still not usable for the question a zone
 exists to answer. Its output is *which panels tore*, and it tears a quarter to a
 half too many. What is **no longer** true is that it is slow.
+
+### Alpha in double — measured, and it is not what was missing
+
+Item 3 of *What to do about it* was the last thing left on this list: "keep alpha in
+double — the EAS block is 7×7, and it is the only part that has been shown to need the
+digits." It has been built and measured, and **it does not close the gap.** What it
+does close is a different question that turned out to be the interesting one.
+
+`solidshell_forces_wg.comp` now compiles into **five kernels from one source**, selected
+by `gpu::EasPrecision` and `zone_gpu_probe --eas=`. One source matters: any difference
+between two of them is the precision and nothing else, and at level 0 the SPIR-V is
+**byte-identical** to the kernel this work started from, so the float column below is
+the same kernel §8 has been quoting throughout.
+
+| `--eas=` | what is in fp64 | stopping rule |
+|---|---|---|
+| `float` | nothing — as shipped | 1e-9·σ_y V, 12 iterations |
+| `tight` | nothing — **the control** | the CPU's 1e-16, 40 iterations |
+| `solve` | the Jacobi equilibration, the 7×7 Cholesky, both substitutions | shipped |
+| `condense` | + Kaa and the residual, over an fp64 copy of G and the weights | shipped |
+| `newton` | + alpha, its correction, its persistent per-element state | the CPU's |
+
+`tight` is there because `newton` changes the tolerance and the arithmetic together.
+Without a kernel that changes only the tolerance there is no way to say which of the two
+moved anything — and it turns out to be entirely the tolerance.
+
+**The fp64 copy of G is not optional at `condense` and above.** A double accumulation of
+`∫GᵀCG` over a G that was rounded to float is an operator known to seven digits however
+it is summed, so a level that widened the arithmetic without widening the operator would
+have measured nothing and reported it as a result.
+
+#### First, the float baseline — and two more cells of the table above do not reproduce
+
+Same probe, same five sizes, today's tree:
+
+| | 192 | 768 | 3 072 | 8 192 | 16 384 |
+|---|---|---|---|---|---|
+| CPU double, torn | 0 | **32** | **162** | 0 | 0 |
+| GPU float, torn | 0 | **41** | **248** | 0 | 0 |
+| control: double, jittered 2e-7 m | — | **32** | **162** | — | — |
+| GPU dissipation, relative | 2.79e-1 | 2.74e-1 | 3.40e-1 | 9.3e-2 | 2.3e-2 |
+| control dissipation, relative | — | 7.9e-3 | 5.6e-4 | — | — |
+
+At 192 elements every figure reproduces to four significant figures: dissipation 1.1114
+against 1.4214 MJ, peak damage 0.6527 against 0.4094, zero torn on both sides. The
+reference's 32 and 162 reproduce, and so does the negative control's exact 32 and 162 —
+which is the load-bearing part of the argument and it is intact.
+
+> **What does not reproduce is the float kernel's own torn count and the CPU's
+> dissipation at 768 and 3 072.** *Precision* above records 40 and 247 torn on the
+> workgroup mapping, 213 on the invocation mapping at 3 072, and the CPU dissipating
+> 1.5194 and 1.2910 MJ. The tool produces **41 and 248**, **241**, and 1.5205 and
+> 1.2963 MJ, and it does so:
+>
+> - on a repeat run, exactly — both paths are deterministic here, so it is not noise;
+> - at 1, 4, 12 and 23 CPU workers, identically — so it is not the reduction order;
+> - **and on `776d15e` itself, the commit that table was taken at**, built from a `git
+>   archive` of it. `scantlings.cpp` and `solid_shell.cpp` have both moved since, which
+>   was the obvious explanation and is the wrong one: the old tree gives 1.5205 MJ and
+>   41 torn as well.
+>
+> So a second set of cells in §8's precision table did not come from the run the rest of
+> it came from. Four of them are off by one element or 0.4%; the invocation mapping's
+> 3 072-element count is off by 28, which is 13%. **The conclusion is untouched** —
+> float is 28% and 53% over a reference that a float-sized geometric jitter reproduces
+> exactly — but it is the same failure twice in one table, and the reusable part is how
+> it was found: by re-running the tool at the old commit, not by comparing two
+> documents. The obvious explanation, that `scantlings.cpp` and `solid_shell.cpp` have
+> both moved since, is the wrong one and would have been recorded as fact if the
+> archive had not been built.
+
+#### Then the ladder, and nothing on it converges to the reference
+
+| torn elements | 768 | 3 072 | dissipation, relative |
+|---|---|---|---|
+| CPU double, the reference | **32** | **162** | — |
+| control: double, mesh jittered 2e-7 m | **32** | **162** | 7.9e-3 / 5.6e-4 |
+| `float`, as shipped | 41 | 248 | 2.74e-1 / 3.40e-1 |
+| `tight` — float, the CPU's stopping rule | 40 | 205 | 2.65e-1 / 2.87e-1 |
+| `solve` — + the 7×7 solve in fp64 | 44 | 248 | 2.67e-1 / 3.58e-1 |
+| `condense` — + the condensation in fp64 | 49 | 268 | 2.80e-1 / 3.80e-1 |
+| `newton` — the **whole block** in fp64 | 45 | 241 | 2.80e-1 / 3.40e-1 |
+
+**Read the spread, not any one row.** Five kernels that differ only in the precision of
+the enhanced block land between 40 and 49 at 768 and between 205 and 268 at 3 072, while
+the reference is 32 and 162 and the negative control hits both exactly. The variation
+*among the precisions* is the same size as the gap they were supposed to close, and it is
+not monotone in precision: of the three that share the shipped stopping rule, the one
+with the most of its enhanced block in fp64 (`condense`) is the furthest from the
+reference at both sizes. That is the signature of a quantity that is not responding to
+the variable being changed at all.
+
+Over the full five sizes the fp64 block changes the dissipation in the fourth digit and
+the torn count nowhere it was zero:
+
+| elements | steps | CPU torn | float torn | fp64 torn | float diss. rel. | fp64 diss. rel. |
+|---|---|---|---|---|---|---|
+| 192 | 5 505 | 0 | 0 | 0 | 2.79e-1 | 2.79e-1 |
+| 768 | 5 505 | **32** | 41 | 45 | 2.74e-1 | 2.80e-1 |
+| 3 072 | 5 505 | **162** | 248 | 241 | 3.40e-1 | 3.40e-1 |
+| 8 192 | 1 500 | 0 | 0 | 0 | 9.32e-2 | 9.32e-2 |
+| 16 384 | 1 000 | 0 | 0 | 0 | 2.28e-2 | 2.28e-2 |
+
+#### Why it cannot help, which was visible before it was built and is now measured
+
+Kaa is `∫GᵀCG dV` and the residual is `∫Gᵀσ dV`. **C and σ are produced by a float return
+map into float shared memory.** Widening the arithmetic that consumes them cannot recover
+digits they never had, so the enhanced block's accuracy is capped at float's ~1e-7 on its
+own inputs however it is compiled. That cap was not binding when §8 wrote item 3, because
+κ(Kaa) was then (h/t)⁴ ≈ 10⁷ and the block genuinely had no correct digits; item 2's
+normalisation has since put κ(Kaa) at a constant **3.50**, and a well-conditioned 7×7
+solve on float inputs already delivers everything float can deliver.
+
+Measured directly, on the same 400-step unit-scale fixture the two mappings are compared
+on: holding the stopping rule fixed, the **entire** enhanced block in fp64 moves alpha by
+**4.6 × 10⁻⁹** where the float kernel is already **3.8 × 10⁻⁶** away from the double CPU.
+A factor of **810**. `tests/test_zone_gpu.cpp` asserts that ratio at 100, so it fails if
+fp64 ever does start mattering here.
+
+#### The one thing that did move, and §8 had the mechanism wrong
+
+Item 2 recorded: "measured at 100 steps … the GPU's enhanced parameters were **exactly
+zero** — the residual gate fired on the first iteration and left them at their warm
+start". The zero is real and reproduces. **It is not the residual gate.** `kResidualTol`
+is already the CPU's `1e-12·σ_y V`; what differs is `kEnhancedWorkTol`, **1e-9 against
+the CPU's 1e-16** — and the shader tests it *after* computing the correction and *before*
+applying it, so the element returns alpha at its warm start of zero. Measured on the
+192-element patch, and on the unit-scale fixture in the suite:
+
+| | CPU double | `float` | `solve` | `condense` | `tight` | `newton` |
+|---|---|---|---|---|---|---|
+| peak \|alpha\|, 192 elements at 50 steps | 7.671e-9 | **0** | **0** | **0** | 2.010e-8 | 2.010e-8 |
+| peak \|alpha\|, unit fixture, 120 light steps | 5.511e-9 | **0** | **0** | **0** | 5.206e-9 | 5.206e-9 |
+
+Three things fall out of that table and each is a separate finding.
+
+- **fp64 in the solve and in the condensation changes nothing whatsoever** — they return
+  the identical bit-zero, because the correction they compute to sixteen digits is
+  discarded at the same gate the float kernel discards it at.
+- **`tight` and `newton` are indistinguishable.** Every digit printed agrees, at every
+  step count tried. The whole of the fp64 block's effect on this kernel is the tolerance
+  it was bundled with.
+- **The tolerance is worth something on its own.** In float, with the CPU's rule, alpha
+  goes from wrong by 100% of the reference (it is zero) to wrong by 20%, and the peak
+  lands within 5.5%. It is also the only variant that moves the torn count meaningfully:
+  248 → 205 at 3 072, which takes it from 53% over the reference to 27%. It is not
+  reproduced at 768 (41 → 40, 28% over to 25%), it costs 3.5× on the kernel, and 27%
+  over is still not an answer — so the shipped gate stays at 1e-9 and this is recorded
+  rather than adopted. It is the one thing on this page that a future attempt should
+  start from, and it is not a precision question at all.
+
+**A caution on comparing alpha's *value* across item 2.** Normalising the enhanced modes
+rescales alpha by construction — column *j* of G by *s* and α*ⱼ* by 1/*s*, which is what
+makes the fix exact — so the numbers are not commensurable either side of it and §8's
+"the CPU's were 3.9e-8" should not be compared with the 3.445e-8 measured today at the
+same 100 steps. What *is* commensurable is whether the device's alpha is zero, and there
+item 2 did move something: at 100 steps the device now returns 6.202e-8 rather than
+nothing. The bit-zero reproduces at 50 steps and below. That crossover shift is the one
+thing item 2 changed on this path, and it is a change in where the work gate stops
+firing, not in how many digits the block has.
+
+#### The cost, which is not small
+
+`zone_gpu_probe --stats`, so the compiler's account rather than the curve's:
+
+| kernel | registers/thread | spill over calibration | shared |
+|---|---|---|---|
+| `solidshell_forces_wg.comp` | 64 | 96 B | 2 832 B |
+| + fp64 7×7 solve | 72 | 128 B | 2 928 B |
+| + fp64 condensation | 80 | 128 B | 2 928 B |
+| + fp64 alpha and Newton | 80 | 128 B | 2 960 B |
+
+Derived from the register count and Pascal's 65 536-register file, warp occupancy falls
+from 32 warps per SM to 25. That is the cheap part. The expensive part is the arithmetic
+and the extra Newton iterations the tighter rule buys:
+
+Kernel time at 768 elements, two interleaved passes of all five, relative to `float`:
+
+| kernel | × `float` |
+|---|---|
+| `tight` — float, the CPU's stopping rule | ×3.5 |
+| `solve` | ×1.8 |
+| `condense` | ×2.9 |
+| `newton` | ×6.5 |
+
+And `newton` against `float` across the whole size range, from the two sweeps:
+
+| elements | 192 | 768 | 3 072 | 8 192 | 16 384 |
+|---|---|---|---|---|---|
+| `newton` ÷ `float`, kernel time | ×10.4 | ×8.5 | ×9.9 | ×5.3 | ×6.0 |
+| float mapping, against the CPU (§8) | 1.55× | 1.26× | 1.38× | 2.28× | 2.43× |
+| **implied for the fp64 kernel** | **0.15×** | **0.15×** | **0.14×** | **0.43×** | **0.41×** |
+
+> **Measured against an unrelated GPU consumer at 100% utilisation, and that is not a
+> footnote.** Repeat passes of the *same* configuration differ by up to 35% on the float
+> kernel, and the CPU reference column moved 47% across the sweep, so these are
+> within-session ratios good to one significant figure and nothing finer should be read
+> off them. The absolute end-to-end speedups from that session are meaningless and are
+> not quoted; §8's 1.26–2.43× is carried through instead, which is why the last row above
+> is labelled *implied*. `newton` itself is the steadiest of the five — two passes 0.8%
+> apart — because at six times the work it is the least sensitive to anything else on the
+> device.
+
+**Five to ten times, and it is enough to undo the remap.** The fp64 block puts the kernel
+at **0.14–0.43× the 23-worker CPU**, lower at both ends than the one-invocation mapping's
+0.23–0.68×. §8 item 3's estimate — "even at Pascal's 1/32 fp64 rate it is a small share
+of the kernel" — is wrong twice over: the enhanced block is ~70% of a Newton iteration by
+§8's own phase table in *The remap, and what it did*, not a small share; and the
+stopping rule that has to come with it multiplies the iteration count on top.
+
+#### Where the error is instead, which the same runs place directly
+
+The two zeros above do more than explain themselves. **At 50 steps and below the shipped
+kernel's enhanced modes are switched off entirely** — alpha is bit-zero on every element,
+so the enhanced block contributes exactly nothing to the answer. And at 100 steps, still
+before a single point has yielded, the device's node field is already **1.41 × 10⁻⁶ m
+away from the CPU's, 5.8 × 10⁻² of the 2.4 × 10⁻⁵ m the punch has travelled**.
+
+So the divergence is well established in a regime where the enhanced block is provably
+not participating. It cannot be the enhanced block. What is left is `u = Rᵀx − X`, the
+polar decomposition, the return map and the integrator — per-step float error injected
+thousands of times, and biased, exactly as *Precision* above describes.
+
+**So the item closes as a negative.** Alpha in double was the last thing on this list, it
+has been tried, and the digits the enhanced block was missing were not what stands
+between this kernel and its answer. The enhanced block was simply not the part that
+needed the digits.
+
+### What mutation testing found on the fp64 block
+
+Forty-one mutants — the twenty-six from the remap, brought up to date, plus twelve of
+the fp64 block and its host wiring, and three deliberate controls.
+**29 of 38 real mutants killed; 3 of 3 controls survive.** `tools/zone_gpu_probe/mutate.py`.
+
+> **The harness now mutates a copy of the tree outside the repository.** Two harnesses
+> here have left a mutant applied in the working tree after being killed before their
+> cleanup ran, and a `finally` does not survive a kill. A copy cannot have that failure
+> mode at all, and it also makes the harness safe to run while something else is
+> building the real tree — which is how this pass and the gate ran together.
+
+**Four of the survivors are the same finding as the measurements above, arrived at from
+the other end**, and they are why this pass is worth reading next to the tables.
+
+- **Dropping the fp64 warm start survives. So does never writing the fp64 alpha back.**
+  Two independent mutants of the persistent fp64 alpha buffer — the *literal* reading of
+  "keep alpha in double" — and nothing observes either. With the CPU's stopping rule the
+  enhanced Newton converges to the same alpha from a cold start as from a warm one, so
+  carrying it in double between steps buys nothing that any quantity this repo measures
+  can see.
+- **Making the fp64 condensation read its Gauss weights from the wrong offset survives**,
+  and this is the sharpest statement of *why* fp64 in the condensation cannot help.
+  **Kaa is the enhanced Newton's Jacobian, not its residual.** The root is set by
+  `∫Gᵀσ dV`; Kaa only decides the path to it. A wrong Kaa changes how many iterations
+  the Newton takes and not what it converges to — so widening Kaa to fp64 cannot move
+  the converged alpha either. The mutant found the argument the measurement had only
+  the shape of.
+- **Cutting the tight variant's iteration cap from 40 back to 12 survives**, which says
+  the Newton reaches the CPU's 1e-16 work gate inside twelve iterations. The cap is not
+  what the tight rule costs; the extra iterations below it are.
+
+**Two survivors are hazards no test on this machine can see, and both are the same
+shape as §8's barriers.**
+
+- **Three of the four `barrier()` deletions survive**, exactly as recorded before: the
+  1070 Ti's subgroup is 32 and so is the workgroup. Reproduced rather than repeated.
+- **Never requesting `shaderFloat64` of the device survives.** This driver runs a shader
+  carrying the `Float64` capability on a device created without the feature enabled.
+  That is undefined behaviour the spec forbids and this driver permits, so the request
+  is correct by the specification and by nothing the suite can observe. An edit removing
+  it will pass everything here and fail on a stricter driver.
+
+**One survivor is §8's own reversal, reproduced.** Replacing the shader's Jacobi
+equilibration of Kaa with the identity survives, as it has since `computeRestForms`
+normalised the enhanced modes.
+
+> **And one control was killed, which is the third time in this repo that a control
+> behaving unexpectedly has been a defect in the *harness*.** Rewriting `mutate.py` for
+> this pass mistyped the "write `gl_WorkGroupSize.x` as the literal 32" control: the
+> literal went into the loop's *bound* rather than its *stride*, so it ran eight
+> iterations past `kDof` and wrote off the end of a shared array. Not an equivalent edit
+> at all, and the suite killed it in nineteen checks. Nothing but the control's own
+> recorded expectation would have said so — a mutant that dies looks like a suite doing
+> its job. Fixed, and it survives.
+>
+> A second control was killed once and survives on a re-run, and the reason is worth
+> recording separately because it is not about this work: it failed on
+> `test_promotion.cpp`'s **"two zones cost about two zones"**, a wall-clock ratio
+> asserted between 1.4 and 3.0. Under an unrelated GPU consumer and forty mutants'
+> worth of load, that ratio can leave its band. The gate's six repeat runs did not
+> catch it and neither did the other forty mutants. It is a pre-existing flaky
+> assertion, not a consequence of anything here, and it is recorded rather than
+> quietly re-run.
 
 ### What mutation testing found on the remap
 
@@ -1032,21 +1343,40 @@ which says the fix earns its place.
    scale is constant for the element's life, consistent for the stored α by
    construction, and free. Deriving it from the *current* configuration would be
    the version that looks equivalent and is not.
-3. **Keep alpha in double — this is now the only thing left to try.** The EAS block
+3. ~~**Keep alpha in double — this is now the only thing left to try.** The EAS block
    is 7×7. Even at Pascal's 1/32 fp64 rate it is a small share of the kernel, and it
-   is the only part that has been shown to need the digits. It was third on this
-   list when the kernel was 4× too slow to afford it; the remap has bought
-   1.26–2.43×, so there is now headroom to spend on it.
+   is the only part that has been shown to need the digits.~~ **Done, and it is a
+   negative.** *Alpha in double — measured, and it is not what was missing*, above, has
+   the tables. The short version: five kernels from one source, differing only in how
+   much of the enhanced block is fp64, land between 40 and 49 torn at 768 elements and
+   between 205 and 268 at 3 072, against a reference of 32 and 162 that the negative
+   control reproduces exactly — a spread the size of the gap and not monotone in
+   precision. Holding the stopping rule fixed, the whole block in fp64 moves alpha by
+   1/810 of the amount the float kernel is already wrong by, because Kaa's inputs are a
+   float tangent and a float stress and widening what consumes them recovers nothing.
+   It costs **5–10× on the kernel**, which turns 1.26–2.43× against the CPU into
+   0.14–0.43×. Two claims in this item were wrong: the block is ~70% of a Newton
+   iteration rather than "a small share", and it was not "the only part shown to need
+   the digits" — that was true when κ(Kaa) was (h/t)⁴ and stopped being true when
+   item 2 made it 3.50.
 4. ~~**Re-map the kernel to a workgroup per element** before measuring throughput
    again. The current numbers measure register spilling, not the element.~~
    **Done**, and the diagnosis held: `solidshell_forces_wg.comp`, 1.26–2.43× against
    the CPU where the invocation mapping was 0.23–0.68×, and 484 floats of spill per
    thread down to 24. Every precision figure is unchanged by it.
 
-**The status of this item has changed, and the change is in which half is the
-blocker.** Throughput was the visible problem and it is solved. Precision was the
-one that decided whether the element belongs on a GPU at all, and it is
-**unchanged**: the float kernel tears a quarter to a half too many elements, which
-is exactly the output a zone exists to produce. Until 3 is tried, the CPU remains
-the *trustworthy* path for Tier 2 — but it is no longer the faster one, and the two
-statements should stop being made together as though one implied the other.
+**The status of this item has changed twice, and the second change is that the list is
+now empty.** Throughput was the visible problem and it is solved. Precision was the one
+that decided whether the element belongs on a GPU at all, and it is **unchanged**: the
+float kernel tears a quarter to a half too many elements, which is exactly the output a
+zone exists to produce. Item 3 was the remaining hypothesis about *why*, and it is now
+disproved rather than untried — the enhanced block is well conditioned, float already
+resolves it, and putting it in fp64 costs 5–10× to move the answer by less than the
+noise between five kernels that all claim to compute it.
+
+So the CPU remains the *trustworthy* path for Tier 2, it is no longer the faster one,
+and the two statements should still not be made together as though one implied the
+other. What has changed is that there is no longer a cheap experiment outstanding.
+**Anything further would have to widen the parts that actually carry the error** — `u`,
+the return map, the integrator — which is the whole element in fp64 on a device that
+runs it at 1/32, and the measurement above is the reason not to start.

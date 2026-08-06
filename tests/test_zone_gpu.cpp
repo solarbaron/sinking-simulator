@@ -72,6 +72,29 @@ void testTheShadersAndTheHostAgreeOnTheLayout() {
                        found && got == c.want);
         }
     }
+    // The fp64 enhanced forms are the workgroup kernel's alone -- a second, double copy
+    // of G and the Gauss weights, with B deliberately left out because the enhanced
+    // block never reads it. Same argument as above: two strides in two files.
+    {
+        const long long g = solidshell::kGauss * 6 * solidshell::kEas;   // 336
+        const Check easChecks[] = {
+            {"kEasFormG", 0}, {"kEasFormW", g}, {"kEasFormStride", g + solidshell::kGauss},
+        };
+        const std::string path =
+            std::string(SHIPSIM_SHADER_SOURCE_DIR) + "/solidshell_forces_wg.comp";
+        std::ifstream file(path);
+        if (file.good()) {
+            const std::string source((std::istreambuf_iterator<char>(file)),
+                                     std::istreambuf_iterator<char>());
+            for (const Check& c : easChecks) {
+                long long got = -1;
+                const bool found = constantFromShader(source, c.name, got);
+                expectTrue(std::string("the workgroup shader declares ") + c.name, found);
+                expectTrue(std::string("and its ") + c.name + " matches the element's",
+                           found && got == c.want);
+            }
+        }
+    }
     // Guard against a vacuous pass: if the parser silently returned zero for
     // everything the loop above would compare zeros to zeros on a mis-sized element.
     expectTrue("and the strides being compared are not degenerate",
@@ -114,6 +137,22 @@ void testItDeclinesWhatItCannotDo() {
                                           SHIPSIM_SHADER_DIR, error);
         expectTrue("and it declines the elastic path, saying why",
                    !ok && error.find("elastoplastic") != std::string::npos);
+    }
+    {
+        // The fp64 enhanced-strain variants are compiled for the workgroup mapping
+        // only. Asking for one with the other mapping has to be refused rather than
+        // quietly served the float kernel: that would be a precision comparison in
+        // which both sides were float, which is this repo's most common shape of
+        // vacuous test and the exact mutant that survived §8's last pass.
+        zone::SolveParams params;
+        zone::Solver cpu(patch, plasticity::shipSteel(), params);
+        gpu::ZoneGpuSolver device;
+        std::string error;
+        const bool ok = device.initialise(patch, cpu, plasticity::shipSteel(), params,
+                                          SHIPSIM_SHADER_DIR, error, gpu::Mapping::Invocation,
+                                          gpu::EasPrecision::Newton);
+        expectTrue("and it declines an fp64 enhanced block on the one-invocation mapping",
+                   !ok && error.find("workgroup mapping") != std::string::npos);
     }
 }
 
@@ -677,6 +716,225 @@ void testTheTwoMappingsComputeTheSameElement() {
     expectTrue("and it did work, so the integrator was compared", got[0].work > 0.0);
 }
 
+// **The enhanced block in fp64, and what actually moves when it is.**
+//
+// `07-fem-spike-findings.md` §8's last open item was "keep alpha in double -- the only
+// part that has been shown to need the digits". Five kernels are compared here, all
+// compiled from one GLSL source so that nothing but the precision differs:
+//
+//   Float        as shipped
+//   FloatTight   float arithmetic, the CPU's stopping rule (1e-16 sigma_y V, 40 its)
+//   Solve        the 7x7 equilibration, Cholesky and substitutions in fp64
+//   Condense     + Kaa and the residual accumulated in fp64 over a fp64 G
+//   Newton       + alpha, its correction and its persistent state, and the CPU's rule
+//
+// The pairing is what makes this a measurement rather than a demonstration. `Newton`
+// changes the tolerance and the arithmetic together, so `FloatTight` is the control
+// that holds the tolerance fixed and asks what the *arithmetic* was worth; `Solve` and
+// `Condense` hold the tolerance at the shipped one and ask the same question from the
+// other side.
+//
+// Two regimes, because they say different things.
+void testTheEnhancedBlockInDouble() {
+    solidshell::HexMesh flat = solidshell::makePlateMesh(0.4, 0.2, 0.01, 8, 4, 1);
+    for (std::size_t n = 0; n < flat.nodeCount(); ++n) {
+        const double x = flat.position[n * 3], y = flat.position[n * 3 + 1];
+        if (x <= 1e-9 || x >= 0.4 - 1e-9 || y <= 1e-9 || y >= 0.2 - 1e-9)
+            for (int k = 0; k < 3; ++k) flat.pin(n, k);
+    }
+    // Sheared, for the same reason the other comparisons are: on an axis-aligned mesh
+    // the rest Jacobian is diagonal and a transpose is not a change.
+    for (std::size_t n = 0; n < flat.nodeCount(); ++n)
+        flat.position[n * 3] += 0.35 * flat.position[n * 3 + 1];
+    zone::Patch patch;
+    patch.mesh = flat;
+    patch.axis = Vec3{0, 0, 1};
+    patch.right = Vec3{1, 0, 0};
+    patch.up = Vec3{0, 1, 0};
+    patch.centre = Vec3{0.2 + 0.35 * 0.1, 0.1, 0.0};
+    patch.outerFace.assign(flat.nodeCount(), 0u);
+    for (std::size_t n = 0; n < flat.nodeCount(); ++n)
+        patch.outerFace[n] = flat.position[n * 3 + 2] > 0.0 ? 1u : 0u;
+    patch.elementArea.assign(flat.elementCount(), 0.4 * 0.2 / 32.0);
+    patch.panelOf.assign(flat.elementCount(), 0);
+    patch.panels.push_back(0);
+    patch.panelArea.push_back(0.08);
+    patch.material = ah36Steel();
+    patch.thickness = 0.01;
+    patch.criticalTimestep =
+        solidshell::criticalTimestep(flat, patch.material, solidshell::Formulation::SolidShell);
+
+    const int steps = 400;
+    const double dt = patch.criticalTimestep * 1.0;
+    const gpu::EasPrecision ladder[5] = {
+        gpu::EasPrecision::Float, gpu::EasPrecision::FloatTight, gpu::EasPrecision::Solve,
+        gpu::EasPrecision::Condense, gpu::EasPrecision::Newton};
+    const char* names[5] = {"float", "tight", "solve", "condense", "fp64"};
+
+    // What one run of the ladder measures: the peak enhanced parameter each kernel
+    // committed, and the worst it is off the double CPU by.
+    struct Ladder {
+        double peak[5] = {0, 0, 0, 0, 0};
+        double againstCpu[5] = {0, 0, 0, 0, 0};
+        double cpuPeak = 0;
+        double travel = 0;
+        double cpuDissipation = 0;
+        double dissipation[5] = {0, 0, 0, 0, 0};
+        double alphaSpread[5] = {0, 0, 0, 0, 0};   // against kernel 0's own answer
+        double positionSpread[5] = {0, 0, 0, 0, 0};
+        bool ran = false;
+        std::string shader[5];
+    };
+    const auto sweep = [&](double speed, int steps) {
+        Ladder out;
+        zone::SolveParams params;
+        params.indenter.halfLength = 0.05;
+        params.indenter.halfWidth = 0.05;
+        params.indenter.speed = speed;
+        params.indenter.rampTime = 1.0e-4;
+        params.indenter.stopAt = 0.0;
+        params.duration = steps * dt;
+        params.maxSteps = steps;
+
+        gpu::ZoneGpuState got[5];
+        for (int which = 0; which < 5; ++which) {
+            zone::Solver seed(patch, plasticity::shipSteel(), params);
+            gpu::ZoneGpuSolver device;
+            std::string error;
+            if (!device.initialise(patch, seed, plasticity::shipSteel(), params,
+                                   SHIPSIM_SHADER_DIR, error, gpu::Mapping::Workgroup,
+                                   ladder[which])) {
+                std::printf("     skipped: %s\n", error.c_str());
+                return out;
+            }
+            device.run(steps);
+            got[which] = device.readback();
+            out.shader[which] = device.elementShader();
+            out.dissipation[which] = got[which].dissipation;
+        }
+        zone::Solver cpu(patch, plasticity::shipSteel(), params);
+        out.cpuDissipation = cpu.run().dissipation;
+        for (std::size_t e = 0; e < patch.elementCount(); ++e)
+            for (int k = 0; k < solidshell::kEas; ++k) {
+                const double want = cpu.elementState()[e].enhanced[k];
+                out.cpuPeak = std::max(out.cpuPeak, std::abs(want));
+                for (int which = 0; which < 5; ++which) {
+                    const double a = got[which].plastic[e].enhanced[k];
+                    out.peak[which] = std::max(out.peak[which], std::abs(a));
+                    out.againstCpu[which] = std::max(out.againstCpu[which], std::abs(a - want));
+                    out.alphaSpread[which] =
+                        std::max(out.alphaSpread[which],
+                                 std::abs(a - got[which == 4 ? 1 : 0].plastic[e].enhanced[k]));
+                }
+            }
+        for (std::size_t i = 0; i < got[0].position.size(); ++i) {
+            out.travel = std::max(out.travel, std::abs(got[0].position[i] - patch.mesh.position[i]));
+            for (int which = 0; which < 5; ++which)
+                out.positionSpread[which] =
+                    std::max(out.positionSpread[which],
+                             std::abs(got[which].position[i] - got[which == 4 ? 1 : 0].position[i]));
+        }
+        out.ran = true;
+        return out;
+    };
+
+    // --- Regime one: lightly loaded, and the enhanced modes are simply off ----------
+    //
+    // At 0.005 m/s over 120 steps the plate stays elastic and `|delta . r| <= 1e-9
+    // sigma_y V` is met on the **first** iteration of every element. The shader stops
+    // *before applying* that first correction, so alpha never leaves its warm start of
+    // zero and the enhanced modes are, on the device, switched off.
+    //
+    // **That is the mechanism behind §8's "the GPU's enhanced parameters were exactly
+    // zero", and it is not a precision failure.** `Solve` and `Condense` compute the
+    // same correction in fp64 and then discard it at the same gate, so they return the
+    // identical bit-zero. Only the stopping rule turns them back on, and once it does
+    // float alone gets within 20% of the CPU's alpha on the worst parameter and 5.5% on
+    // the peak -- which is the ceiling the float tangent and stress impose, and not one
+    // that fp64 lifts: the fp64 kernel lands on the same figure.
+    const Ladder light = sweep(0.005, 120);
+    if (!light.ran) return;
+    std::printf("     lightly loaded, 120 steps: cpu |alpha| %.3e; device", light.cpuPeak);
+    for (int which = 0; which < 5; ++which)
+        std::printf(" %s %.3e", names[which], light.peak[which]);
+    std::printf(" (worst off the cpu: float %.2e, tight %.2e, fp64 %.2e)\n",
+                light.againstCpu[0], light.againstCpu[1], light.againstCpu[4]);
+
+    expectTrue("the five enhanced-block precisions loaded five different kernels",
+               light.shader[0] != light.shader[1] && light.shader[1] != light.shader[2] &&
+                   light.shader[2] != light.shader[3] && light.shader[3] != light.shader[4] &&
+                   light.shader[0] != light.shader[4] && !light.shader[0].empty());
+    // Exact, not a tolerance: bit-zero on all seven parameters of all thirty-two
+    // elements is not something rounding produces by accident.
+    expectTrue("under the shipped work gate the device's enhanced modes are exactly off",
+               light.peak[0] == 0.0);
+    expectTrue("and fp64 in the 7x7 solve does not turn them on", light.peak[2] == 0.0);
+    expectTrue("nor fp64 in the condensation", light.peak[3] == 0.0);
+    expectTrue("but the CPU's own stopping rule does, in float", light.peak[1] > 0.0);
+    expectTrue("and in fp64", light.peak[4] > 0.0);
+    // The guard that stops those three zeros from being a run that did nothing: the
+    // double reference solved the same element and got enhanced parameters out of it.
+    expectTrue("and the CPU's are non-zero, so that zero is the gate and not the fixture",
+               light.cpuPeak > 0.0);
+    expectTrue("and the light run still deformed the patch", light.travel > 1e-8);
+    // **Quantified, so "off" and "on" are a difference and not two adjectives.** With
+    // the modes off the worst enhanced parameter is wrong by the whole of the CPU's --
+    // exactly, since it is zero. With the rule tightened, float alone brings that to
+    // 1.10e-9 of a 5.51e-9 peak, i.e. 20.0%, and the peak itself lands within 5.5% of
+    // the CPU's. Asserted at 30%: the measurement with room for a driver that contracts
+    // a multiply-add differently, and still a fifth of the 100% above it.
+    expectTrue("with the modes off the device's alpha is wrong by the whole of the CPU's",
+               light.againstCpu[0] == light.cpuPeak);
+    expectTrue("and with the rule tightened, float alone recovers it to 30%",
+               light.againstCpu[1] < 0.3 * light.cpuPeak);
+    expectTrue("and fp64 recovers it no better than float does",
+               light.againstCpu[4] >= 0.5 * light.againstCpu[1]);
+
+    // --- Regime two: loaded and yielding, where the modes are live on every kernel ---
+    //
+    // Here the gate never fires early and all five kernels carry live enhanced modes.
+    // What they show is the ceiling: every one of them is off the double CPU by
+    // 3.8e-6 of an alpha of 3.6e-5, and the *whole* fp64 enhanced block moves alpha by
+    // 4.6e-9 against its float twin -- eight hundred times less than the error it was
+    // supposed to fix. That ratio is the finding, and it is asserted as a ratio so
+    // that it fails if fp64 ever does start mattering here.
+    const Ladder loaded = sweep(4.0, steps);
+    if (!loaded.ran) return;
+    std::printf("     loaded, %d steps: cpu |alpha| %.3e; device", steps, loaded.cpuPeak);
+    for (int which = 0; which < 5; ++which)
+        std::printf(" %s %.3e (off cpu %.2e, off its float twin %.2e)", names[which],
+                    loaded.peak[which], loaded.againstCpu[which], loaded.alphaSpread[which]);
+    std::printf("; worst node against the float twin");
+    for (int which = 0; which < 5; ++which)
+        std::printf(" %.2e", loaded.positionSpread[which]);
+    std::printf(" of %.4f m\n", loaded.travel);
+
+    expectTrue("with the plate loaded every kernel's enhanced modes are live",
+               loaded.peak[0] > 0.0 && loaded.peak[4] > 0.0 && loaded.cpuPeak > 0.0);
+    // Measured: 4.03e-9, 4.24e-9 and 4.64e-9 against an error of 3.77e-6, so ratios of
+    // 940, 890 and 810. Asserted at 100, which is a factor of eight of headroom.
+    expectTrue("fp64 in the 7x7 solve moves alpha by under 1% of how wrong it already is",
+               loaded.alphaSpread[2] * 100.0 < loaded.againstCpu[0]);
+    expectTrue("and fp64 in the condensation likewise",
+               loaded.alphaSpread[3] * 100.0 < loaded.againstCpu[0]);
+    expectTrue("and the whole enhanced block in fp64 likewise, against its float twin",
+               loaded.alphaSpread[4] * 100.0 < loaded.againstCpu[1]);
+    // And the same statement on the field the energies are integrals of: 1.04e-7 m of
+    // 2.2e-3 m travelled, asserted at ten times that.
+    expectTrue("and it moves no node position by more than 5e-4 of the travel",
+               loaded.positionSpread[4] < 5.0e-4 * std::max(loaded.travel, 1e-30));
+    // Vacuity. Every ratio above is a difference divided by a difference, and both
+    // halves have to be real: the kernels have to disagree with the CPU at all, and the
+    // fp64 one has to have differed from its float twin rather than being the same
+    // pipeline twice.
+    expectTrue("the kernels really do differ from the CPU, so those ratios have a "
+               "denominator", loaded.againstCpu[0] > 0.0 && loaded.againstCpu[1] > 0.0);
+    expectTrue("and fp64 really did change the answer, so they have a numerator",
+               loaded.alphaSpread[4] > 0.0 && loaded.alphaSpread[2] > 0.0);
+    expectTrue("and the loaded run yielded, so the return map was exercised",
+               loaded.cpuDissipation > 1.0 && loaded.dissipation[4] > 1.0);
+}
+
 }  // namespace
 
 void runZoneGpuTests() {
@@ -696,4 +954,5 @@ void runZoneGpuTests() {
         testADegradedElementReportsZeroedEnhancedParameters(mappings[which]);
     }
     testTheTwoMappingsComputeTheSameElement();
+    testTheEnhancedBlockInDouble();
 }

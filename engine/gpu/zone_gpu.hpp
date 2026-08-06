@@ -70,13 +70,21 @@
 // divergence in the quantities that mean anything.
 //
 // **It is not enough, and the remap did not change that by so much as a digit.**
-// Where it fails is the torn set: at 768 and 3 072 elements this kernel tears 40 and
-// 247 elements where the double reference tears 32 and 162, while the negative
+// Where it fails is the torn set: at 768 and 3 072 elements this kernel tears 41 and
+// 248 elements where the double reference tears 32 and 162, while the negative
 // control -- the same double solver on a mesh jittered by the size of float's own
 // representation error -- tears exactly 32 and 162. That is the whole argument, and
-// it is why the CPU is still the path a zone's answer comes from. The remaining
-// thing to try is keeping `alpha` in double; the numbers are in
-// `docs/07-fem-spike-findings.md` §8.
+// it is why the CPU is still the path a zone's answer comes from.
+//
+// **Keeping `alpha` in double was the last thing left to try, and it does not work
+// either.** `EasPrecision` below compiles the enhanced block in fp64 at three depths,
+// all from `solidshell_forces_wg.comp` so that nothing but the precision differs. The
+// five resulting kernels tear between 40 and 49 elements at 768 and between 205 and 268
+// at 3 072 -- a spread the size of the gap they were meant to close, and not monotone in
+// precision. Holding the stopping rule fixed, the whole block in fp64 moves alpha by
+// 1/810 of the amount float is already wrong by, because Kaa's inputs are a float
+// tangent and a float stress and widening what consumes them recovers nothing they never
+// had. It costs 5-10x on the kernel. `docs/07-fem-spike-findings.md` §8 has the tables.
 //
 // It inherits §2's reproducibility bound: an explicit scheme at the CFL limit
 // amplifies float rounding in the modes at its stability boundary, so this is not
@@ -122,6 +130,28 @@ enum class Mapping {
     Workgroup,   // solidshell_forces_wg.comp
 };
 
+// **How much of the 7x7 enhanced-strain block runs in fp64.** `07-fem-spike-findings.md`
+// §8's last open item was "keep alpha in double -- the only part that has been shown to
+// need the digits". That claim bundles three separable things together, so these are the
+// three, each a superset of the one before, and all of them are the **workgroup**
+// mapping only: they are variants of `solidshell_forces_wg.comp` compiled from one
+// source, so any difference between them is the precision and nothing else.
+//
+// Pascal runs fp64 at 1/32 rate, so what each costs is a measurement rather than an
+// argument; §8 has the table.
+enum class EasPrecision {
+    Float,      // as shipped -- the whole element, the enhanced block included, in float
+    // **A control, not a step on the ladder.** Float arithmetic with the CPU's own
+    // stopping rule (|delta.r| <= 1e-16 sigma_y V, 40 iterations) instead of the
+    // float kernel's 1e-9 and 12. `Newton` below changes the tolerance and the
+    // arithmetic together; without this there is no way to say which of the two moved
+    // the answer.
+    FloatTight,
+    Solve,      // + the equilibration, the 7x7 Cholesky and its substitutions in double
+    Condense,   // + Kaa and the residual accumulated in double, over a double G
+    Newton,     // + alpha, its correction, its persistent storage and the CPU's rule
+};
+
 // **What the driver's compiler actually did with each mapping**, via
 // `VK_KHR_pipeline_executable_properties`: registers per thread, and how many bytes
 // of local memory the shader spills to. `07-fem-spike-findings.md` §8 attributed the
@@ -151,10 +181,14 @@ public:
     // than rebuilt so that the two paths cannot silently stop being the same
     // solver; `cpu` must therefore have been constructed with
     // `SolveParams::cacheRestForms` on.
+    // An `eas` other than `Float` needs the workgroup mapping and a device with
+    // `shaderFloat64`; both are reported through `error` and both **skip rather than
+    // fail**, like a missing device.
     bool initialise(const sim::zone::Patch& patch, const sim::zone::Solver& cpu,
                     const sim::plasticity::Material& material,
                     const sim::zone::SolveParams& params, const std::string& shaderDirectory,
-                    std::string& error, Mapping mapping = Mapping::Workgroup);
+                    std::string& error, Mapping mapping = Mapping::Workgroup,
+                    EasPrecision eas = EasPrecision::Float);
 
     // Records and submits `substeps` steps as one command buffer and returns the
     // **GPU-measured** milliseconds. Batching is the whole point: an explicit step

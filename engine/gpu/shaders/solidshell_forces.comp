@@ -79,11 +79,23 @@ const uint kStateStride = 129u;
 const float kRoot23 = 0.816496580927726f;
 
 // The CPU converges the enhanced-strain Newton on the correction's **energy**
-// against the element's yield energy, at 1e-16 of it -- which is below what float
-// can represent at all (eps = 1.2e-7). Chasing it here would spin to the iteration
-// cap on every element and still not converge, so the tolerance is the float
-// equivalent: 1e-7 of the same scale. `zone_gpu.cpp` measures what that costs
-// against the double reference rather than assuming it is nothing.
+// against the element's yield energy, at 1e-16 of it. ~~Which is below what float can
+// represent at all (eps = 1.2e-7); chasing it here would spin to the iteration cap on
+// every element and still not converge.~~ **Measured, and that is not what happens.**
+// `solidshell_forces_wg.comp` compiles a variant with the CPU's own rule
+// (`SHIPSIM_EAS_TIGHT`) and it converges perfectly well in float: it runs more
+// iterations -- 3.5x the kernel time -- and recovers alpha to about 20% of the double
+// reference where the 1e-9 gate leaves it at **exactly zero**, because that gate fires
+// on the first iteration of a lightly loaded element and the test sits before the
+// correction is applied. So the enhanced modes are, on this path, switched off wherever
+// the element is not working hard.
+//
+// It is kept at 1e-9 anyway, and that is a measurement rather than an oversight: the
+// tighter rule costs 3.5x and does not deliver the output a zone exists to produce. The
+// torn count goes from 53% over the double reference to 27% at 3 072 elements and from
+// 28% to 25% at 768 -- an improvement at one size, noise at the other, and nowhere near
+// the reference, which a 2e-7 m jitter of the double solver reproduces exactly.
+// `07-fem-spike-findings.md` §8, "Alpha in double", has the table.
 const float kEnhancedWorkTol = 1.0e-9f;
 // ||r|| is not a scale-free measure -- the CPU says so at length and uses 1e-12 of
 // the same scale, which float cannot represent as a *relative* quantity but can as

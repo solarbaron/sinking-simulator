@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -703,18 +704,40 @@ void testCostIsLinearInTheNumberOfZones() {
     solve.indenter.halfWidth = 1e3;
     solve.indenter.speed = 20.0;
     solve.indenter.stopAt = 0.01;
+    // **The minimum of several runs, not one sample.** A wall clock measures the
+    // machine as much as the code, and this assertion used to take one timing of
+    // each and compare them: a single scheduling hiccup on the *one-solve* sample
+    // pushed the ratio under 1.4 and failed the run. It did exactly that to three
+    // agents working in parallel on this box -- one spent eighteen reproduction
+    // runs and a second full gate on it -- and it sits in the gate step whose whole
+    // purpose is detecting flakiness, which is the worst possible place for a test
+    // that fails at random. A test that cries wolf under load teaches everyone to
+    // discount gate failures, and that is the habit that lets a real one through.
+    //
+    // The minimum is the right statistic and not a widened tolerance: contention
+    // can only ever make a run *slower*, so the fastest of several is the closest
+    // estimate of the unloaded cost, and it converges from above rather than
+    // wandering. The band stays where it was, because it was never too tight --
+    // the sampling was too thin. Timing is still what is measured, deliberately:
+    // the point is to catch a global assembly, and a step count would be identical
+    // either way and so could not see one.
     const auto timeSolves = [&](int count) {
-        double seconds = 0;
-        for (int i = 0; i < count; ++i) {
-            zone::Solver solver(one, plasticity::shipSteel(), solve);
-            seconds += solver.run().wallSeconds;
+        double best = std::numeric_limits<double>::infinity();
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            double seconds = 0;
+            for (int i = 0; i < count; ++i) {
+                zone::Solver solver(one, plasticity::shipSteel(), solve);
+                seconds += solver.run().wallSeconds;
+            }
+            best = std::min(best, seconds);
         }
-        return seconds;
+        return best;
     };
     const double single = timeSolves(1);
     const double pair = timeSolves(2);
-    std::printf("     %zu elements: one solve %.3f s, two %.3f s, ratio %.2f\n", one.elementCount(),
-                single, pair, single > 0 ? pair / single : 0.0);
+    std::printf("     %zu elements: one solve %.3f s, two %.3f s, ratio %.2f (best of 3 each)\n",
+                one.elementCount(), single, pair, single > 0 ? pair / single : 0.0);
+    expectTrue("a solve takes a measurable time at all", single > 0);
     expectTrue("two zones cost about two zones", pair > 1.4 * single && pair < 3.0 * single);
 
     // The budget is in elements, and it binds. A criterion that promoted past it

@@ -35,6 +35,8 @@
 set -u
 
 RAM=${RAM:-./build/ram_view}
+SECTION=${SECTION:-./build/section_probe}
+SECTION_DOC=docs/02-simulation.md
 DOC=docs/06-roadmap.md
 fails=0
 checks=0
@@ -48,7 +50,7 @@ red=$'\033[0;31m'; green=$'\033[0;32m'; dim=$'\033[2m'; off=$'\033[0m'
 # runs are deterministic, so a figure that moves at all is either a real change in
 # the physics or a real change in the ship, and both want a human to look.
 check() {
-  local label="$1" expect="$2" tol="$3" actual="$4" quote="$5"
+  local label="$1" expect="$2" tol="$3" actual="$4" quote="$5" where="${6:-$DOC}"
   checks=$((checks + 1))
   if [ -z "$actual" ]; then
     printf '  %s✗%s %s — could not parse the figure out of the tool output\n' "$red" "$off" "$label"
@@ -60,7 +62,7 @@ check() {
     return 0
   fi
   printf '  %s✗%s %s: %s publishes %s, the tool now says %s\n' \
-         "$red" "$off" "$label" "$DOC" "$expect" "$actual"
+         "$red" "$off" "$label" "$where" "$expect" "$actual"
   printf '      %sthe doc line to update contains: %s%s\n' "$dim" "$quote" "$off"
   fails=$((fails + 1))
   return 1
@@ -72,10 +74,11 @@ check() {
 # every failure message would have sent the reader to a line that does not exist.
 # Each hint is checked against the doc before any figure is.
 hint() {
+  local where="${2:-$DOC}"
   checks=$((checks + 1))
-  if grep -qF -- "$1" "$DOC"; then return 0; fi
+  if grep -qF -- "$1" "$where"; then return 0; fi
   printf '  %s✗%s the pointer %s"%s"%s no longer occurs in %s\n' \
-         "$red" "$off" "$dim" "$1" "$off" "$DOC"
+         "$red" "$off" "$dim" "$1" "$off" "$where"
   fails=$((fails + 1))
   return 1
 }
@@ -155,6 +158,33 @@ qwater=$(outcome_line "$out" | sed -n 's/.*-- \([0-9]*\) t of water.*/\1/p')
 qheel=$(outcome_line "$out" | sed -n 's/.*heel \(-\{0,1\}[0-9.]*\) deg.*/\1/p')
 check "floodwater at the quarter (t)" 7323 150 "$qwater" "at the quarter she takes"
 check "heel at the quarter (deg)"    -47.8 1.0 "$qheel" "at the quarter she takes"
+
+# --- the section mesher's reach ---------------------------------------------------
+#
+# `section_probe` joined the gate earlier today, after it published a 3.46 Hz shell
+# frequency that nothing had ever re-run. **Gating a tool stops the tool rotting; it
+# does not stop the documents quoting it.** That half stayed open, and it showed:
+# `section.hpp` §4's resolution table had already drifted from the program it names
+# -- 1.73075 where it published 1.73122 -- with nothing to catch it. So the figures
+# the reach scan publishes are checked here the same way `ram_view`'s are.
+#
+# The reach is the right thing to check rather than the section properties: it is
+# what the whole-ship claim rests on, it is quoted in two documents and a header, and
+# it is an integer count rather than a tolerance argument.
+if [ -x "$SECTION" ]; then
+  for h in "49 of 49 two-bay windows" "120.0 m of 120.0 m"; do hint "$h" "$SECTION_DOC"; done
+  scan=$("$SECTION" --scan=2 2>&1)
+  meshed=$(printf '%s\n' "$scan" | sed -n 's/^ *\([0-9]*\) of \([0-9]*\) windows mesh.*/\1/p')
+  windows=$(printf '%s\n' "$scan" | sed -n 's/^ *\([0-9]*\) of \([0-9]*\) windows mesh.*/\2/p')
+  onepiece=$(printf '%s\n' "$scan" | sed -n 's/^ *\([0-9]*\) of [0-9]* are also a single connected piece.*/\1/p')
+  reach=$(printf '%s\n' "$scan" | sed -n 's/^ *reach: \([0-9.]*\) m of.*/\1/p')
+  check "windows that mesh and solve" 49 0 "$meshed" "49 of 49 two-bay windows" "$SECTION_DOC"
+  check "windows in the scan"         49 0 "$windows" "49 of 49 two-bay windows" "$SECTION_DOC"
+  check "windows in one piece"        46 0 "$onepiece" "46 of 49" "$SECTION_DOC"
+  check "reach along the hull (m)"    120.0 0.05 "$reach" "120.0 m of 120.0 m" "$SECTION_DOC"
+else
+  echo "  - section_probe not built, skipping the reach figures"
+fi
 
 if [ "$fails" -eq 0 ]; then
   echo "ok — $checks published figures still match the tool"

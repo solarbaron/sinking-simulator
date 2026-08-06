@@ -2756,15 +2756,23 @@ reach, which is exactly what that change was for.
    spills 96 bytes and runs at **1.26–2.43×**, rising monotonically with size.
 
    What stops it being used is precision, not speed. At 768 and 3 072 elements the
-   float kernel tears **40 and 247 elements against the double reference's 32 and
-   162**, and plastic dissipation runs 26–34% high — while the negative control, the
+   float kernel tears **41 and 248 elements against the double reference's 32 and
+   162**, and plastic dissipation runs 27–34% high — while the negative control, the
    same double solver on a mesh jittered by 2 × 10⁻⁷ m, tears exactly 32 and 162 and
    moves the dissipation by 0.06–0.8%. **An earlier claim here that it "tears 60
    elements where the CPU tears none" does not reproduce and has been withdrawn.**
    The enhanced modes have since been normalised in `solid_shell.cpp`, and measured
    by A/B that changes nothing on this path, because the shader was already
-   equilibrating Kaa. `07-fem-spike-findings.md` §8 has the measurements; the next
-   thing to try is keeping `alpha` in double.
+   equilibrating Kaa.
+
+   **Keeping `alpha` in double was the last thing left to try, and it does not work
+   either.** The enhanced block is now compilable in fp64 at three depths from the one
+   shader source; the five resulting kernels tear between 40 and 49 elements at 768 and
+   between 205 and 268 at 3 072, against 32 and 162, and the spread among them is as
+   large as the gap. The block is not what was short of digits: `computeRestForms`'s
+   normalisation made κ(Kaa) a constant 3.50, and Kaa's inputs — the algorithmic tangent
+   and the stress — are float whatever consumes them. It costs 5–10× on the kernel.
+   `07-fem-spike-findings.md` §8 has the measurements.
 
 ### Adaptive zone promotion — **implemented**
 
