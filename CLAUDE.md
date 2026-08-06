@@ -110,6 +110,8 @@ most useful thing to know about this codebase:
 | A published "hole size stops mattering" finding that was an **artefact of that gap** — the extra hole opened onto nothing by construction | re-deriving the finding after the defect was fixed, not just the figures |
 | A rigid-body count that found **three of six** modes: translations come out at exactly zero, rotations at 8e-4…9e-3, and a fixed 1e-3 rad/s cutoff landed between them | scaling the threshold off an independently-derived frequency instead of a constant |
 | Two functions on the caller's own path shipped **with no test at all**, in a commit whose headline feature was well tested | asking what in the diff was *not* exercised, rather than whether the tests passed |
+| A section cut **admitted by a tolerant membership test and then dropped by an exact geometry one**, losing all 188 plate panels on 11 of 51 stations while all 181 stiffeners survived | a sweep along the length with the two element populations counted *apart* |
+| The bow and stern refusing to mesh — diagnosed for months as *inverted* elements, when **not one Jacobian on the ship is negative**: 166 input panels are triangles wearing four corners | sampling the nine points the element is *integrated* at, rather than the eight corners |
 | A node ordering chosen on the element graph while the solver assembled a *constrained* one, so a reported half-bandwidth of 146 was really 10 769 and the suite stopped finishing | a test that **rebuilds the assembled band from the mesh and the constraints** instead of asserting the number the mesher reports |
 
 A green functional test is evidence the code does what you thought of, not that
@@ -122,6 +124,13 @@ exact to 8e-12 was first asserted at 1e-3, which would have passed on a model th
 had lost the property entirely and was merely well converged. When a measurement
 comes back far better than the tolerance, tighten the tolerance to what was
 measured and say why it is allowed to be that tight.
+
+**A tolerant test followed by an exact one is a trapdoor.** `sectionElements` admitted
+a panel with a `1e-9` membership tolerance and then looked for a sign change with
+exact arithmetic; a query one ULP outside the bay passed the first and failed the
+second, and the panel vanished without a word. The stiffener branch survived the
+same query only because it happened to `clamp` its parameter. When two tests in
+sequence decide one thing, they need the same notion of "on the boundary".
 
 **Writing a lesson down does not make it learned.** The rigid-body threshold above
 is the second time that mistake was made in this repo — the first was recorded, in

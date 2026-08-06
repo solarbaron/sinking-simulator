@@ -1458,8 +1458,9 @@ deferred, not an oversight:
 - **Authoring.** Scantlings are built in C++, as hulls were before
   `ships/ferry.ship`. A `structure` block in the ship file is Phase 7's.
 
-**How it is checked** (`tests/test_scantlings.cpp`). Three instruments do the
-work, and the first two each found a defect the third would not have:
+**How it is checked** (`tests/test_scantlings.cpp`). Four instruments do the
+work, and the first, second and fourth each found a defect the others would not
+have:
 
 - A **box hull**, where the shell is `L·B + 2·L·D` exactly and every panel is
   planar, so tiling and steel weight are equalities rather than estimates. This
@@ -1473,6 +1474,27 @@ work, and the first two each found a defect the third would not have:
   they converge to the hull's own area *from below* — 2.1 × 10⁻³ at the reference
   spacings, halving to 5.7 × 10⁻⁴ by the third refinement — and section properties
   at a tapered station converge under frame refinement.
+- **A sweep along the length, with the two element populations counted apart.**
+  The half-open interval above fixed the double count and introduced the opposite
+  one, which stood for as long as it did because a single cut has nothing to be
+  compared with. `sectionElements()` decides membership with a 10⁻⁹ m tolerance
+  either side of a seam and then extracted the cut through each panel *exactly*;
+  a plane admitted by the first test could therefore lie a hair outside the panel
+  itself, and then no edge changed sign across it and the panel was dropped
+  without a word. One unit in the last place was enough: the ferry is 120 m over
+  50 bays, so station 33 is `-60 + 120·33/50 = 19.200000000000003`, and a cut
+  asked for at the 19.2 a drawing carries fell 3.6 × 10⁻¹⁵ m aft of the bay that
+  owns the seam. **Named that way, eleven of the ferry's 51 stations lost every
+  plate panel** — 1.80 m² became 0.43 m², and which eleven was decided by nothing
+  but the direction the division rounded — while every stiffener survived,
+  because the member branch clamps its interpolation parameter into the member
+  and was never asked the same question. What came back was 23.8% of the area, which is exactly the
+  stiffeners' share, with a plausible neutral axis and a plausible taper either
+  side of it. The plate cut is now clamped into the panel it belongs to, so the
+  two branches snap to a seam the same way; and the section is asserted over a
+  fine sweep of the whole length rather than at points, with plate and stiffener
+  counts asserted separately, because a total cannot tell "the plating vanished"
+  from "the taper moved".
 
 **Mutation testing killed 36 of 37 mutants**, and the eight it did not kill on
 the first pass were all real holes in the suite: the hull girder taking a
@@ -1484,6 +1506,20 @@ girder built outside the hull; and longitudinals shifted onto the wrong strake
 seam, which leaves one on the centreline keel while weight and count say nothing.
 The single survivor is genuinely equivalent: a station-and-waterline hull mesh has
 a single-valued half-breadth, so nearest and outermost hit are the same ray.
+
+A second pass, of **31 mutants aimed at `sectionElements()` alone**, killed 27 —
+two of them only by a segfault, with no `FAIL` line, which a harness grepping for
+one would have scored survivors. It found two more real holes: the guard that
+rejects a degenerate cut could be raised from a picometre to a centimetre and eat
+a 5 mm gunwale strake unnoticed, and `SectionElement::width` was written and never
+read anywhere in the engine, so any value at all would do. Both are now asserted
+against the box's closed-form girth. The four remaining survivors are equivalent:
+`xHi - (xHi - xLo)` is bit-identical to `xLo` on every panel of the ferry;
+`makeStructuralMesh` never puts a member forward of all plating, so the forward
+end is set by the panels either way; a single crossing is already rejected by the
+degenerate-cut guard before it is used; and dropping the member branch's clamp
+moves a root by under a nanometre, which is the difference between that branch and
+the plate branch failing catastrophically at the same seam.
 
 ### Failed structure → flooding openings — **implemented**
 

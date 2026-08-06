@@ -409,6 +409,11 @@ struct SectionElement {
 // [xLo, xHi), so a cut landing on a frame seam is served by the bay forward of it
 // and not by both -- counting both doubles area and second moment while leaving
 // the neutral axis, a ratio, looking perfectly correct.
+//
+// The seam is fuzzy by a nanometre and `x` snaps onto it, so a caller need not
+// reproduce the arithmetic the stations were laid out with: `120*33/50` lands one
+// unit in the last place above the 19.2 a drawing carries, and both name the same
+// station. The section is continuous across a seam, and it is asked for at one.
 std::vector<SectionElement> sectionElements(const StructuralMesh& mesh, double x);
 
 HullGirderSection hullGirderSection(const StructuralMesh& mesh, double x);
