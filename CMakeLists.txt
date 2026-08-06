@@ -167,6 +167,32 @@ if(Vulkan_FOUND AND GLSLC)
       COMMENT "glslc ${SHADER}")
     list(APPEND SPV_FILES ${SHADER_OUT}/${SHADER}.spv)
   endforeach()
+
+  # The enhanced-strain block in fp64, at three depths, plus the float control that
+  # takes only the CPU's tighter stopping rule. **One GLSL source, five kernels**, so
+  # the only thing that differs between any two of them is the preprocessor definition
+  # -- which is what makes `07-fem-spike-findings.md` §8's ladder a measurement of
+  # precision rather than of five separately-written shaders.
+  # Split on `|` rather than on the `=`: `string(REGEX REPLACE)` replaces *every* match,
+  # so a pattern anchored at the first `=` eats the second one too and the definition
+  # arrives as `-D1`. It compiled to that once and glslc said so.
+  foreach(VARIANT "tight|SHIPSIM_EAS_TIGHT=1"
+                  "f64solve|SHIPSIM_EAS_FP64=1"
+                  "f64condense|SHIPSIM_EAS_FP64=2"
+                  "f64newton|SHIPSIM_EAS_FP64=3")
+    string(REPLACE "|" ";" PARTS ${VARIANT})
+    list(GET PARTS 0 SUFFIX)
+    list(GET PARTS 1 DEFINE)
+    set(OUT ${SHADER_OUT}/solidshell_forces_wg_${SUFFIX}.comp.spv)
+    add_custom_command(
+      OUTPUT ${OUT}
+      COMMAND ${GLSLC} -O -D${DEFINE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/engine/gpu/shaders/solidshell_forces_wg.comp
+              -o ${OUT}
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/engine/gpu/shaders/solidshell_forces_wg.comp
+      COMMENT "glslc solidshell_forces_wg.comp -D${DEFINE}")
+    list(APPEND SPV_FILES ${OUT})
+  endforeach()
   add_custom_target(shipsim_shaders DEPENDS ${SPV_FILES})
 
   target_sources(shipsim_engine PRIVATE engine/gpu/device.cpp engine/gpu/offscreen.cpp

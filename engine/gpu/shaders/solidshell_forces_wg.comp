@@ -90,6 +90,78 @@
 // Everything else -- the return map, the damage law, the enhanced-strain Newton, the
 // tolerances, the two-attempt degradation rule -- is `solidshell_forces.comp` term for
 // term, so the two kernels can be diffed against each other and against the CPU.
+//
+// --- The enhanced block in double, and what that can and cannot buy -----------------
+//
+// `SHIPSIM_EAS_FP64` compiles this one source into several kernels, differing only in
+// how much of the 7x7 enhanced-strain block runs in fp64. It exists because
+// `07-fem-spike-findings.md` §8's last open item was "keep alpha in double -- the only
+// part that has been shown to need the digits", and the three things that claim bundles
+// together are separable:
+//
+//   0  everything float, as shipped.
+//   1  **the linear solve**: the Jacobi equilibration, the 7x7 Cholesky and its two
+//      triangular substitutions, on thread 0. Kaa and the residual still arrive as
+//      float, so this only asks whether the *factorisation* was losing the digits.
+//   2  **+ the condensation**: Kaa = sum w G^T C G and r = sum w G^T sigma accumulated
+//      in double, reading G and the Gauss weights from a **double** copy of the rest
+//      forms. The double copy is not optional at this level: a double accumulation
+//      over a float G is still an operator known to seven digits, so without it the
+//      level would measure nothing.
+//   3  **+ the Newton loop**: alpha itself, its correction, its contribution to the
+//      strain, its per-element persistent storage (a separate fp64 buffer, so it is
+//      not rounded to float at every step boundary), and the CPU's own stopping rule.
+//
+// **What no level of this can reach, and it is worth writing down before any of it is
+// measured.** Kaa's inputs are the algorithmic tangent C and the stress sigma, both
+// produced by a float return map into float shared memory. Widening the arithmetic that
+// consumes them cannot recover digits they never had, so the enhanced block's ceiling
+// is float's ~1e-7 on C and sigma however this is compiled. That ceiling was not
+// binding when §8 wrote its item 3, because kappa(Kaa) was then (h/t)^4 ~ 1e7 and the
+// block genuinely had no correct digits; `computeRestForms`'s normalisation has since
+// put kappa(Kaa) at a constant 3.50. A well-conditioned 7x7 solve on float inputs
+// already delivers most of what float can deliver.
+//
+// That is an argument, and this file exists so it can be a measurement instead.
+#ifndef SHIPSIM_EAS_FP64
+#define SHIPSIM_EAS_FP64 0
+#endif
+
+// The Newton's stopping rule, **separately selectable from the arithmetic**. The
+// shipped float kernel converges on `|delta . r| <= 1e-9 * sigma_y V` in at most 12
+// iterations where the CPU uses `1e-16` and 40, because 1e-16 of a float quantity is
+// below the noise the same float quantity carries and the loop would simply run to its
+// cap every step. Level 3 adopts the CPU's rule, which means it changes two things at
+// once -- so `SHIPSIM_EAS_TIGHT=1` on its own builds a **float** kernel with the tight
+// rule, and that is the control that tells the tolerance and the arithmetic apart.
+#ifndef SHIPSIM_EAS_TIGHT
+#define SHIPSIM_EAS_TIGHT (SHIPSIM_EAS_FP64 >= 3)
+#endif
+
+// `easreal` is the type of the 7x7 solve's own state -- Kaa, its Cholesky factor, the
+// equilibration's D, the residual and the correction. `condreal` is the type the
+// condensation *accumulates* in, which is deliberately not the same knob: at level 1
+// Kaa is stored in double but each entry is still summed in float, so the level really
+// is "only the linear solve". `alphareal` is alpha's own type.
+//
+// At level 0 all three expand to `float` and the preprocessed text is character for
+// character what it was before this knob existed -- checked, not assumed, by comparing
+// the level-0 SPIR-V against the shipped kernel's.
+#if SHIPSIM_EAS_FP64 >= 1
+#define easreal double
+#else
+#define easreal float
+#endif
+#if SHIPSIM_EAS_FP64 >= 2
+#define condreal double
+#else
+#define condreal float
+#endif
+#if SHIPSIM_EAS_FP64 >= 3
+#define alphareal double
+#else
+#define alphareal float
+#endif
 
 layout(local_size_x = 32) in;
 
@@ -103,6 +175,21 @@ layout(std430, binding = 6) readonly  buffer RestPos    { float restPosition[]; 
 layout(std430, binding = 7) writeonly buffer ElemForce  { float elementForce[]; };  // 24 each
 layout(std430, binding = 10)          buffer PlasticSt  { float plastic[]; };    // kStateStride each
 layout(std430, binding = 11)          buffer ElemOut    { float elementOut[]; }; // 1 each
+#if SHIPSIM_EAS_FP64 >= 2
+// The enhanced-strain operator in double: G then the Gauss weights, kEasFormStride per
+// element. A second copy rather than a widened `forms`, because B is 1 152 of the
+// 1 505 floats and nothing in the enhanced block reads it -- widening the whole thing
+// would triple the residency of the largest buffer to serve a fifth of it. The host
+// allocates it only when a kernel that declares it is the one being loaded.
+layout(std430, binding = 14) readonly buffer EasForms   { double easForms[]; };
+#endif
+#if SHIPSIM_EAS_FP64 >= 3
+// alpha's persistent per-element state, kEas doubles each. The float copy in
+// `plastic[kStateEnhanced..]` is still written, because that is what `readback` and
+// every test read; this is what the *next step* warm-starts from, which is the half
+// that a float round trip would quietly undo.
+layout(std430, binding = 15)          buffer Enhanced64 { double easAlpha[]; };
+#endif
 
 layout(push_constant) uniform Params {
     float dt;
@@ -140,16 +227,47 @@ const uint kStateEnhanced = 120u;
 const uint kStateFailure = 127u;
 const uint kStateTorn = 128u;
 const uint kStateStride = 129u;
+// The fp64 enhanced-strain forms, when they exist: g[8][6][7] then weight[8]. Inside
+// the guard so that at level 0 this file compiles to **byte-identical** SPIR-V to the
+// kernel it replaces -- two unused constants are two extra ids, and a comparison that
+// has to be qualified is worth less than one that does not.
+#if SHIPSIM_EAS_FP64 >= 2
+const uint kEasFormG = 0u;
+const uint kEasFormW = 336u;
+const uint kEasFormStride = 344u;
+#endif
 
 const float kRoot23 = 0.816496580927726f;
 
-// Identical to solidshell_forces.comp's, and for the identical reasons -- the CPU's
-// 1e-16 relative gate is below what float can represent at all, and an absolute
-// residual gate at 1e-7 fires on the first iteration of every lightly loaded element
-// and leaves alpha at a warm start of zero, which is the enhanced modes switched off.
-const float kEnhancedWorkTol = 1.0e-9f;
+// Identical to solidshell_forces.comp's. **The reason recorded for the 1e-9 -- that the
+// CPU's 1e-16 is "below what float can represent at all" -- has been measured and is
+// wrong**, and the correction matters because the tolerance turns out to be the only
+// thing on this whole file that changes the answer.
+//
+// What the 1e-9 gate actually does is fire on the *first* iteration of a lightly loaded
+// element, and the test sits after the correction is computed and before it is applied
+// -- so alpha never leaves its warm start and the enhanced modes are simply off. On the
+// 192-element ferry patch at 50 steps the device returns bit-zero for all seven
+// parameters of every element where the CPU returns 7.7e-9, and `--eas=solve` and
+// `--eas=condense` return the identical zero: they compute the same correction in fp64
+// and discard it at the same gate. Float at the CPU's 1e-16 does *not* stall; it runs
+// more iterations and recovers alpha to about 20%.
+//
+// It is left at 1e-9 because the CPU's rule costs 3.5x on this kernel and does not fix
+// what the kernel is actually wrong about -- see `07-fem-spike-findings.md` §8, "Alpha
+// in double". `SHIPSIM_EAS_TIGHT` builds the variant that uses it. The residual gate is
+// *already* the CPU's 1e-12, so only the work gate and the iteration cap move.
+#if SHIPSIM_EAS_TIGHT
+const easreal kEnhancedWorkTol = easreal(1.0e-16);
+#else
+const easreal kEnhancedWorkTol = easreal(1.0e-9);
+#endif
 const float kResidualTol = 1.0e-12f;
+#if SHIPSIM_EAS_TIGHT
+const int   kMaxIterations = 40;
+#else
 const int   kMaxIterations = 12;
+#endif
 
 // --- Shared: the per-element state that used to be thread-private -----------------
 //
@@ -161,12 +279,12 @@ shared float sR[9];               // rotation, row-major, matching the CPU's `r`
 shared float sStrain[kGauss * 6];
 shared float sStress[kGauss * 6];
 shared float sTangent[kGauss * 36];   // produced per point, consumed by the Kaa phase
-shared float sKaa[kEas * kEas];
-shared float sChol[kEas * kEas];
-shared float sResidual[kEas];
-shared float sAlpha[kEas];
-shared float sDelta[kEas];
-shared float sScaleD[kEas];       // the Jacobi equilibration's D
+shared easreal sKaa[kEas * kEas];
+shared easreal sChol[kEas * kEas];
+shared easreal sResidual[kEas];
+shared alphareal sAlpha[kEas];
+shared easreal sDelta[kEas];
+shared easreal sScaleD[kEas];     // the Jacobi equilibration's D
 shared float sDissipation[kGauss];
 shared int   sPointFailed[kGauss];
 shared float sYieldEnergy;        // sigma_y * V, the scale both tolerances are on
@@ -354,6 +472,9 @@ void main() {
 
     const uint fb = e * kFormStride;
     const uint sb = e * kStateStride;
+#if SHIPSIM_EAS_FP64 >= 2
+    const uint eb = e * kEasFormStride;
+#endif
 
     // Already torn: output-identical to running the update, since every point returns
     // no stress and no dissipation. Uniform over the workgroup, so every thread takes
@@ -433,7 +554,11 @@ void main() {
         gStart.failed = plastic[p + 14u] != 0.0f;
         sPointFailed[t] = gStart.failed ? 1 : 0;
     }
+#if SHIPSIM_EAS_FP64 >= 3
+    if (t < uint(kEas)) sAlpha[t] = easAlpha[e * uint(kEas) + t];
+#else
     if (t < uint(kEas)) sAlpha[t] = plastic[sb + kStateEnhanced + t];
+#endif
     barrier();
 
     // An element that has lost a point drops its enhanced modes and finishes its life
@@ -445,7 +570,7 @@ void main() {
         sEasCount = degraded > 0 ? 0 : kEas;
     }
     barrier();
-    if (sEasCount == 0 && t < uint(kEas)) sAlpha[t] = 0.0f;
+    if (sEasCount == 0 && t < uint(kEas)) sAlpha[t] = alphareal(0.0);
     barrier();
 
     // Two attempts at most: the second is entered only when a point died inside this
@@ -457,6 +582,23 @@ void main() {
 
         for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
             // Strain: 8 Gauss points x 6 Voigt components, one B-row dot product each.
+#if SHIPSIM_EAS_FP64 >= 3
+            // The enhanced part summed in double against the double G, then added to
+            // the float B u and rounded **once** into the strain the return map takes.
+            // `sStrain` stays float on purpose: it is the enhanced block's interface to
+            // the rest of the element, and widening it would be widening the element.
+            for (uint task = t; task < uint(kGauss * 6); task += gl_WorkGroupSize.x) {
+                const uint gp = task / 6u, i = task % 6u;
+                const uint bb = fb + kFormB + gp * 144u;
+                const uint gb = eb + kEasFormG + gp * 42u;
+                float s = 0.0f;
+                for (int j = 0; j < kDof; ++j) s += forms[bb + i * uint(kDof) + uint(j)] * sU[j];
+                double enhanced = 0.0;
+                for (int k = 0; k < sEasCount; ++k)
+                    enhanced += easForms[gb + i * uint(kEas) + uint(k)] * sAlpha[k];
+                sStrain[task] = float(double(s) + enhanced);
+            }
+#else
             for (uint task = t; task < uint(kGauss * 6); task += gl_WorkGroupSize.x) {
                 const uint gp = task / 6u, i = task % 6u;
                 const uint bb = fb + kFormB + gp * 144u;
@@ -467,6 +609,7 @@ void main() {
                     s += forms[gb + i * uint(kEas) + uint(k)] * sAlpha[k];
                 sStrain[task] = s;
             }
+#endif
             barrier();
 
             if (t < uint(kGauss)) {
@@ -479,6 +622,20 @@ void main() {
             if (sEasCount == 0) break;   // uniform: sEasCount is shared and set by t == 0
 
             // Residual r_k = sum_gp w_gp * sum_i G[gp][i][k] * sigma[gp][i].
+#if SHIPSIM_EAS_FP64 >= 2
+            if (t < uint(kEas)) {
+                double s = 0.0;
+                for (int gp = 0; gp < kGauss; ++gp) {
+                    const uint gb = eb + kEasFormG + uint(gp) * 42u;
+                    const double w = easForms[eb + kEasFormW + uint(gp)];
+                    double inner = 0.0;
+                    for (int i = 0; i < 6; ++i)
+                        inner += easForms[gb + uint(i) * uint(kEas) + t] * sStress[gp * 6 + i];
+                    s += w * inner;
+                }
+                sResidual[t] = s;
+            }
+#else
             if (t < uint(kEas)) {
                 float s = 0.0f;
                 for (int gp = 0; gp < kGauss; ++gp) {
@@ -491,10 +648,11 @@ void main() {
                 }
                 sResidual[t] = s;
             }
+#endif
             barrier();
 
             if (t == 0u) {
-                float norm = 0.0f;
+                easreal norm = easreal(0.0);
                 for (int k = 0; k < sEasCount; ++k) norm += sResidual[k] * sResidual[k];
                 sStop = sqrt(norm) <= kResidualTol * sYieldEnergy ? 1 : 0;
             }
@@ -504,6 +662,26 @@ void main() {
             // Kaa = sum_gp w_gp * G^T C G, its 49 entries strided over the 32 threads.
             // ~70% of a Newton iteration's arithmetic, and the reason this phase is the
             // one that had to spread wide.
+#if SHIPSIM_EAS_FP64 >= 2
+            for (uint entry = t; entry < uint(kEas * kEas); entry += gl_WorkGroupSize.x) {
+                const uint p = entry / uint(kEas), qq = entry % uint(kEas);
+                if (int(p) >= sEasCount || int(qq) >= sEasCount) { sKaa[entry] = 0.0; continue; }
+                double acc = 0.0;
+                for (int gp = 0; gp < kGauss; ++gp) {
+                    const uint gb = eb + kEasFormG + uint(gp) * 42u;
+                    const double w = easForms[eb + kEasFormW + uint(gp)];
+                    double s = 0.0;
+                    for (int i = 0; i < 6; ++i) {
+                        double cg = 0.0;
+                        for (int m = 0; m < 6; ++m)
+                            cg += sTangent[gp * 36 + i * 6 + m] * easForms[gb + uint(m) * uint(kEas) + qq];
+                        s += easForms[gb + uint(i) * uint(kEas) + p] * cg;
+                    }
+                    acc += w * s;
+                }
+                sKaa[entry] = acc;
+            }
+#else
             for (uint entry = t; entry < uint(kEas * kEas); entry += gl_WorkGroupSize.x) {
                 const uint p = entry / uint(kEas), qq = entry % uint(kEas);
                 if (int(p) >= sEasCount || int(qq) >= sEasCount) { sKaa[entry] = 0.0f; continue; }
@@ -522,6 +700,7 @@ void main() {
                 }
                 sKaa[entry] = acc;
             }
+#endif
             barrier();
 
             // The 7x7 solve: thread 0 alone. ~200 flops against the Kaa phase's 14 000,
@@ -545,9 +724,9 @@ void main() {
                 // `07-fem-spike-findings.md` §8 records it.
                 bool ok = true;
                 for (int i = 0; i < sEasCount; ++i) {
-                    const float diagonal = sKaa[i * kEas + i];
-                    if (!(diagonal > 0.0f)) { ok = false; break; }
-                    sScaleD[i] = 1.0f / sqrt(diagonal);
+                    const easreal diagonal = sKaa[i * kEas + i];
+                    if (!(diagonal > easreal(0.0))) { ok = false; break; }
+                    sScaleD[i] = easreal(1.0) / sqrt(diagonal);
                 }
                 if (ok) {
                     for (int i = 0; i < sEasCount; ++i)
@@ -557,13 +736,13 @@ void main() {
                     // Cholesky on the equilibrated Kaa, mirroring solveSmall. A
                     // non-positive pivot means the element has no stiffness left, which
                     // is a state to leave rather than to iterate on.
-                    for (int k = 0; k < kEas * kEas; ++k) sChol[k] = 0.0f;
+                    for (int k = 0; k < kEas * kEas; ++k) sChol[k] = easreal(0.0);
                     for (int i = 0; i < sEasCount && ok; ++i)
                         for (int j = 0; j <= i; ++j) {
-                            float s = sKaa[i * kEas + j];
+                            easreal s = sKaa[i * kEas + j];
                             for (int k = 0; k < j; ++k) s -= sChol[i * kEas + k] * sChol[j * kEas + k];
                             if (i == j) {
-                                if (!(s > 0.0f)) { ok = false; break; }
+                                if (!(s > easreal(0.0))) { ok = false; break; }
                                 sChol[i * kEas + i] = sqrt(s);
                             } else {
                                 sChol[i * kEas + j] = s / sChol[j * kEas + j];
@@ -573,15 +752,15 @@ void main() {
                 if (!ok) {
                     sStop = 1;
                 } else {
-                    float delta[kEas];
+                    easreal delta[kEas];
                     for (int k = 0; k < sEasCount; ++k) delta[k] = -sResidual[k] * sScaleD[k];
                     for (int i = 0; i < sEasCount; ++i) {
-                        float s = delta[i];
+                        easreal s = delta[i];
                         for (int k = 0; k < i; ++k) s -= sChol[i * kEas + k] * delta[k];
                         delta[i] = s / sChol[i * kEas + i];
                     }
                     for (int i = sEasCount - 1; i >= 0; --i) {
-                        float s = delta[i];
+                        easreal s = delta[i];
                         for (int k = i + 1; k < sEasCount; ++k) s -= sChol[k * kEas + i] * delta[k];
                         delta[i] = s / sChol[i * kEas + i];
                     }
@@ -591,7 +770,7 @@ void main() {
                     // Converge on the correction's energy, not on ||r||: delta . r is
                     // joules and sigma_y * V is the element's yield energy, so the ratio
                     // is dimensionless however the modes are normalised.
-                    float work = 0.0f;
+                    easreal work = easreal(0.0);
                     for (int k = 0; k < sEasCount; ++k) work += delta[k] * sResidual[k];
                     sStop = abs(work) <= kEnhancedWorkTol * sYieldEnergy ? 1 : 0;
                 }
@@ -599,7 +778,7 @@ void main() {
             barrier();
             if (sStop != 0) break;
 
-            if (t < uint(sEasCount)) sAlpha[t] += sDelta[t];
+            if (t < uint(sEasCount)) sAlpha[t] += alphareal(sDelta[t]);
             barrier();
         }
 
@@ -612,7 +791,7 @@ void main() {
         barrier();
         if (!(sDegraded > 0 && sEasCount > 0)) break;
         if (t == 0u) sEasCount = 0;
-        if (t < uint(kEas)) sAlpha[t] = 0.0f;
+        if (t < uint(kEas)) sAlpha[t] = alphareal(0.0);
         barrier();
     }
 
@@ -630,7 +809,18 @@ void main() {
     }
     // All seven, not just sEasCount of them: a degraded element must report zeros
     // rather than the values it had before it started tearing.
+#if SHIPSIM_EAS_FP64 >= 3
+    // Both copies. `easAlpha` is what the next step warm-starts from and is the one
+    // that has to stay in double; the float copy is what `readback` and every test
+    // read, and a degraded element has to read zero in *both* or the rule is only
+    // half applied.
+    if (t < uint(kEas)) {
+        easAlpha[e * uint(kEas) + t] = sAlpha[t];
+        plastic[sb + kStateEnhanced + t] = float(sAlpha[t]);
+    }
+#else
     if (t < uint(kEas)) plastic[sb + kStateEnhanced + t] = sAlpha[t];
+#endif
     barrier();
 
     if (t == 0u) {

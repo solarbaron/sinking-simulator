@@ -24,6 +24,8 @@
 //
 //   ./zone_gpu_probe [--radius=M] [--sub=N] [--depth=M] [--speed=M_PER_S]
 //                    [--aim=M] [--height=M] [--threads=N] [--steps=N]
+//                    [--jitter=M] [--mapping=workgroup|invocation] [--stats]
+//                    [--eas=float|tight|solve|condense|newton]
 //
 // **Skips rather than fails with no Vulkan device.**
 #include "engine/core/jobs.hpp"
@@ -63,8 +65,27 @@ struct Options {
     // register spilling rather than to the element, so the two have to be comparable
     // on one command line or the re-measurement is not a re-measurement.
     gpu::Mapping mapping = gpu::Mapping::Workgroup;
+    // How much of the 7x7 enhanced-strain block runs in fp64.
+    // `07-fem-spike-findings.md` §8's last open item was "keep alpha in double", and
+    // the three things that claim bundles together are separable -- the linear solve,
+    // the condensation, and alpha's own state and stopping rule. `--eas=` runs each,
+    // and `--eas=tight` is the float control that separates the tolerance from the
+    // arithmetic. The comparison is one command apart rather than a rebuild apart, for
+    // the same reason `--mapping=` is.
+    gpu::EasPrecision eas = gpu::EasPrecision::Float;
     bool stats = false;   // report the compiler's register and spill counts, then stop
 };
+
+const char* easName(gpu::EasPrecision e) {
+    switch (e) {
+        case gpu::EasPrecision::FloatTight: return "float, the CPU's stopping rule";
+        case gpu::EasPrecision::Solve:      return "fp64 7x7 linear solve";
+        case gpu::EasPrecision::Condense:   return "fp64 condensation";
+        case gpu::EasPrecision::Newton:     return "fp64 alpha and Newton loop";
+        case gpu::EasPrecision::Float:      break;
+    }
+    return "float";
+}
 
 bool parse(int argc, char** argv, Options& o) {
     for (int i = 1; i < argc; ++i) {
@@ -88,6 +109,18 @@ bool parse(int argc, char** argv, Options& o) {
             if (m == "workgroup") o.mapping = gpu::Mapping::Workgroup;
             else if (m == "invocation") o.mapping = gpu::Mapping::Invocation;
             else { std::printf("--mapping must be workgroup or invocation\n"); return false; }
+        }
+        else if (const char* v = value("eas")) {
+            const std::string m = v;
+            if (m == "float") o.eas = gpu::EasPrecision::Float;
+            else if (m == "tight") o.eas = gpu::EasPrecision::FloatTight;
+            else if (m == "solve") o.eas = gpu::EasPrecision::Solve;
+            else if (m == "condense") o.eas = gpu::EasPrecision::Condense;
+            else if (m == "newton") o.eas = gpu::EasPrecision::Newton;
+            else {
+                std::printf("--eas must be float, tight, solve, condense or newton\n");
+                return false;
+            }
         }
         else {
             std::printf("unknown option %s\n", a.c_str());
@@ -159,13 +192,14 @@ int main(int argc, char** argv) {
     gpu::ZoneGpuSolver device;
     std::string error;
     if (!device.initialise(patch, seed, sim::plasticity::shipSteel(), solve, SHIPSIM_SHADER_DIR,
-                           error, options.mapping)) {
+                           error, options.mapping, options.eas)) {
         std::printf("skipped: %s\n", error.c_str());
         return 0;
     }
-    std::printf("device : %s, %s mapping\n", device.deviceName().c_str(),
+    std::printf("device : %s, %s mapping, enhanced block: %s (%s)\n", device.deviceName().c_str(),
                 options.mapping == gpu::Mapping::Workgroup ? "one workgroup per element"
-                                                           : "one invocation per element");
+                                                           : "one invocation per element",
+                easName(options.eas), device.elementShader().c_str());
 
     const auto gpuBegin = std::chrono::steady_clock::now();
     const double kernelMs = device.run(steps);

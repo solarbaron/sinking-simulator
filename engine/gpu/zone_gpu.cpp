@@ -16,7 +16,12 @@ using sim::solidshell::kEas;
 using sim::solidshell::kGauss;
 using sim::solidshell::kNodes;
 
-constexpr int kBufferCount = 14;
+// 14 and 15 are the fp64 enhanced-strain block's: a double copy of G and the Gauss
+// weights, and alpha's persistent per-element state. They are in the descriptor set
+// layout unconditionally, because one layout serves every shader; they are **allocated
+// with real contents only for the kernels that declare them**, and otherwise get a
+// four-byte stub, so the float path pays nothing for them.
+constexpr int kBufferCount = 16;
 constexpr uint32_t kElementGroup = 32;  // matches solidshell_forces.comp
 constexpr uint32_t kNodeGroup = 64;     // matches solidshell_integrate.comp
 
@@ -35,7 +40,36 @@ constexpr std::size_t kStateFailure = kStateEnhanced + kEas;      // 127
 constexpr std::size_t kStateTorn = kStateFailure + 1;             // 128
 constexpr std::size_t kStateStride = kStateTorn + 1;              // 129
 
+// The fp64 enhanced forms, in doubles per element. Must match the shader's
+// kEasFormG / kEasFormW / kEasFormStride; `tests/test_zone_gpu.cpp` checks them.
+constexpr std::size_t kEasFormG = 0;
+constexpr std::size_t kEasFormW = kGauss * 6 * kEas;               // 336
+constexpr std::size_t kEasFormStride = kEasFormW + kGauss;         // 344
+
 constexpr double kWorkScale = 100.0;  // matches solidshell_integrate.comp
+
+// Which of the five compiled variants of the workgroup kernel a precision selects, and
+// which fp64 buffers it needs. All five come from one GLSL source
+// (`solidshell_forces_wg.comp`, `-DSHIPSIM_EAS_FP64=`), so the difference between any
+// two of them is the precision and nothing else -- which is what makes the ladder a
+// measurement rather than five kernels that might also differ in other ways.
+const char* workgroupShaderFor(EasPrecision eas) {
+    switch (eas) {
+        case EasPrecision::FloatTight: return "solidshell_forces_wg_tight.comp.spv";
+        case EasPrecision::Solve:      return "solidshell_forces_wg_f64solve.comp.spv";
+        case EasPrecision::Condense:   return "solidshell_forces_wg_f64condense.comp.spv";
+        case EasPrecision::Newton:     return "solidshell_forces_wg_f64newton.comp.spv";
+        case EasPrecision::Float:      break;
+    }
+    return "solidshell_forces_wg.comp.spv";
+}
+bool needsDoubleForms(EasPrecision eas) {
+    return eas == EasPrecision::Condense || eas == EasPrecision::Newton;
+}
+bool needsDoubleAlpha(EasPrecision eas) { return eas == EasPrecision::Newton; }
+bool needsFloat64(EasPrecision eas) {
+    return eas != EasPrecision::Float && eas != EasPrecision::FloatTight;
+}
 
 struct PushConstants {
     float dt;
@@ -132,6 +166,14 @@ std::string describeElementPipelines(const std::string& shaderDirectory) {
     deviceInfo.pQueueCreateInfos = &queueInfo;
     deviceInfo.enabledExtensionCount = 1;
     deviceInfo.ppEnabledExtensionNames = wanted;
+    // fp64 as well, or the enhanced-block variants below cannot be created and the one
+    // number this report exists to give -- what the double block costs in registers and
+    // spill -- would be missing exactly where it matters.
+    VkPhysicalDeviceFeatures statsFeatures{};
+    VkPhysicalDeviceFeatures availableFeatures{};
+    vkGetPhysicalDeviceFeatures(physical, &availableFeatures);
+    statsFeatures.shaderFloat64 = availableFeatures.shaderFloat64;
+    deviceInfo.pEnabledFeatures = &statsFeatures;
     if (vkCreateDevice(physical, &deviceInfo, nullptr, &device) != VK_SUCCESS) {
         vkDestroyInstance(instance, nullptr);
         return "  (vkCreateDevice failed with the statistics extension)\n";
@@ -198,12 +240,20 @@ std::string describeElementPipelines(const std::string& shaderDirectory) {
     // correctly. Confirmed against `tet_forces.comp`, which reports the identical
     // baseline -- which is also §8's claim that a linear tet's state fits in
     // registers, checked rather than repeated.
-    const char* files[3] = {"node_integrate.comp.spv", "solidshell_forces.comp.spv",
-                            "solidshell_forces_wg.comp.spv"};
-    const char* labels[3] = {"node_integrate.comp (spill-free calibration)",
-                             "one invocation per element", "one workgroup per element"};
+    const char* files[6] = {"node_integrate.comp.spv",
+                            "solidshell_forces.comp.spv",
+                            "solidshell_forces_wg.comp.spv",
+                            "solidshell_forces_wg_f64solve.comp.spv",
+                            "solidshell_forces_wg_f64condense.comp.spv",
+                            "solidshell_forces_wg_f64newton.comp.spv"};
+    const char* labels[6] = {"node_integrate.comp (spill-free calibration)",
+                             "one invocation per element",
+                             "one workgroup per element",
+                             "  + the 7x7 linear solve in fp64",
+                             "  + Kaa and the residual condensed in fp64",
+                             "  + alpha and the Newton loop in fp64"};
     long long localBaseline = -1;
-    for (int which = 0; which < 3; ++which) {
+    for (int which = 0; which < 6; ++which) {
         out += "  ";
         out += labels[which];
         out += " (";
@@ -446,7 +496,7 @@ bool ZoneGpuSolver::initialise(const sim::zone::Patch& patch, const sim::zone::S
                                const sim::plasticity::Material& material,
                                const sim::zone::SolveParams& params,
                                const std::string& shaderDirectory, std::string& error,
-                               Mapping mapping) {
+                               Mapping mapping, EasPrecision eas) {
     if (cpu.restForms().size() != patch.elementCount()) {
         error = "the CPU solver was built without SolveParams::cacheRestForms, so there is "
                 "nothing to upload";
@@ -455,6 +505,15 @@ bool ZoneGpuSolver::initialise(const sim::zone::Patch& patch, const sim::zone::S
     if (!params.plastic) {
         error = "the GPU path implements the elastoplastic element only -- the elastic one is "
                 "0.27 us against 7.3 and is not what costs anything";
+        return false;
+    }
+    // The fp64 enhanced block exists for the workgroup mapping only. Saying so is
+    // better than quietly running the float kernel, which is a comparison that would
+    // pass every tolerance while measuring nothing -- this repo's most common shape of
+    // vacuous test.
+    if (eas != EasPrecision::Float && mapping != Mapping::Workgroup) {
+        error = "the fp64 enhanced-strain variants are compiled for the workgroup mapping "
+                "only; the one-invocation kernel is float throughout";
         return false;
     }
 
@@ -518,6 +577,23 @@ bool ZoneGpuSolver::initialise(const sim::zone::Patch& patch, const sim::zone::S
     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
+    // **fp64 is a feature and has to be asked for.** A shader carrying the Float64
+    // capability against a device created without `shaderFloat64` is undefined
+    // behaviour that this driver happens to run, so it is requested explicitly and its
+    // absence **skips rather than fails**, like a missing device. It is only requested
+    // when a variant needs it, so the float path's device is unchanged.
+    VkPhysicalDeviceFeatures wantedFeatures{};
+    if (needsFloat64(eas)) {
+        VkPhysicalDeviceFeatures available{};
+        vkGetPhysicalDeviceFeatures(d.physical, &available);
+        if (!available.shaderFloat64) {
+            error = "this device has no shaderFloat64, so the fp64 enhanced-strain "
+                    "variants cannot run on it";
+            return false;
+        }
+        wantedFeatures.shaderFloat64 = VK_TRUE;
+        deviceInfo.pEnabledFeatures = &wantedFeatures;
+    }
     if (vkCreateDevice(d.physical, &deviceInfo, nullptr, &d.device) != VK_SUCCESS) {
         error = "vkCreateDevice failed";
         return false;
@@ -617,6 +693,35 @@ bool ZoneGpuSolver::initialise(const sim::zone::Patch& patch, const sim::zone::S
         out[kStateTorn] = s.torn ? 1.0f : 0.0f;
     }
 
+    // **The enhanced-strain operator in double, and only when a kernel reads it.** A
+    // double accumulation of `sum w G^T C G` over a G that was rounded to float is an
+    // operator known to seven digits however it is summed, so a level that widens the
+    // arithmetic without widening G would measure nothing. B is deliberately *not*
+    // copied: it is 1 152 of the 1 505 floats and the enhanced block never touches it.
+    std::vector<double> easForms(needsDoubleForms(eas) ? e * kEasFormStride : 1, 0.0);
+    if (needsDoubleForms(eas))
+        for (std::size_t el = 0; el < e; ++el) {
+            const sim::solidshell::RestForms& f = cpu.restForms()[el];
+            double* out = easForms.data() + el * kEasFormStride;
+            for (int gp = 0; gp < kGauss; ++gp)
+                for (int i = 0; i < 6; ++i)
+                    for (int k = 0; k < kEas; ++k)
+                        out[kEasFormG + static_cast<std::size_t>(gp) * 6 * kEas +
+                            static_cast<std::size_t>(i) * kEas + static_cast<std::size_t>(k)] =
+                            f.g[gp][i][k];
+            for (int gp = 0; gp < kGauss; ++gp)
+                out[kEasFormW + static_cast<std::size_t>(gp)] = f.weight[gp];
+        }
+    // alpha's persistent state in double. The float copy in `plastic` is still written
+    // by the kernel and is what `readback` reads; this is what the *next* step warm
+    // starts from, which is the half a float round trip would quietly undo.
+    std::vector<double> easAlpha(needsDoubleAlpha(eas) ? e * kEas : 1, 0.0);
+    if (needsDoubleAlpha(eas))
+        for (std::size_t el = 0; el < e; ++el)
+            for (int k = 0; k < kEas; ++k)
+                easAlpha[el * kEas + static_cast<std::size_t>(k)] =
+                    cpu.elementState()[el].enhanced[k];
+
     const std::vector<uint32_t> index(patch.mesh.index.begin(), patch.mesh.index.end());
     const std::vector<uint32_t> driven(cpu.drivenNodes().begin(), cpu.drivenNodes().end());
     d.drivenCount = driven.size();
@@ -639,12 +744,15 @@ bool ZoneGpuSolver::initialise(const sim::zone::Patch& patch, const sim::zone::S
         elementOut.size() * sizeof(float),               // 11
         std::max<VkDeviceSize>(driven.size() * sizeof(uint32_t), 4),  // 12
         accumulator.size() * sizeof(int32_t),            // 13
+        easForms.size() * sizeof(double),                // 14
+        easAlpha.size() * sizeof(double),                // 15
     };
     const void* data[kBufferCount] = {
         position.data(),     velocity.data(),  mass.data(),         pinned.data(),
         index.data(),        forms.data(),     restPosition.data(), elementForce.data(),
         cpu.adjacencyOffset().data(), cpu.adjacencyEntry().data(),
         state.data(),        elementOut.data(), driven.data(),      accumulator.data(),
+        easForms.data(),     easAlpha.data(),
     };
 
     VkDeviceSize largest = 0;
@@ -739,7 +847,7 @@ bool ZoneGpuSolver::initialise(const sim::zone::Patch& patch, const sim::zone::S
         }
         return true;
     };
-    const char* forceShader = mapping == Mapping::Workgroup ? "solidshell_forces_wg.comp.spv"
+    const char* forceShader = mapping == Mapping::Workgroup ? workgroupShaderFor(eas)
                                                             : "solidshell_forces.comp.spv";
     elementShader_ = forceShader;
     if (!makePipeline(forceShader, d.forceModule, d.forcePipeline)) return false;

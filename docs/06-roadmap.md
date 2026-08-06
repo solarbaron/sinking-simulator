@@ -441,17 +441,25 @@ The longest and highest-risk phase.
   so κ(Kaa) is a constant 3.50 rather than (h/t)⁴; **measured by A/B, that changes
   nothing for this kernel**, because the shader's equilibration was already
   addressing the same conditioning. What remains: at 768 and 3 072 elements the float
-  kernel tears 40 and 247 where the double reference tears **32 and 162**, while the
+  kernel tears 41 and 248 where the double reference tears **32 and 162**, while the
   negative control — the double solver on a mesh jittered by 2 × 10⁻⁷ m — tears
-  exactly 32 and 162. Plastic dissipation runs 26–34% high where the control moves
+  exactly 32 and 162. Plastic dissipation runs 27–34% high where the control moves
   0.06–0.8%. **A previous claim here that it "tears 60 elements where the double
   reference tears none" does not reproduce under any configuration and has been
   withdrawn** — see §8; the GPU's peak damage on that case is 0.41 against the CPU's
   0.65, so it is further from tearing, not nearer.
 
-  **The next step is `alpha` in double**, which §8 item 3 already named: the EAS
-  block is 7×7 and it is the only part shown to need the digits, and Pascal's 1/32
-  fp64 rate now has 1.26–2.43× of headroom to spend
+  **`alpha` in double was the next step, it has been taken, and it is a negative.**
+  §8 item 3 named it as the only part shown to need the digits. Five kernels are now
+  compiled from one source, differing only in how much of the enhanced block is fp64
+  (`--eas=float|tight|solve|condense|newton`). They land between **40 and 49** torn at
+  768 elements and between **205 and 268** at 3 072, against a reference of 32 and 162
+  that the negative control hits exactly — a spread the size of the gap, and not
+  monotone in precision. Holding the stopping rule fixed, the whole block in fp64 moves
+  alpha by 1/810 of the amount float is already wrong by, because Kaa's inputs are a
+  float tangent and a float stress. It costs 5–10× on the kernel, turning 1.26–2.43×
+  into 0.14–0.43×. **The list of cheap things to try is now empty**, and the error is
+  where §8 said it was: per-step float in `u`, the return map and the integrator
 - ~~FEM → flooding coupling (a tear becomes an orifice)~~ — done:
   `engine/sim/breach.hpp`, measured in `02-simulation.md` §3. Failed panels become
   merged `Opening`s whose area, position and connectivity come from the structure,
