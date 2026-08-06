@@ -644,7 +644,11 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
     for (std::size_t e = 0; e < elements; ++e) {
         double nodePos[kDof];
         mesh.gather(e, mesh.position, nodePos);
-        if (!(solidshell::smallestJacobian(nodePos) > 0.0)) {
+        // `integrable`, not `smallestJacobian > 0`: a collapsed hexahedron -- the
+        // wedge a degenerate plate panel extrudes to -- has a zero determinant at
+        // the closed edge and a sound one everywhere it is integrated. See
+        // `solidshell::ElementShape`.
+        if (!solidshell::elementShape(nodePos).integrable) {
             s.problems.push_back("element " + std::to_string(e) + " is inverted or degenerate");
             return;
         }
@@ -1389,6 +1393,7 @@ Eigenpairs Substructure::fixedInterfaceModes(int count, double tolerance, int ma
             previous[static_cast<std::size_t>(j)] = value;
         }
         out.iterations = iteration;
+        out.lastChange = worst;
         if (worst < tolerance) {
             out.converged = true;
             break;
@@ -1403,8 +1408,20 @@ Eigenpairs Substructure::fixedInterfaceModes(int count, double tolerance, int ma
         return out;
     }
     if (!out.converged && out.problem.empty())
+        // **The size of the change is the message.** An iteration that has hit the
+        // floor `cond(K_ii)` puts under it -- the ordinary case on slender plating,
+        // see `fixedInterfaceModes` in the header -- leaves this around 1e-8 while
+        // the eigenvalues themselves are right to seven figures; a solve that is
+        // genuinely lost leaves it at order one. Without the number the two read
+        // identically, and a warning that cannot be triaged is a warning that gets
+        // ignored, which is how this repo sat on a `ram_view` finding for months.
         out.problem = "subspace iteration did not converge in " + std::to_string(maxIterations) +
-                      " iterations";
+                      " iterations: the wanted eigenvalues still moved by " +
+                      std::to_string(out.lastChange) + " relative, against a tolerance of " +
+                      std::to_string(tolerance) +
+                      " -- around 1e-8 is the accuracy floor a slender K_ii's conditioning puts"
+                      " under the banded solve, and the values are still good to most of their"
+                      " figures; order one is a lost solve";
 
     out.count = count;
     out.value.assign(previous.begin(), previous.end());

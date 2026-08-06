@@ -183,6 +183,29 @@ if [ -x ./build/zone_gpu_probe ]; then
 else
   skip "zone_gpu_probe not built"
 fi
+# The Tier-1 section at ship scale. `tests/test_section.cpp` checks the mesher
+# against closed forms at unit scale and on two frame bays; this is the only thing
+# that asks the whole hull, and **every ship-scale figure docs/02-simulation.md §3
+# publishes about the section mesher comes out of it**.
+#
+# It was not in the gate until it published a 3.46 Hz shell frequency that nothing
+# had ever re-run — the same failure `zone_gpu_probe` was added for, and the third
+# time this session that a document quoted a tool nobody executed. It had no
+# success contract at all either: it exited 0 whatever it measured.
+#
+# Two runs, 45 s together. `--scan=2` is the **reach**: a two-bay window slid along
+# the whole ship, every one of which has to mesh, reduce and solve. The default run
+# is what the reach is *for* — that the junction tie closes the cell — and it is
+# checked on torsion, on the lowest fixed-interface frequency and on the component
+# count, because `section.hpp` §2 shows EA and EI are exact on a section whose
+# plating is joined to nothing. `--no-reduce` skips the Craig-Bampton block, which
+# is 70 s and which the unit suite already covers at unit scale.
+if [ -x ./build/section_probe ]; then
+  expect_ok "section_probe reach" '^ok$' ./build/section_probe --scan=2
+  expect_ok "section_probe tie"   '^ok$' ./build/section_probe --sweep=0 --no-reduce
+else
+  skip "section_probe not built"
+fi
 if [ -x ./build/seaway_view ]; then
   expect_ok "seaway_view" '^ok$|no usable GPU' \
             ./build/seaway_view --out=/tmp --frames=2

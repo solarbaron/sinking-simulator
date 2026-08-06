@@ -949,6 +949,53 @@ double smallestJacobian(const double nodes[kDof]) {
     return worst;
 }
 
+ElementShape elementShape(const double nodes[kDof]) {
+    ElementShape out;
+
+    // Exact coincidence, not a tolerance. A collapsed element's two nodes are the
+    // *same mesh node* scattered twice, so their coordinates are bit-identical; a
+    // sliver whose corners are merely close still has a small positive determinant
+    // there and is still judged on it. A tolerance here would turn "this element
+    // is a wedge" into "this element is nearly a wedge", which is the loosening
+    // this whole classification exists to avoid.
+    for (int a = 0; a < kNodes; ++a)
+        for (int b = a + 1; b < kNodes; ++b) {
+            const double dx = nodes[a * 3 + 0] - nodes[b * 3 + 0];
+            const double dy = nodes[a * 3 + 1] - nodes[b * 3 + 1];
+            const double dz = nodes[a * 3 + 2] - nodes[b * 3 + 2];
+            if (dx == 0.0 && dy == 0.0 && dz == 0.0) out.collapsed[a] = out.collapsed[b] = true;
+        }
+    for (int a = 0; a < kNodes; ++a)
+        if (out.collapsed[a]) ++out.collapsedNodes;
+
+    out.smallestNodal = std::numeric_limits<double>::infinity();
+    bool soundCorners = true;
+    for (int a = 0; a < kNodes; ++a) {
+        Point p;
+        evaluate(nodes, kXi[a], kEta[a], kZta[a], p);
+        const double det = determinant3(p.jac);
+        out.smallestNodal = std::min(out.smallestNodal, det);
+        if (!(det > 0.0) && !out.collapsed[a]) soundCorners = false;
+    }
+
+    // The centre and the 2x2x2 rule: exactly where `computeForms` evaluates, and
+    // exactly what it requires to be positive. Asking anywhere else would be
+    // asking a different question from the one the solve asks.
+    const double q = 1.0 / std::sqrt(3.0);
+    out.smallestGauss = std::numeric_limits<double>::infinity();
+    for (int gp = -1; gp < kGauss; ++gp) {
+        const double xi = gp < 0 ? 0.0 : ((gp & 1) ? q : -q);
+        const double eta = gp < 0 ? 0.0 : ((gp & 2) ? q : -q);
+        const double zta = gp < 0 ? 0.0 : ((gp & 4) ? q : -q);
+        Point p;
+        evaluate(nodes, xi, eta, zta, p);
+        out.smallestGauss = std::min(out.smallestGauss, determinant3(p.jac));
+    }
+
+    out.integrable = soundCorners && out.smallestGauss > 0.0;
+    return out;
+}
+
 double criticalTimestep(const double nodes[kDof], const StructuralMaterial& material,
                         Formulation form, double safety) {
     double k[kDof * kDof];
@@ -1214,7 +1261,9 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
     for (std::size_t e = 0; e < elements; ++e) {
         double nodePos[kDof];
         mesh.gather(e, mesh.position, nodePos);
-        if (!(smallestJacobian(nodePos) > 0.0)) {
+        // `integrable`, not `smallestJacobian > 0`: a collapsed hexahedron is a
+        // wedge and integrates, an inverted one does not. See `ElementShape`.
+        if (!elementShape(nodePos).integrable) {
             if (problem) *problem = "element " + std::to_string(e) + " is inverted or degenerate";
             return false;
         }

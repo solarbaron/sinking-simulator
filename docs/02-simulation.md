@@ -3432,12 +3432,23 @@ makes, arriving as a frequency.
    model of the whole length: measured against the same length in one piece at
    1e-10 in `EA`, `EI` and `GJ` on the box girder and 4e-10 on the ferry.
 
-   What is left is not the tier's machinery, it is the mesher's reach. Two-bay
-   sections of the reference ferry only reduce between about x = −26.4 and 16.8 m;
-   outside that `buildSection` refuses them with an inverted element, so the chain
-   cannot yet be run bow to stern. And a cut plane is an interface, so it unties the
-   junctions on it — see the section below for what that costs, which is the one
-   thing about a chain that is worse than the monolith rather than equal to it.
+   ~~What is left is the mesher's reach.~~ **Also done, and the diagnosis was worth
+   more than the fix.** Two-bay sections used to work over 62.4 m of a 120 m ship in
+   five disconnected islands, the longest unbroken run being 26.4 m, and
+   `buildSection` refused the rest "with an inverted element". **Nothing was
+   inverted.** Every refusal on this ship was a
+   *collapsed* hexahedron: `makeStructuralMesh` emits 166 degenerate `PlatePanel`s
+   (quads with two coincident corners — a bulkhead running into the keel, a deck
+   strake running out at the stem), each of which extrudes to a triangular prism
+   whose Jacobian is exactly zero on the closed edge and sound at every point the
+   element is integrated at. `solidshell::smallestJacobian` samples the *corners*,
+   which is right for a general hex and wrong for this one. See `section.hpp` §7:
+   the reach is now **120.0 m of 120.0 m**, 49 of 49 two-bay windows mesh, reduce
+   and solve, and the whole hull meshes as one 8 900-element component.
+
+   A cut plane is still an interface, so it unties the junctions on it — see the
+   section below for what that costs, which is the one thing about a chain that is
+   worse than the monolith rather than equal to it.
 2. ~~**Nothing assembles two substructures.**~~ **Done** — `matchBoundaries()` and
    `assemble()`. Two components meeting at an interface have the same displacement
    there, so their shared boundary DOF *are* the same unknown and coupling is
@@ -3812,6 +3823,117 @@ argued equivalent.** The ones worth recording:
    this ship's members in a two-bay section; the alternative is a plausible wrong
    second moment.
 
+#### Reaching the whole ship: the "inverted element" was a triangle
+
+This section was written, validated and mutation-tested on **a quarter of this ship**,
+and nobody noticed until the reach was asked for directly. Of the 49 two-bay windows,
+21 meshed, reduced and solved; the rest reported "an element came out inverted or
+degenerate" and were refused by `applyBeamLoad` and `Substructure`.
+
+**And they were never a range.** The 21 were five islands — x = −43.2…−38.4,
+−36…−31.2, −28.8…−9.6, −7.2…19.2 and 21.6…28.8 — so 62.4 m of 120 m worked in total
+while the longest *unbroken* run was 26.4 m: exactly the eleven-bay hold every figure
+above was measured on. The two windows containing the bulkhead at x = −8 failed while
+sitting in the middle of the best island, which is the clue that the cause was never
+"the ends are curved".
+
+**The guess was curvature approaching the plate thickness. The measurement says
+otherwise: there is not one negative Jacobian anywhere on this ship.** Over all 49
+two-bay windows every non-positive determinant is exactly zero, and every one of
+them is on a *collapsed* element:
+
+- `makeStructuralMesh` emits **degenerate `PlatePanel`s** — quads with two coincident
+  corners, i.e. triangles. 90 bulkhead panels and 76 deck panels of 8 900; **no shell
+  panels at all**. A bulkhead grid running into the centreline or the keel; a deck
+  laid on fixed |y| lines clipped to a hull that narrows past them. 39.1 m² of
+  12 802.9 — **0.305%** of her plating.
+- Extruding one gives a **collapsed hexahedron**: a triangular prism written in eight
+  nodes, two of them the same node. A covariant base vector vanishes on the closed
+  edge, so `det J` is exactly zero *there and only there*.
+- `solidshell::smallestJacobian` samples the eight **corners**. The element is
+  integrated at the centre and the 2×2×2 Gauss points, and at every one of those it is
+  sound: the collapsed elements' worst Gauss determinant on the ferry is 5.6e-6
+  against 2.7e-5 for the worst *sound* element. No closer to singular than the mesh
+  already was.
+
+`solidshell::ElementShape` separates the two. A section is refused when a corner that
+nothing coincides with has gone non-positive, **or** when the quadrature has — not
+when a wedge's closed edge reads zero. Both halves are load-bearing and both have a
+negative control in `tests/test_solid_shell.cpp`, including a wedge folded through its
+thickness at one corner, which the quadrature alone would accept.
+
+**What a wedge is worth**, measured on the box girder with *every* panel triangulated
+— the worst case, against 1.9% of elements on the ferry:
+
+| subdivision | EA/exact | EI/exact | GJ/Bredt, tied | (quads, tied) |
+|---|---|---|---|---|
+| 1 | 1.00000000 | 1.1370088 | 1.2015 | 1.0986 |
+| 2 | 1.00000000 | 1.0068191 | 1.0516 | 1.0512 |
+| 3 | 1.00000000 | 1.0021759 | 1.0315 | 1.0367 |
+| 4 | 1.00000000 | 1.0011108 | 1.0126 | 1.0297 |
+
+`EA` is exact at every refinement — a collapsed element still passes the patch test —
+and `EI`'s 14% converges away twentyfold on the first refinement, so it is a
+discretisation error and not the formulation. The test asserts the *convergence*,
+because a tolerance on the coarse value would pass on an element that was simply
+wrong by a constant.
+
+**The reach**, from `tools/section_probe --scan=2`, which `verify.sh full` now runs:
+
+| | before | after |
+|---|---|---|
+| two-bay windows that mesh, reduce and solve | 21 / 49 | **49 / 49** |
+| of those, a single connected piece | 21 / 49 | 46 / 49 |
+| union of hull inside a working window | 62.4 m (52.0%) | **120.0 m (100%)** |
+| longest *unbroken* run of working windows | 26.4 m, x = −7.2…19.2 | **120.0 m, bow to stern** |
+| the whole 120 m as one section | refused | 8 900 elements, **one component** |
+
+**The old range was never the contiguous 43 m this document used to quote.** The
+working windows were an archipelago: x = −43.2…−38.4 and −36…−31.2 worked, so did
+21.6…28.8, and the two windows containing the bulkhead at x = −8 did *not*, even
+though they sit in the middle of the range. What a chain needs is the unbroken run,
+and that was 26.4 m — eleven bays, which is exactly the hold every measurement in
+this section was made on.
+
+One window regressed, and it is worth naming rather than netting off: x = −43.2…−38.4
+used to come out in one piece and now comes out in two, because `junctionWeightLimit`
+refuses a tie there that was closing a 22.4 mm gap with a weight of 2.10. It still
+meshes, reduces and solves.
+
+Two things it did not fix, both now reported rather than latent:
+
+1. **A tie can take more of a slave's mass than the slave has.** The junction search
+   admits a master whose mid-surface is within `junctionTolerance` — 25 mm, an
+   *absolute* figure — while the through-thickness split is relative to the master's
+   own thickness. On 10 mm plating a slave 21.5 mm off the mid-surface is admitted and
+   asks for a weight of 2.65, putting −1.65 of the slave's steel on one master face;
+   `Substructure` then refuses the **whole section** for a non-positive nodal mass.
+   `SectionParams::junctionWeightLimit` refuses the junction instead — one full share
+   is the limit, and on this ship that separates cleanly, every junction being at or
+   below 1.885 or at 2.10 and above. It costs three windows their single-component
+   status, which is why the two rows above differ. The fix that needs no limit is a
+   `junctionTolerance` scaled off the plating, which changes the junction *census* as
+   well as the tie.
+2. **`hullGirderSection` sampled exactly on a frame station loses 76% of the ship**,
+   and it is the Tier-0 reference this whole section is compared against. Measured:
+   0.42932 m² at x = 19.2, 21.6 and 24.0 against 1.80133 at 18.8 and 19.6 — the
+   plating either side of the plane fails the half-open `straddles` test in
+   `sectionElements` on a floating-point knife edge and only the longitudinals
+   survive. Not every station does it (16.8 is fine), which is what says it is
+   representation rather than geometry. `section_probe --scan` now samples Tier 0 at
+   the centre of a bay and reports both areas rather than their ratio; fixing it
+   belongs with `girder.hpp` and moves published figures.
+3. **The thickness-seam rule costs five times more at the ends than amidships.**
+   `nodeThickness` is an area-weighted mean over the sub-quads *inside* the section,
+   so a station where a strake steps hands one thickness to the section aft of it,
+   another to the one forward, and the mean to a section spanning it. A member run
+   stops at a thickness change, so a spanning section stops runs its two halves never
+   see and drops the seam node's run of one. Cutting a window in two conserves the
+   stiffener steel **exactly** amidships, loses 1.9% at x = −24…−19.2 — inside the
+   range that always worked, so this is older than the reach — and loses **25.2%** at
+   the bow shoulder. It is the nodal-thickness twin of the nodal-normal problem in
+   §*A ship: a chain of sections*, and it has the same fix: a halo.
+
 ### The junction tie — **implemented**
 
 `solidshell::Mpc` and `solidshell::DofExpansion` in `engine/sim/solid_shell.{hpp,cpp}`,
@@ -4074,9 +4196,12 @@ forward for the other. Prismatic hull, same vector, exact coincidence. Shoulder,
 | worst gap, m | 6.4e-4 | 3.5e-4 | 3.4e-6 | 0 | 0 | 0 | 1.9e-4 | 7.1e-4 | 1.0e-3 |
 | nodes past 1e-9 | 116 | 112 | 112 | 0 | 0 | 0 | 112 | 116 | 120 |
 
-Most of that row is unreachable and saying so is the honest half of quoting it — the
-mesher already refuses two-bay sections outside about x = −26.4…16.8. What is
-reachable is **x = −21.6**, where the gap is 3.4 µm: three orders of magnitude below
+That row was measured when the mesher refused two-bay sections outside about
+x = −26.4…19.2, so most of it was unreachable and only **x = −21.6** could be
+checked. `section.hpp` §7 removed that limit — every plane in the row is reachable
+now — and the figures below are still the ones taken at x = −21.6, because that is
+where they were measured and re-measuring them elsewhere is a different claim.
+The gap there is 3.4 µm: three orders of magnitude below
 the plating and three above `matchBoundaries`' 1e-9 default. At the default **336 of
 that plane's 1 170 boundary DOF find no partner**, and a chain assembles out of them,
 solves, and is torn along 29% of the cut. `Chain::unmatched` counts them and

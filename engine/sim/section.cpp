@@ -428,7 +428,17 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
         const double sign =
             dot(raw, structure.panels[static_cast<std::size_t>(q.panel)].normal()) >= 0 ? 1.0 : -1.0;
         const Vec3 oriented = raw * (sign * q.orient);
-        for (std::uint32_t node : q.node) {
+        for (int a = 0; a < 4; ++a) {
+            const std::uint32_t node = q.node[static_cast<std::size_t>(a)];
+            // **Once per sub-quad, not once per corner of it.** A collapsed
+            // sub-quad -- see §7 -- names its apex twice, and counting it twice
+            // would give that panel double weight in the area-weighted normal and
+            // thickness at exactly the node where several panels meet. Where no
+            // sub-quad is collapsed this loop is what it always was.
+            bool repeat = false;
+            for (int b = 0; b < a; ++b)
+                if (q.node[static_cast<std::size_t>(b)] == node) repeat = true;
+            if (repeat) continue;
             nodeNormal[node] += oriented;
             nodeThickness[node] += thickness * area;
             nodeWeight[node] += area;
@@ -514,6 +524,31 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
         std::uint32_t slave;    // mid-surface node
         std::size_t quad[2];    // the master face each of its two extruded nodes landed in
         double xi[2], eta[2];   // where in that face
+        // The through-thickness split of the master, `constraint::tieWeight`.
+        // Computed once, when the pairing decides whether the tie is admissible at
+        // all, and carried to the write-out -- because a tie refused on one number
+        // and written with another is exactly the kind of disagreement that never
+        // shows up in a total.
+        double weight[2];
+    };
+    // Where a slave's extruded node lands on a master face, and how the master's
+    // thickness splits it. Shared by the pairing and the write-out for the same
+    // reason.
+    const auto tieOnFace = [&](std::uint32_t slave, int face, std::size_t quad, double xi,
+                               double eta, double shape[4]) {
+        const SubQuad& q = quads[quad];
+        bilinear(xi, eta, shape);
+        Vec3 surface{0, 0, 0}, normal{0, 0, 0};
+        double thickness = 0;
+        for (int a = 0; a < 4; ++a) {
+            surface += mid[q.node[a]] * shape[a];
+            normal += nodeNormal[q.node[a]] * shape[a];
+            thickness += nodeThickness[q.node[a]] * shape[a];
+        }
+        normal = normalize(normal);
+        const Vec3 at =
+            mid[slave] + nodeNormal[slave] * ((face == 0 ? -0.5 : 0.5) * nodeThickness[slave]);
+        return constraint::tieWeight(dot(at - surface, normal), thickness);
     };
     std::vector<PairedTie> paired;
     std::vector<std::uint8_t> tieRole(mid.size(), 0u);  // 1 slave, 2 master
@@ -535,7 +570,7 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
             // own surface slope. Tying both to one point would clamp that rotation.
             const Vec3 through[2] = {mid[i] - nodeNormal[i] * (0.5 * nodeThickness[i]),
                                      mid[i] + nodeNormal[i] * (0.5 * nodeThickness[i])};
-            PairedTie tie{i, {quads.size(), quads.size()}, {0, 0}, {0, 0}};
+            PairedTie tie{i, {quads.size(), quads.size()}, {0, 0}, {0, 0}, {0.5, 0.5}};
             FaceCoordinate landed[2];
             for (int face = 0; face < 2; ++face) {
                 auto found = bucket.find(
@@ -569,6 +604,25 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
             if (landed[0].overshoot > params.junctionOvershoot ||
                 landed[1].overshoot > params.junctionOvershoot) {
                 ++section.junctionsOutsideFace;
+                continue;
+            }
+            // And the through-thickness half of the same guarantee. A weight
+            // outside [0, 1] is normal -- a deck edge sits on the far face of the
+            // shell -- but one that takes more than `junctionWeightLimit` shares of
+            // the slave's mass off a master face leaves `T^T M T` with a
+            // non-positive diagonal, and `reduction::Substructure` then refuses the
+            // whole section rather than this one junction. Better to leave the
+            // junction open and say which.
+            bool overWeight = false;
+            for (int face = 0; face < 2; ++face) {
+                double shape[4];
+                tie.weight[face] = tieOnFace(i, face, tie.quad[face], landed[face].xi,
+                                             landed[face].eta, shape);
+                const double share = std::min(tie.weight[face], 1.0 - tie.weight[face]);
+                if (share < -params.junctionWeightLimit) overWeight = true;
+            }
+            if (overWeight) {
+                ++section.junctionsThroughThickness;
                 continue;
             }
             // Already the master side of a junction made from the other plate. The
@@ -612,6 +666,12 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
             report(std::to_string(section.junctionsOutsideFace) +
                    " junction nodes land further outside a master face than"
                    " SectionParams::junctionOvershoot allows and were left untied");
+        if (section.junctionsThroughThickness > 0)
+            report(std::to_string(section.junctionsThroughThickness) +
+                   " junction nodes sit so far off their master's mid-surface that the tie would"
+                   " take more than SectionParams::junctionWeightLimit of the slave's mass off one"
+                   " master face; they were left untied rather than left to make the section's"
+                   " condensed mass non-positive");
     }
 
     // --- Node numbering -----------------------------------------------------------
@@ -795,7 +855,14 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
 
         double nodes[kDof];
         section.mesh.gather(section.mesh.elementCount() - 1, section.mesh.position, nodes);
-        section.worstJacobian = std::min(section.worstJacobian, solidshell::smallestJacobian(nodes));
+        // The Gauss-point determinant, not the nodal one, because that is the one a
+        // solve requires and the one whose sign is fatal. A collapsed element's
+        // nodal determinant is zero by construction and says nothing about it; it
+        // is counted instead. See `solidshell::ElementShape` and §7.
+        const solidshell::ElementShape shape = solidshell::elementShape(nodes);
+        section.worstJacobian = std::min(section.worstJacobian, shape.smallestGauss);
+        if (shape.collapsedNodes > 0) ++section.collapsedElements;
+        if (!shape.integrable) ++section.invertedElements;
 
         for (int k = 1; k < 4; ++k)
             connected.join(static_cast<int>(corner[0]), static_cast<int>(corner[k]));
@@ -826,9 +893,18 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
                "% excess bending stiffness in those elements alone. It is the plating's own"
                " bending about its own mid-surface, which is 0.03% of a hull girder's second"
                " moment; ThicknessSeam::Split is the control that measures it");
-    if (!(section.worstJacobian > 0))
-        report("an element came out inverted or degenerate; nothing computed on this section"
-               " means anything");
+    if (section.invertedElements > 0)
+        report(std::to_string(section.invertedElements) + " of " +
+               std::to_string(section.elementCount()) +
+               " elements came out inverted; nothing computed on this section means anything");
+    else if (section.collapsedElements > 0)
+        report(std::to_string(section.collapsedElements) + " of " +
+               std::to_string(section.elementCount()) +
+               " elements are collapsed hexahedra -- the wedge a plate panel with two coincident"
+               " corners extrudes to, which is what a bulkhead running into the keel or a deck"
+               " strake running out at the stem is. They integrate; the worst Gauss determinant"
+               " over the whole section is " +
+               std::to_string(section.worstJacobian));
 
     {
         std::set<int> covered;
@@ -874,18 +950,9 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
             const SubQuad& q = quads[tie.quad[face]];
             double shape[4];
             bilinear(tie.xi[face], tie.eta[face], shape);
-            Vec3 surface{0, 0, 0}, normal{0, 0, 0};
-            double thickness = 0;
-            for (int a = 0; a < 4; ++a) {
-                surface += mid[q.node[a]] * shape[a];
-                normal += nodeNormal[q.node[a]] * shape[a];
-                thickness += nodeThickness[q.node[a]] * shape[a];
-            }
-            normal = normalize(normal);
-            const Vec3 at = mid[tie.slave] +
-                            nodeNormal[tie.slave] * ((face == 0 ? -0.5 : 0.5) *
-                                                     nodeThickness[tie.slave]);
-            const double weight = constraint::tieWeight(dot(at - surface, normal), thickness);
+            // The weight the pairing admitted this tie on, not a second computation
+            // of it.
+            const double weight = tie.weight[face];
             section.worstJunctionWeight = std::max(
                 section.worstJunctionWeight, std::max(std::abs(weight), std::abs(1.0 - weight)));
             for (int k = 0; k < 3; ++k) {
