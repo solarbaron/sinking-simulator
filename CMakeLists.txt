@@ -155,6 +155,7 @@ if(Vulkan_FOUND AND GLSLC)
   file(MAKE_DIRECTORY ${SHADER_OUT})
   set(SPV_FILES)
   foreach(SHADER tet_forces.comp node_integrate.comp solidshell_forces.comp
+                 solidshell_forces_wg.comp
                  solidshell_integrate.comp mesh.vert mesh.frag ocean.vert ocean.frag
                  hull.vert hull.frag)
     add_custom_command(

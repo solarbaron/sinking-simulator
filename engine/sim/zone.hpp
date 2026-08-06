@@ -195,11 +195,17 @@
 //     keeps its mass. The hole is therefore the deleted area, which this reports as
 //     whole panels because that is what `breachesFromFailedPanels` consumes -- see
 //     `SolveParams::tearFraction`.
-//  4. **The GPU path is slower than the CPU one** -- `engine/gpu/zone_gpu.{hpp,cpp}`,
-//     whose state comes back through `Solver::adopt` below -- and there is no rate
-//     dependence in the material, so the resistance is under-predicted by the
-//     10-30% steel gains at collision strain rates. This item said "no GPU path"
-//     while the same file named `gpu::ZoneGpuSolver` fifty lines further down.
+//  4. **The GPU path is now the faster one and still cannot be trusted** --
+//     `engine/gpu/zone_gpu.{hpp,cpp}`, whose state comes back through
+//     `Solver::adopt` below. Re-mapped to one workgroup per element it runs at
+//     1.26-2.43x this solver on 23 workers, where one invocation per element ran at
+//     0.23-0.68x. What stops it being used is precision: in float it tears a
+//     quarter to a half more elements than this double path does, and the torn set
+//     is the answer a zone exists to produce. `07-fem-spike-findings.md` §8.
+//     This item said "no GPU path" while the same file named `gpu::ZoneGpuSolver`
+//     fifty lines further down, and then said "slower" after it had stopped being.
+//  5. **No rate dependence in the material**, so the resistance is under-predicted
+//     by the 10-30% steel gains at collision strain rates.
 //
 // SI units, body frame per CLAUDE.md.
 #pragma once

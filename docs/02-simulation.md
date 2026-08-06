@@ -2706,22 +2706,29 @@ reach, which is exactly what that change was for.
    is right: a first dead element over-states a slit by the subdivision squared and
    requiring all of them under-states a tear that has crossed the bay. The real fix
    is a breach interface that takes an area.
-4. **A GPU path exists and is slower than the CPU**, and there is no rate
-   dependence in the material, so the resistance is under-predicted by the 10–30%
-   steel gains at collision strain rates.
+4. **A GPU path exists, is now faster than the CPU, and still cannot be used** —
+   and there is no rate dependence in the material, so the resistance is
+   under-predicted by the 10–30% steel gains at collision strain rates.
 
    `engine/gpu/zone_gpu.{hpp,cpp}` is the Vulkan back-end for this solver, built to
    `fem_gpu.cpp`'s pattern with the EAS variables and the plastic history resident
-   on the device. It runs at **0.23–0.68× the 24-thread CPU** end to end on the real
-   patch, and it gets worse past 3 000 elements because one thread per element needs
-   ~500 floats of dynamically indexed private state and Pascal spills it to local
-   memory. Its float answer also stops tracking the double reference: over 5 505
-   steps it tears 60 elements where the CPU tears none, and a double-precision
-   control shows that is **not** the explicit scheme's known sensitivity to a
-   perturbation of that size. `07-fem-spike-findings.md` §8 has the measurements and
-   what to do about them; the short version is that the enhanced modes need
-   normalising in `solid_shell.cpp` — κ(Kaa) ≈ (h/t)⁴ ≈ 10⁷ on ordinary plating —
-   before any more GPU work.
+   on the device. One invocation per element ran at **0.23–0.68× the 24-thread CPU**
+   and got worse past 3 000 elements, because that mapping needs ~500 floats of
+   dynamically indexed private state and Pascal spills it — 1 936 bytes per thread,
+   confirmed from the driver's own pipeline statistics rather than inferred.
+   `solidshell_forces_wg.comp` re-maps it to **one workgroup per element**, which
+   spills 96 bytes and runs at **1.26–2.43×**, rising monotonically with size.
+
+   What stops it being used is precision, not speed. At 768 and 3 072 elements the
+   float kernel tears **40 and 247 elements against the double reference's 32 and
+   162**, and plastic dissipation runs 26–34% high — while the negative control, the
+   same double solver on a mesh jittered by 2 × 10⁻⁷ m, tears exactly 32 and 162 and
+   moves the dissipation by 0.06–0.8%. **An earlier claim here that it "tears 60
+   elements where the CPU tears none" does not reproduce and has been withdrawn.**
+   The enhanced modes have since been normalised in `solid_shell.cpp`, and measured
+   by A/B that changes nothing on this path, because the shader was already
+   equilibrating Kaa. `07-fem-spike-findings.md` §8 has the measurements; the next
+   thing to try is keeping `alpha` in double.
 
 ### Adaptive zone promotion — **implemented**
 

@@ -404,14 +404,15 @@ The longest and highest-risk phase.
   **Mesh-splitting fracture is not**: a failed integration point is deleted, and the
   maximum principal direction it returns — the plane a tear would open on — has no
   consumer yet
-- **GPU element solver for the solid-shell** — built, measured, and **the CPU is
-  still the faster path**. `engine/gpu/zone_gpu.{hpp,cpp}` plus
-  `solidshell_forces.comp` and `solidshell_integrate.comp`, following the tet back
-  end's pattern exactly: one invocation per element, forces to per-element slots, a
-  CSR gather in a fixed order, every substep in one command buffer. EAS internal
-  variables and eight Gauss points of plastic history are device-resident and the
-  seven enhanced parameters are condensed in the shader each step. The full account
-  is `07-fem-spike-findings.md` §8; three things belong here.
+- **GPU element solver for the solid-shell** — built, re-mapped, and **now the
+  faster path on throughput while still not being usable, for a different reason**.
+  `engine/gpu/zone_gpu.{hpp,cpp}` plus `solidshell_forces.comp`,
+  `solidshell_forces_wg.comp` and `solidshell_integrate.comp`, following the tet
+  back end's pattern: forces to per-element slots, a CSR gather in a fixed order,
+  every substep in one command buffer. EAS internal variables and eight Gauss points
+  of plastic history are device-resident and the seven enhanced parameters are
+  condensed in the shader each step. The full account is
+  `07-fem-spike-findings.md` §8; four things belong here.
 
   **The profile came first and it changed the job.** Element evaluation is 98.5% of
   a Tier-2 solve on one worker, so the pattern does apply — but half of that was
@@ -423,26 +424,34 @@ The longest and highest-risk phase.
   never grew the equivalent. The per-element cost *was* measured and was right; what
   was never asked is which part of it depended on the state being advanced.
 
-  **The kernel is 0.23–0.68× the 24-thread CPU**, end to end on the real patch, and
-  it gets *worse* past 3 000 elements. One thread per element needs ~500 floats of
-  dynamically indexed private state — two copies of the plastic history, a 6×6
-  tangent, a 7×7 Kaa and its factor — which Pascal spills to local memory. **The
-  tet's mapping does not carry over**: a linear tet has twelve DOF and no history
-  and fits in registers, which is the whole reason it reaches 450 M
-  element-updates/s. One workgroup per element is the design to try, and it is a
-  different kernel rather than a tuning pass.
+  **One invocation per element was 0.23–0.68× the CPU; one workgroup per element is
+  1.26–2.43×.** The first mapping got *worse* past 3 000 elements, which was
+  diagnosed as register spilling from the shape of the curve alone. The driver's own
+  statistics now confirm it — **1 936 bytes per thread of spill, 484 floats, against
+  the tet's zero** — and the remap takes it to 96 bytes and halves the register
+  count. The degradation past 3 000 elements is gone and the curve rises
+  monotonically. **The tet's mapping does not carry over**: a linear tet has twelve
+  DOF and no history and fits in registers, which is the whole reason it reaches
+  450 M element-updates/s.
 
-  **Float is not sufficient for this element as formulated.** Two defects were found
-  and fixed — absolute ship coordinates in float lose the displacement to
-  cancellation (solve about the patch centroid: 190× better), and Kaa must be
-  equilibrated before it is factored, because the enhanced modes' G columns differ
-  by `1/t²` against `1/h²` and κ(Kaa) ≈ (h/t)⁴ ≈ 10⁷ on ordinary plating. Even
-  after both, a 5 505-step run ends 28% high in plastic dissipation and **tears 60
-  elements where the double reference tears none**. That is not the explicit
-  scheme's known sensitivity: perturbing the *double* solver's mesh by the same
-  2 × 10⁻⁷ m moves the dissipation by 10⁻⁶ and tears nothing. The next step is to
-  normalise the enhanced modes in `solid_shell.cpp` — a free basis change that would
-  fix the conditioning for both paths — before any more GPU work
+  **Float is still not sufficient, and the reason is the torn count.** Two defects
+  were found and fixed — absolute ship coordinates in float lose the displacement to
+  cancellation (solve about the patch centroid: 190× better), and Kaa is equilibrated
+  before it is factored. `computeRestForms` now also normalises the enhanced modes,
+  so κ(Kaa) is a constant 3.50 rather than (h/t)⁴; **measured by A/B, that changes
+  nothing for this kernel**, because the shader's equilibration was already
+  addressing the same conditioning. What remains: at 768 and 3 072 elements the float
+  kernel tears 40 and 247 where the double reference tears **32 and 162**, while the
+  negative control — the double solver on a mesh jittered by 2 × 10⁻⁷ m — tears
+  exactly 32 and 162. Plastic dissipation runs 26–34% high where the control moves
+  0.06–0.8%. **A previous claim here that it "tears 60 elements where the double
+  reference tears none" does not reproduce under any configuration and has been
+  withdrawn** — see §8; the GPU's peak damage on that case is 0.41 against the CPU's
+  0.65, so it is further from tearing, not nearer.
+
+  **The next step is `alpha` in double**, which §8 item 3 already named: the EAS
+  block is 7×7 and it is the only part shown to need the digits, and Pascal's 1/32
+  fp64 rate now has 1.26–2.43× of headroom to spend
 - ~~FEM → flooding coupling (a tear becomes an orifice)~~ — done:
   `engine/sim/breach.hpp`, measured in `02-simulation.md` §3. Failed panels become
   merged `Opening`s whose area, position and connectivity come from the structure,

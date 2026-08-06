@@ -37,7 +37,7 @@ layout(std430, binding = 10)          buffer PlasticSt  { float plastic[]; };   
 // owns its own slot, so it needs no atomic, and summing over elements once at
 // readback is a fixed order. A single global accumulator would have needed an
 // atomic per element per step contending on one word.
-layout(std430, binding = 11)           buffer ElemOut   { float elementOut[]; }; // 2 each
+layout(std430, binding = 11)           buffer ElemOut   { float elementOut[]; }; // 1 each
 
 layout(push_constant) uniform Params {
     float dt;
@@ -288,7 +288,6 @@ void main() {
     // rest of a dead element's life. The same short circuit zone.cpp takes.
     if (plastic[sb + kStateTorn] != 0.0f) {
         for (int i = 0; i < kDof; ++i) elementForce[e * uint(kDof) + uint(i)] = 0.0f;
-        elementOut[e * 2u + 1u] = 1.0f;   // the running dissipation total stands
         return;
     }
 
@@ -422,8 +421,20 @@ void main() {
             for (int k = 0; k < easCount; ++k) norm += residual[k] * residual[k];
             if (sqrt(norm) <= kResidualTol * scale) break;
 
-            // **Kaa is equilibrated before it is factored, and in float that is the
-            // difference between seven correct digits in alpha and none.**
+            // **Kaa is equilibrated before it is factored.** This was, when written,
+            // the difference between seven correct digits in alpha and none.
+            //
+            // **It is now redundant, and that is a measurement rather than a
+            // suspicion.** `computeRestForms` normalises the enhanced modes, which
+            // takes kappa(Kaa) from (h/t)^4 to a constant 3.50 before this shader
+            // ever sees G -- so there is nothing left for a diagonal scaling to
+            // recover. Mutation testing says so directly: replacing the scaling
+            // below with 1.0 now **survives the whole suite**, where the same mutant
+            // was killed before the normalisation landed. It is kept because it costs
+            // 7 divisions per Newton iteration and it is the only thing standing
+            // between this kernel and a `RestForms` that was built without the
+            // normalisation; but nothing tests it, and that is written here so the
+            // next person does not read its presence as evidence it is load-bearing.
             //
             // The enhanced modes are not commensurate. The three thickness modes
             // carry E_zeta,zeta, so their columns of G are scaled by the Voigt
@@ -520,8 +531,7 @@ void main() {
     for (int k = 0; k < kEas; ++k) plastic[sb + kStateEnhanced + uint(k)] = alpha[k];
     const bool torn = failedPoints == kGauss;
     plastic[sb + kStateTorn] = torn ? 1.0f : 0.0f;
-    elementOut[e * 2u] += dissipation;
-    elementOut[e * 2u + 1u] = torn ? 1.0f : 0.0f;
+    elementOut[e] += dissipation;
 
     float internalF[kDof];
     for (int j = 0; j < kDof; ++j) internalF[j] = 0.0f;
