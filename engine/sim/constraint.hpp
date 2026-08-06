@@ -301,6 +301,39 @@ std::vector<solidshell::DofBlock> stiffnessBlocks(const Stiffening& stiffening,
                                                   const std::vector<double>& rest,
                                                   const RestFibers& forms, double youngsModulus);
 
+// What a fibre set gives a *linear* model: its stiffness, and how to read back
+// what each fibre is carrying.
+//
+// **A block cannot be asked what its member is carrying, and that is why the
+// second half exists.** A fibre's block is `s v v^T` with `s = EA/L`, so it pins
+// down the strain energy `s (v . u)^2` and nothing that separates the stress
+// `E (v . u) / L` from the volume it acts in -- the area appears once in `s` and
+// once in the volume, and the product has forgotten which. So the recovery is
+// carried rather than derived, and a caller that assembles a stiffened model with
+// `stiffnessBlocks` alone has a model whose members' stress is unknowable from
+// what it kept. `reduction::checkValidity` is exactly that caller, and reading a
+// stiffened region by its plating alone under-states the utilisation in the
+// *unsafe* direction -- see `reduction.hpp` §9.
+//
+// `stiffness[i]` and `stress[i]` are **the same fibre and name the same degrees of
+// freedom in the same order**, because both come out of one `fiberStiffness` in
+// one pass. Two loops would be two places to decide which fibres to skip, and a
+// stress form paired with the wrong block reports a plausible number for the wrong
+// member. A fibre with no rest length or no area is dropped from both.
+struct AttachedForms {
+    std::vector<solidshell::DofBlock> stiffness;
+    // Per block, one entry per degree of freedom that block names. The fibre's
+    // axial stress is `sum_k stress[i][k] * u[stiffness[i].dof[k]]`, in Pa: the
+    // same rank-one form the stiffness is built from, divided by the rest length
+    // and multiplied by E. **The same form, not a second one** -- a stress taken
+    // from the co-rotational `fiberForces` instead would be a different strain
+    // measure from the one the linear model was solved with, and the fibre's
+    // `sigma * A` would then not be the force the model actually carried.
+    std::vector<std::vector<double>> stress;  // Pa per metre of displacement
+};
+AttachedForms attachedForms(const Stiffening& stiffening, const std::vector<double>& rest,
+                            const RestFibers& forms, double youngsModulus);
+
 // Smallest stable explicit step the fibres allow, given the assembled nodal mass:
 // `safety * 2 / omega_max` over every fibre. Infinite -- returned as zero -- when
 // there are no fibres, so a caller takes the plating's own step.

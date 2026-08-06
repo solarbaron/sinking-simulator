@@ -244,15 +244,19 @@ double fiberFrequencySquared(const FiberStiffness& stiffness,
     return stiffness.scale * sum;
 }
 
-std::vector<solidshell::DofBlock> stiffnessBlocks(const Stiffening& stiffening,
-                                                  const std::vector<double>& rest,
-                                                  const RestFibers& forms, double youngsModulus) {
-    std::vector<solidshell::DofBlock> blocks;
-    blocks.reserve(stiffening.fiber.size());
+AttachedForms attachedForms(const Stiffening& stiffening, const std::vector<double>& rest,
+                            const RestFibers& forms, double youngsModulus) {
+    AttachedForms out;
+    out.stiffness.reserve(stiffening.fiber.size());
+    out.stress.reserve(stiffening.fiber.size());
     for (std::size_t i = 0; i < stiffening.fiber.size(); ++i) {
         const double restLength = i < forms.length.size() ? forms.length[i] : 0.0;
         const FiberStiffness fiber =
             fiberStiffness(stiffening.fiber[i], rest, restLength, youngsModulus);
+        // One skip test for both halves. Splitting this loop in two would let the
+        // two lists disagree about which fibres they dropped, and then every
+        // stress after the first disagreement would belong to a different member
+        // from the block beside it -- a plausible number for the wrong fibre.
         if (!(fiber.scale > 0)) continue;
         solidshell::DofBlock block;
         block.dof.assign(fiber.dof, fiber.dof + 12);
@@ -261,9 +265,24 @@ std::vector<solidshell::DofBlock> stiffnessBlocks(const Stiffening& stiffening,
             for (int q = 0; q < 12; ++q)
                 block.stiffness[static_cast<std::size_t>(p) * 12 + static_cast<std::size_t>(q)] =
                     fiber.scale * fiber.vector[p] * fiber.vector[q];
-        blocks.push_back(std::move(block));
+        out.stiffness.push_back(std::move(block));
+
+        // sigma = E * (v . u) / L. `fiber.scale` is EA/L and the area cancels out
+        // of the stress, so E/L is taken directly rather than as scale/area --
+        // one fewer place a zero area could divide.
+        std::vector<double> gradient(12, 0.0);
+        const double perMetre = youngsModulus / restLength;
+        for (int p = 0; p < 12; ++p) gradient[static_cast<std::size_t>(p)] =
+            perMetre * fiber.vector[p];
+        out.stress.push_back(std::move(gradient));
     }
-    return blocks;
+    return out;
+}
+
+std::vector<solidshell::DofBlock> stiffnessBlocks(const Stiffening& stiffening,
+                                                  const std::vector<double>& rest,
+                                                  const RestFibers& forms, double youngsModulus) {
+    return attachedForms(stiffening, rest, forms, youngsModulus).stiffness;
 }
 
 double criticalTimestep(const Stiffening& stiffening, const RestFibers& forms,

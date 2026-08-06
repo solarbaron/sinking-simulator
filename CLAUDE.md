@@ -113,6 +113,7 @@ most useful thing to know about this codebase:
 | A section cut **admitted by a tolerant membership test and then dropped by an exact geometry one**, losing all 188 plate panels on 11 of 51 stations while all 181 stiffeners survived | a sweep along the length with the two element populations counted *apart* |
 | The bow and stern refusing to mesh — diagnosed for months as *inverted* elements, when **not one Jacobian on the ship is negative**: 166 input panels are triangles wearing four corners | sampling the nine points the element is *integrated* at, rather than the eight corners |
 | A node ordering chosen on the element graph while the solver assembled a *constrained* one, so a reported half-bandwidth of 146 was really 10 769 and the suite stopped finishing | a test that **rebuilds the assembled band from the mesh and the constraints** instead of asserting the number the mesher reports |
+| `reduction::recover` leaving every MPC-eliminated DOF at **zero** — a hole in the displacement field that read as 850 788 MPa against a true 427, on every tied section the mesher builds | adding a *second* reader of the same recovered field, and asking what else already read it |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct. **Nothing at all tests a comment** — three documents here repeated a

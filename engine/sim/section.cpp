@@ -1222,9 +1222,17 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
             const constraint::RestFibers forms =
                 constraint::restFibers(section.stiffening, section.mesh.position);
             if (!forms.ok) report("a stiffener fibre came out with no length");
-            section.attachment.stiffness =
-                constraint::stiffnessBlocks(section.stiffening, section.mesh.position, forms,
-                                            section.material.youngsModulus);
+            // Both halves, from `attachedForms` rather than `stiffnessBlocks`
+            // alone: a block says what a member adds to the stiffness and cannot
+            // be asked what the member is *carrying*, so a section built without
+            // the stress forms is one whose longitudinals are invisible to
+            // `reduction::checkValidity` -- and the plating is the softer half, so
+            // the promotion trigger then reads low. See `reduction.hpp` §9.
+            constraint::AttachedForms built =
+                constraint::attachedForms(section.stiffening, section.mesh.position, forms,
+                                          section.material.youngsModulus);
+            section.attachment.stiffness = std::move(built.stiffness);
+            section.attachment.stress = std::move(built.stress);
             section.attachment.mass.assign(section.mesh.nodeCount(), 0.0);
             constraint::lumpFiberMass(section.stiffening, forms, section.material.density,
                                       section.attachment.mass);

@@ -263,24 +263,28 @@
 //     a substructure that turns through a finite angle -- a capsizing ship, a
 //     detached section -- is outside its validity, unlike the co-rotational Tier-2
 //     element.
-//   * **`checkValidity` reads the elements only, so an attached member's own
-//     stress is not in the utilisation** -- see §8. A stiffened region is reported
-//     by its plating, and the plating is the softer half.
+//   * **A member the mesh does not carry is only as visible as the `Attachment`
+//     made it.** `checkValidity` reads the attached members' stress as well as the
+//     elements' (§9), but only when `Attachment::stress` was supplied; given
+//     stiffness alone it falls back to judging a stiffened region by its plating,
+//     which is the softer half. It says so in `problems()` rather than reporting
+//     the low number silently.
 //   * **It is stale the moment anything changes.** Thinning, tearing or a moved
 //     boundary changes K, so the reduction must be rebuilt. It is a one-off cost,
 //     not a per-step one, but it is not free.
 //
 // **What the caller must do instead.** Watch `checkValidity`, which recovers the
 // interior displacement, evaluates the element stresses through the same
-// `solidshell::elementStress` the Tier-2 solver uses, and reports the peak von
-// Mises utilisation. When it approaches one, the region has to be **promoted to
-// Tier 2** -- `promotion.hpp` already owns that decision and `zone::buildPatch`
-// already meshes the result. The reduced model's job at that point is to stop
-// answering and hand over its interface displacements as the zone's boundary
-// condition; it must not be asked for the answer itself. **Handing them over is
-// `coupling.{hpp,cpp}`**, which drives a `zone::Patch`'s perimeter from an
-// assembled reduced model and is exact for a linear zone -- the property below
-// being exactly why.
+// `solidshell::elementStress` the Tier-2 solver uses and the attached members'
+// through the same rank-one form their stiffness came from, and reports the peak
+// von Mises utilisation over both. When it approaches one, the region has to be
+// **promoted to Tier 2** -- `promotion.hpp` already owns that decision and
+// `zone::buildPatch` already meshes the result. The reduced model's job at that
+// point is to stop answering and hand over its interface displacements as the
+// zone's boundary condition; it must not be asked for the answer itself.
+// **Handing them over is `coupling.{hpp,cpp}`**, which drives a `zone::Patch`'s
+// perimeter from an assembled reduced model and is exact for a linear zone -- the
+// property below being exactly why.
 //
 // One caveat on that warning, and it points the wrong way: the recovered stress is
 // only as good as the mode set. A truncated basis cannot represent a stress
@@ -383,13 +387,15 @@
 // here and the lumped one there would make the two tiers disagree about the
 // inertia of the same steel, which is the disagreement §4 exists to avoid.
 //
-// **And what it does not reach.** `checkValidity` walks the elements, so an
-// attached member's own stress is not in the peak von Mises -- a stiffened region
-// is judged by its plating. The stiffener makes the plating *less* utilised, so
-// the promotion trigger moves later on both counts, which is the same direction
-// §6 already warns about for a truncated basis. Measured on the stiffened
-// cantilever in the tests: 58.2 MPa reported against 65.2 MPa in the member, a
-// utilisation of 0.164 where the true one is 0.184.
+// **And what it used to not reach: §9 is the fix.** `checkValidity` walked the
+// elements alone, so an attached member's own stress was not in the peak von
+// Mises and a stiffened region was judged by its plating. The stiffener makes the
+// plating *less* utilised, so the trigger moved later on both counts -- the same
+// unsafe direction §6 warns about for a truncated basis. Measured on the
+// stiffened cantilever in the tests: 58.2 MPa reported against 65.2 MPa in the
+// member, a utilisation of 0.164 where the true one is 0.184, 11% low. It is
+// closed by `Attachment::stress`, which is what `constraint::attachedForms`
+// produces alongside the blocks.
 //
 // **One result from validating this is worth carrying, because it is not the
 // expected one.** A stiffener stiff enough holds its own line still, and that line
@@ -399,6 +405,98 @@
 // modes -- but a single-frequency check would have concluded it did not matter,
 // and on a member the panel can actually bend with (60 x 6) the first frequency
 // lands within 4.5% of what `scantlings::stiffenedSection` predicts.
+//
+// --- 9. What the promotion trigger reads, and in how many numbers ---------------
+//
+// `checkValidity` takes the peak over **both** halves of the structure: every
+// Gauss point of every element, and every attached member's own stress. That is
+// the fix for §8's last paragraph, and the shape it takes settles two questions
+// that are worth writing down because both have an obvious wrong answer.
+//
+// **One number or two: both, and they are not interchangeable.** `Validity`
+// carries `platingVonMises` and `memberVonMises` apart, and `utilisation` as the
+// governing scalar over the two. A promotion trigger has to be one comparable
+// number -- promotion is a decision about the region, and the region stops being
+// linear when its most utilised part does, whichever part that is. But the two
+// halves are not two readings of one quantity and a single peak throws away which
+// one it came from: a plating at 0.6 under a longitudinal at 1.1 is a section that
+// has lost its stiffener and will shed load into the plate, and the reverse is a
+// panel buckling between intact frames. Those are different structures needing
+// different Tier-2 meshes, and `promotion.hpp` is the file that will care.
+//
+// The split is not a formality on this structure. On the stiffened cantilever the
+// two peaks are in different places and different stress states: the plating's is
+// one element *off* the seam -- 75 mm, at the loaded end -- and is *transverse*
+// bending, `sigma_yy` 61.3 MPa against an axial 18.9 and a shear of 11.9, while
+// the member's is pure axial 65.2 MPa at the far fibre, on the seam. The ratio of
+// the plating's von Mises to its own axial component there is **3.08**, so the
+// region's two governing points have almost nothing to do with each other and
+// "the peak" without a label would be actively misleading. Both figures are
+// asserted in `tests/test_reduction.cpp` rather than left here to be believed.
+//
+// **Is a fibre's uniaxial stress comparable to the plating's von Mises? Yes, and
+// exactly -- but the equality is a statement about the fibre model, not about the
+// member.** A bar's stress tensor has one non-zero entry, and for `sigma_xx = s`
+// with everything else zero the von Mises reduces to
+//
+//     sqrt(0.5 * ((s - 0)^2 + 0 + (0 - s)^2)) = |s|
+//
+// identically -- not to within a tolerance, and `tests/test_reduction.cpp` asserts
+// it through the same formula `checkValidity` uses rather than restating it. So
+// `max(plating von Mises, |sigma_fibre|)` is a peak over two equivalent stresses
+// computed the same way, and it is the right thing to compare against one yield.
+//
+// What is given up is the *fibre model*, not the comparison. `constraint.hpp` §2
+// builds axial bars: a fibre has no transverse stress and no shear at all, so the
+// biaxial state a real weld toe is in is outside the model and cannot appear in
+// the number however it is combined. **And that omission has no fixed sign**, which
+// is the part the obvious argument gets wrong. For a transverse stress `a * s`
+// beside an axial `s`, von Mises is `|s| sqrt(1 - a + a^2)`: a transverse tension
+// of half the axial *lowers* it to 0.866 |s| -- the minimum over all `a` -- while a
+// transverse compression of equal magnitude *raises* it to sqrt(3) |s|. So the
+// fibre stress neither flatters nor conservatively bounds the member in general;
+// it is exact for what the model carries and blind to what the model omits, and
+// the blindness is bounded by that factor either way.
+//
+// **The member is judged against the substructure's own yield strength**, because
+// there is no other one to be had: `constraint::Stiffening` carries a single
+// material for the whole fibre set, and both callers that build one
+// (`zone.cpp`, `section.cpp`) assign it the *panel's* material. A ship with
+// higher-tensile longitudinals on mild-steel plating is real and
+// `scantlings.hpp` describes one, but the distinction is already lost upstream of
+// this file -- carrying a per-member yield here would be precision the input does
+// not have.
+//
+// **Validated against `scantlings.hpp`, which owes this nothing.** Under a
+// prescribed `u_x = (eps + kappa z) g(x)` every fibre lies along x and the tie is
+// defined to put the tied point at exactly `(eps + kappa e) g(x)`, so a fibre
+// spanning `x_a` to `x_b` carries
+//
+//     sigma = E (eps + kappa e) (g(x_b) - g(x_a)) / (x_b - x_a)
+//
+// with nothing approximated. Choose `eps` so the section carries no net axial
+// force and the offset term is `E kappa (e - z_na)` with `z_na` the combined
+// neutral axis -- and `z_na` derived from the fibre stations the constraint
+// machinery built agrees with `scantlings::stiffenedSection`'s, computed from the
+// rectangle dimensions, to **3.5e-18 m**. Two files, two formulas, one number.
+//
+// `g` is `x + x^2 / (2c)` rather than `x`, and the difference is a vacuity rather
+// than a flourish: with `g(x) = x` every segment of the seam elongates identically,
+// so a recovery reading the *neighbouring* segment's degrees of freedom returns
+// exactly the right answer and a test over all sixteen fibres passes. The
+// quadratic term gives each segment its own elongation and keeps the form closed,
+// because `(x_b^2 - x_a^2) / (x_b - x_a)` is `x_a + x_b`.
+//
+// **Two things the fibre model does not sample, found while validating it.** The
+// neutral axis of the 200 x 10 bar on this plate is 23.0 mm above the mid-surface
+// -- inside the web, whose root is at 6.0 mm -- but two-point Gauss puts the lowest
+// station at 48.3 mm. So *every* fibre is in tension and the plating carries all
+// of the compression: the section straddles its neutral axis, but not through any
+// fibre. The energy is still integrated exactly (`constraint.hpp` §2); what cannot
+// be reported is a stress in the part of the web below the axis. And every fibre a
+// `SeamRun` builds on a plate lies in a plane, so the through-thickness terms of
+// the stress form are identically zero -- a diagonal brace is what exercises them,
+// and `tests/test_reduction.cpp` builds one.
 //
 // SI units, body frame per CLAUDE.md.
 #pragma once
@@ -494,9 +592,11 @@ std::vector<std::uint32_t> nodesPinned(const solidshell::HexMesh& mesh);
 // Both fields come ready-made from `constraint.{hpp,cpp}`:
 //
 //     const constraint::RestFibers forms = constraint::restFibers(stiffening, mesh.position);
+//     constraint::AttachedForms built = constraint::attachedForms(stiffening, mesh.position,
+//                                                                 forms, material.youngsModulus);
 //     reduction::Attachment attached;
-//     attached.stiffness = constraint::stiffnessBlocks(stiffening, mesh.position, forms,
-//                                                      material.youngsModulus);
+//     attached.stiffness = std::move(built.stiffness);
+//     attached.stress = std::move(built.stress);
 //     attached.mass.assign(mesh.nodeCount(), 0.0);
 //     constraint::lumpFiberMass(stiffening, forms, material.density, attached.mass);
 //
@@ -518,12 +618,29 @@ std::vector<std::uint32_t> nodesPinned(const solidshell::HexMesh& mesh);
 // unknown. Naming an interface degree of freedom is therefore refused -- the
 // interface is what a reduction keeps *exactly*, and a kept degree of freedom that
 // is secretly a function of others is not kept.
+//
+// **`stress` is how the promotion trigger sees the member at all**, and without it
+// a stiffened region is judged by its plating -- which is the softer half, so the
+// utilisation comes out low in the unsafe direction. See §9. It is parallel to
+// `stiffness`: entry `i` reads the same degrees of freedom as `stiffness[i]`, in
+// the same order, and `constraint::attachedForms` produces the two together for
+// exactly that reason. A length that does not match is refused rather than
+// truncated, because a stress form paired with the wrong block reports a
+// plausible number for the wrong member. Empty is allowed -- a caller may have no
+// stress to report for a block, and `solidshell::Mpc` ties carry none -- and is
+// reported in `problems()` when there is stiffness, because a member whose stress
+// the trigger cannot see is the failure this field exists to close.
 struct Attachment {
     std::vector<solidshell::DofBlock> stiffness;
     std::vector<double> mass;  // kg per node, added to the row-sum lumped diagonal
     std::vector<solidshell::Mpc> constrained;
+    // Per block, per degree of freedom that block names: the member's own stress
+    // is `sum_k stress[i][k] * u[stiffness[i].dof[k]]`, in Pa.
+    std::vector<std::vector<double>> stress;
 
-    bool empty() const { return stiffness.empty() && mass.empty() && constrained.empty(); }
+    bool empty() const {
+        return stiffness.empty() && mass.empty() && constrained.empty() && stress.empty();
+    }
 };
 
 // The full finite element model of one component, assembled once, partitioned, and
@@ -569,6 +686,25 @@ public:
     // steel `totalMass()` grew by.
     std::size_t attachedBlocks() const;
     double attachedMass() const;  // kg
+
+    // How many of those blocks arrived with a stress form, and what one of them is
+    // carrying under a displacement field in this substructure's global DOF
+    // numbering -- `recover()`'s output, or any field a caller has.
+    //
+    // **Signed**, not an absolute value: which fibres of a member are in tension
+    // and which in compression is where its neutral axis is, and `checkValidity`
+    // is the only caller that wants the magnitude. Zero for a member out of range,
+    // and zero when no stress form was given, which is the same answer a
+    // substructure built before §9 existed would have given.
+    std::size_t attachedMembers() const;
+    double memberStress(std::size_t member, const std::vector<double>& displacement) const;
+
+    // What each degree of freedom stands for once `Attachment::constrained` is
+    // applied. `recover()` fills the eliminated ones through it; it is exposed
+    // because a caller that builds a displacement field some other way has to as
+    // well, and because a field with a hole where a tie was is not a small error
+    // -- see the note on `recover`.
+    const solidshell::DofExpansion& expansion() const;
 
     // Global DOF index (3 * node + axis) of each boundary / interior DOF, in the
     // order the reduced model uses. `boundaryDof()` is what a caller couples
@@ -743,6 +879,17 @@ std::vector<double> reduceLoad(const Substructure& substructure, const Reduction
                                const std::vector<double>& load);
 
 // u = T x, in the substructure's global DOF numbering.
+//
+// **A degree of freedom `Attachment::constrained` eliminated is filled in from its
+// masters here**, so what comes back is a field over the *mesh's* degrees of
+// freedom and not over the reduction's unknowns. It has to be: an eliminated DOF
+// is in neither partition, so leaving it at zero puts a hole in the middle of the
+// displacement field, and every element and every fibre touching that node then
+// sees an enormous artificial gradient. Measured on a plate with one node tied to
+// two neighbours, `checkValidity` came back with a peak of 850 788 MPa -- a
+// utilisation of 2396 against the 427 MPa the same state really carries, a factor
+// of 1992 -- entirely from the hole. `solidshell::DofExpansion::recover` is the
+// same call `solveStatic` already makes for the same reason.
 std::vector<double> recover(const Substructure& substructure, const Reduction& reduced,
                             const std::vector<double>& state);
 
@@ -765,12 +912,33 @@ std::vector<double> reducedFrequencies(const Reduction& reduced,
 // What the reduced state means in stress, and therefore whether the region is
 // still inside the model's validity. See §6: this is a **trigger for promotion**,
 // not a strength check, and it under-predicts a concentration.
+//
+// **One number and two, and §9 is why both.** `utilisation` is the one a promotion
+// trigger compares, because promotion is a decision about the *region* and a
+// region is no more linear than its most utilised part; the split below it is
+// what says which half that part is in, because "the plating is at 0.6 and the
+// longitudinal at 1.1" is a different structure from the reverse and a single
+// peak cannot tell them apart. Measured on the stiffened cantilever in the tests,
+// the two halves peak in different places and in different stress states: the
+// plating's worst Gauss point is transverse bending one element off the seam,
+// where `sigma_yy` is 61.3 MPa against an axial 18.9, while the member's is pure
+// axial 65.2 MPa at the far fibre. They are not two readings of one stress.
 struct Validity {
-    double peakVonMises = 0;   // Pa, over every Gauss point of every element
-    double utilisation = 0;    // peakVonMises / yield strength
+    // The region's worst, whichever half it is in: `peakVonMises` is exactly
+    // `max(platingVonMises, memberVonMises)` and `utilisation` is it over yield.
+    double peakVonMises = 0;  // Pa
+    double utilisation = 0;   // peakVonMises / yield strength
+    bool linear = true;       // utilisation < 1: the reduced answer still means something
+
+    // The two halves apart. With no attached members `memberVonMises` is zero,
+    // `worstMember` is -1, and `peakVonMises` is `platingVonMises` to the last
+    // bit -- which is what says the member path is inert where it should be.
+    double platingVonMises = 0;  // Pa, over every Gauss point of every element
+    double memberVonMises = 0;   // Pa, |sigma| over every attached member
     int worstElement = -1;
+    int worstMember = -1;  // index into `Attachment::stress`
+
     double peakDisplacement = 0;  // m, largest nodal displacement magnitude
-    bool linear = true;           // utilisation < 1: the reduced answer still means something
 };
 
 Validity checkValidity(const Substructure& substructure, const Reduction& reduced,

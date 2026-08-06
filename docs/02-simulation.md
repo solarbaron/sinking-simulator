@@ -3121,6 +3121,8 @@ Reduction craigBampton(const Substructure&, const ReduceParams& = {});
 std::vector<double> recover(const Substructure&, const Reduction&, const std::vector<double>&);
 bool   staticSolve(const Reduction&, load, held, state, std::string* problem = nullptr);
 Validity checkValidity(const Substructure&, const Reduction&, const std::vector<double>&);
+double Substructure::memberStress(std::size_t, const std::vector<double>&) const;
+constraint::AttachedForms constraint::attachedForms(...);   // blocks and stress forms together
 Eigenpairs symmetricEigen(const std::vector<double>&, int n);     // no third-party dependency
 Eigenpairs generalisedEigen(const std::vector<double>&, const std::vector<double>&, int n);
 ```
@@ -3367,8 +3369,29 @@ already owns that decision and `zone::buildPatch` already meshes the result — 
 the reduced model's job at that point is to stop answering and hand over its
 interface displacements as the zone's boundary condition. `checkValidity` is the
 trigger: it recovers the interior displacement, evaluates stresses through the
-same `solidshell::elementStress` Tier 2 uses, and reports the peak von Mises
-utilisation.
+same `solidshell::elementStress` Tier 2 uses **and the attached members' through
+the same rank-one form their stiffness came from**, and reports the peak von
+Mises utilisation over both halves.
+
+`Validity` carries the two halves apart — `platingVonMises` and `memberVonMises`
+— as well as the governing `utilisation` over them. One number is what a
+promotion trigger has to compare, because promotion is a decision about the
+region and a region is no more linear than its most utilised part; two is what
+says *which* half, because a plating at 0.6 under a longitudinal at 1.1 is a
+section shedding load off a failed stiffener and the reverse is a panel buckling
+between intact frames. They are not two readings of one stress: on the stiffened
+cantilever the plating's peak is transverse bending one element *off* the seam —
+75 mm, at the loaded end — where σ_yy is 61.3 MPa against an axial 18.9, while
+the member's is pure axial 65.2 MPa at the far fibre, on the seam. The
+von-Mises-to-axial ratio at the plating's own governing point is **3.08**.
+
+A fibre is an axial bar, so its stress tensor has one non-zero entry and its von
+Mises is `|σ|` *identically* — the two halves are therefore the same equivalent
+stress computed the same way, and comparing them against one yield is exact. What
+is given up is the fibre *model*, not the comparison: a bar carries no transverse
+stress at all, and that omission has **no fixed sign** — a transverse tension of
+half the axial lowers von Mises to 0.866 |σ|, a transverse compression of equal
+size raises it to √3 |σ|.
 
 **And the warning is late, not early**, which is the direction that matters and is
 measured rather than asserted: a truncated basis cannot represent a
@@ -3442,10 +3465,19 @@ node of any eccentric tie (`constraint.hpp`), so about the seam the model carrie
 factor of **312**, all of it. Tier 1 is implicit and could integrate a negative
 diagonal where Tier 2 could not, but taking the consistent mass here and the
 lumped one there would make the two tiers disagree about the inertia of the same
-steel. And `checkValidity` walks the elements, so an attached member's own stress
-is not in the utilisation: a stiffened region is judged by its plating, and the
-stiffener makes the plating *less* utilised, so the promotion trigger moves later
-on both counts.
+steel.
+
+`checkValidity` used to walk the elements alone, so an attached member's own
+stress was not in the utilisation: a stiffened region was judged by its plating,
+and the stiffener makes the plating *less* utilised, so the promotion trigger
+moved later on both counts. Measured on the stiffened cantilever, 58.2 MPa
+reported against 65.2 MPa in the member — utilisation **0.164 against a true
+0.184**, 11% low and low in the *unsafe* direction. It is closed by
+`Attachment::stress`, which `constraint::attachedForms` produces alongside the
+blocks; a `DofBlock` on its own cannot supply it, because a rank-one `s v vᵀ`
+pins down the strain energy `s (v·u)²` and nothing that separates the stress from
+the volume it acts in. A substructure given stiffness with no stress form says so
+in `problems()` rather than reporting the low number silently.
 
 **One result worth having, because it is not the obvious one.** On the test plate
 the 200 × 10 bar raises the first frequency by **307%** and its own mass moves
@@ -3533,11 +3565,12 @@ makes, arriving as a frequency.
    represent a zone that has *yielded* without tearing, which is item 6 there.
 4. ~~**Stiffeners are invisible**, inherited from `zone.hpp` §3 — the substructure
    is as good as the mesh it is given.~~ **Done** — `reduction::Attachment`,
-   §*Stiffness and mass the elements do not carry* above. Still true, and it is a
-   real limit rather than a rounding: a stiffener is *condensed*, not meshed, so
-   its own stress is not in `checkValidity`'s utilisation and its rotary inertia
-   about the seam is not in `M`. The substructure is still as good as what it is
-   given — it just can now be given more than a mesh.
+   §*Stiffness and mass the elements do not carry* above. A stiffener is
+   *condensed*, not meshed, and the two consequences of that have had different
+   fates: its own stress **is** now in `checkValidity`'s utilisation, through
+   `Attachment::stress`, while its rotary inertia about the seam is still not in
+   `M` and cannot be without a negative nodal mass. The substructure is still as
+   good as what it is given — it just can now be given more than a mesh.
 5. **No damping.** `M_r` and `K_r` are what comes out; a modal damping ratio or a
    Rayleigh pair is a caller's to add, and there is no measurement here that sets
    one.
@@ -3597,6 +3630,34 @@ adding a test: the interface check tested a node count and then collinearity, an
 changing the count threshold from three to two altered nothing, because two nodes
 are collinear and one is and none is. The count was dead. It survives only in the
 message, where it does tell a caller something the word "collinear" does not.
+
+**A later pass over the member half of `checkValidity`** ran 38 mutants and killed
+25 on the first attempt; every one of the thirteen that lived was a hole, and
+three of them are worth carrying:
+
+- **A uniform prescribed field makes every segment of a seam identical**, so a
+  recovery that read the *neighbouring* segment's degrees of freedom returned
+  exactly the right number — and the test that checked all sixteen fibres against
+  a closed form passed. The field is now `(ε + κz)·g(x)` with `g` quadratic, which
+  gives each segment its own elongation and keeps the form closed because
+  `(x_b² − x_a²)/(x_b − x_a)` is `x_a + x_b`.
+- **The worst fibre under bending is never the first and never ties**, so the
+  sweep's lower bound and its tie-break were both unreachable from the sixteen-
+  fibre seam. They are reached by a substructure carrying *one* member, and by one
+  carrying the same member twice — which is what two identical longitudinals
+  either side of a symmetric section do for real, and which is what makes
+  "the first of the tied members" a specification rather than an accident.
+- **Every fibre on a flat plate lies in a plane**, so the last four terms of the
+  twelve-term stress form are identically zero and dropping one is a no-op. A
+  diagonal brace — one end tied to the −ζ face, the other to the +ζ face of the
+  next column — reaches them, checked against the change in distance between its
+  two tied points rather than against the condensed form the stress comes from.
+
+Two of the thirty-eight were killed **only by SIGSEGV, with no `FAIL` line at
+all**, so a harness that counted failures rather than exit status would have
+scored them survivors. The harness counts signals, exit codes and a per-mutant
+timeout, and it compiles from a copy outside the repository so a killed run
+cannot leave a mutant applied in the tree. The final pass kills 38 of 38.
 
 ### Tier-1 section mesher — **implemented**
 
