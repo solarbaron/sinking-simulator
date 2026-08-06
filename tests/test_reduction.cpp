@@ -1207,6 +1207,90 @@ void testModeCount() {
         expectTrue("in a handful of iterations", modes.iterations <= 12);
         std::printf("     twelve modes in %d subspace iterations\n", modes.iterations);
     }
+
+    // --- What `converged == false` means, which is not "the answer is wrong" -------
+    //
+    // `tools/section_probe` prints "subspace iteration did not converge in 60
+    // iterations" on three of its five ferry cases and always has. The question is
+    // whether the eigenvalue it reports anyway is any good, and the answer needs a
+    // *controlled* version of the case rather than the ferry: the same plate at
+    // three thicknesses, where the only thing that changes is `h/t` and therefore
+    // the conditioning of `K_ii`.
+    //
+    // Every subspace iteration solves through the banded Cholesky of `K_ii`, so the
+    // Ritz values carry that solve's error. On a slender plate that error is around
+    // 1e-8 relative, the per-eigenvalue change **plateaus** there instead of
+    // decreasing, and a 1e-10 tolerance can then only be met by coincidence.
+    {
+        std::printf("     the convergence flag against slenderness:\n");
+        const double lx = 1.2, ly = 0.6;
+        const std::vector<Plane> ends{{Vec3{0, 0, 0}, Vec3{1, 0, 0}},
+                                      {Vec3{lx, 0, 0}, Vec3{1, 0, 0}}};
+        struct Row {
+            double thickness;
+            bool converges;
+        };
+        Eigenpairs slender;
+        double slenderValue = 0;
+        for (const Row& row : {Row{0.012, true}, Row{0.004, true}, Row{0.0015, false}}) {
+            solidshell::HexMesh plate =
+                solidshell::makePlateMesh(lx, ly, row.thickness, 24, 12, 1);
+            const Substructure sub(plate, steel, reduction::nodesNearPlanes(plate, ends, 1e-9));
+            expectTrue("the plate reduces", sub.ready());
+            const Eigenpairs modes = sub.fixedInterfaceModes(1);
+            std::printf("       t %6.4f m (h/t %5.1f): %3d iterations, converged %d, last change"
+                        " %9.2e, w1 %12.6f rad/s\n",
+                        row.thickness, (lx / 24) / row.thickness, modes.iterations,
+                        static_cast<int>(modes.converged), modes.lastChange,
+                        std::sqrt(modes.value[0]));
+            // The claim is that the flag is a function of the *structure* and not of
+            // the solve being wrong. Both directions are asserted, because only the
+            // thick one converging makes the thin one's failure informative.
+            expectEqual(std::string("the ") + (row.converges ? "stocky" : "slender") +
+                            " plate's convergence flag",
+                        static_cast<long long>(modes.converged), row.converges ? 1LL : 0LL);
+            if (!row.converges) {
+                slender = modes;
+                slenderValue = modes.value[0];
+            }
+        }
+
+        expectTrue("the slender plate says why it stopped, with the number",
+                   slender.problem.find("relative") != std::string::npos);
+        // It stalled at a *small* change, not an order-one one. Measured at 7.5e-9;
+        // asserted at 1e-5, four decades above it and four below the order-one a
+        // genuinely lost solve leaves.
+        expectTrue("and it stalled at a change far below one", slender.lastChange < 1e-5);
+        expectTrue("but above the tolerance it was asked for", slender.lastChange > 1e-10);
+
+        // More iterations buy nothing: the change is a floor, not a trend. If this
+        // ever fails, the cause is *not* the floor and the diagnosis above is stale.
+        const solidshell::HexMesh thin = solidshell::makePlateMesh(lx, ly, 0.0015, 24, 12, 1);
+        const Substructure sub(thin, steel, reduction::nodesNearPlanes(thin, ends, 1e-9));
+        const Eigenpairs longer = sub.fixedInterfaceModes(1, 1e-10, 240);
+        expectTrue("four times the iterations does not converge it either", !longer.converged);
+        const double drift = std::abs(longer.value[0] / slenderValue - 1.0);
+        std::printf("       60 against 240 iterations moves the eigenvalue by %.2e relative\n",
+                    drift);
+        // Measured at 5e-8. Asserted at 1e-5, which is three decades above it and
+        // three below the 1e-2 that would make the reported frequency untrustworthy.
+        expectTrue("and the eigenvalue barely moves", drift < 1e-5);
+
+        // **The independent instrument.** `eigenvaluesBelow` is an inertia count of
+        // an LDL^T factorisation -- it counts rather than converges, so it owes the
+        // subspace iteration nothing. It brackets the unconverged answer to one part
+        // in ten thousand, which is what turns "probably fine" into a measurement.
+        bool exactBelow = false, exactAbove = false;
+        const int below = sub.eigenvaluesBelow(0.9999 * slenderValue, &exactBelow);
+        const int above = sub.eigenvaluesBelow(1.0001 * slenderValue, &exactAbove);
+        std::printf("       inertia count: %d below 0.9999 lambda1, %d below 1.0001 (exact %d/%d)\n",
+                    below, above, static_cast<int>(exactBelow), static_cast<int>(exactAbove));
+        expectTrue("both inertia counts are exact", exactBelow && exactAbove);
+        expectEqual("nothing lies below the unconverged eigenvalue", below, 0);
+        expectEqual("and exactly one lies just above it", above, 1);
+        // Vacuity: an eigenvalue at zero would make a relative bracket meaningless.
+        expectTrue("and it is a real frequency", slenderValue > 1.0);
+    }
 }
 
 // --- 8. Where the linear model stops ---------------------------------------------

@@ -593,13 +593,23 @@ The longest and highest-risk phase.
   clamped on a boundary that cannot move~~ — **done**,
   `engine/sim/coupling.{hpp,cpp}`.
 
-  What is left before a hull girder that has lost a bay learns about it through the
-  interface DOF rather than through a section is **reach, not machinery**: two-bay
-  sections of the reference ferry only reduce between about x = −26.4 and 16.8 m,
-  and outside that `buildSection` refuses them with an inverted element. And a cut
-  plane unties the junctions on it, which costs a five-section chain 8.9% of its
-  torsional stiffness — invisible in `EA` and `EI`, which is exactly the trap
-  `docs/02-simulation.md` §*A ship: a chain of sections* is written around.
+  ~~What is left is **reach, not machinery**~~ — **the reach is done, and what it
+  cost was a diagnosis rather than a rewrite.** Two-bay sections used to work over
+  62.4 m of a 120 m ship in five disconnected islands — the longest unbroken run
+  being 26.4 m, x = −7.2…19.2, which is the hold every figure here was measured on —
+  with `buildSection` reporting an inverted element outside that. **Nothing was
+  inverted**: every one of
+  those refusals is a *collapsed* hexahedron — the triangular prism that one of the
+  ferry's 166 degenerate `PlatePanel`s extrudes to — whose Jacobian is exactly zero
+  at the closed edge and sound wherever the element is integrated, and
+  `smallestJacobian` samples the corners. `section.hpp` §7 has the measurement; the
+  reach is now the whole 120 m, and `./scripts/verify.sh full` runs
+  `section_probe --scan=2` so it stays that way.
+
+  What is left is that a cut plane unties the junctions on it, which costs a
+  five-section chain 8.9% of its torsional stiffness — invisible in `EA` and `EI`,
+  which is exactly the trap `docs/02-simulation.md` §*A ship: a chain of sections*
+  is written around.
 
 This is the phase the whole concept is named for. If it works, everything after
 it is addition; if it does not, the project is a very good flooding simulator and

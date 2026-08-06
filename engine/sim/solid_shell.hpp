@@ -246,8 +246,47 @@ double criticalTimestep(const double nodes[kDof], const StructuralMaterial& mate
                         Formulation form, double safety = 0.9);
 
 // Smallest Jacobian determinant over the eight corners. Non-positive means the
-// element is inverted or degenerate and nothing computed from it means anything.
+// element is inverted **or degenerate**, and `elementShape` below is what tells
+// those two apart -- which matters, because one of them is fine.
 double smallestJacobian(const double nodes[kDof]);
+
+// --- Collapsed elements: a wedge written in eight nodes -------------------------
+//
+// `smallestJacobian` samples the eight corners, which is the right test for a
+// general hexahedron and the wrong one for a **collapsed** hexahedron -- the
+// triangular prism that a degenerate plate panel extrudes to. A ship is full of
+// them: a bulkhead running into the keel, a deck strake running out at the stem,
+// a girth band the hull has closed to nothing. `makeStructuralMesh` emits those
+// as quads with two coincident corners, and 166 of the reference ferry's 8 900
+// panels are one.
+//
+// Extrude such a quad and two of the element's nodes land on top of each other.
+// One covariant base vector then vanishes on the edge between them, so `det J` is
+// **exactly zero at those corners and only there**: at the centre and at all
+// eight 2x2x2 Gauss points -- the only places the element is ever integrated, and
+// the only places `computeForms` requires positivity -- it is sound. On the ferry
+// the collapsed elements' worst Gauss determinant is 5.6e-6 against 2.7e-5 for
+// the worst *sound* element, so they are no closer to singular than the mesh
+// already is.
+//
+// An inverted element is a different animal and is still refused: a fold is
+// negative where the quadrature can see it. So the test is not "is the smallest
+// nodal determinant positive" but "is every non-positive corner one that another
+// corner sits on, and is the quadrature positive". Loosening it to "positive at
+// the Gauss points" alone would accept a fold whose Gauss points happened to
+// survive, which is why `collapsed` is part of the answer rather than dropped.
+struct ElementShape {
+    double smallestNodal = 0;  // det J over the eight corners; `smallestJacobian`
+    double smallestGauss = 0;  // det J over the centre and the 2x2x2 rule
+    // Which corners sit exactly on another corner of the same element. A sound
+    // hex has none; a collapsed one has the two ends of each closed edge.
+    bool collapsed[kNodes] = {};
+    int  collapsedNodes = 0;
+    // The quadrature is positive everywhere and every corner that is not is a
+    // collapsed one. This -- not `smallestNodal > 0` -- is what a solve needs.
+    bool integrable = false;
+};
+ElementShape elementShape(const double nodes[kDof]);
 
 // --- Plasticity and tearing ---------------------------------------------------
 //

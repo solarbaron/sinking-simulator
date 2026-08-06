@@ -447,6 +447,30 @@ struct SectionParams {
     // -- `reduction::Substructure` checks it and would refuse the section rather
     // than integrate it.
     double junctionOvershoot = 0.25;
+
+    // The same guarantee in the *other* direction, which `junctionOvershoot` does
+    // not cover and which is what actually bites on a real hull.
+    //
+    // A tie splits the slave through the master's thickness by
+    // `constraint::tieWeight`, `(e + t/2) / t` for a slave `e` off the master's
+    // mid-surface. Inside the plate that is a weight in [0, 1]; outside it one of
+    // the two goes negative, and a real junction is always outside -- a deck edge
+    // sits on the shell's *outer* face, plus whatever gap two plates of different
+    // thickness leave. The reference ferry's ordinary deck-to-shell junctions run
+    // at `w = 1.69`, so `-0.69` on the inner face, and that is not a tolerance to
+    // be tightened: it is where the steel is.
+    //
+    // What is not survivable is a master face asked to give up **more of the
+    // slave's steel than the slave has**. `reduction::Substructure` row-sums
+    // `T^T M T` and refuses a non-positive nodal mass, so past one full share the
+    // tie does not make the section slightly wrong, it makes it unusable -- and it
+    // refuses the whole section rather than the one junction. One share is
+    // therefore the limit, and a tie past it is left open and counted in
+    // `Section::junctionsThroughThickness`, the same way an over-reaching face
+    // coordinate is. Measured on the reference ferry: every junction on the ship
+    // is inside it but six, at x = 45.6..50.4 m, where a deck lands 2.15
+    // thicknesses off a bilge strake's mid-surface and asks for `w = 2.65`.
+    double junctionWeightLimit = 1.0;
 };
 
 // A meshed section: the elements, what they came from, how well they joined up,
@@ -489,7 +513,16 @@ struct Section {
     double worstNormalSpread = 0;  // rad
     double spuriousStiffness = 0;  // 90 * spread^2
     int    distortedElements = 0;
-    double worstJacobian = 0;      // <= 0 is fatal
+    // Smallest `det J` over the centre and the 2x2x2 rule of every element -- the
+    // places `solidshell` integrates and the only places it requires positivity.
+    // <= 0 is fatal. **Not** the smallest nodal determinant, which is zero by
+    // construction on the collapsed elements of §7 and says nothing about them.
+    double worstJacobian = 0;
+    // Elements with two coincident nodes: the wedge a degenerate plate panel
+    // extrudes to. Sound, integrated, and counted rather than refused -- see §7.
+    int    collapsedElements = 0;
+    // Elements that are genuinely folded. Non-zero means the section is worthless.
+    int    invertedElements = 0;
     double worstAspect = 0;
     // The DOF half-bandwidth the node numbering delivers. `solidshell::solveStatic`
     // numbers its free degrees of freedom in the mesh's own order and has no
@@ -544,6 +577,9 @@ struct Section {
     // others -- and one whose master face is further outside than
     // `SectionParams::junctionOvershoot`.
     int    junctionsChained = 0, junctionsOnInterface = 0, junctionsOutsideFace = 0;
+    // And one whose through-thickness split would hand a master face more than
+    // `SectionParams::junctionWeightLimit` shares of the slave's mass, negative.
+    int    junctionsThroughThickness = 0;
     // The largest overshoot outside a master face, in that face's own natural
     // coordinates, and the largest through-thickness weight any tie used. Both
     // bound how negative a master's share of the slave's mass can be, which is the
@@ -683,6 +719,163 @@ struct TorsionResponse {
 TorsionResponse applyTwist(const Section& section, const StructuralMaterial& material,
                            double twist, double reference = 0.0);
 
+// --- 7. Reaching the whole ship: the collapsed element ----------------------------
+//
+// **Everything above was measured on a quarter of this ship, and the reason was one
+// line in a validity check.** Of the 49 two-bay windows of this ferry, 21 meshed,
+// reduced and solved; the rest reported "an element came out inverted or degenerate"
+// and were refused by `applyBeamLoad` and `reduction::Substructure`.
+//
+// **And they were not a range.** The 21 were five islands -- x = -43.2..-38.4,
+// -36..-31.2, -28.8..-9.6, -7.2..19.2 and 21.6..28.8 -- so 62.4 m of 120 m worked in
+// total while the longest *unbroken* run was **26.4 m**, x = -7.2 to 19.2, which is
+// exactly the eleven-bay hold every figure in the sections above was measured on. A
+// chain needs the unbroken run and got a fifth of the ship. The two windows
+// containing the bulkhead at x = -8 failed while sitting in the middle of the best
+// island, which is the clue that the cause was never "the ends are curved".
+//
+// **Nothing was ever inverted.** Over all 49 two-bay windows of this ship there is
+// not one negative Jacobian anywhere, and the worst determinant over the sound
+// elements is 2.7e-5 -- at the stem and the stern as much as amidships. The
+// mechanism is not curvature approaching the plate thickness, not warp, not taper:
+//
+//   * `makeStructuralMesh` emits **degenerate `PlatePanel`s** -- quads with two
+//     coincident corners, which are triangles. 90 bulkhead panels and 76 deck panels
+//     of the ferry's 8 900, no shell panels at all: a bulkhead grid running into the
+//     centreline or the keel, and a deck laid on fixed |y| lines clipped to a hull
+//     that narrows past them. 39.1 m^2 of 12 802.9, **0.305%** of her plating.
+//   * Extruding one gives a **collapsed hexahedron** -- a triangular prism written
+//     in eight nodes, two of them the same node. One covariant base vector vanishes
+//     on the closed edge, so `det J` is *exactly* zero there.
+//   * `solidshell::smallestJacobian` samples the eight **corners**. That is the right
+//     test for a general hex and the wrong one for this: the element is integrated at
+//     the centre and the 2x2x2 Gauss points, and at every one of those it is sound.
+//     On the ferry the collapsed elements' worst Gauss determinant is 5.6e-6 against
+//     2.7e-5 for the worst *sound* element -- no closer to singular than the mesh
+//     already was.
+//
+// So the fix is a classification rather than a loosening: `solidshell::ElementShape`
+// separates *collapsed* from *inverted*, and a section is refused only when a corner
+// that nothing coincides with has gone non-positive, or when the quadrature has.
+// `tests/test_solid_shell.cpp` carries three negative controls for that, including a
+// wedge folded through its thickness at one corner -- which the quadrature alone
+// would accept and the corner rule refuses.
+//
+// **What it cost, and what a wedge is worth.** A collapsed hex is a stiffer
+// approximation than the quad it replaces, the way a constant-strain triangle is
+// stiffer than a bilinear quad. Measured on the box with **every** panel triangulated
+// -- the worst case, against 1.9% of elements on the ferry:
+//
+//     subdivision   EA/exact      EI/exact    GJ/Bredt tied    (quads, tied)
+//     -----------------------------------------------------------------------
+//         1        1.00000000    1.1370088       1.2015           1.0986
+//         2        1.00000000    1.0068191       1.0516           1.0512
+//         3        1.00000000    1.0021759       1.0315           1.0367
+//         4        1.00000000    1.0011108       1.0126           1.0297
+//
+// `EA` is **exact at every refinement**, because a collapsed element still passes the
+// patch test and `EA` is the integral of a constant stress; `EI` converges away at
+// twenty fold on the first refinement. It is a discretisation error and not the
+// formulation, which is why the test asserts the convergence rather than the number.
+// On the ferry the wedges are 0.305% of the plating, so even the coarse 14% is
+// 0.04% of a section's bending stiffness.
+//
+// --- What that buys, measured by `tools/section_probe --scan=2` --------------------
+//
+//                                                        before          after
+//     ---------------------------------------------------------------------------
+//     windows that mesh, reduce and solve                21 / 49        49 / 49
+//     of those, a single connected piece                 21 / 49        46 / 49
+//     union of hull inside a working window              62.4 m (52%)   120.0 m (100%)
+//     longest unbroken run of working windows            26.4 m         120.0 m
+//     the whole 120 m as one section                     refused        8 900 elements,
+//                                                                       one component
+//     the whole 120 m as a chain of five                 refused        one piece, 5 058
+//                                                                       boundary DOF
+//
+// **One window regressed and netting it off would be dishonest**: x = -43.2..-38.4
+// used to come out in one piece and now comes out in two, because
+// `junctionWeightLimit` below refuses a tie there that was closing a 22.4 mm gap. It
+// still meshes, reduces and solves; it is one of the three that separate the two
+// counts above.
+//
+// --- What it did *not* fix, and one thing it exposed --------------------------------
+//
+//   * **A tie can still take more of a slave's mass than the slave has.** The
+//     junction search accepts a master whose mid-surface is within
+//     `junctionTolerance` -- 25 mm, absolute -- while the through-thickness split is
+//     relative to the master's own thickness. On 10 mm plating a slave 21.5 mm off
+//     the mid-surface is admitted and asks for a weight of 2.65, which puts -1.65 of
+//     the slave's steel on one master face and makes `reduction::Substructure` refuse
+//     the **whole section** for a non-positive nodal mass. That is now
+//     `SectionParams::junctionWeightLimit`, which refuses the junction instead. It
+//     costs three of the 49 windows their single-component status -- those junctions
+//     were closing a 21 mm gap -- and it is why the two counts above differ. The
+//     fix that would need no limit is a `junctionTolerance` scaled off the plating,
+//     which this file already says it wants and which changes the junction *census*
+//     as well as the tie, so it is a separate piece of work.
+//   * **`hullGirderSection` sampled exactly on a frame station loses 76% of the
+//     ship**, and it is the Tier-0 reference everything above is compared against.
+//     Measured: 0.42932 m^2 at x = 19.2, 21.6 and 24.0 against 1.80133 at 19.6 and
+//     18.8 -- the plating either side of the plane fails the half-open `straddles`
+//     test in `sectionElements` on a floating-point knife edge and only the
+//     longitudinals survive. It is not every station (16.8 is fine), which is what
+//     says it is representation rather than geometry. `tools/section_probe --scan`
+//     therefore samples Tier 0 at the centre of a bay and reports both areas rather
+//     than their ratio. Fixing it belongs with `girder.hpp`, and it moves published
+//     figures.
+//   * **The thickness-seam rule costs five times more at the ends than amidships,
+//     and how much depends on where the section was cut.** `nodeThickness` is an
+//     area-weighted mean over the sub-quads *inside* the section, so a station where
+//     a strake steps carries one thickness to the section aft of it, another to the
+//     one forward of it, and the mean to a section spanning it. A member run stops at
+//     a thickness change (§3), so a spanning section stops runs its two halves never
+//     see and drops the seam node's run of one. Measured: cutting a window in two
+//     conserves the stiffener steel **exactly** amidships, loses 1.9% at
+//     x = -24 .. -19.2 -- inside the range that always worked, so this is older than
+//     the reach -- and loses **25.2%** at the bow shoulder. It is the nodal-thickness
+//     twin of §6 note 1's nodal normal and it has the same fix: a halo.
+//
+// --- What mutation testing said about §7 -------------------------------------------
+//
+// Nineteen single edits across `solid_shell.cpp`, `section.cpp` and `reduction.cpp`.
+// The first run killed twelve, and **the seven survivors were worth more than the
+// score**, because five of them said the same thing: a predicate is only tested by an
+// input whose verdict it changes, and every element the suite fed `elementShape` was
+// one it was already happy with.
+//
+//   * Dropping the quadrature test from `integrable`, dropping the centre sample,
+//     dropping a Gauss point, and sampling one zeta level instead of two **all
+//     survived**. Nothing had ever handed it an element that is sound at all eight
+//     corners and folded inside. One now does -- found by searching a quarter-unit
+//     lattice, because no closed form hands such a thing over -- along with a sweep of
+//     two hundred elements checked against an independent evaluation of the same nine
+//     determinants, and an element deliberately pinched at its centre, which is where
+//     no random element's minimum ever landed.
+//   * `Section::invertedElements` never firing survived, because every section in the
+//     suite has none. The case now tested is the one the check exists for: 1.00 m of
+//     plating over a 0.10 m fold, where the extrusion turns through itself. At 0.15 m
+//     the same fold leaves every *Gauss point* positive and still inverts two corners,
+//     which is the control for the other half.
+//   * Counting a wedge's apex twice in the nodal averages survived. A collapsed
+//     sub-quad names its apex in two of its four corners, and nothing measured a nodal
+//     thickness where that mattered; a two-panel fixture with different thicknesses
+//     either side now does, against the closed form.
+//
+// With those tests the score is eighteen of nineteen. **The one that is left is
+// equivalent on every input this ship has, and saying which is more useful than the
+// number:** replacing `min(w, 1 - w)` with `min(w, w)` in the weight limit changes
+// nothing, because every over-weight tie on this hull has `w` itself negative --
+// -1.649 at x = 45.6..50.4, -1.104 at -43.2..-38.4 -- so `w` is already the smaller of
+// the pair. Separating them needs a junction whose slave lies past the master's *other*
+// face, which this hull does not have.
+//
+// Two mutants were killed **only by a segmentation fault with no failure line at
+// all** -- reverting the corner rule in `elementShape` and in `solveStatic`, both of
+// which reach `reduction::Substructure`'s refusal path. A harness that counted `FAIL`
+// lines would have scored them as survivors, which is the mistake §5's run records
+// making the first time round.
+//
 // --- 6. A ship: a chain of sections ----------------------------------------------
 //
 // One section is a component and a component is not a ship. A ship is the whole
@@ -715,10 +908,12 @@ TorsionResponse applyTwist(const Section& section, const StructuralMaterial& mat
 //     worst gap m   6.4e-4 3.5e-4 3.4e-6    0      0      0   1.9e-4 7.1e-4 1.0e-3
 //     nodes > 1e-9    116    112    112      0      0      0    112    116    120
 //
-// Most of that row is unreachable, and saying so is the honest half of quoting it:
-// two-bay sections of this ferry only reduce between about x = -26.4 and 16.8, and
-// outside that `buildSection` already refuses them with an inverted element. What is
-// reachable is the plane at **x = -21.6**, where the gap is 3.4e-6 m -- three orders
+// That row was measured when most of it was unreachable -- two-bay sections then only
+// reduced over 62.4 m of this ship in five islands, and only **x = -21.6** of the nine
+// planes above was inside one. §7 removed that limit and every plane in the row can be
+// cut now; the figures below are still the ones taken at x = -21.6, because that is
+// where they were measured and quoting them anywhere else would be a different claim.
+// The gap there is 3.4e-6 m -- three orders
 // of magnitude below the plating and three above `matchBoundaries`' default. At that
 // default **336 of the plane's 1 170 boundary DOF find no partner**, and a chain
 // assembles out of them, solves, and is torn along 29% of the cut. So `Chain` counts

@@ -18,7 +18,7 @@
 // output.
 //
 //   ./section_probe [--from=X] [--to=X] [--sub=N] [--sweep=N] [--reduce] [--modes=N]
-//                   [--chain=N] [--match=M]
+//                   [--chain=N] [--match=M] [--scan=BAYS]
 #include "engine/sim/girder.hpp"
 #include "engine/sim/reduction.hpp"
 #include "engine/sim/scantlings.hpp"
@@ -60,6 +60,13 @@ struct Options {
     // third of the interface unmatched at the ends -- see `section.hpp` §6 note 1,
     // and the `--from=36 --to=48` run, which is what measured it.
     double match = 1e-9;
+    // **The reach.** Slide a window this many frame bays long along the whole ship
+    // and report, station by station, whether the mesher delivers something that
+    // reduces and solves. 0 skips it. This is the measurement that says how much of
+    // the ship a Tier-1 model can be built on, and before the collapsed-element
+    // work (`section.hpp` §7) the answer was 21 windows of 49 -- 62.4 m of 120 in
+    // five islands, whose longest unbroken run was 26.4 m.
+    int scan = 0;
 };
 
 bool parse(int argc, char** argv, Options& o) {
@@ -76,6 +83,7 @@ bool parse(int argc, char** argv, Options& o) {
         else if (const char* v = value("modes")) o.modes = std::atoi(v);
         else if (const char* v = value("chain")) o.chain = std::atoi(v);
         else if (const char* v = value("match")) o.match = std::atof(v);
+        else if (const char* v = value("scan")) o.scan = std::atoi(v);
         else if (a == "--no-reduce") o.reduce = false;
         else if (a == "--reduce") o.reduce = true;
         else {
@@ -107,6 +115,147 @@ int main(int argc, char** argv) {
                 middle, girder.area, girder.neutralAxis, girder.secondMoment);
     std::printf("             so EA = %.5e N, EI = %.5e N m^2\n\n", youngs * girder.area,
                 youngs * girder.secondMoment);
+
+    // --- The reach: how much of the ship can be meshed at all ----------------------
+    //
+    // Everything below this measures one section. This measures how many sections
+    // there are: a window of `--scan` frame bays slid along the whole hull, asked
+    // for a mesh, a reduction and two solves at every station. A window counts as
+    // reached only when all four succeed *and* the mesh is one connected piece --
+    // `EA` alone would score a mesh that joined nothing (see `section.hpp` §2), so
+    // it is reported but is not the criterion.
+    if (options.scan > 0) {
+        double lo = 1e300, hi = -1e300;
+        for (const sim::PlatePanel& p : structure.panels)
+            for (int c = 0; c < 4; ++c) {
+                lo = std::min(lo, p.corner[c].x);
+                hi = std::max(hi, p.corner[c].x);
+            }
+        const double bay = structure.frameSpacing;
+        const double span = options.scan * bay;
+        std::printf("=== reach: a %g m window (%d bays) along a hull of %.1f m, subdivision %d ===\n",
+                    span, options.scan, hi - lo, options.subdivision);
+        std::printf("  %8s %8s %8s %7s %7s %6s %11s %9s %9s %10s %9s %8s\n", "xFrom", "xTo",
+                    "elems", "collps", "invert", "comps", "minGaussJ", "A_eff m2", "Tier0 m2",
+                    "GJ", "first Hz", "verdict");
+        // Which bays are inside at least one working window. Consecutive windows
+        // overlap by `span - bay`, so summing their lengths would count the middle
+        // body several times over; a union is the only honest reach.
+        const int bays = static_cast<int>(std::lround((hi - lo) / bay));
+        std::vector<bool> covered(static_cast<std::size_t>(std::max(bays, 0)), false);
+        int windows = 0, good = 0, usable = 0, collapsedSeen = 0;
+        double firstGood = 1e300, lastGood = -1e300, bestTorsion = 0;
+        for (double x = std::floor(lo / bay + 0.5) * bay; x + span <= hi + 1e-9; x += bay) {
+            sim::section::SectionParams window;
+            window.xFrom = x;
+            window.xTo = x + span;
+            window.subdivision = options.subdivision;
+            const sim::section::Section piece = sim::section::buildSection(structure, window);
+            ++windows;
+            // **Tier 0 at the centre of a bay, not at the window's midpoint.** An
+            // even number of bays puts that midpoint on a frame station, and
+            // `hullGirderSection` sampled exactly on a panel seam loses every panel
+            // either side of it: 0.42932 m^2 against 1.80133 amidships, a 76%
+            // shortfall that is a knife-edge on the half-open `straddles` test in
+            // `sectionElements` rather than anything about the ship. It is not this
+            // file's defect to fix -- and it is why the column below reports both
+            // areas rather than their ratio.
+            const sim::HullGirderSection tier0 =
+                sim::hullGirderSection(structure, x + 0.5 * (span - bay));
+            double effective = 0, gj = 0, hz = 0;
+            bool solved = false, reduces = false;
+            if (!piece.empty()) {
+                sim::section::BeamLoad axial;
+                axial.strain = 1e-6;
+                axial.reference = tier0.neutralAxis;
+                const sim::section::BeamResponse stretched =
+                    sim::section::applyBeamLoad(piece, material, axial);
+                const sim::section::TorsionResponse twisted =
+                    sim::section::applyTwist(piece, material, 1e-6, tier0.neutralAxis);
+                solved = stretched.ok && twisted.ok;
+                if (stretched.ok) effective = stretched.axialStiffness / youngs;
+                if (twisted.ok) gj = twisted.torsionalStiffness;
+                const sim::reduction::Substructure substructure(
+                    piece.mesh, piece.material, piece.interfaceNodes, piece.attachment);
+                reduces = substructure.ready();
+                if (reduces) {
+                    const sim::reduction::Eigenpairs modes = substructure.fixedInterfaceModes(1);
+                    if (!modes.value.empty())
+                        hz = std::sqrt(std::max(0.0, modes.value[0])) / (2.0 * std::numbers::pi);
+                }
+            }
+            // Two verdicts, because they answer different questions. **Usable** is
+            // what a Tier-1 model needs: it meshes, it reduces, it solves, and no
+            // piece of it floats free of the interface (a floating component is a
+            // mechanism `reduction::Substructure` does not catch -- `section.hpp`).
+            // **One piece** is stricter and is what a chain wants; a section in two
+            // spanning pieces still reduces and still carries load, it just has a
+            // junction the mesher declined to close.
+            const bool works = !piece.empty() && piece.invertedElements == 0 && solved && reduces &&
+                               piece.floatingComponents == 0;
+            const bool ok = works && piece.components == 1;
+            if (works) ++usable;
+            if (piece.collapsedElements > 0) ++collapsedSeen;
+            bestTorsion = std::max(bestTorsion, gj);
+            if (ok) {
+                ++good;
+                firstGood = std::min(firstGood, window.xFrom);
+                lastGood = std::max(lastGood, window.xTo);
+                for (int b = 0; b < options.scan; ++b) {
+                    const auto index = static_cast<std::size_t>(std::lround((x - lo) / bay) + b);
+                    if (index < covered.size()) covered[index] = true;
+                }
+            }
+            std::printf("  %8.2f %8.2f %8zu %7d %7d %6d %11.3e %9.5f %9.5f %10.3e %9.4f %8s\n",
+                        window.xFrom, window.xTo, piece.elementCount(), piece.collapsedElements,
+                        piece.invertedElements, piece.components, piece.worstJacobian, effective,
+                        tier0.area, gj, hz,
+                        ok ? "ok" : (piece.empty() ? "empty" : (works ? "npieces" : "REFUSED")));
+            std::fflush(stdout);
+        }
+        double reached = 0;
+        for (bool b : covered)
+            if (b) reached += bay;
+        std::printf("\n  %d of %d windows mesh, reduce and solve with nothing floating (%.1f%%)\n",
+                    usable, windows, 100.0 * usable / windows);
+        std::printf("  %d of %d are also a single connected piece (%.1f%%)\n", good, windows,
+                    100.0 * good / windows);
+        std::printf("  outermost working cut planes x = %.1f .. %.1f m\n",
+                    good > 0 ? firstGood : 0.0, good > 0 ? lastGood : 0.0);
+        std::printf("  reach: %.1f m of a %.1f m ship (%.1f%%)\n", reached, hi - lo,
+                    100.0 * reached / (hi - lo));
+
+        // --- The success contract -------------------------------------------------
+        //
+        // The reach is the claim this mode exists to make, so it is the thing the
+        // gate checks. **With two guards against it being vacuous**, because "every
+        // window worked" is also what an empty ship, or a ship with no degenerate
+        // panels on it, would report -- and the second of those is exactly the state
+        // this code was in before the collapsed element was understood.
+        if (usable != windows) {
+            std::printf("       ! %d of %d windows do not mesh, reduce and solve\n",
+                        windows - usable, windows);
+            return 1;
+        }
+        if (reached < hi - lo - 0.5 * bay) {
+            std::printf("       ! the mesher reaches %.1f m of a %.1f m ship\n", reached, hi - lo);
+            return 1;
+        }
+        if (collapsedSeen == 0) {
+            std::printf("       ! not one window contained a collapsed element, so the reach"
+                        " measured nothing: the ship this ran on has no degenerate plating and"
+                        " the whole comparison is vacuous\n");
+            return 1;
+        }
+        if (windows < 8 || !(bestTorsion > 1e11)) {
+            std::printf("       ! %d windows and a best GJ of %.3e: the sections carry no real"
+                        " stiffness, so 'every window worked' is a statement about nothing\n",
+                        windows, bestTorsion);
+            return 1;
+        }
+        std::printf("\nok\n");
+        return 0;
+    }
 
     // --- What the mesher built -----------------------------------------------------
 
@@ -208,6 +357,12 @@ int main(int argc, char** argv) {
     //
     // The two quantities a prescribed plane-sections field cannot see. `EA` and `EI`
     // are above and they move 0.19% and 0.12%; these move by factors.
+    // What the junction tie is worth, kept for the success contract at the end of
+    // main: `EA` cannot see whether the plating is joined (§2 of `section.hpp`) and
+    // torsion and the lowest fixed-interface frequency can, so those two are what
+    // the gate is allowed to assert on.
+    double torsionCut = 0, torsionTied = 0, hertzCut = 0, hertzTied = 0;
+    int componentsCut = 0, componentsTied = 0;
     {
         std::printf("\n=== the junction tie: cut against tied ===\n");
         std::printf("  %-6s %7s %6s %9s %9s %8s %12s %10s %10s\n", "", "band", "comps", "tied m",
@@ -238,6 +393,9 @@ int main(int argc, char** argv) {
                         piece.tiedEdges, stretched.axialStiffness / youngs, solveSeconds,
                         twisted.torsionalStiffness, hz, now() - reducing);
             std::fflush(stdout);
+            (tie ? torsionTied : torsionCut) = twisted.torsionalStiffness;
+            (tie ? hertzTied : hertzCut) = hz;
+            (tie ? componentsTied : componentsCut) = piece.components;
         }
     }
 
@@ -443,5 +601,44 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         }
     }
+
+    // --- The success contract ------------------------------------------------------
+    //
+    // **This program had none until it was put in the gate**, and it published a
+    // ship-scale frequency that nothing ever re-ran. What it asserts is chosen the
+    // same way `section.hpp` §2 chooses what a test may assert on: `EA` and `EI` are
+    // exact on a section whose plating is joined to nothing, so they are checked
+    // only loosely and against Tier 0, while everything about *joining* is checked
+    // on torsion, on the lowest fixed-interface frequency and on the component
+    // count -- the three quantities a prescribed plane-sections field cannot see.
+    if (hold.invertedElements != 0 || !(hold.worstJacobian > 0)) {
+        std::printf("       ! the section has %d inverted elements and a worst Gauss determinant"
+                    " of %.3e\n", hold.invertedElements, hold.worstJacobian);
+        return 1;
+    }
+    if (hold.elementCount() < 1000 || !(hold.area > 100.0)) {
+        std::printf("       ! %zu elements over %.1f m2 is not a ship section, so nothing below"
+                    " means anything\n", hold.elementCount(), hold.area);
+        return 1;
+    }
+    if (!(torsionCut > 0) || !(torsionTied > 1.3 * torsionCut)) {
+        std::printf("       ! tying the junctions moved GJ from %.4e to %.4e. A tie that does not"
+                    " close the cell has not joined the plating, and EA would not have said so\n",
+                    torsionCut, torsionTied);
+        return 1;
+    }
+    if (!(hertzCut > 0) || !(hertzTied > 1.3 * hertzCut)) {
+        std::printf("       ! the first fixed-interface mode went %.4f -> %.4f Hz. Untied it is"
+                    " the decks' own frequency; a tie that does not raise it has joined nothing\n",
+                    hertzCut, hertzTied);
+        return 1;
+    }
+    if (componentsTied != 1 || componentsCut <= 1) {
+        std::printf("       ! components went %d untied -> %d tied, and the pair has to be"
+                    " many -> one or the tie is being credited with a mesh that was already"
+                    " joined\n", componentsCut, componentsTied);
+        return 1;
+    }
+    std::printf("\nok\n");
     return 0;
 }

@@ -425,6 +425,11 @@ struct Eigenpairs {
     int count = 0;       // how many pairs
     int iterations = 0;  // QL sweeps, or subspace iterations
     bool converged = false;
+    // The largest relative change in a wanted eigenvalue over the last subspace
+    // iteration -- what `converged` was decided on. Reported because on a
+    // **degenerate** spectrum it stalls at a level that is not an error in the
+    // answer: see `fixedInterfaceModes`.
+    double lastChange = 0;
     std::string problem;
 
     const double* mode(int j) const { return vector.data() + static_cast<std::size_t>(j) * static_cast<std::size_t>(size); }
@@ -596,6 +601,53 @@ public:
     // the vectors are **mass-normalised**, phi^T M_ii phi = 1, which is the
     // normalisation that makes the modal mass block the identity. `count` above the
     // interior size is clamped and reported.
+    //
+    // --- What `converged == false` means, which is not "the answer is wrong" -------
+    //
+    // `tools/section_probe` prints "subspace iteration did not converge in 60
+    // iterations" on three of its five ferry cases, and it has printed it for as
+    // long as the tool has existed. **It is the default `eigenTolerance` being set
+    // below the accuracy the iteration can attain, not a failure of the solve**, and
+    // that is measured rather than assumed.
+    //
+    // The test is the relative change in each wanted eigenvalue from one iteration
+    // to the next. Every iteration solves `K_ii x = M_ii x` through the banded
+    // Cholesky, so each Ritz value carries that solve's error -- of order the unit
+    // round-off times `cond(K_ii)`. A slender plate's `K_ii` is badly conditioned
+    // for exactly the reason §"normalise the enhanced modes" in `solid_shell.cpp`
+    // gives about `Kaa`, and the change then **plateaus** at that level instead of
+    // decreasing. The 1e-10 default is a hundred times below the plateau, so
+    // `converged` fires only when two consecutive iterates happen to land inside it
+    // -- a coincidence, not a statement.
+    //
+    // Measured on a 1.2 x 0.6 m plate held at both ends, 24 x 12 elements, which is
+    // the controlled version of the ferry cases and is what `test_reduction.cpp`
+    // asserts on:
+    //
+    //     thickness   h/t    iterations   converged   last change    omega_1
+    //     ----------------------------------------------------------------------
+    //     12 mm        4.2         5         yes        1.5e-11    285.494556
+    //      4 mm       12.5        28         yes        4.7e-11     95.243205
+    //      1.5 mm     33.3       400          no        1.7e-07     35.7195326
+    //
+    // and on the slender one the change does not improve with iterations -- 9.5e-8
+    // at 20, 7.5e-9 at 60, 1.7e-7 at 400 -- while `omega_1` moves by 1.6e-7 relative
+    // over the whole of that. So the reported value is good to seven figures and
+    // more iterations buy nothing.
+    //
+    // **The independent check is `eigenvaluesBelow`, which counts rather than
+    // converges**: on that plate it puts 0 eigenvalues below 0.9999 lambda_1 and 1
+    // below 1.0001 lambda_1, both exactly, so a completely different instrument
+    // brackets the unconverged answer to one part in ten thousand.
+    //
+    // Two fixes would remove it and neither is made here. Raising `eigenTolerance`
+    // to the attainable floor would make the flag mean something, at the cost of a
+    // number that has to be justified per structure; a **residual** test,
+    // ||K x - lambda M x|| / lambda ||M x||, is the principled one and is a
+    // numerically load-bearing change to a separately validated eigensolver.
+    // Nothing downstream reads `converged` for anything but a message, and
+    // `ReduceParams::verifyModes` -- which is what actually guards a kept mode set
+    // -- is an inertia count and owes this nothing.
     Eigenpairs fixedInterfaceModes(int count, double tolerance = 1e-10,
                                  int maxIterations = 60) const;
 

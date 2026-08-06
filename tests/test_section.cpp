@@ -105,6 +105,38 @@ StructuralMesh makeBox(double thicknessInner, double thicknessOuter,
     return mesh;
 }
 
+// **The same box with every panel cut down its own diagonal**, which turns each
+// quad into two `PlatePanel`s whose fourth corner sits on their first. That is
+// exactly the shape `makeStructuralMesh` emits where a bulkhead runs into the keel
+// or a deck strake runs out at the stem -- 166 of the reference ferry's 8 900
+// panels -- and extruding one gives a **collapsed hexahedron**: a wedge, whose
+// Jacobian is zero on the closed edge and sound everywhere it is integrated. See
+// `section.hpp` §7.
+//
+// The split conforms at any subdivision. Panel `(c0, c1, c2, c0)` divides its
+// `c0->c1`, `c1->c2` and `c0->c2` edges into `n`, and `(c0, c2, c3, c0)` divides
+// `c0->c2` the same way round, so the diagonal the two share is cut identically and
+// the mesh needs no seam matching -- the same argument `SectionParams::subdivision`
+// makes for whole panels.
+StructuralMesh triangulated(const StructuralMesh& source) {
+    StructuralMesh out = source;
+    out.panels.clear();
+    for (const PlatePanel& p : source.panels) {
+        PlatePanel a = p, b = p;
+        a.corner[0] = p.corner[0];
+        a.corner[1] = p.corner[1];
+        a.corner[2] = p.corner[2];
+        a.corner[3] = p.corner[0];
+        b.corner[0] = p.corner[0];
+        b.corner[1] = p.corner[2];
+        b.corner[2] = p.corner[3];
+        b.corner[3] = p.corner[0];
+        out.panels.push_back(a);
+        out.panels.push_back(b);
+    }
+    return out;
+}
+
 section::SectionParams boxParams(int subdivision = 1) {
     section::SectionParams p;
     p.xFrom = 0.0;
@@ -287,6 +319,320 @@ void testBoxMesh() {
 // Two identities, checked on the constraint set itself rather than through a solve,
 // because a tie that is wrong in either is wrong in a way an energy comparison
 // would report as a small stiffness change.
+
+// --- 1b. Collapsed panels: the whole ship, not just its parallel middle body ------
+//
+// **This is the defect that kept the mesher off three quarters of the reference
+// ferry's two-bay windows.** A
+// degenerate plate panel -- a quad with two coincident corners -- extrudes to a
+// triangular prism, and `solidshell::smallestJacobian` samples the *corners*, where
+// such an element's determinant is exactly zero. `buildSection` reported "an element
+// came out inverted", `applyBeamLoad` and `reduction::Substructure` refused it, and
+// nothing forward of x = 19.2 m or aft of x = -26.4 m could be modelled. Nothing was
+// ever inverted: over all 49 two-bay windows of that ship there is **not one negative
+// Jacobian**, and the worst determinant over the *sound* elements is 2.7e-5 at the
+// stem as well as amidships.
+//
+// The box is where every quantity has a closed form, so the claim is made here first
+// and on the ferry below. Triangulating every panel doubles the element count and
+// changes nothing that has an exact answer.
+void testCollapsedPanelsMeshAsWedges() {
+    std::printf("\n--- section: a panel with two coincident corners is a wedge, not a fold ---\n");
+    const StructuralMesh quads = makeBox(kT, kT);
+    const StructuralMesh triangles = triangulated(quads);
+    const StructuralMaterial material = ah36Steel();
+    const double youngs = material.youngsModulus;
+    const double shear = youngs / (2 * (1 + material.poissonRatio));
+    const double bredt = shear * kBoxTorsionConstant;
+
+    const section::Section plain = section::buildSection(quads, openBoxParams());
+    const section::Section wedges = section::buildSection(triangles, openBoxParams());
+
+    // The mesher builds it, says what it built, and does not call it inverted.
+    expectEqual("no quad panel is collapsed", plain.collapsedElements, 0);
+    expectEqualCount("triangulating doubles the elements", wedges.elementCount(),
+                     2 * plain.elementCount());
+    expectEqual("and every one of them is a collapsed hexahedron", wedges.collapsedElements,
+                static_cast<int>(wedges.elementCount()));
+    expectEqual("none of which is inverted", wedges.invertedElements, 0);
+    expectTrue("so the section's worst determinant is positive", wedges.worstJacobian > 0);
+    // The guard that says the old rule really would have refused this. Without it
+    // the test passes on a mesher that never had the problem.
+    {
+        double worstNodal = 1e300;
+        for (std::size_t e = 0; e < wedges.elementCount(); ++e) {
+            double nodes[solidshell::kDof];
+            wedges.mesh.gather(e, wedges.mesh.position, nodes);
+            worstNodal = std::min(worstNodal, solidshell::smallestJacobian(nodes));
+        }
+        std::printf("     worst determinant: %.3e at the corners, %.3e at the Gauss points\n",
+                    worstNodal, wedges.worstJacobian);
+        expectNear("the corner-sampling rule sees exactly zero on this mesh", worstNodal, 0.0, 0.0);
+    }
+
+    // --- The steel is all there, which "drop the element instead" would lose -------
+    expectNear("the wedges cover the same mid-surface", wedges.area, plain.area, 1e-12);
+    expectNear("and carry the same plating", wedges.plateMass, plain.plateMass, 1e-9);
+    expectNear("which is the closed form", wedges.area, 2 * (kB + kH) * kL, 1e-12);
+
+    // --- And they integrate ---------------------------------------------------------
+    section::BeamLoad axial;
+    axial.strain = 1e-6;
+    section::BeamLoad bending;
+    bending.curvature = 1e-6;
+    bending.reference = kH / 2;
+    const section::BeamResponse stretched = section::applyBeamLoad(wedges, material, axial);
+    const section::BeamResponse bent = section::applyBeamLoad(wedges, material, bending);
+    expectTrue("a section of wedges takes an axial load: " + stretched.problem, stretched.ok);
+    expectTrue("and a curvature: " + bent.problem, bent.ok);
+    // `EA` is a closed form and a wedge that passes the patch test reproduces it
+    // exactly -- a mis-integrated one does not, because `EA` is the *integral* of
+    // sigma over the cut and a wrong Jacobian is a wrong area.
+    expectNear("EA is the closed form, to the same exactness the quad mesh reaches",
+               stretched.axialStiffness, youngs * kBoxArea, kAxialTolerance * youngs * kBoxArea);
+    // **`EI` is where a wedge costs something, and the cost is a discretisation
+    // error rather than the formulation.** Two collapsed hexes are a different and
+    // stiffer approximation than the one quad they replace -- the same reason a
+    // constant-strain triangle is stiffer than a bilinear quad -- and at one element
+    // per panel, with *every* panel triangulated, that is 13.7% of `EI`. What makes
+    // it a mesh error and not a broken element is that it converges away, so that is
+    // what is asserted rather than the number.
+    const double second = bent.bendingStiffness / (youngs * kBoxSecondMoment);
+    std::printf("     wedge mesh: EA/closed form %.10f, EI/closed form %.6f\n",
+                stretched.axialStiffness / (youngs * kBoxArea), second);
+    {
+        double previous = std::abs(second - 1.0);
+        std::printf("     EI error under refinement: %.3e", previous);
+        bool falling = true;
+        double finest = previous;
+        for (int subdivision = 2; subdivision <= 3; ++subdivision) {
+            const section::Section refined =
+                section::buildSection(triangles, openBoxParams(subdivision));
+            const section::BeamResponse fine =
+                section::applyBeamLoad(refined, material, bending);
+            expectTrue("the refined wedge mesh solves", fine.ok);
+            const double error =
+                std::abs(fine.bendingStiffness / (youngs * kBoxSecondMoment) - 1.0);
+            std::printf(" %.3e", error);
+            if (!(error < previous)) falling = false;
+            previous = error;
+            finest = error;
+        }
+        std::printf("\n");
+        // 0.137 -> 0.0068 -> 0.0022: it falls at every step and by twenty fold on the
+        // first, which is what a discretisation error does and a wrong element does
+        // not. Asserted as *convergence*, because a fixed tolerance on the coarse
+        // value would pass on an element that was simply wrong by a constant.
+        expectTrue("the wedge mesh's EI error falls at every refinement", falling);
+        expectTrue("and is under a per cent one refinement in", finest < 0.01);
+        expectTrue("having started above ten per cent, so there was something to converge",
+                   std::abs(second - 1.0) > 0.10);
+    }
+
+    // --- The one that says the wedges carry shear ------------------------------------
+    //
+    // `EA` and `EI` are prescribed by the cut planes and would come out right on a
+    // mesh of wedges that touched nothing (§2). Torsion is not: Bredt needs the cell
+    // closed, and closing it means shear flowing *through* the collapsed elements.
+    const section::Section tiedWedges = section::buildSection(triangles, boxParams());
+    const section::Section tiedQuads = section::buildSection(quads, boxParams());
+    const section::TorsionResponse wedgeTwist =
+        section::applyTwist(tiedWedges, material, 1e-6, kH / 2);
+    const section::TorsionResponse quadTwist =
+        section::applyTwist(tiedQuads, material, 1e-6, kH / 2);
+    const section::TorsionResponse openTwist = section::applyTwist(wedges, material, 1e-6, kH / 2);
+    expectTrue("all three twists ran",
+               wedgeTwist.ok && quadTwist.ok && openTwist.ok);
+    std::printf("     GJ/Bredt: wedges tied %.4f, quads tied %.4f, wedges untied %.4f\n",
+                wedgeTwist.torsionalStiffness / bredt, quadTwist.torsionalStiffness / bredt,
+                openTwist.torsionalStiffness / bredt);
+    expectEqual("the tied wedge mesh is one piece", tiedWedges.components, 1);
+    // Bredt plus the open-section term, as `testJunctionTieClosesTheCell` explains,
+    // and the wedge mesh is over-stiff at one element per panel by the same 10-14%
+    // it is in `EI`. The band is round the sum and is wide enough for that; what it
+    // is not wide enough for is an *open* cell, which is a factor of ten below.
+    expectTrue("and carries Bredt's shear flow",
+               wedgeTwist.torsionalStiffness > 0.9 * bredt &&
+                   wedgeTwist.torsionalStiffness < 1.3 * bredt);
+    // Vacuity: an open cell is an order of magnitude softer, so this is a
+    // measurement of something. The same guard `testJunctionTieClosesTheCell` uses.
+    expectTrue("where the untied wedge mesh carries a fraction of it",
+               openTwist.torsionalStiffness < 0.2 * bredt);
+    // And the two discretisations converge on each other: they differ by 9.4% at one
+    // element per panel and 0.03% at two, which is the same statement `EI` makes.
+    const section::Section fineWedges = section::buildSection(triangles, boxParams(2));
+    const section::Section fineQuads = section::buildSection(quads, boxParams(2));
+    const section::TorsionResponse fineWedgeTwist =
+        section::applyTwist(fineWedges, material, 1e-6, kH / 2);
+    const section::TorsionResponse fineQuadTwist =
+        section::applyTwist(fineQuads, material, 1e-6, kH / 2);
+    expectTrue("the refined twists ran", fineWedgeTwist.ok && fineQuadTwist.ok);
+    const double coarseGap =
+        std::abs(wedgeTwist.torsionalStiffness / quadTwist.torsionalStiffness - 1.0);
+    const double fineGap =
+        std::abs(fineWedgeTwist.torsionalStiffness / fineQuadTwist.torsionalStiffness - 1.0);
+    std::printf("     wedges against quads in GJ: %.4f at one element per panel, %.4f at two\n",
+                coarseGap, fineGap);
+    expectTrue("the two discretisations converge on the same torsion", fineGap < 0.1 * coarseGap);
+    expectTrue("having started apart, so the comparison had something in it", coarseGap > 0.05);
+
+    // --- Nothing floats, and the reduction takes it -----------------------------------
+    const reduction::Substructure substructure(tiedWedges.mesh, tiedWedges.material,
+                                               tiedWedges.interfaceNodes, tiedWedges.attachment);
+    expectTrue("a substructure of collapsed elements is ready", substructure.ready());
+    expectEqual("with nothing floating", tiedWedges.floatingComponents, 0);
+    // The condensed mass has to stay positive at the apex of every wedge, where two
+    // of the element's own nodes land on one mesh node. Nothing else here would
+    // notice a lumping that dropped one of them.
+    expectNear("and the same total mass as the quad mesh", substructure.totalMass(),
+               tiedQuads.mass(), 1e-9 * tiedQuads.mass());
+}
+
+// **A wedge's apex is named twice by its own sub-quad, and the nodal averages must
+// count it once.** `nodeThickness` and `nodeNormal` are area-weighted over the
+// sub-quads that reach a node; a collapsed sub-quad lists its apex in two of its four
+// corners, so counting per corner gives that one panel double weight at exactly the
+// node where several panels meet. Mutation testing found this: removing the
+// deduplication survived everything else.
+//
+// Two coplanar panels sharing an edge, one of them a triangle, with *different*
+// thicknesses -- so the apex node's mean thickness is a closed form that the two
+// countings disagree about.
+void testWedgeApexIsCountedOnce() {
+    std::printf("\n--- section: the nodal average counts a wedge's apex once ---\n");
+    const double square = 0.010, triangle = 0.020;
+    StructuralMesh mesh;
+    mesh.materials = {ah36Steel()};
+    mesh.frameSpacing = 1.0;
+    const auto panel = [&](const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& d, double t) {
+        PlatePanel p;
+        p.corner[0] = a;
+        p.corner[1] = b;
+        p.corner[2] = c;
+        p.corner[3] = d;
+        p.thickness = t;
+        p.material = 0;
+        p.role = PanelRole::Shell;
+        p.source = 0;
+        mesh.panels.push_back(p);
+    };
+    // A unit square, and to starboard of it a triangle whose collapsed corner sits on
+    // the square's own corner at (1, 0, 0).
+    panel({0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}, square);
+    panel({1, 0, 0}, {2, 0, 0}, {1, 1, 0}, {1, 0, 0}, triangle);
+    mesh.frameStations = {0.0, 1.0, 2.0};
+
+    section::SectionParams params;
+    params.xFrom = 0.0;
+    params.xTo = 2.0;
+    params.subdivision = 1;
+    params.members = false;
+    const section::Section flat = section::buildSection(mesh, params);
+    expectEqualCount("two panels, two elements", flat.elementCount(), 2u);
+    expectEqual("one of which is a wedge", flat.collapsedElements, 1);
+    expectEqual("and neither is inverted", flat.invertedElements, 0);
+
+    // Areas: the square is 1 m^2, the triangle is 1/2. The shared node at (1, 0, 0)
+    // is reached by both, so its area-weighted thickness is
+    //     (1 * 10 mm + 0.5 * 20 mm) / 1.5 = 13.333 mm,
+    // where counting the triangle twice would give (1 * 10 + 1.0 * 20) / 2 = 15 mm.
+    const double correct = (1.0 * square + 0.5 * triangle) / 1.5;
+    const double doubled = (1.0 * square + 1.0 * triangle) / 2.0;
+    double apex = -1;
+    for (std::size_t n = 0; n < flat.nodeCount(); ++n)
+        if (std::abs(flat.mesh.position[n * 3] - 1.0) < 1e-9 &&
+            std::abs(flat.mesh.position[n * 3 + 1]) < 1e-9)
+            apex = flat.nodeThickness[n];
+    std::printf("     apex thickness %.6f m; counted once %.6f, counted twice %.6f\n", apex,
+                correct, doubled);
+    expectTrue("the apex node was found", apex > 0);
+    expectNear("and carries the mean of the two panels it belongs to", apex, correct, 1e-12);
+    // The guard: the two answers have to differ, or the assertion is about nothing.
+    expectTrue("the two countings really do disagree", std::abs(correct - doubled) > 1e-4);
+
+    // And the mass follows, because the plate mass is the same area-weighted
+    // thickness integrated: 1 m^2 at a mean of the two nodes on the seam plus the
+    // triangle's own half. Asserted through the total, which is what a caller sees.
+    expectNear("the section covers both panels", flat.area, 1.5, 1e-12);
+
+    // **And the other half of the classification, which nothing else here exercises.**
+    // Every section in this file has `invertedElements == 0`, so a counter that never
+    // fired would pass all of them -- mutation testing said exactly that.
+    //
+    // The case the check exists for: **plating thick against the panel it is meshed
+    // on, over a fold.** Two panels 0.10 m long meeting at 40 degrees -- inside
+    // `foldLimit`, so they weld into one surface -- carrying 1.00 m of thickness. The
+    // node on the seam is extruded half a thickness along the bisector, which is five
+    // times the panel's own length, so the inner face turns through itself. Nothing
+    // here is collapsed; the element is simply inside out.
+    const auto foldedPlate = [&](double panelLength, double thickness) {
+        const double angle = 40.0 * 3.14159265358979323846 / 180.0;
+        StructuralMesh bent;
+        bent.materials = {ah36Steel()};
+        bent.frameSpacing = panelLength;
+        const Vec3 far{panelLength + panelLength * std::cos(angle), 0,
+                       panelLength * std::sin(angle)};
+        const auto add = [&](const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& d) {
+            PlatePanel p;
+            p.corner[0] = a;
+            p.corner[1] = b;
+            p.corner[2] = c;
+            p.corner[3] = d;
+            p.thickness = thickness;
+            p.material = 0;
+            p.role = PanelRole::Shell;
+            p.source = 0;
+            bent.panels.push_back(p);
+        };
+        add({0, 0, 0}, {panelLength, 0, 0}, {panelLength, 1, 0}, {0, 1, 0});
+        add({panelLength, 0, 0}, far, {far.x, 1, far.z}, {panelLength, 1, 0});
+        section::SectionParams p;
+        p.xFrom = 0.0;
+        p.xTo = far.x;
+        p.subdivision = 1;
+        p.members = false;
+        return section::buildSection(bent, p);
+    };
+
+    const section::Section inverted = foldedPlate(0.10, 1.00);
+    std::printf("     1.00 m of plating over a 0.10 m fold: %d inverted, %d collapsed,"
+                " %d surfaces, worst Gauss determinant %.3e\n",
+                inverted.invertedElements, inverted.collapsedElements, inverted.surfaces,
+                inverted.worstJacobian);
+    expectEqual("the two panels weld into one surface", inverted.surfaces, 1);
+    expectEqual("both elements come out inverted", inverted.invertedElements, 2);
+    expectEqual("and neither is a wedge", inverted.collapsedElements, 0);
+    expectTrue("so the section's worst determinant is not positive",
+               !(inverted.worstJacobian > 0));
+    expectTrue("and the mesher says inverted rather than collapsed", [&] {
+        for (const std::string& problem : inverted.problems)
+            if (problem.find("came out inverted") != std::string::npos) return true;
+        return false;
+    }());
+    const section::BeamResponse refused =
+        section::applyBeamLoad(inverted, ah36Steel(), section::BeamLoad{1e-6, 0, 0});
+    expectTrue("and loading it is refused rather than solved", !refused.ok);
+
+    // **The corner rule earns its place here too.** At 0.15 m the same fold leaves
+    // every *quadrature* point positive and still turns two corners through
+    // themselves, so a check that looked only at the Gauss points would accept it.
+    const section::Section corners = foldedPlate(0.15, 1.00);
+    std::printf("     the same over a 0.15 m fold: %d inverted, worst Gauss determinant %.3e\n",
+                corners.invertedElements, corners.worstJacobian);
+    expectTrue("the quadrature alone would accept the shallower fold",
+               corners.worstJacobian > 0);
+    expectEqual("but its corners are inside out", corners.invertedElements, 2);
+    expectTrue("so it is refused as well",
+               !section::applyBeamLoad(corners, ah36Steel(), section::BeamLoad{1e-6, 0, 0}).ok);
+
+    // The vacuity guard: the same fold on ordinary plating is fine, so this is about
+    // the thickness against the panel and not about folds.
+    const section::Section sound = foldedPlate(0.10, 0.10);
+    expectEqual("the same fold on plating a tenth as thick is sound",
+                sound.invertedElements, 0);
+    expectTrue("and solves", section::applyBeamLoad(sound, ah36Steel(),
+                                                    section::BeamLoad{1e-6, 0, 0}).ok);
+}
 
 void testJunctionTieIsAPartitionOfUnity() {
     const section::Section tied = section::buildSection(makeBox(kT, kT), boxParams());
@@ -1899,6 +2245,274 @@ void testFerryChainConservesTheStructure() {
     expectNear("exactly", map.worstGap, 0.0, 0.0);
 }
 
+// --- The reach: the ends of the ship, which is what §7 is about ---------------------
+//
+// Before the collapsed element was understood, 21 of this ship's 49 two-bay windows
+// meshed, reduced and solved -- five islands covering 62.4 m of 120 m, whose longest
+// unbroken run was the 26.4 m hold every other measurement in this file is made on.
+// That made every downstream result -- the chain, the N-way assembly, the hull-girder
+// agreement, the torsion -- a statement about the parallel middle body only.
+//
+// The stations below are the ones that could not be meshed: the extreme stern, the
+// extreme bow, a bulkhead amidships, and the shoulder. What is asserted is not
+// "it meshed" -- an empty section meshes -- but that it reduces, solves, holds
+// together, and carries the steel an independent count of the same panels says it
+// should.
+void testMesherReachesTheEndsOfTheShip() {
+    std::printf("\n--- section: the bow, the stern and the bulkheads, which used to refuse ---\n");
+    const StructuralMesh structure = ferryStructure();
+    const StructuralMaterial material = ah36Steel();
+
+    // The plating an independent count of the same panels finds in a window. This
+    // is `buildSection`'s ownership rule -- a panel with extent along x belongs when
+    // it lies wholly between the planes, a transverse plate is taken at the aft
+    // plane only -- applied to `structure.panels` directly, so it shares no code
+    // with the mesher. A wedge that had been *dropped* rather than meshed would show
+    // up here and nowhere else: `EA` cannot see 0.3% of the plating and neither can
+    // a component count.
+    const auto expectedPlating = [&](double from, double to, double& area, double& mass) {
+        area = 0;
+        mass = 0;
+        for (const PlatePanel& p : structure.panels) {
+            double lo = 1e300, hi = -1e300;
+            for (int c = 0; c < 4; ++c) {
+                lo = std::min(lo, p.corner[c].x);
+                hi = std::max(hi, p.corner[c].x);
+            }
+            const bool transverse = hi - lo <= 1e-6;
+            const bool owned = transverse ? (lo >= from - 1e-6 && lo < to - 1e-6)
+                                          : (lo >= from - 1e-6 && hi <= to + 1e-6);
+            if (!owned) continue;
+            // A quad's area as two triangles, which is right for a triangle too --
+            // one of the two is degenerate and contributes nothing.
+            const double quad =
+                0.5 * length(cross(p.corner[1] - p.corner[0], p.corner[2] - p.corner[0])) +
+                0.5 * length(cross(p.corner[2] - p.corner[0], p.corner[3] - p.corner[0]));
+            area += quad;
+            mass += quad * p.thickness * material.density;
+        }
+    };
+
+    struct Station {
+        const char* label;
+        double from, to;
+    };
+    const Station stations[] = {{"extreme stern", -60.0, -55.2},
+                                {"stern shoulder", -45.6, -40.8},
+                                {"bulkhead at -8", -12.0, -7.2},
+                                {"bulkhead at 20", 16.8, 21.6},
+                                {"bow shoulder", 40.8, 45.6},
+                                {"extreme bow", 55.2, 60.0}};
+    std::printf("     %-16s %8s %7s %7s %6s %11s %11s %10s\n", "", "elements", "collps", "invert",
+                "comps", "minGaussJ", "plate kg", "GJ");
+    int reached = 0, withWedges = 0;
+    for (const Station& station : stations) {
+        section::SectionParams params;
+        params.xFrom = station.from;
+        params.xTo = station.to;
+        params.subdivision = 1;
+        const section::Section piece = section::buildSection(structure, params);
+
+        const section::BeamResponse stretched =
+            section::applyBeamLoad(piece, material, section::BeamLoad{1e-6, 0, 0});
+        const section::TorsionResponse twisted = section::applyTwist(piece, material, 1e-6, 6.86);
+        const reduction::Substructure substructure(piece.mesh, piece.material,
+                                                   piece.interfaceNodes, piece.attachment);
+        std::printf("     %-16s %8zu %7d %7d %6d %11.3e %11.0f %10.3e\n", station.label,
+                    piece.elementCount(), piece.collapsedElements, piece.invertedElements,
+                    piece.components, piece.worstJacobian, piece.plateMass,
+                    twisted.torsionalStiffness);
+
+        expectTrue(std::string(station.label) + " meshes something", !piece.empty());
+        expectEqual(std::string(station.label) + " has no inverted element",
+                    piece.invertedElements, 0);
+        expectTrue(std::string(station.label) + "'s quadrature is positive",
+                   piece.worstJacobian > 0);
+        expectEqual(std::string(station.label) + " cuts no panel in half",
+                    piece.straddlingPanels, 0);
+        expectEqual(std::string(station.label) + " has nothing floating free of the interface",
+                    piece.floatingComponents, 0);
+        expectTrue(std::string(station.label) + " takes an axial load: " + stretched.problem,
+                   stretched.ok);
+        expectTrue(std::string(station.label) + " twists: " + twisted.problem, twisted.ok);
+        expectTrue(std::string(station.label) + " reduces", substructure.ready());
+        expectTrue(std::string(station.label) + " carries a real torque",
+                   twisted.torsionalStiffness > 1e11);
+
+        // The independent count. Exact, not approximate: the mesher's mid-surface is
+        // the panel and the two are the same integral.
+        double area = 0, mass = 0;
+        expectedPlating(station.from, station.to, area, mass);
+        expectNear(std::string(station.label) + " meshes the plating those panels have",
+                   piece.area, area, 1e-9 * area);
+        expectNear(std::string(station.label) + " carries the steel those panels have",
+                   piece.plateMass, mass, 1e-9 * mass);
+        expectTrue(std::string(station.label) + " is a real piece of ship", area > 100.0);
+
+        if (piece.collapsedElements > 0) ++withWedges;
+        ++reached;
+    }
+    expectEqual("every station reached", reached, 6);
+    // **The vacuity guard, and it is the load-bearing one.** If none of these windows
+    // contained a collapsed element then none of them was ever refused, and the whole
+    // test is a statement about stations that always worked.
+    expectEqual("and every one of them contains the shape that used to refuse", withWedges, 6);
+
+    // The middle body is *not* one of them, which is what says the new path cannot
+    // have moved it. Amidships there is no degenerate panel at all, so
+    // `testFerryChainConservesTheStructure` and the chain tests below are measuring
+    // exactly the mesh they measured before.
+    section::SectionParams amidships;
+    amidships.xFrom = -2.4;
+    amidships.xTo = 2.4;
+    const section::Section middle = section::buildSection(structure, amidships);
+    expectEqual("amidships there is no collapsed element to be affected by any of this",
+                middle.collapsedElements, 0);
+    expectEqual("nor an inverted one", middle.invertedElements, 0);
+
+    // --- What the reach exposes, which is not the reach ------------------------------
+    //
+    // Cutting a window in two conserves the plating exactly and the **stiffener steel
+    // only where the plating does not change thickness**, and reaching the ends is
+    // what makes that visible. `nodeThickness` is an area-weighted mean over the
+    // sub-quads *inside the section*, so a station where the strake steps carries one
+    // thickness to the section aft of it, another to the section forward of it, and
+    // the mean of the two to a section that spans it. A member run stops at a
+    // thickness change (§3), so the spanning section stops runs the two halves never
+    // see, and the seam node's run of one is dropped.
+    //
+    // **It is not new and it is not the collapsed element.** It is the nodal-thickness
+    // twin of `section.hpp` §6 note 1's nodal normal, and it is measurable inside the
+    // range that always worked -- 1.9% at x = -24 .. -19.2. The ends are where it
+    // stops being a rounding: at the bow shoulder the spanning section carries **25%
+    // less** stiffener steel than the two halves it is made of.
+    const auto cut = [&](double from, double to) {
+        section::SectionParams p;
+        p.xFrom = from;
+        p.xTo = to;
+        p.junctions = false;
+        return section::buildSection(structure, p);
+    };
+    struct Split {
+        const char* label;
+        double from, middle, to;
+        bool uniform;  // is the plating the same thickness across the shared station
+    };
+    for (const Split& split : {Split{"amidships", -7.2, -2.4, 2.4, true},
+                               Split{"old reach", -24.0, -21.6, -19.2, false},
+                               Split{"bow shoulder", 40.8, 43.2, 45.6, false}}) {
+        const section::Section aft = cut(split.from, split.middle);
+        const section::Section forward = cut(split.middle, split.to);
+        const section::Section whole = cut(split.from, split.to);
+        // The plating, the elements and the wedges conserve whatever the thickness
+        // does. Only the members are at issue.
+        expectEqualCount(std::string(split.label) + ": two sections have one section's elements",
+                         aft.elementCount() + forward.elementCount(), whole.elementCount());
+        expectNear(std::string(split.label) + ": and its plating", aft.plateMass + forward.plateMass,
+                   whole.plateMass, 1e-9);
+        expectEqual(std::string(split.label) + ": and its collapsed elements",
+                    aft.collapsedElements + forward.collapsedElements, whole.collapsedElements);
+
+        const double halves = aft.memberMass + forward.memberMass;
+        const double shortfall = 1.0 - whole.memberMass / halves;
+        const int splitHalves =
+            aft.memberRunsSplitByThickness + forward.memberRunsSplitByThickness;
+        std::printf("     %-13s stiffener steel: halves %8.1f kg, one piece %8.1f (%+.1f%%);"
+                    " runs stopped at a seam %d against %d\n",
+                    split.label, halves, whole.memberMass, -100.0 * shortfall,
+                    whole.memberRunsSplitByThickness, splitHalves);
+        if (split.uniform) {
+            expectNear(std::string(split.label) + ": the stiffener steel conserves exactly",
+                       whole.memberMass, halves, 1e-9 * halves);
+            expectEqual(std::string(split.label) + ": and no extra run is stopped",
+                        whole.memberRunsSplitByThickness, splitHalves);
+        } else {
+            // The direction is the whole point: the *spanning* section is the one
+            // that loses, because it is the one that sees the seam. A test that
+            // asserted only "they differ" would pass on the opposite sign, which
+            // would be double-counted steel rather than dropped steel.
+            expectTrue(std::string(split.label) + ": the spanning section stops more runs",
+                       whole.memberRunsSplitByThickness > splitHalves);
+            expectTrue(std::string(split.label) + ": and is the one short of steel",
+                       whole.memberMass < halves);
+            expectTrue(std::string(split.label) + ": by a real fraction of it", shortfall > 0.01);
+        }
+    }
+}
+
+// **A tie that would take more of a slave's mass than the slave has.** The junction
+// search accepts a master whose *mid-surface* is within `junctionTolerance` -- 25 mm,
+// an absolute figure -- and the through-thickness split is `(e + t/2) / t`, which is
+// relative. On 10 mm plating those disagree: a slave 21.5 mm off the master's
+// mid-surface is inside the tolerance and asks for a weight of 2.65, so `-1.65` of
+// the slave's steel comes off one master face and `reduction::Substructure` refuses
+// the whole section for a non-positive nodal mass.
+//
+// `SectionParams::junctionWeightLimit` refuses the **junction** instead, which is the
+// choice `section.hpp` §1 makes everywhere else: left open and reported rather than
+// closed wrongly and not.
+void testJunctionWeightLimitRefusesTheNodeAndNotTheSection() {
+    std::printf("\n--- section: a tie that would make the condensed mass negative ---\n");
+    const StructuralMesh structure = ferryStructure();
+    section::SectionParams params;
+    params.xFrom = 45.6;
+    params.xTo = 50.4;
+    params.subdivision = 1;
+
+    const section::Section limited = section::buildSection(structure, params);
+    section::SectionParams unlimited = params;
+    unlimited.junctionWeightLimit = 1e9;
+    const section::Section loose = section::buildSection(structure, unlimited);
+
+    const reduction::Substructure withLimit(limited.mesh, limited.material,
+                                            limited.interfaceNodes, limited.attachment);
+    const reduction::Substructure without(loose.mesh, loose.material, loose.interfaceNodes,
+                                          loose.attachment);
+    std::printf("     with the limit: %d ties, %d refused, worst weight %.4f, reduces %d\n",
+                limited.junctionTies, limited.junctionsThroughThickness,
+                limited.worstJunctionWeight, static_cast<int>(withLimit.ready()));
+    std::printf("     without it:     %d ties, %d refused, worst weight %.4f, reduces %d\n",
+                loose.junctionTies, loose.junctionsThroughThickness, loose.worstJunctionWeight,
+                static_cast<int>(without.ready()));
+
+    // **The negative control comes first**, because without it "the section reduces"
+    // is what a mesher with no ties at all would report.
+    expectEqual("without the limit nothing is refused", loose.junctionsThroughThickness, 0);
+    expectTrue("and a tie takes more than a full share of the slave's mass off a face",
+               loose.worstJunctionWeight > 2.0);
+    expectTrue("so the substructure refuses the whole section", !without.ready());
+    expectTrue("for the reason the limit is about",
+               !without.problems().empty() &&
+                   without.problems().front().find("lumped mass") != std::string::npos);
+
+    // And with it, the two junctions are refused and the section is usable.
+    expectEqual("the limit refuses exactly the two junctions that do it",
+                limited.junctionsThroughThickness, 2);
+    expectTrue("and says so", [&] {
+        for (const std::string& problem : limited.problems)
+            if (problem.find("junctionWeightLimit") != std::string::npos) return true;
+        return false;
+    }());
+    expectTrue("every tie that is left is inside the limit", limited.worstJunctionWeight <= 2.0);
+    expectTrue("and the section reduces", withLimit.ready());
+    expectEqual("in one piece", limited.components, 1);
+    // The ties it did keep are still doing something -- the section is not merely
+    // usable because it stopped tying anything.
+    expectTrue("having kept most of them", limited.junctionTies > 0 &&
+                                               limited.junctionTies >= loose.junctionTies - 2);
+
+    // Amidships nothing is refused, so the limit is not quietly costing the middle
+    // body its junctions. The ferry's ordinary deck-to-shell junction runs at 1.69,
+    // which is a *negative* 0.69 on the inner face and is where the steel is.
+    section::SectionParams midship = params;
+    midship.xFrom = -2.4;
+    midship.xTo = 2.4;
+    const section::Section middle = section::buildSection(structure, midship);
+    expectEqual("amidships the limit refuses nothing", middle.junctionsThroughThickness, 0);
+    expectTrue("though its junctions do extrapolate through the master's thickness",
+               middle.worstJunctionWeight > 1.5 && middle.worstJunctionWeight <= 2.0);
+}
+
 // **The interface is not coincident by construction, and the parallel middle body is
 // what hides it.** See `section.hpp` §6 note 1. A node is the mid-surface offset by
 // `t/2` along a normal this file averages over the sub-quads *inside* the section, so
@@ -1999,6 +2613,8 @@ void testFerryChainInterfaceIsNotCoincidentByConstruction() {
 void runSectionTests() {
     std::printf("\n=== Tier-1 section mesher ===\n");
     testBoxMesh();
+    testCollapsedPanelsMeshAsWedges();
+    testWedgeApexIsCountedOnce();
     testJunctionTieIsAPartitionOfUnity();
     testWeldIsADistance();
     testReversedWindingIsOriented();
@@ -2020,6 +2636,8 @@ void runSectionTests() {
     testChainOfSectionsIsTheWholeSection();
     testChainCutPlanesUntieTheJunctions();
     testChainFrequencySeesTheJoins();
+    testMesherReachesTheEndsOfTheShip();
+    testJunctionWeightLimitRefusesTheNodeAndNotTheSection();
     testFerryChainConservesTheStructure();
     testFerryChainInterfaceIsNotCoincidentByConstruction();
 }

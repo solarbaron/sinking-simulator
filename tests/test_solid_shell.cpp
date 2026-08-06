@@ -375,6 +375,391 @@ void testInvertedElementIsCaught() {
     expectTrue("solveStatic refuses an inverted element", !solved && !problem.empty());
 }
 
+// --- The collapsed element, which is a wedge and not a fold ------------------------
+//
+// `smallestJacobian` samples the corners and so cannot tell a **collapsed**
+// hexahedron -- the triangular prism a degenerate plate panel extrudes to -- from an
+// inverted one. `elementShape` can, and everything below is a closed form on the
+// simplest such element there is: the right triangle (0,0), (1,0), (0,1) written as a
+// quad with its fourth corner on its first, extruded +/- t/2 in z.
+//
+// For that element the bilinear map collapses the whole `xi = -1` edge onto the
+// origin, and
+//
+//     dX/dxi = ((1-eta)/4, (1+eta)/4, 0)
+//     dX/deta = (-(1+xi)/4, (1+xi)/4, 0)
+//     dX/dzta = (0, 0, t/2)
+//     det J   = t (1 + xi) / 16
+//
+// -- exactly zero on the collapsed edge, positive everywhere else, and **linear in
+// xi**, so the 2x2x2 rule integrates the wedge's volume exactly. Every number below
+// is that expression rather than a reading.
+void testCollapsedElementIsAWedgeAndNotAFold() {
+    std::printf("\n   collapsed element: a triangular prism written in eight nodes\n");
+    const double t = 0.012;
+    // Corners 0-3 on zeta = -1 counter-clockwise seen from +zeta, 4-7 above them.
+    const double wedge[kDof] = {0, 0, -t / 2, 1, 0, -t / 2, 0, 1, -t / 2, 0, 0, -t / 2,
+                                0, 0, t / 2,  1, 0, t / 2,  0, 1, t / 2,  0, 0, t / 2};
+    const ElementShape shape = elementShape(wedge);
+
+    // Node 0 sits on node 3 and node 4 on node 7: four corners of eight.
+    expectEqual("the wedge has four collapsed corners", shape.collapsedNodes, 4);
+    expectTrue("and they are the ones that coincide",
+               shape.collapsed[0] && shape.collapsed[3] && shape.collapsed[4] && shape.collapsed[7] &&
+                   !shape.collapsed[1] && !shape.collapsed[2] && !shape.collapsed[5] &&
+                   !shape.collapsed[6]);
+
+    // The nodal determinant is *exactly* zero, not small: at xi = -1 the expression
+    // above is 0. So `smallestJacobian` refuses this element, and that refusal is
+    // the whole defect -- 64% of the reference ferry could not be meshed because of
+    // it. Asserted at 0.0 tolerance because the arithmetic is exact.
+    expectNear("the collapsed corners give a determinant of exactly zero",
+               shape.smallestNodal, 0.0, 0.0);
+    expectTrue("so the corner-sampling check refuses it", !(smallestJacobian(wedge) > 0.0));
+
+    // And the quadrature does not see it. The smallest of the nine samples is the
+    // Gauss point at xi = -1/sqrt(3).
+    const double smallest = t * (1.0 - 1.0 / std::sqrt(3.0)) / 16.0;
+    expectNear("the smallest quadrature determinant is t(1 - 1/sqrt 3)/16",
+               shape.smallestGauss, smallest, 1e-15 * smallest);
+    expectTrue("which is positive", shape.smallestGauss > 0.0);
+    expectTrue("so the element is integrable", shape.integrable);
+
+    // The volume, integrated by the rule the element actually uses. det J is linear
+    // in xi and constant in eta and zeta, so 2x2x2 Gauss is exact and the answer is
+    // the triangle's own area times the thickness -- to the last bit, which is why
+    // this is asserted at 1e-15 rather than at a convergence tolerance.
+    double volumes[kGauss];
+    gaussVolumes(wedge, volumes);
+    double volume = 0;
+    for (double v : volumes) volume += v;
+    expectNear("and the rule integrates the wedge's volume exactly", volume, 0.5 * t,
+               1e-15 * 0.5 * t);
+
+    // A sound hexahedron is unchanged by all of this: nothing collapsed, and the two
+    // determinants agree because the element is a cuboid.
+    const double cube[kDof] = {0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0,
+                               0, 0, t, 1, 0, t, 1, 1, t, 0, 1, t};
+    const ElementShape sound = elementShape(cube);
+    expectEqual("a sound element has no collapsed corner", sound.collapsedNodes, 0);
+    expectTrue("and is integrable", sound.integrable);
+    expectNear("with the same determinant at its corners and its Gauss points",
+               sound.smallestNodal, sound.smallestGauss, 1e-15 * sound.smallestNodal);
+
+    // --- The three negative controls, because a check that accepts a wedge could
+    // just as easily have been a check that accepts anything -------------------------
+
+    // 1. The folded element from `testInvertedElementIsCaught`. Nothing coincides,
+    //    so there is nothing to excuse the non-positive corner.
+    double folded[kDof] = {0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0,
+                           0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1};
+    folded[6 * 3 + 0] = -0.4;
+    folded[6 * 3 + 1] = -0.4;
+    const ElementShape bad = elementShape(folded);
+    expectEqual("a folded element has no collapsed corner", bad.collapsedNodes, 0);
+    expectTrue("and is refused", !bad.integrable);
+
+    // 2. **Collapsed *and* folded.** This is the one that matters: an element that
+    //    has a genuine wedge edge and is also inside out must not be waved through
+    //    on the strength of the wedge. Node 2 is dragged back past the collapsed
+    //    edge, which turns the triangle over without un-collapsing it.
+    double foldedWedge[kDof];
+    for (int i = 0; i < kDof; ++i) foldedWedge[i] = wedge[i];
+    foldedWedge[2 * 3 + 1] = -1.0;
+    foldedWedge[6 * 3 + 1] = -1.0;
+    const ElementShape both = elementShape(foldedWedge);
+    expectEqual("a folded wedge is still collapsed", both.collapsedNodes, 4);
+    expectTrue("and its quadrature is negative", both.smallestGauss < 0.0);
+    expectTrue("so it is refused", !both.integrable);
+
+    // 3. **The control that says `integrable` is not just `smallestGauss > 0`.** A
+    //    wedge folded *through its thickness* at one sound corner: node 5 pushed
+    //    0.6 t below node 1, so the thickness direction reverses there while the
+    //    other three corners hold the quadrature positive. No in-plane move would
+    //    do -- a collapsed quad's determinant is `(1 + xi) det(P1, P2) / 8`, whose
+    //    sign does not vary over the element, so a triangle folds all at once or
+    //    not at all and the thickness is the only direction that can fold locally.
+    double corneredWedge[kDof];
+    for (int i = 0; i < kDof; ++i) corneredWedge[i] = wedge[i];
+    corneredWedge[5 * 3 + 2] = -t / 2 - 0.6 * t;
+    const ElementShape cornered = elementShape(corneredWedge);
+    expectEqual("the third control is still a wedge", cornered.collapsedNodes, 4);
+    expectTrue("its quadrature alone would accept it", cornered.smallestGauss > 0.0);
+    expectTrue("but a sound corner has folded", cornered.smallestNodal < 0.0);
+    expectTrue("so it is refused", !cornered.integrable);
+
+    // 4. **A sliver is not a wedge.** Coincidence is tested by exact equality, not by
+    //    a tolerance, and this is what that buys: pull the collapsed pair a nanometre
+    //    apart and the element stops being a wedge, so the same fold at the same
+    //    corner is judged on its own determinant again. A tolerance of even 1e-12 m
+    //    here would excuse a *nearly* collapsed element -- turning "this is a
+    //    triangle" into "this is almost a triangle", which is the loosening the whole
+    //    classification exists to avoid. Mutation testing found this: replacing the
+    //    equality with a 1e-6 m distance survived everything else in the suite.
+    double sliver[kDof];
+    for (int i = 0; i < kDof; ++i) sliver[i] = corneredWedge[i];
+    // **Into the element, not out of it.** Node 3 is the collapsed one, and pulling
+    // it anywhere except towards the triangle's interior -- away from node 1, towards
+    // node 2 -- turns the quad itself inside out, which would make the element
+    // refused for the nudge rather than for the fold under test. Measured: of the
+    // eight nanometre offsets in the plane, only this one leaves a positive corner.
+    sliver[3 * 3 + 0] = -1e-9;
+    sliver[3 * 3 + 1] = 1e-9;
+    sliver[7 * 3 + 0] = -1e-9;
+    sliver[7 * 3 + 1] = 1e-9;
+    const ElementShape thin = elementShape(sliver);
+    expectEqual("a pair a nanometre apart is not collapsed", thin.collapsedNodes, 0);
+    expectTrue("its corner determinant is tiny but the sign is what is read",
+               thin.smallestNodal < 0.0);
+    expectTrue("and with nothing to excuse it, the element is refused", !thin.integrable);
+    // The vacuity guard for *this* control: pulled apart the other way, with no fold,
+    // a sliver is still a legal element and must not be refused -- otherwise the
+    // assertion above would pass on a rule that rejected everything near-degenerate.
+    double soundSliver[kDof];
+    for (int i = 0; i < kDof; ++i) soundSliver[i] = wedge[i];
+    soundSliver[3 * 3 + 0] = -1e-9;
+    soundSliver[3 * 3 + 1] = 1e-9;
+    soundSliver[7 * 3 + 0] = -1e-9;
+    soundSliver[7 * 3 + 1] = 1e-9;
+    const ElementShape ok = elementShape(soundSliver);
+    expectEqual("a sound sliver is not collapsed either", ok.collapsedNodes, 0);
+    expectTrue("but it is accepted, because nothing about it is inside out", ok.integrable);
+}
+
+// **Which nine points `elementShape` looks at, checked against a second evaluation of
+// the same determinant.**
+//
+// Mutation testing put this here. Dropping the centre sample, dropping the last Gauss
+// point, sampling one zeta level instead of two, and dropping the quadrature test from
+// `integrable` altogether all survived a suite that only ever fed the predicate
+// elements it was happy with. A rule is only tested by an input whose verdict it
+// changes.
+//
+// `determinantAt` below is the trilinear map's Jacobian written out independently --
+// three partial derivatives and a triple product -- so the comparison is two
+// implementations of the same quantity rather than one restated.
+double determinantAt(const double nodes[kDof], double xi, double eta, double zta) {
+    static constexpr double kXiOf[kNodes] = {-1, +1, +1, -1, -1, +1, +1, -1};
+    static constexpr double kEtaOf[kNodes] = {-1, -1, +1, +1, -1, -1, +1, +1};
+    static constexpr double kZtaOf[kNodes] = {-1, -1, -1, -1, +1, +1, +1, +1};
+    double d[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+    for (int a = 0; a < kNodes; ++a) {
+        const double x = 1.0 + xi * kXiOf[a], y = 1.0 + eta * kEtaOf[a], z = 1.0 + zta * kZtaOf[a];
+        const double dn[3] = {0.125 * kXiOf[a] * y * z, 0.125 * kEtaOf[a] * x * z,
+                              0.125 * kZtaOf[a] * x * y};
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) d[i][j] += dn[i] * nodes[a * 3 + j];
+    }
+    return d[0][0] * (d[1][1] * d[2][2] - d[1][2] * d[2][1]) -
+           d[0][1] * (d[1][0] * d[2][2] - d[1][2] * d[2][0]) +
+           d[0][2] * (d[1][0] * d[2][1] - d[1][1] * d[2][0]);
+}
+
+void testElementShapeSamplesTheQuadratureAndNotOnlyTheCorners() {
+    std::printf("\n   element shape: the nine points it looks at\n");
+    const double q = 1.0 / std::sqrt(3.0);
+
+    // **The element that separates the two halves of `integrable`**: every one of its
+    // eight corners is sound and its interior quadrature is not, so the corner rule
+    // alone accepts it. Found by searching a quarter-unit lattice rather than derived
+    // -- a trilinear hexahedron can be convex at all eight corners and still fold
+    // through itself inside, and no closed form hands one over.
+    const double concave[kDof] = {2.00,  1.00,  1.75, 0.00,  1.00, 1.50, 1.50,  2.75, 0.00,
+                                  -0.75, 0.00,  -1.00, -0.75, -0.75, 1.50, 1.50,  -0.75, 2.00,
+                                  0.25,  3.00,  2.75, -0.75, 2.75, 2.25};
+    const ElementShape bent = elementShape(concave);
+    std::printf("     corner-sound, quadrature-folded: nodal %+.6f, Gauss %+.6f\n",
+                bent.smallestNodal, bent.smallestGauss);
+    expectEqual("nothing about it is collapsed", bent.collapsedNodes, 0);
+    expectTrue("every corner is sound, so the corner rule would accept it",
+               bent.smallestNodal > 0.0);
+    expectTrue("but the quadrature folds through itself", bent.smallestGauss < 0.0);
+    expectTrue("so the element is refused", !bent.integrable);
+    // And it reaches a caller: `computeForms` requires the same positivity, so an
+    // element like this must not reach a solve either.
+    {
+        double stiffness[kDof * kDof];
+        elementStiffness(concave, steelMaterial(), Formulation::SolidShell, stiffness);
+        double sum = 0;
+        for (int i = 0; i < kDof * kDof; ++i) sum += std::abs(stiffness[i]);
+        expectNear("and the element refuses to produce a stiffness at all", sum, 0.0, 0.0);
+    }
+
+    // **The sample set itself, swept.** Two hundred deterministic pseudo-random
+    // elements: for each, the two determinants `elementShape` reports must equal an
+    // independent minimum over the eight corners and over the centre plus the 2x2x2
+    // rule. A sweep rather than three hand-written cases, because which of the nine
+    // points is the smallest depends on the element, and a rule that dropped one
+    // would be caught only by an element whose minimum was there.
+    std::uint64_t state = 0x9e3779b97f4a7c15ull;
+    const auto next = [&] {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return 2.0 * (static_cast<double>(state >> 11) / static_cast<double>(1ull << 53)) - 1.0;
+    };
+    const double base[kDof] = {0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0,
+                               0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1};
+    int centreWorst = 0, lowLevelWorst = 0, highLevelWorst = 0;
+    double worstNodalGap = 0, worstGaussGap = 0;
+    for (int trial = 0; trial < 200; ++trial) {
+        double nodes[kDof];
+        for (int i = 0; i < kDof; ++i) nodes[i] = base[i] + 0.8 * next();
+        const ElementShape shape = elementShape(nodes);
+
+        static constexpr double kXiOf[kNodes] = {-1, +1, +1, -1, -1, +1, +1, -1};
+        static constexpr double kEtaOf[kNodes] = {-1, -1, +1, +1, -1, -1, +1, +1};
+        static constexpr double kZtaOf[kNodes] = {-1, -1, -1, -1, +1, +1, +1, +1};
+        double nodal = 1e300;
+        for (int a = 0; a < kNodes; ++a)
+            nodal = std::min(nodal, determinantAt(nodes, kXiOf[a], kEtaOf[a], kZtaOf[a]));
+        double gauss = determinantAt(nodes, 0.0, 0.0, 0.0);
+        int argmin = -1;  // -1 the centre, otherwise the Gauss index
+        for (int gp = 0; gp < kGauss; ++gp) {
+            const double value = determinantAt(nodes, (gp & 1) ? q : -q, (gp & 2) ? q : -q,
+                                               (gp & 4) ? q : -q);
+            if (value < gauss) {
+                gauss = value;
+                argmin = gp;
+            }
+        }
+        const double scale = std::max(1.0, std::abs(gauss));
+        worstNodalGap = std::max(worstNodalGap, std::abs(shape.smallestNodal - nodal) / scale);
+        worstGaussGap = std::max(worstGaussGap, std::abs(shape.smallestGauss - gauss) / scale);
+        if (argmin < 0) ++centreWorst;
+        else if (argmin & 4) ++highLevelWorst;
+        else ++lowLevelWorst;
+    }
+    std::printf("     over 200 elements: worst disagreement %.2e (corners) %.2e (quadrature);"
+                " the smallest sample was the centre %d times, zeta=-q %d, zeta=+q %d\n",
+                worstNodalGap, worstGaussGap, centreWorst, lowLevelWorst, highLevelWorst);
+    expectTrue("the corner minimum is the eight corners", worstNodalGap < 1e-12);
+    expectTrue("and the quadrature minimum is the centre and the 2x2x2 rule",
+               worstGaussGap < 1e-12);
+    // **The vacuity guards, and they are what make the sweep worth running.** Unless
+    // the smallest sample lands on both zeta levels somewhere in the sweep, dropping
+    // one of them would change nothing and the comparison above would be eight points
+    // against eight points.
+    expectTrue("the smallest sample is on the lower zeta level for some element",
+               lowLevelWorst > 0);
+    expectTrue("and on the upper for some other", highLevelWorst > 0);
+
+    // The centre is not the smallest sample of a random element -- it did not happen
+    // once in two hundred -- so it needs one chosen for it, or dropping it would cost
+    // nothing here. This one's centre determinant is a quarter of its smallest Gauss
+    // point. Found by the same lattice search.
+    expectEqual("no random element had its minimum at the centre", centreWorst, 0);
+    const double pinched[kDof] = {0.25, 1.00, 1.50,  0.00, -0.25, -0.25, 2.50, 2.75, 2.00,
+                                  1.00, 1.75, 0.25,  1.50, 0.00,  2.00,  2.75, -1.00, 0.00,
+                                  1.00, 3.00, 2.25,  -0.25, 2.50, 0.00};
+    double pinchedGauss = 1e300;
+    for (int gp = 0; gp < kGauss; ++gp)
+        pinchedGauss = std::min(pinchedGauss, determinantAt(pinched, (gp & 1) ? q : -q,
+                                                            (gp & 2) ? q : -q, (gp & 4) ? q : -q));
+    const double pinchedCentre = determinantAt(pinched, 0.0, 0.0, 0.0);
+    std::printf("     an element pinched at its centre: centre %.6f, smallest Gauss %.6f\n",
+                pinchedCentre, pinchedGauss);
+    expectTrue("the pinched element really is worst at its centre", pinchedCentre < pinchedGauss);
+    expectNear("and that is the determinant `elementShape` reports",
+               elementShape(pinched).smallestGauss, pinchedCentre, 1e-12);
+}
+
+// And the same statement at the level a caller sees: a mesh of collapsed elements
+// solves, and solves *right*.
+//
+// The unit square as two triangles, extruded to a plate, under the linear field
+// `u = (eps x, -nu eps y, -nu eps z)` prescribed on every boundary node with the one
+// interior-most node free. That field is exact for uniaxial stress and it is in the
+// trilinear span of both elements, so an element that passes the patch test
+// reproduces it to round-off whatever its shape -- and an element whose Jacobian is
+// wrong does not.
+void testCollapsedElementSolvesAndPassesThePatchTest() {
+    const StructuralMaterial steel = steelMaterial();
+    const double t = 0.02, strain = 1e-4, nu = steel.poissonRatio;
+
+    HexMesh mesh;
+    // Five mid-surface points: the unit square's corners and its centre, so the
+    // square is four triangles round a free interior node rather than two with
+    // nothing free -- a patch with no free degree of freedom proves nothing.
+    const double p[5][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}, {0.37, 0.44}};
+    for (const auto& q : p) {
+        mesh.position.push_back(q[0]);
+        mesh.position.push_back(q[1]);
+        mesh.position.push_back(-t / 2);
+        mesh.position.push_back(q[0]);
+        mesh.position.push_back(q[1]);
+        mesh.position.push_back(t / 2);
+    }
+    const auto triangle = [&](std::uint32_t a, std::uint32_t b) {
+        // (a, b, centre, a): the fourth corner on the first, which is exactly what a
+        // degenerate `PlatePanel` hands the section mesher.
+        const std::uint32_t corner[4] = {a, b, 4u, a};
+        for (int k = 0; k < 4; ++k) mesh.index.push_back(corner[k] * 2);
+        for (int k = 0; k < 4; ++k) mesh.index.push_back(corner[k] * 2 + 1);
+    };
+    triangle(0, 1);
+    triangle(1, 2);
+    triangle(2, 3);
+    triangle(3, 0);
+
+    std::size_t collapsed = 0;
+    for (std::size_t e = 0; e < mesh.elementCount(); ++e) {
+        double nodes[kDof];
+        mesh.gather(e, mesh.position, nodes);
+        const ElementShape shape = elementShape(nodes);
+        if (shape.collapsedNodes > 0) ++collapsed;
+        expectTrue("every triangle of the patch is integrable", shape.integrable);
+    }
+    expectEqual("all four elements of the patch are collapsed",
+                static_cast<long long>(collapsed), 4LL);
+
+    // Prescribe the exact field on the four corners; the centre node pair is free.
+    mesh.fixed.assign(mesh.nodeCount() * 3, 0u);
+    mesh.prescribed.assign(mesh.nodeCount() * 3, 0.0);
+    for (std::uint32_t n = 0; n < 8u; ++n) {
+        for (int k = 0; k < 3; ++k) {
+            mesh.fixed[n * 3 + static_cast<std::size_t>(k)] = 1u;
+            const double x = mesh.position[n * 3 + static_cast<std::size_t>(k)];
+            mesh.prescribed[n * 3 + static_cast<std::size_t>(k)] =
+                (k == 0 ? strain : -nu * strain) * x;
+        }
+    }
+    std::vector<double> load(mesh.nodeCount() * 3, 0.0), displacement;
+    std::string problem;
+    const bool solved =
+        solveStatic(mesh, steel, Formulation::SolidShell, load, displacement, &problem);
+    expectTrue("solveStatic accepts a mesh of collapsed elements: " + problem, solved);
+
+    double worst = 0;
+    for (std::size_t n = 8; n < mesh.nodeCount(); ++n)
+        for (int k = 0; k < 3; ++k) {
+            const double x = mesh.position[n * 3 + static_cast<std::size_t>(k)];
+            worst = std::max(worst, std::abs(displacement[n * 3 + static_cast<std::size_t>(k)] -
+                                             (k == 0 ? strain : -nu * strain) * x));
+        }
+    std::printf("     collapsed patch: free node off the exact field by %.2e m of %.2e\n", worst,
+                strain);
+    // Measured at 3.4e-19 m, which is 3.4e-15 of the field. Asserted a hundredfold
+    // above that and still eleven decades below anything a mis-integrated wedge
+    // could hide in -- a wrong Jacobian shows up in the *third* figure, not the
+    // fifteenth.
+    expectTrue("and reproduces the linear field exactly", worst < 1e-13 * strain);
+    // Vacuity: the free node has to be somewhere the field is non-zero, or "exact"
+    // would mean "zero equals zero".
+    expectTrue("the free node is somewhere the field is not zero",
+               std::abs(mesh.position[8 * 3]) > 0.1);
+
+    // And the steel is all there: the four triangles are the unit square.
+    double volume = 0;
+    for (std::size_t e = 0; e < mesh.elementCount(); ++e) {
+        double nodes[kDof], gauss[kGauss];
+        mesh.gather(e, mesh.position, nodes);
+        gaussVolumes(nodes, gauss);
+        for (double v : gauss) volume += v;
+    }
+    expectNear("and the four wedges are exactly the plate they cover", volume, t, 1e-15 * t);
+}
+
 // The pressure load's *line of action*, not just its total. Both are closed forms
 // -- the resultant is p times the face area vector and it acts through the face's
 // area centroid -- and on a rectangular face an even quarter-each lumping gets both
@@ -2224,6 +2609,9 @@ void runSolidShellTests() {
     testElementStiffnessRank();
     testLumpedMass();
     testInvertedElementIsCaught();
+    testCollapsedElementIsAWedgeAndNotAFold();
+    testElementShapeSamplesTheQuadratureAndNotOnlyTheCorners();
+    testCollapsedElementSolvesAndPassesThePatchTest();
     testPressureLoadResultant();
     testFiniteRotationCarriesNoForce();
     testFrameIndifference();
