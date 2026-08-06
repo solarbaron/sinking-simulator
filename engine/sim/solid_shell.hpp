@@ -81,9 +81,19 @@
 // modes are scaled by `1/h^2`, of order ten. Kaa inherits the square of the ratio,
 // so **kappa(Kaa) ~ (h/t)^4 ~ 1e7 on perfectly ordinary plating**, and float's
 // seven digits leave none in alpha. Equilibrating Kaa before factoring recovers
-// most of it and is what the shader does; the better fix is to normalise the
-// enhanced modes here, which is a free basis change and would cost the double path
-// nothing. `07-fem-spike-findings.md` §8 has the measurements.
+// most of it and is what the shader does; **the better fix is to normalise the
+// enhanced modes here, and `computeForms` now does** -- a free basis change that
+// costs the double path nothing and takes kappa(Kaa) to a constant 3.50,
+// independent of the element's shape.
+//
+// **It did not, however, rescue the float path**, and that is worth recording
+// because the expectation that it would was explicit. Measured by A/B on a full
+// 5 505-step run with the normalisation switched off, every reported quantity is
+// unchanged to four significant figures -- because the shader's Jacobi
+// equilibration was already addressing the same conditioning, so there was nothing
+// left for a second fix to do. Float is still insufficient for this element, and
+// where it fails is the torn count. `07-fem-spike-findings.md` §8 has both
+// measurements.
 //
 // Body frame and SI units per CLAUDE.md.
 #pragma once

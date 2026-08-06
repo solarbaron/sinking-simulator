@@ -72,6 +72,231 @@ uint32_t groupsFor(std::size_t items, uint32_t size) {
 
 }  // namespace
 
+std::string describeElementPipelines(const std::string& shaderDirectory) {
+    std::string out;
+    VkInstance instance = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.pApplicationName = "shipsim-zone-gpu-stats";
+    app.apiVersion = VK_API_VERSION_1_3;
+    VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    instanceInfo.pApplicationInfo = &app;
+    if (vkCreateInstance(&instanceInfo, nullptr, &instance) != VK_SUCCESS)
+        return "  (no Vulkan instance)\n";
+
+    uint32_t count = 0;
+    vkEnumeratePhysicalDevices(instance, &count, nullptr);
+    if (count == 0) { vkDestroyInstance(instance, nullptr); return "  (no Vulkan device)\n"; }
+    std::vector<VkPhysicalDevice> devices(count);
+    vkEnumeratePhysicalDevices(instance, &count, devices.data());
+    VkPhysicalDevice physical = devices[0];
+    for (VkPhysicalDevice candidate : devices) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(candidate, &props);
+        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { physical = candidate; break; }
+    }
+
+    uint32_t extensionCount = 0;
+    vkEnumerateDeviceExtensionProperties(physical, nullptr, &extensionCount, nullptr);
+    std::vector<VkExtensionProperties> extensions(extensionCount);
+    vkEnumerateDeviceExtensionProperties(physical, nullptr, &extensionCount, extensions.data());
+    bool haveStats = false;
+    for (const VkExtensionProperties& ext : extensions)
+        if (std::strcmp(ext.extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) == 0)
+            haveStats = true;
+    if (!haveStats) {
+        vkDestroyInstance(instance, nullptr);
+        return "  (driver has no VK_KHR_pipeline_executable_properties)\n";
+    }
+
+    uint32_t families = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &families, nullptr);
+    std::vector<VkQueueFamilyProperties> familyProps(families);
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &families, familyProps.data());
+    uint32_t family = 0;
+    for (uint32_t i = 0; i < families; ++i)
+        if (familyProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { family = i; break; }
+
+    const float priority = 1.0f;
+    VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    queueInfo.queueFamilyIndex = family;
+    queueInfo.queueCount = 1;
+    queueInfo.pQueuePriorities = &priority;
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR feature{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    feature.pipelineExecutableInfo = VK_TRUE;
+    const char* wanted[] = {VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME};
+    VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    deviceInfo.pNext = &feature;
+    deviceInfo.queueCreateInfoCount = 1;
+    deviceInfo.pQueueCreateInfos = &queueInfo;
+    deviceInfo.enabledExtensionCount = 1;
+    deviceInfo.ppEnabledExtensionNames = wanted;
+    if (vkCreateDevice(physical, &deviceInfo, nullptr, &device) != VK_SUCCESS) {
+        vkDestroyInstance(instance, nullptr);
+        return "  (vkCreateDevice failed with the statistics extension)\n";
+    }
+
+    auto getStatistics = reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(
+        vkGetDeviceProcAddr(device, "vkGetPipelineExecutableStatisticsKHR"));
+    auto getExecutables = reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(
+        vkGetDeviceProcAddr(device, "vkGetPipelineExecutablePropertiesKHR"));
+
+    VkDescriptorSetLayoutBinding bindings[kBufferCount]{};
+    for (int i = 0; i < kBufferCount; ++i) {
+        bindings[i].binding = static_cast<uint32_t>(i);
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = kBufferCount;
+    layoutInfo.pBindings = bindings;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &setLayout);
+    VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants)};
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &setLayout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout);
+
+    // **The subgroup size, because it decides whether `solidshell_forces_wg.comp`'s
+    // barriers do anything on this machine.** That kernel declares
+    // `local_size_x = 32`. If the device's subgroup is also 32 then a workgroup is
+    // exactly one subgroup, executing in lockstep, and every `barrier()` in it is
+    // synchronising threads the hardware has already synchronised -- so removing one
+    // changes nothing here and would change everything on a device with independent
+    // thread scheduling. Mutation testing found exactly that: three of the four
+    // barrier mutants survive. This number is what turns that from a guess into a
+    // mechanism, so it is printed next to the statistics that motivated looking.
+    VkPhysicalDeviceSubgroupProperties subgroup{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    props2.pNext = &subgroup;
+    vkGetPhysicalDeviceProperties2(physical, &props2);
+    // Built by concatenation rather than into a fixed buffer: `deviceName` is 256
+    // bytes and any buffer short enough to be comfortable is short enough to
+    // truncate it, which `-Wformat-truncation` says out loud.
+    out += "  device ";
+    out += props2.properties.deviceName;
+    out += ": subgroup size " + std::to_string(subgroup.subgroupSize) +
+           ", workgroup of the remapped kernel 32 -- ";
+    out += subgroup.subgroupSize >= 32
+               ? "so one workgroup is one subgroup and its barriers are no-ops here\n"
+               : "so a workgroup spans subgroups and its barriers are load-bearing\n";
+
+    // **`node_integrate.comp` is the calibration, and it is here rather than in a
+    // constant on purpose.** This driver reports `Local Memory Size` with a large
+    // fixed offset -- 2^36 on the 1070 Ti -- so the raw number says nothing on its
+    // own. Rather than hardcode that, the first shader queried is one known to spill
+    // nothing (it is a handful of loads, a multiply-add and a store), and every
+    // spill figure below is quoted against whatever *it* reports. If a driver ever
+    // stops adding the offset the baseline goes to zero and the deltas still read
+    // correctly. Confirmed against `tet_forces.comp`, which reports the identical
+    // baseline -- which is also §8's claim that a linear tet's state fits in
+    // registers, checked rather than repeated.
+    const char* files[3] = {"node_integrate.comp.spv", "solidshell_forces.comp.spv",
+                            "solidshell_forces_wg.comp.spv"};
+    const char* labels[3] = {"node_integrate.comp (spill-free calibration)",
+                             "one invocation per element", "one workgroup per element"};
+    long long localBaseline = -1;
+    for (int which = 0; which < 3; ++which) {
+        out += "  ";
+        out += labels[which];
+        out += " (";
+        out += files[which];
+        out += ")\n";
+        const std::vector<uint32_t> spirv = readSpirv(shaderDirectory + "/" + files[which]);
+        if (spirv.empty()) { out += "    (shader not found)\n"; continue; }
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = spirv.size() * 4;
+        moduleInfo.pCode = spirv.data();
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(device, &moduleInfo, nullptr, &module) != VK_SUCCESS) continue;
+        VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        info.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+        info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        info.stage.module = module;
+        info.stage.pName = "main";
+        info.layout = pipelineLayout;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) !=
+            VK_SUCCESS) {
+            out += "    (pipeline creation failed)\n";
+            vkDestroyShaderModule(device, module, nullptr);
+            continue;
+        }
+        VkPipelineInfoKHR pipelineInfo{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+        pipelineInfo.pipeline = pipeline;
+        uint32_t executables = 0;
+        getExecutables(device, &pipelineInfo, &executables, nullptr);
+        std::vector<VkPipelineExecutablePropertiesKHR> props(
+            executables, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+        getExecutables(device, &pipelineInfo, &executables, props.data());
+        for (uint32_t i = 0; i < executables; ++i) {
+            VkPipelineExecutableInfoKHR executableInfo{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+            executableInfo.pipeline = pipeline;
+            executableInfo.executableIndex = i;
+            uint32_t statistics = 0;
+            getStatistics(device, &executableInfo, &statistics, nullptr);
+            std::vector<VkPipelineExecutableStatisticKHR> stats(
+                statistics, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+            getStatistics(device, &executableInfo, &statistics, stats.data());
+            // **Built by concatenation, not into a fixed buffer.** `s.name` is a
+            // 256-byte array the driver fills, so any `snprintf` into a buffer small
+            // enough to be convenient can truncate it -- which
+            // `-Wformat-truncation` says, but only at the optimisation level the
+            // sanitizer build uses. `CLAUDE.md`: "a build cannot see a warning its
+            // optimisation level does not produce", and this file proved it again.
+            const auto padded = [](const char* name) {
+                std::string s(name);
+                if (s.size() < 28) s.append(28 - s.size(), ' ');
+                return "    " + s + " ";
+            };
+            for (const VkPipelineExecutableStatisticKHR& s : stats) {
+                out += padded(s.name);
+                switch (s.format) {
+                    case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+                        out += std::to_string(s.value.i64);
+                        break;
+                    case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+                        out += std::to_string(s.value.u64);
+                        break;
+                    case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
+                        out += std::to_string(s.value.f64);
+                        break;
+                    default:
+                        out += s.value.b32 ? "true" : "false";
+                        break;
+                }
+                out += "\n";
+                if (std::strcmp(s.name, "Local Memory Size") == 0) {
+                    const long long raw = static_cast<long long>(s.value.u64);
+                    if (which == 0) {
+                        localBaseline = raw;
+                    } else if (localBaseline >= 0) {
+                        out += padded("  spill over calibration") +
+                               std::to_string(raw - localBaseline) + " bytes/thread (" +
+                               std::to_string((raw - localBaseline) / 4) + " floats)\n";
+                    }
+                }
+            }
+        }
+        vkDestroyPipeline(device, pipeline, nullptr);
+        vkDestroyShaderModule(device, module, nullptr);
+    }
+
+    vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
+    vkDestroyDevice(device, nullptr);
+    vkDestroyInstance(instance, nullptr);
+    return out;
+}
+
 struct ZoneGpuSolver::Impl {
     VkInstance       instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -103,6 +328,7 @@ struct ZoneGpuSolver::Impl {
     std::size_t elementCount = 0;
     std::size_t drivenCount = 0;
     PushConstants push{};
+    Mapping mapping = Mapping::Workgroup;
     sim::zone::Indenter indenter{};
     double timestep = 0;
     double time = 0;
@@ -219,7 +445,8 @@ ZoneGpuSolver::~ZoneGpuSolver() {
 bool ZoneGpuSolver::initialise(const sim::zone::Patch& patch, const sim::zone::Solver& cpu,
                                const sim::plasticity::Material& material,
                                const sim::zone::SolveParams& params,
-                               const std::string& shaderDirectory, std::string& error) {
+                               const std::string& shaderDirectory, std::string& error,
+                               Mapping mapping) {
     if (cpu.restForms().size() != patch.elementCount()) {
         error = "the CPU solver was built without SolveParams::cacheRestForms, so there is "
                 "nothing to upload";
@@ -233,6 +460,7 @@ bool ZoneGpuSolver::initialise(const sim::zone::Patch& patch, const sim::zone::S
 
     impl_ = new Impl();
     Impl& d = *impl_;
+    d.mapping = mapping;
     d.nodeCount = patch.nodeCount();
     d.elementCount = patch.elementCount();
     d.indenter = params.indenter;
@@ -393,7 +621,7 @@ bool ZoneGpuSolver::initialise(const sim::zone::Patch& patch, const sim::zone::S
     const std::vector<uint32_t> driven(cpu.drivenNodes().begin(), cpu.drivenNodes().end());
     d.drivenCount = driven.size();
     const std::vector<float> elementForce(e * kDof, 0.0f);
-    const std::vector<float> elementOut(e * 2, 0.0f);
+    const std::vector<float> elementOut(e, 0.0f);
     const std::vector<int32_t> accumulator(2, 0);
 
     const VkDeviceSize sizes[kBufferCount] = {
@@ -511,7 +739,10 @@ bool ZoneGpuSolver::initialise(const sim::zone::Patch& patch, const sim::zone::S
         }
         return true;
     };
-    if (!makePipeline("solidshell_forces.comp.spv", d.forceModule, d.forcePipeline)) return false;
+    const char* forceShader = mapping == Mapping::Workgroup ? "solidshell_forces_wg.comp.spv"
+                                                            : "solidshell_forces.comp.spv";
+    elementShader_ = forceShader;
+    if (!makePipeline(forceShader, d.forceModule, d.forcePipeline)) return false;
     if (!makePipeline("solidshell_integrate.comp.spv", d.integrateModule, d.integratePipeline))
         return false;
 
@@ -558,7 +789,14 @@ double ZoneGpuSolver::run(int substeps) {
                            &d.push);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.forcePipeline);
-        vkCmdDispatch(cmd, groupsFor(d.elementCount, kElementGroup), 1, 1);
+        // One workgroup per element, or one *invocation* per element packed 32 to a
+        // workgroup. The two shaders declare the same `local_size_x = 32`, so the only
+        // difference the host sees is how many groups an element costs.
+        vkCmdDispatch(cmd,
+                      d.mapping == Mapping::Workgroup
+                          ? static_cast<uint32_t>(d.elementCount)
+                          : groupsFor(d.elementCount, kElementGroup),
+                      1, 1);
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0,
                              nullptr);
@@ -589,7 +827,7 @@ ZoneGpuState ZoneGpuSolver::readback() const {
     const std::size_t n = d.nodeCount, e = d.elementCount;
 
     std::vector<float> position(n * 3), velocity(n * 3), state(e * kStateStride),
-        elementOut(e * 2);
+        elementOut(e);
     int32_t accumulator[2] = {0, 0};
     d.downloadFrom(d.buffers[0], position.data(), position.size() * sizeof(float));
     d.downloadFrom(d.buffers[1], velocity.data(), velocity.size() * sizeof(float));
@@ -627,7 +865,7 @@ ZoneGpuState ZoneGpuSolver::readback() const {
         // elements every step), so the two totals differ in rounding by
         // construction; that is a different summation order and not a different
         // model, and the comparison tool reports the gap rather than hiding it.
-        out.dissipation += elementOut[el * 2];
+        out.dissipation += elementOut[el];
     }
     out.work = static_cast<double>(accumulator[0]) / kWorkScale;
     out.steps = steps_;

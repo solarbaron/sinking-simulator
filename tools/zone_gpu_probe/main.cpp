@@ -58,6 +58,12 @@ struct Options {
     // produces in double. Without it there is no way to tell a wrong kernel from a
     // problem that amplifies any perturbation at all.
     double jitter = 0.0;
+    // Which device mapping to measure. `07-fem-spike-findings.md` §8's table was
+    // taken on `invocation` -- one thread per element -- and attributed its shape to
+    // register spilling rather than to the element, so the two have to be comparable
+    // on one command line or the re-measurement is not a re-measurement.
+    gpu::Mapping mapping = gpu::Mapping::Workgroup;
+    bool stats = false;   // report the compiler's register and spill counts, then stop
 };
 
 bool parse(int argc, char** argv, Options& o) {
@@ -75,7 +81,14 @@ bool parse(int argc, char** argv, Options& o) {
         else if (const char* v = value("sub")) o.subdivision = std::atoi(v);
         else if (const char* v = value("threads")) o.threads = std::atoi(v);
         else if (const char* v = value("steps")) o.steps = std::atoi(v);
+        else if (a == "--stats") o.stats = true;
         else if (const char* v = value("jitter")) o.jitter = std::atof(v);
+        else if (const char* v = value("mapping")) {
+            const std::string m = v;
+            if (m == "workgroup") o.mapping = gpu::Mapping::Workgroup;
+            else if (m == "invocation") o.mapping = gpu::Mapping::Invocation;
+            else { std::printf("--mapping must be workgroup or invocation\n"); return false; }
+        }
         else {
             std::printf("unknown option %s\n", a.c_str());
             return false;
@@ -94,6 +107,15 @@ double relative(double got, double want) {
 int main(int argc, char** argv) {
     Options options;
     if (!parse(argc, argv, options)) return 2;
+
+    // What the driver's compiler did with each mapping, before anything is timed.
+    // §8 diagnosed register spilling from the *shape* of the throughput curve; this
+    // asks the compiler directly, so the diagnosis is checked rather than inherited.
+    if (options.stats) {
+        std::printf("pipeline statistics, %s:\n", SHIPSIM_SHADER_DIR);
+        std::printf("%s", gpu::describeElementPipelines(SHIPSIM_SHADER_DIR).c_str());
+        return 0;
+    }
 
     sim::Ship ferry = game::buildFerry();
     ferry.initialise(0.0);
@@ -137,11 +159,13 @@ int main(int argc, char** argv) {
     gpu::ZoneGpuSolver device;
     std::string error;
     if (!device.initialise(patch, seed, sim::plasticity::shipSteel(), solve, SHIPSIM_SHADER_DIR,
-                           error)) {
+                           error, options.mapping)) {
         std::printf("skipped: %s\n", error.c_str());
         return 0;
     }
-    std::printf("device : %s\n", device.deviceName().c_str());
+    std::printf("device : %s, %s mapping\n", device.deviceName().c_str(),
+                options.mapping == gpu::Mapping::Workgroup ? "one workgroup per element"
+                                                           : "one invocation per element");
 
     const auto gpuBegin = std::chrono::steady_clock::now();
     const double kernelMs = device.run(steps);
@@ -216,6 +240,27 @@ int main(int argc, char** argv) {
         }
     std::printf("%-28s %16.4f %16.3e %12.2e\n", "peak eps_p / worst diff", peakStrain, worstStrain,
                 peakStrain > 0 ? worstStrain / peakStrain : 0.0);
+
+    // **How close either path came to tearing at all**, which is what decides
+    // whether a torn-element count is a measurement or a coincidence. Damage is the
+    // integral the tearing criterion reads: a point fails at 1.0 and an element is
+    // torn when all eight of its points have. Reporting the peak on both sides turns
+    // "0 torn against 0 torn" from an agreement that might be two zeros for
+    // unrelated reasons into a margin that can be quoted.
+    double peakDamage = 0, peakDamageGpu = 0;
+    int failedPoints = 0, failedPointsGpu = 0;
+    for (std::size_t e = 0; e < patch.elementCount(); ++e)
+        for (int gp = 0; gp < sim::solidshell::kGauss; ++gp) {
+            const auto& p = cpu.elementState()[e].point[gp];
+            const auto& q = state.plastic[e].point[gp];
+            peakDamage = std::max(peakDamage, p.damage);
+            peakDamageGpu = std::max(peakDamageGpu, q.damage);
+            if (p.failed) ++failedPoints;
+            if (q.failed) ++failedPointsGpu;
+        }
+    std::printf("%-28s %16.4f %16.4f %12.2e\n", "peak damage (1.0 fails)", peakDamage,
+                peakDamageGpu, relative(peakDamageGpu, peakDamage));
+    std::printf("%-28s %16d %16d\n", "failed Gauss points", failedPoints, failedPointsGpu);
 
     // The seven enhanced parameters, which are the per-element internal variables
     // the GPU condenses out every step. They are the part of this element most

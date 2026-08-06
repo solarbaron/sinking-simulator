@@ -4,12 +4,20 @@
 // Tier-2 element kernel of `engine/sim/zone.{hpp,cpp}` on the GPU.
 //
 // `fem_gpu.{hpp,cpp}` is the pattern, and the two are deliberately the same shape:
-// one invocation per element writing to a per-element force slot, a companion node
-// kernel that gathers them over a CSR adjacency in a fixed order, and every substep
-// recorded into one command buffer so the CPU is not in the loop. What differs is
-// the element -- eight nodes and 24 degrees of freedom against a tet's four and
-// twelve, seven enhanced assumed strains condensed at element level, and eight
-// integration points of plastic history that live on the device.
+// per-element force slots, a companion node kernel that gathers them over a CSR
+// adjacency in a fixed order, and every substep recorded into one command buffer so
+// the CPU is not in the loop. What differs is the element -- eight nodes and 24
+// degrees of freedom against a tet's four and twelve, seven enhanced assumed strains
+// condensed at element level, and eight integration points of plastic history that
+// live on the device.
+//
+// **The one part of the tet's pattern that does not carry over is one invocation per
+// element**, and that took a measurement to establish rather than an argument. A
+// linear tet's whole state fits in registers -- the driver reports zero spill for
+// `tet_forces.comp`. This element's does not: one thread per element spills 1 936
+// bytes, 484 floats, and Pascal serves that out of global memory. Both mappings are
+// built and `Mapping` selects between them; see below and
+// `07-fem-spike-findings.md` §8.
 //
 // --- Why this exists in the shape it does, which was measured first --------------
 //
@@ -59,8 +67,16 @@
 // Float, because the target is a GTX 1070 Ti where fp64 runs at 1/32 rate. Whether
 // that is enough is a measurement and not an assumption -- `tools/zone_gpu_probe`
 // runs this against the CPU double reference on the same patch and reports the
-// divergence in the quantities that mean anything. Two places were expected to
-// hurt and one of them does; the numbers are in `docs/07-fem-spike-findings.md` §8.
+// divergence in the quantities that mean anything.
+//
+// **It is not enough, and the remap did not change that by so much as a digit.**
+// Where it fails is the torn set: at 768 and 3 072 elements this kernel tears 40 and
+// 247 elements where the double reference tears 32 and 162, while the negative
+// control -- the same double solver on a mesh jittered by the size of float's own
+// representation error -- tears exactly 32 and 162. That is the whole argument, and
+// it is why the CPU is still the path a zone's answer comes from. The remaining
+// thing to try is keeping `alpha` in double; the numbers are in
+// `docs/07-fem-spike-findings.md` §8.
 //
 // It inherits §2's reproducibility bound: an explicit scheme at the CFL limit
 // amplifies float rounding in the modes at its stability boundary, so this is not
@@ -90,6 +106,35 @@ struct ZoneGpuState {
     int    tornElements = 0;
 };
 
+// How the element kernel is mapped onto the device. **Both compute the same thing**
+// -- the same element, the same arithmetic, the same accumulation order, the same 24
+// force slots -- and they exist together so the mapping can be A/B'd on one run
+// rather than argued about.
+//
+// `Invocation` is the tet back-end's pattern: one thread per element. It needs about
+// five hundred floats of thread-private, dynamically indexed state, which is twice
+// Pascal's register file per thread, so all of it spills to local memory.
+// `Workgroup` is 32 threads per element with that state in shared memory and the
+// eight Gauss points as threads rather than a loop. `07-fem-spike-findings.md` §8
+// has what each measures.
+enum class Mapping {
+    Invocation,  // solidshell_forces.comp
+    Workgroup,   // solidshell_forces_wg.comp
+};
+
+// **What the driver's compiler actually did with each mapping**, via
+// `VK_KHR_pipeline_executable_properties`: registers per thread, and how many bytes
+// of local memory the shader spills to. `07-fem-spike-findings.md` §8 attributed the
+// one-invocation kernel's throughput curve to spilling, which was a diagnosis from
+// the *shape* of the curve rather than from the compiler; this reads it out.
+//
+// Builds its own throwaway device and pipelines so it cannot perturb the path being
+// timed -- capturing statistics needs a pipeline-creation flag the spec allows to
+// change codegen, so it must not be set on a pipeline anyone measures. Returns a
+// human-readable report, or a line saying why it could not (no device, or a driver
+// without the extension). **Never fails; it is an instrument, not a dependency.**
+std::string describeElementPipelines(const std::string& shaderDirectory);
+
 class ZoneGpuSolver {
 public:
     ~ZoneGpuSolver();
@@ -109,7 +154,7 @@ public:
     bool initialise(const sim::zone::Patch& patch, const sim::zone::Solver& cpu,
                     const sim::plasticity::Material& material,
                     const sim::zone::SolveParams& params, const std::string& shaderDirectory,
-                    std::string& error);
+                    std::string& error, Mapping mapping = Mapping::Workgroup);
 
     // Records and submits `substeps` steps as one command buffer and returns the
     // **GPU-measured** milliseconds. Batching is the whole point: an explicit step
@@ -123,6 +168,13 @@ public:
     ZoneGpuState readback() const;
 
     const std::string& deviceName() const { return deviceName_; }
+    // Which element shader this solver actually loaded. Exposed for one reason:
+    // `tests/test_zone_gpu.cpp` compares the two mappings against each other, and
+    // that comparison is **vacuous if both of them loaded the same kernel** -- two
+    // runs of one shader agree perfectly and every tolerance passes. Mutation
+    // testing proved it: a mutant collapsing the ternary below to a single filename
+    // survived the whole suite. The guard is now an equality on this string.
+    const std::string& elementShader() const { return elementShader_; }
     bool valid() const { return device_ != nullptr; }
     // Steps recorded so far, and the simulated time and penetration they represent.
     int steps() const { return steps_; }
@@ -132,6 +184,7 @@ private:
     Impl* impl_ = nullptr;
     void* device_ = nullptr;  // mirrors impl_->device, for valid()
     std::string deviceName_;
+    std::string elementShader_;
     int steps_ = 0;
 };
 

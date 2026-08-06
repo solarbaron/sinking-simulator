@@ -167,6 +167,22 @@ if [ -x ./build/zone_probe ]; then
 else
   skip "zone_probe not built"
 fi
+# The same zone on the GPU against the CPU double reference. **Every figure in
+# `07-fem-spike-findings.md` §8 comes out of this tool and nothing ran it**, so it
+# could rot silently between the measurements that cite it — which is the shape of
+# the wing-tank warning that printed on every run for months with nobody reading it.
+# 1 500 steps, and the number was measured rather than picked. The tool refuses to
+# report `ok` unless the patch both moved and yielded — its own guard against
+# comparing two solvers that did nothing — and 600 steps does not yield it: peak
+# equivalent plastic strain 0.0000, and the guard fires exactly as it should. 1 200
+# is the first count that yields; 1 500 gives margin and still costs under a second,
+# against the ~30 s a run to tearing would.
+if [ -x ./build/zone_gpu_probe ]; then
+  expect_ok "zone_gpu_probe" '^ok$|^skipped: ' \
+            ./build/zone_gpu_probe --radius=2.5 --sub=4 --steps=1500
+else
+  skip "zone_gpu_probe not built"
+fi
 if [ -x ./build/seaway_view ]; then
   expect_ok "seaway_view" '^ok$|no usable GPU' \
             ./build/seaway_view --out=/tmp --frames=2
