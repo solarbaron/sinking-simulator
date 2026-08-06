@@ -171,10 +171,14 @@ namespace sim::coupling {
 // --- 1. A boundary condition on a reduced model ---------------------------------
 
 // One assembled DOF held at a value rather than at zero.
-struct Prescribed {
-    std::uint32_t dof = 0;  // index into the assembled model
-    double value = 0;       // m
-};
+//
+// **This moved.** It only ever touched an `Assembly`, and a chain of Tier-1 sections
+// needs the same thing from the other side of this file -- a ship is loaded by
+// prescribing a plane-sections field on its two end cuts -- so it lives in
+// `reduction.hpp` next to the solve it eliminates into. The names here are the same
+// names and mean the same thing; §2 below is still where the reasoning is written
+// down.
+using Prescribed = reduction::Prescribed;
 
 // K x = f with `held` at zero and `prescribed` at their values. See §2: the
 // prescribed values are eliminated into the right-hand side, so this is

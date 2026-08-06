@@ -1498,6 +1498,502 @@ void testInterfaceIsChosenOnTheMidSurface() {
     expectTrue("and what it does find is a subset of what the mesher found", subset);
 }
 
+// --- 6. A ship: a chain of sections ----------------------------------------------
+//
+// The end-to-end claim of the tier. **The reference is the same length meshed as one
+// section**, which owes nothing to the assembly -- it goes through
+// `solidshell::solveStatic` on the monolithic mesh -- and the box girder is used
+// because every quantity in it also has a closed form.
+//
+// The trap this file already knows about is the one that decides how these tests are
+// written. `EA` comes out exact on a chain of eight sections that tie nothing to
+// anything: prescribing plane sections at the ends makes every longitudinal strip
+// carry `sigma = E eps` whatever it is joined to (§2), and a chain is no different.
+// So every claim below that is about **joining** is made on torsion or on a frequency,
+// and `EA` appears only as the thing that is exact while `GJ` is 19% out.
+
+section::ChainParams boxChain(int sections, bool junctions) {
+    section::ChainParams p;
+    p.section.subdivision = 1;
+    p.section.members = false;
+    p.section.junctions = junctions;
+    p.reduce.modes = 0;
+    p.reduce.cutoffFrequency = 0;
+    for (int i = 0; i <= sections; ++i) p.station.push_back(kL * i / sections);
+    return p;
+}
+
+constexpr double kBoxTorsion = kBoxTorsionConstant;  // GJ / G, m^4
+
+double shearModulus() {
+    const StructuralMaterial steel = ah36Steel();
+    return steel.youngsModulus / (2.0 * (1.0 + steel.poissonRatio));
+}
+
+// **Like for like: N sections and one section, with the junctions off on both.**
+//
+// Off on both, because the chain and the monolith are then the *same structure* and
+// any difference between them is the assembly. Tied they are not the same structure
+// -- an interior cut plane is an interface, an interface DOF is prescribed rather
+// than derived, and the chain therefore ties one station fewer per cut -- and mixing
+// the two questions is how a 19% error would come to look like round-off.
+void testChainOfSectionsIsTheWholeSection() {
+    std::printf("\n--- section: a chain of sections against the same length in one piece ---\n");
+    const StructuralMesh structure = makeBox(kT, kT);
+    const StructuralMaterial steel = ah36Steel();
+
+    const section::Chain chain = section::buildChain(structure, boxChain(4, false));
+    const section::Section whole = section::buildSection(structure, openBoxParams());
+    expectTrue("the chain built", chain.ready());
+    expectEqual("four sections went in", chain.assembly.parts, 4);
+    expectEqualCount("the sections together have the elements the whole box has",
+                     chain.section[0].elementCount() + chain.section[1].elementCount() +
+                         chain.section[2].elementCount() + chain.section[3].elementCount(),
+                     whole.elementCount());
+    double plate = 0;
+    for (const section::Section& s : chain.section) plate += s.plateMass;
+    expectNear("and the steel the whole box has", plate, whole.plateMass, 1e-9);
+
+    // Five cut planes, three of them interior and shared. A shared plane must be
+    // shared *entirely*: a chain assembles and solves with part of a cut unmatched.
+    expectEqualCount("three interior cut planes", chain.shared.size(), 3u);
+    for (std::size_t i = 0; i < chain.shared.size(); ++i) {
+        expectEqualCount("each shares a whole plane", chain.shared[i],
+                         3 * chain.section[i].forwardNodes.size());
+        expectEqualCount("with nothing left over", chain.unmatched[i], 0u);
+    }
+    expectNear("the box's plates are prismatic, so the planes coincide exactly",
+               chain.worstGap, 0.0, 0.0);
+    // The union of five planes counted once, not the sum of eight section planes.
+    expectEqualCount("the assembled boundary is the five planes", chain.boundaryDof(),
+                     5 * 3 * chain.section[0].forwardNodes.size());
+
+    // Untied, the box is four plates that touch nothing -- in the chain and in the
+    // monolith alike. `components` has to see both: that each section is four pieces,
+    // *and* that a piece of one section is the same piece of ship as the piece of the
+    // next it shares a cut plane with.
+    expectEqual("the untied chain is the four plates the untied box is", chain.components,
+                whole.components);
+    expectEqual("which is four and not sixteen", chain.components, 4);
+    // And the reduced model alone cannot see that, which is why there are two counts.
+    expectEqual("the reduced model is one piece even so", chain.reducedComponents, 1);
+
+    section::BeamLoad axial;
+    axial.strain = 1e-4;
+    section::BeamLoad bending;
+    bending.curvature = 1e-5;
+    bending.reference = kH / 2;
+    const section::BeamResponse chainAxial = section::applyBeamLoad(chain, axial);
+    const section::BeamResponse wholeAxial = section::applyBeamLoad(whole, steel, axial);
+    const section::BeamResponse chainBend = section::applyBeamLoad(chain, bending);
+    const section::BeamResponse wholeBend = section::applyBeamLoad(whole, steel, bending);
+    const section::TorsionResponse chainTwist = section::applyTwist(chain, 1e-4, kH / 2);
+    const section::TorsionResponse wholeTwist = section::applyTwist(whole, steel, 1e-4, kH / 2);
+    expectTrue("every solve ran", chainAxial.ok && wholeAxial.ok && chainBend.ok &&
+                                      wholeBend.ok && chainTwist.ok && wholeTwist.ok);
+
+    // Exact, not converged. The assembled boundary is the union of the cut planes,
+    // Guyan condensation is exact there for a load-free interior, and the scatter-add
+    // approximates nothing -- so the chain is the monolith to the conditioning of two
+    // independent solves. Measured at 9.9e-13, 1.4e-10 and 1.3e-10; asserted a decade
+    // or two above, because a tolerance far looser than the measurement would pass on
+    // a model that had lost the property and was merely well converged.
+    std::printf("     untied, 4 sections against 1: EA %+.2e, EI %+.2e, GJ %+.2e\n",
+                chainAxial.axialStiffness / wholeAxial.axialStiffness - 1,
+                chainBend.bendingStiffness / wholeBend.bendingStiffness - 1,
+                chainTwist.torsionalStiffness / wholeTwist.torsionalStiffness - 1);
+    expectNear("the chain's EA is the whole section's", chainAxial.axialStiffness,
+               wholeAxial.axialStiffness, 1e-11 * wholeAxial.axialStiffness);
+    expectNear("and its EI", chainBend.bendingStiffness, wholeBend.bendingStiffness,
+               1e-8 * wholeBend.bendingStiffness);
+    expectNear("and its GJ", chainTwist.torsionalStiffness, wholeTwist.torsionalStiffness,
+               1e-8 * wholeTwist.torsionalStiffness);
+    // Against the closed forms, so the pair are not merely agreeing with each other.
+    expectNear("and EA is the closed form", chainAxial.axialStiffness,
+               steel.youngsModulus * kBoxArea, kAxialTolerance * steel.youngsModulus * kBoxArea);
+    // The rigid body restraints pick one of a family of zero-energy motions rather
+    // than resisting anything, so their reaction is a defect and not a tolerance --
+    // and there are three of them per piece here, twelve in all.
+    expectTrue("the restraints carry nothing",
+               chainAxial.restraintReaction < 1e-9 * std::fabs(chainAxial.axialForce));
+
+    // **The vacuity guard.** All three agreeing to 1e-10 would also be what a chain
+    // that had silently collapsed onto one section produced, so the comparison has to
+    // be shown to have something in it: the same box tied is a *different* answer in
+    // torsion by an order of magnitude, and the chain is not the monolith's own solve.
+    const section::Section tiedWhole = section::buildSection(structure, boxParams());
+    const section::TorsionResponse tiedTwist = section::applyTwist(tiedWhole, steel, 1e-4, kH / 2);
+    expectTrue("a closed cell carries an order of magnitude more torque than an open one",
+               tiedTwist.torsionalStiffness > 10.0 * wholeTwist.torsionalStiffness);
+    expectTrue("and the chain solved a model of its own size, not the section's",
+               chain.assembly.size() > static_cast<int>(3 * chain.section[0].forwardNodes.size()));
+}
+
+// **What a cut plane costs, which `EA` cannot see and torsion can.**
+//
+// A junction node on a cut plane is an interface degree of freedom, and one of those
+// is prescribed rather than derived -- so it cannot also be tied. Cutting a length
+// into N pieces turns N-1 interior stations into interfaces and unties them. `EA` is
+// exact at every N regardless; `GJ` falls monotonically, and by 19% at N = 8.
+void testChainCutPlanesUntieTheJunctions() {
+    std::printf("\n--- section: what an interior cut plane costs the junctions ---\n");
+    const StructuralMesh structure = makeBox(kT, kT);
+    const StructuralMaterial steel = ah36Steel();
+    const section::Section whole = section::buildSection(structure, boxParams());
+    const section::TorsionResponse wholeTwist = section::applyTwist(whole, steel, 1e-4, kH / 2);
+    const double bredt = shearModulus() * kBoxTorsion;
+    expectTrue("the monolithic box is closed in torsion",
+               wholeTwist.torsionalStiffness > 0.9 * bredt);
+
+    double previousTorsion = 2.0 * wholeTwist.torsionalStiffness;
+    double previousTied = 2.0 * whole.tiedEdges;
+    for (int sections : {1, 2, 4, 8}) {
+        const section::Chain chain = section::buildChain(structure, boxChain(sections, true));
+        expectTrue("the tied chain built", chain.ready());
+        expectEqual("and is one piece of ship", chain.components, 1);
+        section::BeamLoad axial;
+        axial.strain = 1e-4;
+        const section::BeamResponse stretched = section::applyBeamLoad(chain, axial);
+        const section::TorsionResponse twisted = section::applyTwist(chain, 1e-4, kH / 2);
+        expectTrue("both solves ran", stretched.ok && twisted.ok);
+        std::printf("     %d sections: tied %5.1f m of %.1f, EA %+.2e of the whole, GJ %+.3f%%,"
+                    " %.4f of Bredt\n",
+                    sections, chain.tiedEdges, chain.junctionEdges,
+                    stretched.axialStiffness / (steel.youngsModulus * kBoxArea) - 1,
+                    100.0 * (twisted.torsionalStiffness / wholeTwist.torsionalStiffness - 1),
+                    twisted.torsionalStiffness / bredt);
+
+        // The whole point: axial says nothing.
+        expectNear("EA is the closed form at every N", stretched.axialStiffness,
+                   steel.youngsModulus * kBoxArea, kAxialTolerance * steel.youngsModulus * kBoxArea);
+        // And torsion says it every time.
+        expectTrue("every extra cut plane unties another station", chain.tiedEdges < previousTied);
+        expectTrue("and costs torsional stiffness", twisted.torsionalStiffness < previousTorsion);
+        previousTied = chain.tiedEdges;
+        previousTorsion = twisted.torsionalStiffness;
+        if (sections == 1)
+            // One section is the monolith reduced and reassembled, so it is the
+            // control for everything above: it must reproduce it exactly.
+            expectNear("a chain of one is the section it was cut from",
+                       twisted.torsionalStiffness, wholeTwist.torsionalStiffness,
+                       1e-9 * wholeTwist.torsionalStiffness);
+        if (sections == 8)
+            // Measured at -19.20%. Asserted as a band rather than a point because it
+            // is a property of this box's bay count, but a band tight enough that a
+            // chain which had stopped losing ties would fail it.
+            expectTrue("eight sections lose about a fifth of the torsional stiffness",
+                       twisted.torsionalStiffness < 0.85 * wholeTwist.torsionalStiffness &&
+                           twisted.torsionalStiffness > 0.75 * wholeTwist.torsionalStiffness);
+    }
+}
+
+// **The lowest fixed-interface frequency, which is the instrument that sees whether
+// the sections are joined.**
+//
+// Both end planes held is exactly the boundary condition
+// `Substructure::fixedInterfaceModes` applies to the same length in one piece, so the
+// monolithic answer is an independent reference. Three things are checked against it,
+// and the two negative controls are what make the first mean anything:
+//
+//   * untied on both sides, the chain converges on the monolith's own frequency from
+//     above as modes are added -- which is the reduction's upper-bound property
+//     surviving assembly;
+//   * a chain whose plating is not tied reads a fourteenth of the tied frequency,
+//     which is the failure §2 of this file exists to catch;
+//   * a chain whose *interfaces* did not match leaves its interior sections held at
+//     nothing, and opens with six rigid body modes per loose section instead of an
+//     elastic one. Neither shows up in `EA`.
+void testChainFrequencySeesTheJoins() {
+    std::printf("\n--- section: the lowest frequency of a chain, and what it sees ---\n");
+    const StructuralMesh structure = makeBox(kT, kT);
+
+    // The reference: the same length in one piece, its own fixed-interface modes,
+    // through none of the assembly.
+    const section::Section whole = section::buildSection(structure, openBoxParams());
+    reduction::Substructure sWhole(whole.mesh, whole.material, whole.interfaceNodes,
+                                   whole.attachment);
+    expectTrue("the monolithic substructure is ready", sWhole.ready());
+    const reduction::Eigenpairs exact = sWhole.fixedInterfaceModes(1);
+    expectTrue("and has a first mode", !exact.value.empty());
+    const double reference = std::sqrt(std::max(0.0, exact.value[0]));
+    expectTrue("which is not zero", reference > 0);
+
+    double previous = 0, atZeroModes = 0, converged = 0;
+    for (int modes : {0, 2, 6}) {
+        section::ChainParams params = boxChain(4, false);
+        params.reduce.modes = modes;
+        const section::Chain chain = section::buildChain(structure, params);
+        expectTrue("the chain built", chain.ready());
+        const std::vector<double> omega = section::chainFrequencies(chain);
+        expectTrue("it has a spectrum", !omega.empty());
+        std::printf("     %d modes a section: %.9f Hz against the monolith's %.9f\n", modes,
+                    omega[0] / (2 * std::numbers::pi), reference / (2 * std::numbers::pi));
+        expectTrue("an assembled frequency is an upper bound on the true one",
+                   omega[0] > reference * (1.0 - 1e-9));
+        if (modes == 0) atZeroModes = omega[0];
+        // Non-increasing to 1e-7. Enlarging each component's Ritz space can only
+        // lower an assembled Rayleigh quotient, so this is a theorem rather than a
+        // hope -- but by six modes the sequence has stopped moving and what is left
+        // is the dense generalised eigensolve's own accuracy, measured at 1.7e-9
+        // relative between the 2- and 6-mode runs. The slack is a hundred times that
+        // and forty times below the truncation the sequence is still carrying, so a
+        // chain that had stopped converging would still fail this.
+        if (modes > 0)
+            expectTrue("and adding modes brings it down", omega[0] <= previous * (1.0 + 1e-7));
+        previous = omega[0];
+        converged = omega[0];
+    }
+    // Measured: 0.844705 Hz at zero modes falling to 0.843943, which is the monolith's
+    // own 0.843941 to six figures. Asserted at 1e-5 relative because that is what was
+    // measured; 1e-2 would pass on a chain that had lost a whole section.
+    expectNear("with modes the chain reaches the monolith's own frequency", converged, reference,
+               1e-5 * reference);
+    // And the guard that there was anything to converge: Guyan alone is visibly above
+    // it, so this is a convergence rather than an identity that would hold on any
+    // assembly at all.
+    expectTrue("zero modes was visibly above the monolith's own frequency",
+               atZeroModes > reference * (1.0 + 1e-4));
+
+    // Negative control 1: the plating not tied. A chain of untied sections is four
+    // loose plates and reads a plate's frequency, not a box's.
+    const section::Chain tied = section::buildChain(structure, boxChain(4, true));
+    const section::Chain loosePlating = section::buildChain(structure, boxChain(4, false));
+    const std::vector<double> tiedOmega = section::chainFrequencies(tied);
+    const std::vector<double> looseOmega = section::chainFrequencies(loosePlating);
+    expectTrue("both chains have a spectrum", !tiedOmega.empty() && !looseOmega.empty());
+    std::printf("     tied %.4f Hz against untied %.4f Hz (x%.1f)\n",
+                tiedOmega[0] / (2 * std::numbers::pi), looseOmega[0] / (2 * std::numbers::pi),
+                tiedOmega[0] / looseOmega[0]);
+    expectTrue("tying the plating moves the chain's first frequency by an order of magnitude",
+               tiedOmega[0] > 10.0 * looseOmega[0]);
+
+    // Negative control 2: the sections not joined to *each other*. The same four
+    // components, assembled with no joints at all -- which is four perfectly good
+    // reduced models sitting in one matrix and produces a full set of plausible
+    // frequencies. What gives it away is that the two interior sections are then held
+    // at nothing and float free, six rigid body modes each.
+    {
+        std::vector<reduction::Component> parts(tied.section.size());
+        for (std::size_t i = 0; i < parts.size(); ++i)
+            parts[i] = {&tied.substructure[i], &tied.reduced[i]};
+        const reduction::Assembly apart = reduction::assemble(parts, {});
+        expectEqual("unjoined, the assembled model is four pieces",
+                    reduction::assembledComponents(apart), 4);
+        expectEqualCount("and its boundary is the sum rather than the union",
+                         static_cast<std::size_t>(apart.boundary),
+                         static_cast<std::size_t>(4 * tied.reduced[0].boundary));
+
+        // Held exactly as `chainFrequencies` holds them: the two outermost planes,
+        // named off the mesher's own plane lists rather than by position.
+        std::vector<std::uint32_t> held;
+        const auto holdPlane = [&](std::size_t i, const std::vector<std::uint32_t>& nodes) {
+            std::vector<std::uint8_t> onPlane(tied.section[i].mesh.nodeCount(), 0u);
+            for (std::uint32_t n : nodes) onPlane[n] = 1u;
+            const std::vector<std::uint32_t>& dof = tied.substructure[i].boundaryDof();
+            for (std::size_t b = 0; b < dof.size(); ++b)
+                if (onPlane[dof[b] / 3u])
+                    held.push_back(static_cast<std::uint32_t>(apart.from[i][b]));
+        };
+        holdPlane(0, tied.section.front().aftNodes);
+        holdPlane(parts.size() - 1, tied.section.back().forwardNodes);
+        expectEqualCount("two whole planes are held", held.size(),
+                         3 * (tied.section.front().aftNodes.size() +
+                              tied.section.back().forwardNodes.size()));
+
+        const std::vector<double> loose = reduction::assembledFrequencies(apart, held);
+        expectTrue("the unjoined model has a spectrum", loose.size() > 13);
+        // The cutoff is scaled off an independently derived frequency rather than
+        // fixed: rigid modes are near zero but not at machine precision, and a
+        // constant landing between the translations and the rotations is a mistake
+        // this repository has now made twice.
+        // **Count the rigid modes by the gap, not by a threshold.** A rigid mode is
+        // near zero and not at machine precision -- these run up to 7e-3 rad/s -- and
+        // a fixed cutoff landing between the translations and the rotations is a
+        // mistake this repository has recorded twice. So the split is the largest
+        // ratio between consecutive frequencies in the bottom of the spectrum, which
+        // is derived from the answer rather than assumed about it.
+        std::size_t split = 1;
+        double widest = 0;
+        for (std::size_t i = 1; i < 20 && i < loose.size(); ++i)
+            if (loose[i - 1] > 0 && loose[i] / loose[i - 1] > widest) {
+                widest = loose[i] / loose[i - 1];
+                split = i;
+            }
+        std::printf("     unjoined: %zu modes below a gap of x%.0f, first elastic %.4f Hz\n",
+                    split, widest, loose[split] / (2 * std::numbers::pi));
+        expectTrue("the rigid and elastic parts of the spectrum are orders of magnitude apart",
+                   widest > 100.0);
+        expectEqualCount("two of the four sections float free and bring six rigid modes each",
+                         split, 12u);
+        // And the elastic part of an unjoined chain is *higher*, not lower, which is
+        // the other half of why this control is worth having: what is left after the
+        // rigid modes is the two end sections held at one plane each, a quarter of the
+        // span, and a quarter-length cantilever is stiff. Measured 6.31 Hz against the
+        // joined chain's 0.84 -- so a chain that failed to join would show a spectrum
+        // that is wrong in both directions at once and plausible in neither.
+        expectTrue("what is left is two quarter-length pieces, and they are stiffer",
+                   loose[split] > 3.0 * looseOmega[0]);
+    }
+}
+
+// --- The ferry: the same identities on real geometry ------------------------------
+//
+// Mesh level only. A chain at ship scale is a dense reduced model of
+// `(N+1) x 1 170` DOF and the Cholesky at the end of it is core-seconds, so the
+// solved comparison lives in `tools/section_probe --chain=N`. What is here is what a
+// solve would never notice: whether cutting a length in two changes how much steel
+// there is.
+void testFerryChainConservesTheStructure() {
+    std::printf("\n--- section: two ferry sections carry the steel one section carries ---\n");
+    const StructuralMesh structure = ferryStructure();
+
+    section::SectionParams params;
+    params.subdivision = 1;
+    params.junctions = false;
+    const auto cut = [&](double from, double to) {
+        section::SectionParams p = params;
+        p.xFrom = from;
+        p.xTo = to;
+        return section::buildSection(structure, p);
+    };
+    const section::Section aft = cut(-7.2, -2.4);
+    const section::Section forward = cut(-2.4, 2.4);
+    const section::Section whole = cut(-7.2, 2.4);
+    expectTrue("all three meshed", !aft.empty() && !forward.empty() && !whole.empty());
+
+    expectEqualCount("the two sections have the elements the one section has",
+                     aft.elementCount() + forward.elementCount(), whole.elementCount());
+    expectNear("and its plating, to the last bit", aft.plateMass + forward.plateMass,
+               whole.plateMass, 1e-9);
+
+    // **The one that was wrong.** A member with no extent along x -- a frame, a deck
+    // beam -- lies *on* a station, and a station is a cut plane for the sections on
+    // both sides of it. Taken by both, a chain carries that ring of frames twice: 608
+    // fibres and 10.1% of two sections' stiffener mass, landing on shared interface
+    // DOF where nothing but a total would see it. The half-open rule the transverse
+    // *plating* already used is what fixes it, and this is the identity that says so.
+    expectNear("and its stiffener steel", aft.memberMass + forward.memberMass, whole.memberMass,
+               1e-9 * whole.memberMass);
+    expectEqualCount("fibre for fibre", aft.stiffening.fiber.size() + forward.stiffening.fiber.size(),
+                     whole.stiffening.fiber.size());
+    expectEqual("member for member", aft.membersAttached + forward.membersAttached,
+                whole.membersAttached);
+    // The guard: the rule has to have bitten, or the identity above is the identity
+    // of two things neither of which has a frame on the shared plane at all.
+    expectTrue("the shared cut plane really does carry members",
+               aft.membersOnForwardPlane > 0 && aft.membersOnForwardPlane == whole.membersOnForwardPlane);
+    expectTrue("and the stiffener is a real fraction of the section",
+               whole.memberMass > 0.3 * whole.plateMass);
+
+    // And the interfaces this chain would be assembled through: the aft section's
+    // forward plane is the forward section's aft plane, node for node.
+    expectEqualCount("the shared plane has the same nodes on both sides",
+                     aft.forwardNodes.size(), forward.aftNodes.size());
+    reduction::Substructure sAft(aft.mesh, aft.material, aft.interfaceNodes, aft.attachment);
+    reduction::Substructure sForward(forward.mesh, forward.material, forward.interfaceNodes,
+                                     forward.attachment);
+    expectTrue("both reduce", sAft.ready() && sForward.ready());
+    const reduction::InterfaceMap map = reduction::matchBoundaries(sAft, sForward);
+    expectEqualCount("and amidships every one of them matches at the default tolerance",
+                     map.shared, 3 * aft.forwardNodes.size());
+    expectNear("exactly", map.worstGap, 0.0, 0.0);
+}
+
+// **The interface is not coincident by construction, and the parallel middle body is
+// what hides it.** See `section.hpp` §6 note 1. A node is the mid-surface offset by
+// `t/2` along a normal this file averages over the sub-quads *inside* the section, so
+// two sections cut on the same station disagree about where that node is wherever the
+// hull is not prismatic. It is 3.4 µm at the outermost plane a chain can still be
+// built on -- and 3.4 µm is three orders of magnitude above the default tolerance.
+void testFerryChainInterfaceIsNotCoincidentByConstruction() {
+    std::printf("\n--- section: where two sections stop agreeing about the cut plane ---\n");
+    const StructuralMesh structure = ferryStructure();
+    section::ChainParams params;
+    params.section.subdivision = 1;
+    params.section.members = false;
+    params.section.junctions = false;
+    params.reduce.modes = 0;
+    params.reduce.cutoffFrequency = 0;
+    params.station = {-26.4, -21.6, -16.8};
+
+    const section::Chain strict = section::buildChain(structure, params);
+    expectEqualCount("the chain meshed two sections", strict.section.size(), 2u);
+    expectEqualCount("one interior plane", strict.unmatched.size(), 1u);
+    const std::size_t planeDof = 3 * strict.section[0].forwardNodes.size();
+    expectEqualCount("of 1170 boundary DOF", planeDof, 1170u);
+    std::printf("     at 1e-9: %zu of %zu unmatched, worst matched gap %.4e m\n",
+                strict.unmatched[0], planeDof, strict.worstGap);
+    expectTrue("at the default tolerance a large part of the plane finds no partner",
+               strict.unmatched[0] > planeDof / 4);
+    expectTrue("so the chain is refused rather than solved", !strict.ready());
+
+    section::ChainParams loose = params;
+    loose.matchTolerance = 1e-5;
+    const section::Chain joined = section::buildChain(structure, loose);
+    expectTrue("a tolerance the size of the disagreement joins the whole plane",
+               joined.ready());
+    expectEqualCount("with nothing left over", joined.unmatched[0], 0u);
+    expectEqualCount("and the whole plane shared", joined.shared[0], planeDof);
+    std::printf("     at 1e-5: 0 unmatched, worst matched gap %.4e m\n", joined.worstGap);
+    // The assembly's own account of it, which is a different measurement of the same
+    // thing: `Chain::worstGap` comes from the interface map, `worstMergedGap` from
+    // comparing the identities of the DOF that actually landed on one assembled row.
+    // Nothing else in the suite ever merges two DOF that are not exactly coincident,
+    // so without this the two are indistinguishable from zero and from each other.
+    expectNear("and the assembly reports the same gap on the rows it merged",
+               joined.assembly.worstMergedGap, joined.worstGap, 1e-15);
+    expectEqual("with no axis crossed", joined.assembly.axisDisagreements, 0);
+
+    // Measured at 3.4021e-06 m. Bracketed rather than asserted at a point, because it
+    // is a property of this hull's shoulder -- but bracketed tightly enough that a
+    // mesher which had started averaging its normals across the cut would fail it,
+    // which is the fix §6 names.
+    expectTrue("and the disagreement is microns, not the plate thickness",
+               joined.worstGap > 1e-6 && joined.worstGap < 1e-5);
+    // The guard against the whole test being about nothing: amidships the same
+    // measurement is exactly zero, so this is the hull's shape and not the mesher's
+    // arithmetic.
+    section::ChainParams amidships = params;
+    amidships.station = {-7.2, -2.4, 2.4};
+    const section::Chain prismatic = section::buildChain(structure, amidships);
+    expectTrue("amidships the same chain needs no tolerance at all", prismatic.ready());
+    expectNear("and the planes coincide exactly", prismatic.worstGap, 0.0, 0.0);
+    expectNear("by both measurements", prismatic.assembly.worstMergedGap, 0.0, 0.0);
+
+    // --- And the one solved comparison at ship scale ------------------------------
+    //
+    // The box says the assembly is exact; this says it on real geometry, with 1 170
+    // boundary DOF a plane and a section that comes apart into seven pieces. Torsion
+    // and not `EA`, for the reason this file exists to make: `EA` is exact on a chain
+    // that joined nothing. The rest of the ship-scale matrix -- `EA`, the neutral
+    // axis, `EI`, and what all of it costs tied -- is in `tools/section_probe
+    // --chain=N`, because a dense Cholesky at (N+1) x 1 170 is core-seconds and this
+    // one already is.
+    const section::Section mono = section::buildSection(structure, [&] {
+        section::SectionParams p = amidships.section;
+        p.xFrom = -7.2;
+        p.xTo = 2.4;
+        return p;
+    }());
+    expectEqual("the chain and the monolith are the same seven pieces", prismatic.components,
+                mono.components);
+    const section::TorsionResponse chainTwist = section::applyTwist(prismatic, 1e-6, 6.86);
+    const section::TorsionResponse monoTwist =
+        section::applyTwist(mono, mono.material, 1e-6, 6.86);
+    expectTrue("both twists ran", chainTwist.ok && monoTwist.ok);
+    std::printf("     ship scale: GJ chain %.6e against one piece %.6e (%+.2e)\n",
+                chainTwist.torsionalStiffness, monoTwist.torsionalStiffness,
+                chainTwist.torsionalStiffness / monoTwist.torsionalStiffness - 1);
+    // Measured at 3.9e-12 relative. Asserted at 1e-9 -- three decades above the
+    // measurement and six below anything a lost interface could hide in.
+    expectNear("two ferry sections carry the torque one ferry section carries",
+               chainTwist.torsionalStiffness, monoTwist.torsionalStiffness,
+               1e-9 * monoTwist.torsionalStiffness);
+    // Vacuity: an open cell and a closed one differ by orders of magnitude, so this
+    // is a comparison of something rather than of two zeros.
+    expectTrue("and it is a real torque", monoTwist.torsionalStiffness > 1e11);
+}
+
 }  // namespace
 
 void runSectionTests() {
@@ -1521,4 +2017,9 @@ void runSectionTests() {
     testFerryFibresAndTheirMass();
     testFerryBulkheadCutIsNotASeam();
     testInterfaceIsChosenOnTheMidSurface();
+    testChainOfSectionsIsTheWholeSection();
+    testChainCutPlanesUntieTheJunctions();
+    testChainFrequencySeesTheJoins();
+    testFerryChainConservesTheStructure();
+    testFerryChainInterfaceIsNotCoincidentByConstruction();
 }

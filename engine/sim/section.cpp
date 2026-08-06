@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -1028,7 +1030,25 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
             const double lengthSquared = length2(edge);
             if (!(lengthSquared > 0)) continue;
             const double lo = std::min(member.a.x, member.b.x), hi = std::max(member.a.x, member.b.x);
-            if (hi < params.xFrom - eps || lo > params.xTo + eps) continue;
+            // A member with no extent along x -- a frame, a deck beam -- lies *on* a
+            // station, and a station is a cut plane for the section on either side of
+            // it. Taken at both, the chain of sections a ship is built from carries
+            // that frame's steel and its stiffness **twice**, once from each
+            // neighbour: measured on the reference ferry, two four-bay sections come
+            // to 10.1% more stiffener mass than the same length in one piece, and the
+            // doubled tie lands on shared interface DOF where it is invisible in
+            // anything but a total. So it is half-open at the aft plane, which is the
+            // rule the transverse *plating* above already uses and for the same
+            // reason. The forward-most section of a ship loses the frame on its
+            // forward plane, exactly as it loses a bulkhead there.
+            if (hi - lo <= eps) {
+                if (!(lo >= params.xFrom - eps && lo < params.xTo - eps)) {
+                    if (lo >= params.xTo - eps && lo <= params.xTo + eps) ++section.membersOnForwardPlane;
+                    continue;
+                }
+            } else if (hi < params.xFrom - eps || lo > params.xTo + eps) {
+                continue;
+            }
 
             // A member with no extent along x -- a frame, a deck beam, a bulkhead
             // stiffener -- carries no longitudinal stress, so leaving it out costs a
@@ -1387,6 +1407,475 @@ TorsionResponse applyTwist(const Section& section, const StructuralMaterial& mat
     if (twist != 0) out.torsionalStiffness = out.torque * section.length() / twist;
     out.ok = true;
     return out;
+}
+
+// --- 6. A ship: a chain of sections ----------------------------------------------
+
+namespace {
+
+double nowSeconds() {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+// The boundary indices of a substructure whose node is one of `nodes`, ascending.
+std::vector<std::size_t> boundaryOnPlane(const reduction::Substructure& substructure,
+                                         const std::vector<std::uint32_t>& nodes) {
+    std::vector<std::size_t> out;
+    if (nodes.empty()) return out;
+    std::uint32_t highest = 0;
+    for (std::uint32_t n : nodes) highest = std::max(highest, n);
+    std::vector<std::uint8_t> onPlane(static_cast<std::size_t>(highest) + 1, 0u);
+    for (std::uint32_t n : nodes) onPlane[n] = 1u;
+    const std::vector<std::uint32_t>& dof = substructure.boundaryDof();
+    for (std::size_t b = 0; b < dof.size(); ++b) {
+        const std::size_t node = dof[b] / 3u;
+        if (node < onPlane.size() && onPlane[node]) out.push_back(b);
+    }
+    return out;
+}
+
+}  // namespace
+
+bool Chain::ready() const {
+    // **Not `components == 1`.** A chain of sections whose plating is not tied is
+    // several pieces and is still a model worth solving -- it is the negative control
+    // every junction claim is made against, and `applyBeamLoad` restrains each piece.
+    // What makes a chain unusable is an interface that did not match, because that is
+    // two unknowns where the ship has one.
+    if (section.empty() || assembly.empty()) return false;
+    if (reduced.size() != section.size() || substructure.size() != section.size()) return false;
+    for (const reduction::Substructure& s : substructure)
+        if (!s.ready()) return false;
+    for (const reduction::Reduction& r : reduced)
+        if (r.empty()) return false;
+    for (std::size_t u : unmatched)
+        if (u != 0) return false;
+    return !aftDof.empty() && !forwardDof.empty();
+}
+
+Chain buildChain(const StructuralMesh& structure, const ChainParams& params) {
+    Chain chain;
+    const auto report = [&](std::string message) { chain.problems.push_back(std::move(message)); };
+    if (params.station.size() < 2) {
+        report("a chain needs at least two cut planes");
+        return chain;
+    }
+    for (std::size_t i = 0; i + 1 < params.station.size(); ++i)
+        if (!(params.station[i + 1] > params.station[i])) {
+            report("the cut planes are not ascending");
+            return chain;
+        }
+    chain.xFrom = params.station.front();
+    chain.xTo = params.station.back();
+
+    // Every section first, and the vector sized once: a `reduction::Substructure`
+    // holds a reference to the mesh it was built from, so a reallocation here would
+    // leave every substructure pointing at a freed mesh.
+    const std::size_t pieces = params.station.size() - 1;
+    chain.section.reserve(pieces);
+    double t = nowSeconds();
+    for (std::size_t i = 0; i < pieces; ++i) {
+        SectionParams p = params.section;
+        p.xFrom = params.station[i];
+        p.xTo = params.station[i + 1];
+        chain.section.push_back(buildSection(structure, p));
+        const Section& s = chain.section.back();
+        chain.tiedEdges += s.tiedEdges;
+        chain.junctionEdges += s.junctionEdges;
+        if (s.empty()) {
+            report("section " + std::to_string(i) + " meshed no elements");
+            return chain;
+        }
+        if (s.floatingComponents > 0)
+            report("section " + std::to_string(i) + " has " +
+                   std::to_string(s.floatingComponents) +
+                   " components touching neither cut plane, which nothing in the assembled model"
+                   " restrains");
+    }
+    chain.meshSeconds = nowSeconds() - t;
+
+    t = nowSeconds();
+    chain.substructure.reserve(pieces);
+    chain.reduced.reserve(pieces);
+    for (std::size_t i = 0; i < pieces; ++i) {
+        const Section& s = chain.section[i];
+        chain.substructure.emplace_back(s.mesh, s.material, s.interfaceNodes, s.attachment);
+        if (!chain.substructure.back().ready()) {
+            report("section " + std::to_string(i) + " did not reduce: " +
+                   (chain.substructure.back().problems().empty()
+                        ? std::string("no reason given")
+                        : chain.substructure.back().problems().front()));
+            return chain;
+        }
+    }
+    for (std::size_t i = 0; i < pieces; ++i) {
+        chain.reduced.push_back(reduction::craigBampton(chain.substructure[i], params.reduce));
+        if (chain.reduced.back().empty()) {
+            report("section " + std::to_string(i) + " reduced to nothing");
+            return chain;
+        }
+    }
+    chain.reduceSeconds = nowSeconds() - t;
+
+    // Neighbours only. Two sections two bays apart share no cut plane, and asking
+    // `matchComponents` for every pair would cost k^2 boundary matches to find that
+    // out -- 1 170 x 1 170 distance tests each on this ship.
+    t = nowSeconds();
+    std::vector<reduction::Component> parts(pieces);
+    for (std::size_t i = 0; i < pieces; ++i)
+        parts[i] = {&chain.substructure[i], &chain.reduced[i]};
+    const std::vector<reduction::Joint> joints =
+        reduction::matchNeighbours(parts, params.matchTolerance);
+    if (pieces > 1 && joints.size() != pieces - 1)
+        report("only " + std::to_string(joints.size()) + " of " + std::to_string(pieces - 1) +
+               " interior cut planes joined anything at all: consecutive sections that share no"
+               " boundary DOF assemble into independent models standing side by side");
+
+    // What each interior plane actually matched. The count that matters is the one
+    // that did *not*: a chain assembles and solves with unmatched interface DOF, and
+    // what it has built is a ship torn along part of a cut.
+    chain.shared.assign(pieces > 0 ? pieces - 1 : 0, 0);
+    chain.unmatched.assign(pieces > 0 ? pieces - 1 : 0, 0);
+    for (const reduction::Joint& joint : joints) {
+        if (joint.b != joint.a + 1) continue;
+        const auto plane = static_cast<std::size_t>(joint.a);
+        if (plane >= chain.shared.size()) continue;
+        chain.shared[plane] = joint.map.shared;
+        chain.worstGap = std::max(chain.worstGap, joint.map.worstGap);
+    }
+    // A boundary DOF of section i that lies on the shared plane and found no partner
+    // in section i+1.
+    //
+    // **Which DOF are on the plane comes from the mesher, not from a position test.**
+    // A mesh node is the mid-surface offset by `t/2` along the plating normal, so a
+    // node of a panel whose normal leans out of the transverse plane is up to `t/2`
+    // off it -- 8 mm on the reference ferry, where `SectionParams::planeTolerance` is
+    // 1e-6. `Section::aftNodes` and `forwardNodes` are chosen on the mid-surface and
+    // take both of each pair, which is exact; asking `x == plane` instead silently
+    // drops every strip of plating that is not square to the cut, and a chain whose
+    // end planes were selected that way came out 33% short in `EA` on a shoulder
+    // while reporting nothing wrong at all.
+    for (std::size_t i = 0; i + 1 < pieces; ++i) {
+        std::vector<int> matched(chain.substructure[i].boundaryDof().size(), -1);
+        for (const reduction::Joint& joint : joints)
+            if (joint.a == static_cast<int>(i) && joint.b == static_cast<int>(i) + 1)
+                for (std::size_t b = 0; b < joint.map.aToB.size() && b < matched.size(); ++b)
+                    matched[b] = joint.map.aToB[b];
+        for (std::size_t b : boundaryOnPlane(chain.substructure[i], chain.section[i].forwardNodes))
+            if (matched[b] < 0) ++chain.unmatched[i];
+    }
+    chain.assembly = reduction::assemble(parts, joints);
+    chain.assembleSeconds = nowSeconds() - t;
+    for (const std::string& p : chain.assembly.problems) report(p);
+    if (chain.assembly.empty()) {
+        report("the chain assembled into nothing");
+        return chain;
+    }
+    chain.reducedComponents = reduction::assembledComponents(chain.assembly);
+    if (chain.reducedComponents != 1)
+        report("the assembled reduced model is in " + std::to_string(chain.reducedComponents) +
+               " pieces: consecutive sections do not share the cut plane between them");
+
+    // Pieces of the *structure*, which is a different count and the one a ship is
+    // judged by. `reduction::assembledComponents` cannot see inside a section -- a
+    // component's reduced pair is dense over its own DOF whether the mesh behind it
+    // is one piece or seven -- and `Section::components` cannot see across a cut
+    // plane. This joins the two: a mesh component of one section and a mesh component
+    // of the next are the same piece of ship when they share an assembled row.
+    {
+        std::vector<std::size_t> base(pieces + 1, 0);
+        for (std::size_t i = 0; i < pieces; ++i)
+            base[i + 1] = base[i] + static_cast<std::size_t>(std::max(chain.section[i].components, 1));
+        chain.pieceOf.assign(base[pieces], -1);
+        std::vector<int> parent(base[pieces]);
+        for (std::size_t i = 0; i < parent.size(); ++i) parent[i] = static_cast<int>(i);
+        const std::function<int(int)> find = [&](int a) {
+            while (parent[static_cast<std::size_t>(a)] != a)
+                a = parent[static_cast<std::size_t>(a)] =
+                    parent[static_cast<std::size_t>(parent[static_cast<std::size_t>(a)])];
+            return a;
+        };
+        std::vector<int> claim(static_cast<std::size_t>(chain.assembly.boundary), -1);
+        for (std::size_t i = 0; i < pieces; ++i) {
+            const std::vector<std::uint32_t>& dof = chain.substructure[i].boundaryDof();
+            const std::vector<int>& from = chain.assembly.from[i];
+            for (std::size_t b = 0; b < dof.size() && b < from.size(); ++b) {
+                const std::size_t node = dof[b] / 3u;
+                if (node >= chain.section[i].componentOf.size()) continue;
+                const int component = chain.section[i].componentOf[node];
+                if (component < 0 || from[b] < 0) continue;
+                const int key = static_cast<int>(base[i]) + component;
+                const auto row = static_cast<std::size_t>(from[b]);
+                if (claim[row] < 0) {
+                    claim[row] = key;
+                    continue;
+                }
+                const int x = find(claim[row]), y = find(key);
+                if (x != y) parent[static_cast<std::size_t>(x)] = y;
+            }
+        }
+        std::map<int, int> label;
+        for (std::size_t d = 0; d < chain.pieceOf.size(); ++d) {
+            const int root = find(static_cast<int>(d));
+            auto found = label.find(root);
+            if (found == label.end()) found = label.emplace(root, static_cast<int>(label.size())).first;
+            chain.pieceOf[d] = found->second;
+        }
+        chain.componentBase = base;
+        chain.components = static_cast<int>(label.size());
+    }
+    if (chain.components != 1)
+        report("the chain is in " + std::to_string(chain.components) +
+               " structurally disconnected pieces, counting the mesh inside each section and the"
+               " cut planes between them");
+    for (std::size_t i = 0; i < chain.unmatched.size(); ++i)
+        if (chain.unmatched[i] > 0)
+            report(std::to_string(chain.unmatched[i]) +
+                   " boundary DOF on the cut plane at x = " + std::to_string(params.station[i + 1]) +
+                   " found no partner in the next section and are two unknowns where the ship has"
+                   " one: raise ChainParams::matchTolerance, and see section.hpp section 6 note 1"
+                   " for why they are not coincident");
+
+    // The two end planes, in assembled numbering: the aft-most section's own aft plane
+    // and the forward-most section's own forward plane, mapped through `from`. See
+    // `boundaryOnPlane` for why this is not a position test.
+    if (chain.assembly.boundaryPoint.size() != static_cast<std::size_t>(chain.assembly.boundary))
+        report("the assembly carries no boundary DOF identity, so nothing can be prescribed on it"
+               " by position");
+    {
+        const auto collect = [&](std::size_t i, const std::vector<std::uint32_t>& nodes,
+                                 std::vector<std::uint32_t>& into) {
+            const std::vector<int>& from = chain.assembly.from[i];
+            for (std::size_t b : boundaryOnPlane(chain.substructure[i], nodes))
+                if (b < from.size() && from[b] >= 0)
+                    into.push_back(static_cast<std::uint32_t>(from[b]));
+        };
+        collect(0, chain.section.front().aftNodes, chain.aftDof);
+        collect(pieces - 1, chain.section.back().forwardNodes, chain.forwardDof);
+    }
+    if (chain.aftDof.empty() || chain.forwardDof.empty())
+        report("one of the chain's end planes carries no assembled boundary DOF");
+    return chain;
+}
+
+namespace {
+
+// The reaction at every assembled DOF: `K x` over the dense assembled stiffness.
+// This is the one thing that would notice a stiffness assembled one way and a
+// reaction taken another, which is why it is formed from `assembly.stiffness` rather
+// than from the sections' element matrices.
+std::vector<double> assembledReaction(const reduction::Assembly& assembly,
+                                      const std::vector<double>& state) {
+    const std::size_t n = static_cast<std::size_t>(assembly.size());
+    std::vector<double> out(n, 0.0);
+    if (state.size() != n || assembly.stiffness.size() != n * n) return out;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double* row = &assembly.stiffness[i * n];
+        double sum = 0;
+        for (std::size_t j = 0; j < n; ++j) sum += row[j] * state[j];
+        out[i] = sum;
+    }
+    return out;
+}
+
+// Which assembled boundary rows belong to each structural piece of the chain.
+std::vector<std::vector<std::uint32_t>> rowsPerPiece(const Chain& chain) {
+    std::vector<std::vector<std::uint32_t>> out(static_cast<std::size_t>(std::max(chain.components, 0)));
+    if (out.empty() || chain.componentBase.size() != chain.section.size() + 1) return {};
+    std::vector<std::uint8_t> taken(static_cast<std::size_t>(chain.assembly.boundary), 0u);
+    for (std::size_t i = 0; i < chain.section.size(); ++i) {
+        const std::vector<std::uint32_t>& dof = chain.substructure[i].boundaryDof();
+        const std::vector<int>& from = chain.assembly.from[i];
+        for (std::size_t b = 0; b < dof.size() && b < from.size(); ++b) {
+            const std::size_t node = dof[b] / 3u;
+            if (node >= chain.section[i].componentOf.size() || from[b] < 0) continue;
+            const int component = chain.section[i].componentOf[node];
+            if (component < 0) continue;
+            const auto key = chain.componentBase[i] + static_cast<std::size_t>(component);
+            if (key >= chain.pieceOf.size()) continue;
+            const int piece = chain.pieceOf[key];
+            const auto row = static_cast<std::size_t>(from[b]);
+            if (piece < 0 || static_cast<std::size_t>(piece) >= out.size() || taken[row]) continue;
+            taken[row] = 1u;
+            out[static_cast<std::size_t>(piece)].push_back(static_cast<std::uint32_t>(row));
+        }
+    }
+    return out;
+}
+
+// Three restraints **per structural piece**, which is what takes out the rigid body
+// motions prescribing `u_x` alone leaves: translation in y and z, and rotation about
+// x. Per piece and not per chain, for exactly the reason `applyBeamLoad` gives for
+// one section -- a section of a real ship comes apart into pieces, each keeps its
+// own three, and restraining only one leaves the rest as mechanisms and the
+// factorisation fails. An untied chain of the reference ferry is seven pieces.
+//
+// They are a *statically determinate* restraint, so their reaction is exactly zero on
+// the exact solution, and `restraintReaction` says so rather than assuming it.
+//
+// Chosen off the assembly's own boundary identity rather than off a mesh: an anchor
+// with both transverse DOF in the model, and whichever row of the piece has the
+// longest arm from it in the transverse plane, held on the axis the arm is
+// **perpendicular** to -- a deck node's arm is almost all in y, so holding its `u_y`
+// would carry the rotation about x through a lever of nothing.
+bool chainRestraints(const Chain& chain, std::vector<std::uint32_t>& held) {
+    held.clear();
+    const std::vector<reduction::BoundaryDof>& point = chain.assembly.boundaryPoint;
+    if (point.size() != static_cast<std::size_t>(chain.assembly.boundary)) return false;
+    const std::vector<std::vector<std::uint32_t>> rows = rowsPerPiece(chain);
+    if (rows.empty()) return false;
+
+    for (const std::vector<std::uint32_t>& piece : rows) {
+        int anchorY = -1, anchorZ = -1;
+        Vec3 anchor{};
+        for (std::uint32_t b : piece) {
+            if (point[b].axis != 1) continue;
+            for (std::uint32_t c : piece)
+                if (point[c].axis == 2 && length(point[c].position - point[b].position) < 1e-12) {
+                    anchorY = static_cast<int>(b);
+                    anchorZ = static_cast<int>(c);
+                    anchor = point[b].position;
+                    break;
+                }
+            if (anchorY >= 0) break;
+        }
+        if (anchorY < 0 || anchorZ < 0) return false;
+
+        int lever = -1;
+        double best = 0;
+        for (std::uint32_t b : piece) {
+            const reduction::BoundaryDof& d = point[b];
+            const double dy = d.position.y - anchor.y, dz = d.position.z - anchor.z;
+            const double arm = std::sqrt(dy * dy + dz * dz);
+            const std::uint32_t axis = std::fabs(dy) >= std::fabs(dz) ? 2u : 1u;
+            if (d.axis != axis || !(arm > best)) continue;
+            best = arm;
+            lever = static_cast<int>(b);
+        }
+        if (lever < 0 || !(best > 0)) return false;
+        held.push_back(static_cast<std::uint32_t>(anchorY));
+        held.push_back(static_cast<std::uint32_t>(anchorZ));
+        held.push_back(static_cast<std::uint32_t>(lever));
+    }
+    return true;
+}
+
+}  // namespace
+
+BeamResponse applyBeamLoad(const Chain& chain, const BeamLoad& load) {
+    BeamResponse out;
+    if (!chain.ready()) {
+        out.problem = "the chain is not ready: " +
+                      (chain.problems.empty() ? std::string("no sections") : chain.problems.front());
+        return out;
+    }
+    const std::vector<reduction::BoundaryDof>& point = chain.assembly.boundaryPoint;
+    const double mid = 0.5 * (chain.xFrom + chain.xTo);
+
+    // Only `u_x` on the two end planes, exactly as on one section: pinning `u_y` and
+    // `u_z` there would suppress the Poisson contraction and report a ship stiffer
+    // than it is by roughly `1 / (1 - nu^2)`.
+    std::vector<reduction::Prescribed> prescribed;
+    for (const std::vector<std::uint32_t>* plane : {&chain.aftDof, &chain.forwardDof})
+        for (std::uint32_t b : *plane) {
+            const reduction::BoundaryDof& d = point[b];
+            if (d.axis != 0) continue;
+            const double x = d.position.x - mid, z = d.position.z;
+            prescribed.push_back({b, load.strain * x + load.curvature * x * (z - load.reference)});
+        }
+    std::vector<std::uint32_t> held;
+    if (!chainRestraints(chain, held)) {
+        out.problem = "the chain's end planes carry no lever arm in the transverse plane, so the"
+                      " rotation about x cannot be held";
+        return out;
+    }
+
+    std::vector<double> state;
+    const std::vector<double> zeroLoad(static_cast<std::size_t>(chain.assembly.size()), 0.0);
+    std::string problem;
+    if (!reduction::assembledStaticSolve(chain.assembly, zeroLoad, held, prescribed, state,
+                                         &problem)) {
+        out.problem = problem;
+        return out;
+    }
+
+    const std::vector<double> reaction = assembledReaction(chain.assembly, state);
+    for (std::uint32_t b : chain.forwardDof) {
+        const reduction::BoundaryDof& d = point[b];
+        if (d.axis != 0) continue;
+        out.axialForce += reaction[b];
+        out.bendingMoment += reaction[b] * (d.position.z - load.reference);
+    }
+    for (std::size_t i = 0; i < state.size(); ++i) out.strainEnergy += 0.5 * state[i] * reaction[i];
+
+    std::vector<std::uint8_t> fixed(state.size(), 0u);
+    for (const reduction::Prescribed& p : prescribed) fixed[p.dof] = 1u;
+    for (std::uint32_t d : held) fixed[d] = 1u;
+    for (std::size_t i = 0; i < state.size(); ++i)
+        if (!fixed[i]) out.residual = std::max(out.residual, std::fabs(reaction[i]));
+    for (std::uint32_t d : held)
+        out.restraintReaction = std::max(out.restraintReaction, std::fabs(reaction[d]));
+    // Over the boundary rows only. A modal coordinate is not a displacement -- it is
+    // an amplitude against a mass-normalised mode shape -- so taking the largest of
+    // the whole reduced state would report metres that are not metres.
+    for (int b = 0; b < chain.assembly.boundary; ++b)
+        out.peakDisplacement =
+            std::max(out.peakDisplacement, std::fabs(state[static_cast<std::size_t>(b)]));
+    if (load.strain != 0) out.axialStiffness = out.axialForce / load.strain;
+    if (load.curvature != 0) out.bendingStiffness = out.bendingMoment / load.curvature;
+    out.ok = true;
+    return out;
+}
+
+TorsionResponse applyTwist(const Chain& chain, double twist, double reference) {
+    TorsionResponse out;
+    if (!chain.ready()) {
+        out.problem = "the chain is not ready: " +
+                      (chain.problems.empty() ? std::string("no sections") : chain.problems.front());
+        return out;
+    }
+    const std::vector<reduction::BoundaryDof>& point = chain.assembly.boundaryPoint;
+
+    // A rigid disc at each end: every degree of freedom prescribed, the aft plane
+    // held and the forward one turned. A twist is a statement about the section's
+    // shape and leaving anything free there would let the ship shear instead of turn.
+    std::vector<reduction::Prescribed> prescribed;
+    for (std::uint32_t b : chain.aftDof) prescribed.push_back({b, 0.0});
+    for (std::uint32_t b : chain.forwardDof) {
+        const reduction::BoundaryDof& d = point[b];
+        const double y = d.position.y, z = d.position.z - reference;
+        prescribed.push_back({b, d.axis == 0 ? 0.0 : (d.axis == 1 ? -twist * z : twist * y)});
+    }
+
+    std::vector<double> state;
+    const std::vector<double> zeroLoad(static_cast<std::size_t>(chain.assembly.size()), 0.0);
+    std::string problem;
+    if (!reduction::assembledStaticSolve(chain.assembly, zeroLoad, {}, prescribed, state,
+                                         &problem)) {
+        out.problem = problem;
+        return out;
+    }
+    const std::vector<double> reaction = assembledReaction(chain.assembly, state);
+    // The torque is the moment of the forward plane's reaction about x, and it needs
+    // both transverse components of the same node -- so it is summed per DOF with the
+    // arm each one has, which is the same sum written the other way round.
+    for (std::uint32_t b : chain.forwardDof) {
+        const reduction::BoundaryDof& d = point[b];
+        if (d.axis == 1) out.torque += -(d.position.z - reference) * reaction[b];
+        else if (d.axis == 2) out.torque += d.position.y * reaction[b];
+    }
+    for (std::size_t i = 0; i < state.size(); ++i) out.strainEnergy += 0.5 * state[i] * reaction[i];
+    if (twist != 0) out.torsionalStiffness = out.torque * chain.length() / twist;
+    out.ok = true;
+    return out;
+}
+
+std::vector<double> chainFrequencies(const Chain& chain) {
+    if (chain.assembly.empty()) return {};
+    std::vector<std::uint32_t> held = chain.aftDof;
+    held.insert(held.end(), chain.forwardDof.begin(), chain.forwardDof.end());
+    return reduction::assembledFrequencies(chain.assembly, held);
 }
 
 }  // namespace sim::section

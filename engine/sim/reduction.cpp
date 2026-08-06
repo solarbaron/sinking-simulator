@@ -1765,36 +1765,87 @@ bool solveHeld(const std::vector<double>& stiffness, std::size_t n,
     return true;
 }
 
+// Scatter-add one component's reduced pair into the assembly. Shared boundary DOF
+// land on the same row and column, which is the whole of the coupling: components
+// meeting at an interface have the same displacement there, so those are the same
+// unknown. Every route into an `Assembly` goes through this, so "assembling is
+// addition" is a property of the code rather than of three copies of it.
+void scatterInto(Assembly& out, const Reduction& r, const std::vector<int>& from) {
+    const std::size_t n = static_cast<std::size_t>(out.size());
+    const std::size_t m = static_cast<std::size_t>(r.size());
+    for (std::size_t i = 0; i < m; ++i) {
+        const int ri = from[i];
+        if (ri < 0) continue;
+        for (std::size_t j = 0; j < m; ++j) {
+            const int rj = from[j];
+            if (rj < 0) continue;
+            out.stiffness[static_cast<std::size_t>(ri) * n + static_cast<std::size_t>(rj)] +=
+                r.stiffness[i * m + j];
+            out.mass[static_cast<std::size_t>(ri) * n + static_cast<std::size_t>(rj)] +=
+                r.mass[i * m + j];
+        }
+    }
+}
+
+// Union-find over the boundary DOF of every component at once, which is what makes
+// three components possible where two needed only a map: a DOF shared by A and B and
+// by B and C is *one* assembled row, and no pairwise map says so.
+struct DofClasses {
+    std::vector<int> parent;
+    explicit DofClasses(std::size_t n) : parent(n) {
+        for (std::size_t i = 0; i < n; ++i) parent[i] = static_cast<int>(i);
+    }
+    int find(int a) {
+        while (parent[static_cast<std::size_t>(a)] != a) {
+            parent[static_cast<std::size_t>(a)] =
+                parent[static_cast<std::size_t>(parent[static_cast<std::size_t>(a)])];
+            a = parent[static_cast<std::size_t>(a)];
+        }
+        return a;
+    }
+    void join(int a, int b) {
+        a = find(a);
+        b = find(b);
+        if (a != b) parent[static_cast<std::size_t>(a)] = b;
+    }
+};
+
 }  // namespace
 
-InterfaceMap matchBoundaries(const Substructure& a, const Substructure& b, double tolerance) {
-    InterfaceMap out;
-    if (!a.ready() || !b.ready()) {
-        out.problems.push_back("a substructure is not ready, so its boundary means nothing");
-        return out;
+std::vector<BoundaryDof> boundaryIdentity(const Substructure& substructure) {
+    std::vector<BoundaryDof> out;
+    if (!substructure.ready()) return out;
+    const std::vector<std::uint32_t>& dof = substructure.boundaryDof();
+    const std::vector<double>& position = substructure.mesh().position;
+    out.reserve(dof.size());
+    for (std::uint32_t d : dof) {
+        const std::size_t node = d / 3u;
+        // A boundary DOF past the end of the mesh cannot happen from a ready
+        // substructure, and coming back short rather than reading past the array is
+        // what makes that a statement rather than an assumption.
+        if (3 * node + 2 >= position.size()) return {};
+        out.push_back({Vec3{position[3 * node], position[3 * node + 1], position[3 * node + 2]},
+                       d % 3u});
     }
-    const std::vector<std::uint32_t>& da = a.boundaryDof();
-    const std::vector<std::uint32_t>& db = b.boundaryDof();
-    const std::vector<double>& pa = a.mesh().position;
-    const std::vector<double>& pb = b.mesh().position;
-    out.aToB.assign(da.size(), -1);
+    return out;
+}
+
+InterfaceMap matchBoundaries(const std::vector<BoundaryDof>& a, const std::vector<BoundaryDof>& b,
+                             double tolerance) {
+    InterfaceMap out;
+    out.aToB.assign(a.size(), -1);
 
     const double tol2 = tolerance * tolerance;
-    std::vector<std::uint8_t> takenB(db.size(), 0);
-    for (std::size_t i = 0; i < da.size(); ++i) {
-        const std::uint32_t axis = da[i] % 3u;
-        const std::size_t na = da[i] / 3u;
-        if (3 * na + 2 >= pa.size()) continue;
-        for (std::size_t j = 0; j < db.size(); ++j) {
+    std::vector<std::uint8_t> takenB(b.size(), 0);
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        for (std::size_t j = 0; j < b.size(); ++j) {
             // The axis must agree. Matching on position alone would let a
             // coincident node couple x to y, and the assembled model would be
             // wrong in a way that still produces plausible numbers.
-            if (takenB[j] || db[j] % 3u != axis) continue;
-            const std::size_t nb = db[j] / 3u;
-            if (3 * nb + 2 >= pb.size()) continue;
-            const double dx = pa[3 * na] - pb[3 * nb];
-            const double dy = pa[3 * na + 1] - pb[3 * nb + 1];
-            const double dz = pa[3 * na + 2] - pb[3 * nb + 2];
+            if (takenB[j] || b[j].axis != a[i].axis) continue;
+            const double dx = a[i].position.x - b[j].position.x;
+            const double dy = a[i].position.y - b[j].position.y;
+            const double dz = a[i].position.z - b[j].position.z;
             const double d2 = dx * dx + dy * dy + dz * dz;
             if (d2 > tol2) continue;
             out.aToB[i] = static_cast<int>(j);
@@ -1808,6 +1859,39 @@ InterfaceMap matchBoundaries(const Substructure& a, const Substructure& b, doubl
         out.problems.push_back("the two substructures share no boundary DOF at this tolerance, so "
                                "assembling them would produce two independent models side by side");
     return out;
+}
+
+InterfaceMap matchBoundaries(const Substructure& a, const Substructure& b, double tolerance) {
+    InterfaceMap out;
+    if (!a.ready() || !b.ready()) {
+        out.problems.push_back("a substructure is not ready, so its boundary means nothing");
+        return out;
+    }
+    return matchBoundaries(boundaryIdentity(a), boundaryIdentity(b), tolerance);
+}
+
+InterfaceMap matchBoundaries(const Assembly& a, const Substructure& b, double tolerance) {
+    InterfaceMap out;
+    if (a.boundaryPoint.size() != static_cast<std::size_t>(a.boundary)) {
+        out.problems.push_back("the assembly carries no boundary DOF identity, so there is nothing "
+                               "to match against: it was built from reductions alone");
+        return out;
+    }
+    if (!b.ready()) {
+        out.problems.push_back("a substructure is not ready, so its boundary means nothing");
+        return out;
+    }
+    return matchBoundaries(a.boundaryPoint, boundaryIdentity(b), tolerance);
+}
+
+const std::vector<int>& Assembly::fromA() const {
+    static const std::vector<int> none;
+    return from.size() > 0 ? from[0] : none;
+}
+
+const std::vector<int>& Assembly::fromB() const {
+    static const std::vector<int> none;
+    return from.size() > 1 ? from[1] : none;
 }
 
 Assembly assemble(const Reduction& a, const Reduction& b, const InterfaceMap& map) {
@@ -1837,41 +1921,27 @@ Assembly assemble(const Reduction& a, const Reduction& b, const InterfaceMap& ma
 
     out.boundary = next;
     out.modes = a.modes + b.modes;
+    out.parts = 2;
     const std::size_t n = static_cast<std::size_t>(out.size());
     out.stiffness.assign(n * n, 0.0);
     out.mass.assign(n * n, 0.0);
 
-    out.fromA.assign(static_cast<std::size_t>(a.size()), -1);
-    for (int i = 0; i < a.boundary; ++i) out.fromA[static_cast<std::size_t>(i)] = i;
+    out.from.assign(2, {});
+    std::vector<int>& fromA = out.from[0];
+    std::vector<int>& fromB = out.from[1];
+    fromA.assign(static_cast<std::size_t>(a.size()), -1);
+    for (int i = 0; i < a.boundary; ++i) fromA[static_cast<std::size_t>(i)] = i;
     for (int j = 0; j < a.modes; ++j)
-        out.fromA[static_cast<std::size_t>(a.boundary + j)] = out.boundary + j;
+        fromA[static_cast<std::size_t>(a.boundary + j)] = out.boundary + j;
 
-    out.fromB.assign(static_cast<std::size_t>(b.size()), -1);
+    fromB.assign(static_cast<std::size_t>(b.size()), -1);
     for (int i = 0; i < b.boundary; ++i)
-        out.fromB[static_cast<std::size_t>(i)] = bBoundary[static_cast<std::size_t>(i)];
+        fromB[static_cast<std::size_t>(i)] = bBoundary[static_cast<std::size_t>(i)];
     for (int j = 0; j < b.modes; ++j)
-        out.fromB[static_cast<std::size_t>(b.boundary + j)] = out.boundary + a.modes + j;
+        fromB[static_cast<std::size_t>(b.boundary + j)] = out.boundary + a.modes + j;
 
-    // Scatter-add. Shared boundary DOF land on the same row and column, which is
-    // the whole of the coupling: two components meeting at an interface have the
-    // same displacement there, so those are the same unknown.
-    const auto scatter = [&](const Reduction& r, const std::vector<int>& from) {
-        const std::size_t m = static_cast<std::size_t>(r.size());
-        for (std::size_t i = 0; i < m; ++i) {
-            const int ri = from[i];
-            if (ri < 0) continue;
-            for (std::size_t j = 0; j < m; ++j) {
-                const int rj = from[j];
-                if (rj < 0) continue;
-                out.stiffness[static_cast<std::size_t>(ri) * n + static_cast<std::size_t>(rj)] +=
-                    r.stiffness[i * m + j];
-                out.mass[static_cast<std::size_t>(ri) * n + static_cast<std::size_t>(rj)] +=
-                    r.mass[i * m + j];
-            }
-        }
-    };
-    scatter(a, out.fromA);
-    scatter(b, out.fromB);
+    scatterInto(out, a, fromA);
+    scatterInto(out, b, fromB);
 
     for (const std::string& p : map.problems) out.problems.push_back(p);
     return out;
@@ -1909,6 +1979,55 @@ bool assembledStaticSolve(const Assembly& assembly, const std::vector<double>& l
                      state, problem);
 }
 
+bool assembledStaticSolve(const Assembly& assembly, const std::vector<double>& load,
+                          const std::vector<std::uint32_t>& held,
+                          const std::vector<Prescribed>& prescribed, std::vector<double>& state,
+                          std::string* problem) {
+    const std::size_t n = static_cast<std::size_t>(assembly.size());
+    state.assign(n, 0.0);
+    if (n == 0 || assembly.stiffness.size() != n * n) {
+        if (problem) *problem = "the assembly is empty";
+        return false;
+    }
+
+    // The prescribed field, zero everywhere else. Written by DOF rather than pushed,
+    // so a caller naming the same DOF twice gets the last value instead of two
+    // contributions to the right-hand side.
+    std::vector<double> xp(n, 0.0);
+    std::vector<std::uint8_t> isPrescribed(n, 0u);
+    for (const Prescribed& p : prescribed) {
+        if (p.dof >= n) {
+            if (problem) *problem = "a prescribed DOF is past the end of the assembly";
+            return false;
+        }
+        xp[p.dof] = p.value;
+        isPrescribed[p.dof] = 1u;
+    }
+
+    // f_f - (K x_p)_f. The rows belonging to held or prescribed DOF are discarded by
+    // the solve below, so they are computed and thrown away rather than skipped; the
+    // assembly is dense and the branch would cost more than the multiply.
+    std::vector<double> rhs(n, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        double sum = i < load.size() ? load[i] : 0.0;
+        const double* row = &assembly.stiffness[i * n];
+        for (std::size_t j = 0; j < n; ++j)
+            if (isPrescribed[j]) sum -= row[j] * xp[j];
+        rhs[i] = sum;
+    }
+
+    // A DOF that is both held and prescribed is prescribed: held is the special case
+    // value zero, and the other resolution would discard the value silently.
+    std::vector<std::uint32_t> fixed = held;
+    fixed.reserve(fixed.size() + prescribed.size());
+    for (const Prescribed& p : prescribed) fixed.push_back(p.dof);
+
+    if (!assembledStaticSolve(assembly, rhs, fixed, state, problem)) return false;
+    for (std::size_t d = 0; d < n; ++d)
+        if (isPrescribed[d]) state[d] = xp[d];
+    return true;
+}
+
 std::vector<double> componentState(const Assembly& assembly, const std::vector<int>& from,
                                    const std::vector<double>& state) {
     // The assembly is here to be checked against, not for symmetry. A state of the
@@ -1924,6 +2043,319 @@ std::vector<double> componentState(const Assembly& assembly, const std::vector<i
             out[i] = state[static_cast<std::size_t>(a)];
     }
     return out;
+}
+
+// --- Assembling many -------------------------------------------------------------
+
+namespace {
+
+// The joints of a component list, restricted to the pairs `wanted` accepts. One
+// implementation so that "neighbours only" is a filter rather than a second match.
+std::vector<Joint> matchPairs(const std::vector<Component>& parts, double tolerance,
+                              bool neighboursOnly) {
+    std::vector<Joint> out;
+    std::vector<std::vector<BoundaryDof>> identity(parts.size());
+    for (std::size_t c = 0; c < parts.size(); ++c)
+        if (parts[c].substructure) identity[c] = boundaryIdentity(*parts[c].substructure);
+
+    for (std::size_t a = 0; a < parts.size(); ++a)
+        for (std::size_t b = a + 1; b < parts.size(); ++b) {
+            if (neighboursOnly && b != a + 1) continue;
+            if (identity[a].empty() || identity[b].empty()) continue;
+            InterfaceMap map = matchBoundaries(identity[a], identity[b], tolerance);
+            // Sharing nothing is the expected answer for two components that are not
+            // neighbours, so the complaint `matchBoundaries` raises about it is not a
+            // problem here and the joint is simply not made.
+            if (map.shared == 0) continue;
+            map.problems.clear();
+            out.push_back({static_cast<int>(a), static_cast<int>(b), std::move(map)});
+        }
+    return out;
+}
+
+}  // namespace
+
+std::vector<Joint> matchComponents(const std::vector<Component>& parts, double tolerance) {
+    return matchPairs(parts, tolerance, false);
+}
+
+std::vector<Joint> matchNeighbours(const std::vector<Component>& parts, double tolerance) {
+    return matchPairs(parts, tolerance, true);
+}
+
+Assembly assemble(const std::vector<Component>& parts, const std::vector<Joint>& joints) {
+    Assembly out;
+    if (parts.empty()) {
+        out.problems.push_back("no components to assemble");
+        return out;
+    }
+    for (const Component& part : parts)
+        if (!part.reduced || part.reduced->empty()) {
+            out.problems.push_back("a component reduction is empty");
+            return out;
+        }
+    // A reduction that fell back to an empty one -- which `craigBampton` does rather
+    // than throwing -- is how a map and the matrices it indexes come to disagree, so
+    // the substructure a joint was matched against has to be the one that was reduced.
+    for (const Component& part : parts)
+        if (part.substructure &&
+            part.reduced->boundary != static_cast<int>(part.substructure->boundaryCount())) {
+            out.problems.push_back("a component reduction does not carry its substructure's "
+                                   "boundary, so an interface map does not describe it");
+            return out;
+        }
+
+    const std::size_t k = parts.size();
+    std::vector<std::size_t> offset(k + 1, 0);
+    for (std::size_t c = 0; c < k; ++c)
+        offset[c + 1] = offset[c] + static_cast<std::size_t>(parts[c].reduced->boundary);
+    const std::size_t total = offset[k];
+
+    DofClasses classes(total);
+    for (const Joint& joint : joints) {
+        if (joint.a < 0 || joint.b < 0 || static_cast<std::size_t>(joint.a) >= k ||
+            static_cast<std::size_t>(joint.b) >= k) {
+            out.problems.push_back("a joint names a component that is not in the list");
+            return out;
+        }
+        // A component joined to itself would merge two of its own boundary DOF into
+        // one unknown, which is a constraint and not an assembly.
+        if (joint.a == joint.b) {
+            out.problems.push_back("a joint joins a component to itself");
+            return out;
+        }
+        const std::size_t ca = static_cast<std::size_t>(joint.a), cb = static_cast<std::size_t>(joint.b);
+        if (joint.map.aToB.size() != static_cast<std::size_t>(parts[ca].reduced->boundary)) {
+            out.problems.push_back("a joint's interface map does not describe its component's "
+                                   "boundary");
+            return out;
+        }
+        for (std::size_t i = 0; i < joint.map.aToB.size(); ++i) {
+            const int j = joint.map.aToB[i];
+            if (j < 0) continue;
+            if (j >= parts[cb].reduced->boundary) {
+                out.problems.push_back("a joint's interface map points past its component's "
+                                       "boundary");
+                return out;
+            }
+            classes.join(static_cast<int>(offset[ca] + i),
+                         static_cast<int>(offset[cb] + static_cast<std::size_t>(j)));
+        }
+    }
+
+    // Number the classes in component order, so two components reproduce exactly the
+    // ordering the two-component `assemble` has always produced.
+    std::vector<int> row(total, -1);
+    int boundary = 0;
+    for (std::size_t d = 0; d < total; ++d) {
+        const int root = classes.find(static_cast<int>(d));
+        if (row[static_cast<std::size_t>(root)] < 0)
+            row[static_cast<std::size_t>(root)] = boundary++;
+        row[d] = row[static_cast<std::size_t>(root)];
+    }
+    out.boundary = boundary;
+    out.parts = static_cast<int>(k);
+    for (const Component& part : parts) out.modes += part.reduced->modes;
+
+    const std::size_t n = static_cast<std::size_t>(out.size());
+    out.stiffness.assign(n * n, 0.0);
+    out.mass.assign(n * n, 0.0);
+
+    out.from.assign(k, {});
+    int nextMode = out.boundary;
+    for (std::size_t c = 0; c < k; ++c) {
+        const Reduction& r = *parts[c].reduced;
+        std::vector<int>& from = out.from[c];
+        from.assign(static_cast<std::size_t>(r.size()), -1);
+        for (int i = 0; i < r.boundary; ++i)
+            from[static_cast<std::size_t>(i)] = row[offset[c] + static_cast<std::size_t>(i)];
+        for (int j = 0; j < r.modes; ++j)
+            from[static_cast<std::size_t>(r.boundary + j)] = nextMode++;
+    }
+
+    // The identity, and the check that the merges it describes were merges of the
+    // same physical DOF. `matchBoundaries` guarantees that; a hand-built `Joint` does
+    // not, and an assembly that coupled x to y would still solve.
+    bool haveIdentity = true;
+    for (const Component& part : parts)
+        if (!part.substructure) haveIdentity = false;
+    if (haveIdentity) {
+        out.boundaryPoint.assign(static_cast<std::size_t>(out.boundary), BoundaryDof{});
+        std::vector<std::uint8_t> filled(static_cast<std::size_t>(out.boundary), 0u);
+        for (std::size_t c = 0; c < k; ++c) {
+            const std::vector<BoundaryDof> identity = boundaryIdentity(*parts[c].substructure);
+            if (identity.size() != static_cast<std::size_t>(parts[c].reduced->boundary)) {
+                out.problems.push_back("a component's boundary identity is not its boundary");
+                out.boundaryPoint.clear();
+                haveIdentity = false;
+                break;
+            }
+            for (std::size_t i = 0; i < identity.size(); ++i) {
+                const auto r = static_cast<std::size_t>(row[offset[c] + i]);
+                if (!filled[r]) {
+                    out.boundaryPoint[r] = identity[i];
+                    filled[r] = 1u;
+                    continue;
+                }
+                const BoundaryDof& had = out.boundaryPoint[r];
+                if (had.axis != identity[i].axis) ++out.axisDisagreements;
+                out.worstMergedGap =
+                    std::max(out.worstMergedGap, length(had.position - identity[i].position));
+            }
+        }
+    }
+    if (out.axisDisagreements > 0)
+        out.problems.push_back(std::to_string(out.axisDisagreements) +
+                               " assembled boundary rows merge degrees of freedom along different "
+                               "axes: the model couples one direction to another and still solves");
+
+    for (std::size_t c = 0; c < k; ++c) scatterInto(out, *parts[c].reduced, out.from[c]);
+    for (const Joint& joint : joints)
+        for (const std::string& p : joint.map.problems) out.problems.push_back(p);
+    return out;
+}
+
+Assembly assemble(const Assembly& a, const Component& b, const InterfaceMap& map) {
+    Assembly out;
+    if (a.empty()) {
+        out.problems.push_back("the assembly is empty");
+        return out;
+    }
+    if (!b.reduced || b.reduced->empty()) {
+        out.problems.push_back("a component reduction is empty");
+        return out;
+    }
+    if (b.substructure &&
+        b.reduced->boundary != static_cast<int>(b.substructure->boundaryCount())) {
+        out.problems.push_back("a component reduction does not carry its substructure's boundary, "
+                               "so the interface map does not describe it");
+        return out;
+    }
+    if (map.aToB.size() != static_cast<std::size_t>(a.boundary)) {
+        out.problems.push_back("the interface map does not describe the assembly's boundary");
+        return out;
+    }
+    for (int j : map.aToB)
+        if (j >= b.reduced->boundary) {
+            out.problems.push_back("the interface map points past the component's boundary");
+            return out;
+        }
+
+    // Every existing assembled row keeps its index: the assembly's boundary first,
+    // then the component's unshared boundary, then the assembly's modal block, then
+    // the component's. That is what makes the fold usable by a caller that already
+    // holds indices into the assembly it started with.
+    const Reduction& r = *b.reduced;
+    std::vector<int> bBoundary(static_cast<std::size_t>(r.boundary), -1);
+    for (std::size_t i = 0; i < map.aToB.size(); ++i)
+        if (map.aToB[i] >= 0)
+            bBoundary[static_cast<std::size_t>(map.aToB[i])] = static_cast<int>(i);
+    int next = a.boundary;
+    for (std::size_t j = 0; j < bBoundary.size(); ++j)
+        if (bBoundary[j] < 0) bBoundary[j] = next++;
+
+    out.boundary = next;
+    out.modes = a.modes + r.modes;
+    out.parts = a.parts + 1;
+    out.worstMergedGap = a.worstMergedGap;
+    out.axisDisagreements = a.axisDisagreements;
+    const std::size_t n = static_cast<std::size_t>(out.size());
+    out.stiffness.assign(n * n, 0.0);
+    out.mass.assign(n * n, 0.0);
+
+    // The assembly enters as one component whose reduced DOF are its own, remapped:
+    // its boundary rows are unchanged and its modal block slides up by however many
+    // boundary rows the new component brought.
+    std::vector<int> fromAssembly(static_cast<std::size_t>(a.size()), -1);
+    for (int i = 0; i < a.boundary; ++i) fromAssembly[static_cast<std::size_t>(i)] = i;
+    for (int j = 0; j < a.modes; ++j)
+        fromAssembly[static_cast<std::size_t>(a.boundary + j)] = out.boundary + j;
+
+    out.from.assign(static_cast<std::size_t>(out.parts), {});
+    for (int c = 0; c < a.parts && static_cast<std::size_t>(c) < a.from.size(); ++c) {
+        std::vector<int> mapped = a.from[static_cast<std::size_t>(c)];
+        for (int& d : mapped)
+            if (d >= 0) d = fromAssembly[static_cast<std::size_t>(d)];
+        out.from[static_cast<std::size_t>(c)] = std::move(mapped);
+    }
+    std::vector<int>& fromB = out.from[static_cast<std::size_t>(a.parts)];
+    fromB.assign(static_cast<std::size_t>(r.size()), -1);
+    for (int i = 0; i < r.boundary; ++i)
+        fromB[static_cast<std::size_t>(i)] = bBoundary[static_cast<std::size_t>(i)];
+    for (int j = 0; j < r.modes; ++j)
+        fromB[static_cast<std::size_t>(r.boundary + j)] = out.boundary + a.modes + j;
+
+    // The identity carries only when both sides have one -- an assembly built from
+    // two bare `Reduction`s cannot acquire one by being folded.
+    if (a.boundaryPoint.size() == static_cast<std::size_t>(a.boundary) && b.substructure) {
+        const std::vector<BoundaryDof> identity = boundaryIdentity(*b.substructure);
+        if (identity.size() == static_cast<std::size_t>(r.boundary)) {
+            out.boundaryPoint.assign(static_cast<std::size_t>(out.boundary), BoundaryDof{});
+            for (int i = 0; i < a.boundary; ++i)
+                out.boundaryPoint[static_cast<std::size_t>(i)] =
+                    a.boundaryPoint[static_cast<std::size_t>(i)];
+            for (std::size_t i = 0; i < identity.size(); ++i) {
+                const auto place = static_cast<std::size_t>(bBoundary[i]);
+                if (static_cast<int>(place) >= a.boundary) {
+                    out.boundaryPoint[place] = identity[i];
+                    continue;
+                }
+                const BoundaryDof& had = out.boundaryPoint[place];
+                if (had.axis != identity[i].axis) ++out.axisDisagreements;
+                out.worstMergedGap =
+                    std::max(out.worstMergedGap, length(had.position - identity[i].position));
+            }
+        }
+    }
+
+    // The assembly's own pair is scattered as though it were a reduction, which it is
+    // -- boundary rows first, then modal, symmetric, dense. This is the copy the
+    // N-way route does not make.
+    Reduction asComponent;
+    asComponent.boundary = a.boundary;
+    asComponent.modes = a.modes;
+    asComponent.stiffness = a.stiffness;
+    asComponent.mass = a.mass;
+    scatterInto(out, asComponent, fromAssembly);
+    scatterInto(out, r, fromB);
+
+    for (const std::string& p : a.problems) out.problems.push_back(p);
+    for (const std::string& p : map.problems) out.problems.push_back(p);
+    // The same complaint the N-way route makes, and it has to be made here too: an
+    // assembly that counted a crossed axis and said nothing about it is an assembly
+    // whose caller has to know to look.
+    if (out.axisDisagreements > a.axisDisagreements)
+        out.problems.push_back(std::to_string(out.axisDisagreements) +
+                               " assembled boundary rows merge degrees of freedom along different "
+                               "axes: the model couples one direction to another and still solves");
+    return out;
+}
+
+int assembledComponents(const Assembly& assembly) {
+    const std::size_t n = static_cast<std::size_t>(assembly.size());
+    if (n == 0) return 0;
+    DofClasses classes(n);
+    for (const std::vector<int>& from : assembly.from) {
+        int first = -1;
+        for (int d : from) {
+            if (d < 0 || static_cast<std::size_t>(d) >= n) continue;
+            if (first < 0) {
+                first = d;
+                continue;
+            }
+            classes.join(first, d);
+        }
+    }
+    std::vector<std::uint8_t> seen(n, 0u);
+    int pieces = 0;
+    for (std::size_t d = 0; d < n; ++d) {
+        const auto root = static_cast<std::size_t>(classes.find(static_cast<int>(d)));
+        if (!seen[root]) {
+            seen[root] = 1u;
+            ++pieces;
+        }
+    }
+    return pieces;
 }
 
 }  // namespace sim::reduction

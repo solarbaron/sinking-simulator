@@ -552,6 +552,15 @@ struct Section {
     double worstJunctionWeight = 0;
 
     int straddlingPanels = 0;   // panels a cut plane passed through, and dropped
+    // Members with no extent along x -- frames, deck beams -- lying on the forward
+    // cut plane, left to the section forward of it. A station is a cut plane for the
+    // sections on **both** sides of it, so a member sitting on one belongs to
+    // whichever claims it and not to both: taken by both, a chain carries that
+    // frame's steel and stiffness twice, which is 10.1% of the stiffener mass of two
+    // four-bay sections of the reference ferry and is invisible in any total but the
+    // one it inflates. The rule is the half-open one `SectionParams::xFrom` already
+    // describes for transverse plating.
+    int membersOnForwardPlane = 0;
     int membersAttached = 0;    // members that contributed fibres
     int membersRefused = 0;     // members whose web is not along the plate normal
     int membersMissed = 0;      // members that lie on no run of mesh nodes
@@ -673,5 +682,208 @@ struct TorsionResponse {
 
 TorsionResponse applyTwist(const Section& section, const StructuralMaterial& material,
                            double twist, double reference = 0.0);
+
+// --- 6. A ship: a chain of sections ----------------------------------------------
+//
+// One section is a component and a component is not a ship. A ship is the whole
+// length cut at N+1 transverse planes, each piece reduced once, and the pieces
+// assembled -- `reduction.hpp` §Assembling many, whose union-find over the pairwise
+// interface maps is the part that stops at two components without it.
+//
+// Consecutive sections meet at a cut plane and share every degree of freedom on it,
+// so **the assembly is exact at zero modes**: the reduced boundary is the union of
+// the cut planes, static condensation is exact there for any load with no interior
+// load (`reduction.hpp` property 1), and the scatter-add approximates nothing. A
+// chain of N sections and the same length meshed as one section therefore agree on
+// `EA`, the neutral axis, `EI` and `GJ` to the conditioning of the solves and not to
+// a truncation -- which is a much sharper instrument than a convergence would be,
+// and it is what `tests/test_section.cpp` asserts. Modes buy dynamics, and the
+// chain's fixed-interface spectrum does converge on the monolithic one from above.
+//
+// --- What a chain is not, measured on the reference ferry -------------------------
+//
+// **1. The interface nodes are not coincident by construction, and the parallel
+// middle body is what hides it.** Two sections cut on the same frame station agree
+// on every *mid-surface* point of that station -- they come from the same panel
+// corners. They do not agree on the mesh nodes, because a node is the mid-surface
+// offset by `t/2` along the **nodal normal**, and this file averages that normal
+// over the sub-quads *inside the section*: aft of the plane for one, forward of it
+// for the other. Where the hull is prismatic those are the same vector and the nodes
+// land on top of each other exactly. Where it is not they do not:
+//
+//     plane x       -45.6  -33.6  -21.6   -9.6    0.0   12.0   24.0   36.0   48.0
+//     worst gap m   6.4e-4 3.5e-4 3.4e-6    0      0      0   1.9e-4 7.1e-4 1.0e-3
+//     nodes > 1e-9    116    112    112      0      0      0    112    116    120
+//
+// Most of that row is unreachable, and saying so is the honest half of quoting it:
+// two-bay sections of this ferry only reduce between about x = -26.4 and 16.8, and
+// outside that `buildSection` already refuses them with an inverted element. What is
+// reachable is the plane at **x = -21.6**, where the gap is 3.4e-6 m -- three orders
+// of magnitude below the plating and three above `matchBoundaries`' default. At that
+// default **336 of the plane's 1 170 boundary DOF find no partner**, and a chain
+// assembles out of them, solves, and is torn along 29% of the cut. So `Chain` counts
+// what did not match rather than trusting the tolerance.
+//
+// **What the tolerance costs is measured rather than argued.** At 1e-5 the whole
+// plane matches and the chain reproduces the same length in one piece to 3.1e-7 in
+// `EA`, 3.0e-7 in `EI` and 1.1e-6 in `GJ` -- so joining two nodes 3.4 µm apart is a
+// legitimate answer and the reason to set the tolerance is that the default silently
+// does something worse.
+//
+// The fix that needs no tolerance is that a section's node positions should not
+// depend on where it was cut: average the nodal normal over a halo of panels one bay
+// beyond each plane and mesh only what is inside. That is a change to
+// `buildSection`'s own weld classes and topology census -- the free-edge count, the
+// junction search and the surface walk all read the sub-quad list it would widen --
+// so it belongs with that machinery rather than here, in the same way
+// `constraint::SeamRun`'s per-station thickness belongs with `constraint.hpp` (§3).
+//
+// One warning that cost a day: **which boundary DOF are on a cut plane is a question
+// for the mesher and not for a position test.** `Section::aftNodes` and
+// `forwardNodes` are chosen on the mid-surface and take both nodes of each pair,
+// because a node whose plating leans out of the transverse plane is up to `t/2` off
+// it -- 8 mm here. Selecting the end planes by `x == station` instead drops exactly
+// the plating that is not square to the cut, and a chain built that way came out 33%
+// short in `EA` on a shoulder while reporting nothing wrong at all. It is the same
+// mistake in reverse that hid the 336 above behind a count of 24.
+//
+// **2. Every interior cut plane opens a ring of junctions the monolith closes.** A
+// junction node on a cut plane is an interface degree of freedom, and one of those is
+// prescribed rather than derived -- `Section::junctionsOnInterface`, §5. Cutting a
+// length into N pieces turns N-1 interior stations into interfaces, so the chain ties
+// N-1 stations fewer than the monolith does. Measured on x = -7.2 to 2.4 m of the
+// ferry, four bays: in one piece 36 ties and 72.0 m of junction edge joined; as two
+// two-bay sections, 12 + 12 ties and 4.8 + 4.8 m. That is not a rounding and it does
+// **not** get better with more sections -- it is the one thing about a chain that
+// argues for cutting it into as few pieces as the interface cost allows, and it is
+// the opposite of what an interior plane looks like it should do.
+//
+// It cannot be fixed by tying anyway: a degree of freedom cannot be both prescribed
+// and derived. What would fix it is a tie whose masters all lie *in* the cut plane,
+// which both sections would then derive identically from shared boundary DOF -- and
+// that is a line tie through the plating thickness rather than the bilinear face tie
+// §5 builds, so it is new machinery rather than a parameter.
+//
+// --- What it costs ----------------------------------------------------------------
+//
+// The interface is the whole cost and it is set by the cross-section, not by the
+// length: a transverse cut of the ferry is 1 170 boundary DOF at `subdivision = 1`,
+// so a chain of N sections is a **dense** `(N+1) x 1 170` reduced model -- 3 510 for
+// two, 5 850 for four -- and the assembled solve is a dense Cholesky at that size.
+// Cutting a ship into more pieces makes every piece cheaper to reduce and the
+// assembly quadratically dearer to solve, which is the trade a caller is making
+// whether or not it is stated. `tools/section_probe --chain=N` measures both halves.
+
+struct ChainParams {
+    // The cut planes, ascending: N+1 of them make N sections. **Frame stations**, for
+    // the reason `SectionParams::xFrom` gives -- a plane anywhere else passes through
+    // panels, which are then dropped from both neighbours and leave a gap in the
+    // chain rather than a short bay.
+    std::vector<double> station;
+
+    // What each section is meshed with. `xFrom` and `xTo` are overwritten per
+    // section; everything else is used as given.
+    SectionParams section;
+
+    // How each section is reduced. `modes = 0` is Guyan, which is exact at the
+    // interface for any static load and is what the static comparisons here use.
+    reduction::ReduceParams reduce;
+
+    // How far apart two boundary DOF on a shared cut plane may be and still be the
+    // same unknown. The default is `matchBoundaries`' own, which is right for a
+    // prismatic region and wrong everywhere else -- see note 1 above, and
+    // `Chain::unmatched`, which is what says so rather than leaving it to be assumed.
+    double matchTolerance = 1e-9;
+};
+
+// A ship built from sections: the pieces, their reductions, and the one assembled
+// model.
+//
+// `substructure` holds a reference to `section[i].mesh`, so neither vector may be
+// reallocated once the chain is built. Both are sized once here and never grown,
+// which is why this is a struct a caller receives rather than one it fills in.
+struct Chain {
+    std::vector<Section> section;                      // in order, aft to forward
+    std::vector<reduction::Substructure> substructure;  // one per section
+    std::vector<reduction::Reduction> reduced;
+    reduction::Assembly assembly;
+
+    // The assembled boundary DOF on the two outermost cut planes, which is what a
+    // caller prescribes to load the chain like a beam. Everything else -- every
+    // interior cut plane, every modal coordinate -- is free.
+    std::vector<std::uint32_t> aftDof, forwardDof;
+
+    // Per interior cut plane, N-1 of them: how many boundary DOF the two sections
+    // either side of it turned out to share, and how many of the aft section's
+    // forward-plane DOF found no partner. **`unmatched` is the number that matters**;
+    // a chain assembles and solves with it non-zero, and what it has then built is a
+    // ship torn along part of a cut.
+    std::vector<std::size_t> shared, unmatched;
+    double worstGap = 0;  // m, the furthest apart a matched pair actually was
+
+    // **Two component counts, because there are two questions and neither answers
+    // the other.** `reduction::assembledComponents` works on the reduced model, where
+    // a component's pair is dense over its own DOF whether the mesh behind it is one
+    // piece or seven -- so it sees a chain that failed to join at a cut plane and is
+    // blind to a section whose decks are not tied to its shell. `Section::components`
+    // is the other way round. `components` here joins the two: a mesh component of
+    // one section and a mesh component of the next are the same piece of ship when
+    // they share an assembled boundary row. **That is the one that must be 1.**
+    int components = 0;
+    int reducedComponents = 0;
+    // Which piece each `(section, mesh component)` belongs to, flattened by
+    // `componentBase[i] + c`. Exposed for the same reason `Section::componentOf` is:
+    // every rigid body motion is per piece, so anything restraining a chain has to
+    // restrain each of them -- `applyBeamLoad` below does, and an untied chain of a
+    // real ship has seven.
+    std::vector<int> pieceOf;
+    std::vector<std::size_t> componentBase;
+    // Junction ties the cut planes cost, against what the same length in one piece
+    // would have tied: see note 2. `tiedEdges` is summed over the sections.
+    double tiedEdges = 0, junctionEdges = 0;
+
+    double meshSeconds = 0, reduceSeconds = 0, assembleSeconds = 0;
+    std::size_t boundaryDof() const { return static_cast<std::size_t>(assembly.boundary); }
+    std::vector<std::string> problems;
+
+    double xFrom = 0, xTo = 0;
+    double length() const { return xTo - xFrom; }
+
+    // Every section meshed, every reduction ready, and nothing unmatched.
+    bool ready() const;
+};
+
+Chain buildChain(const StructuralMesh& structure, const ChainParams& params);
+
+// `applyBeamLoad` and `applyTwist`, on the assembled model instead of one section.
+//
+// The same field on the same two planes: `u_x = strain * x + curvature * x * (z -
+// reference)` on the chain's outermost cuts with `u_y` and `u_z` free, and for the
+// twist a rigid disc with every degree of freedom prescribed. What the reduced model
+// cannot do is restrain a rigid body mode on an *interior* node, because it has none
+// -- so the three restraints that take out the translations in y and z and the
+// rotation about x go on boundary DOF of the outermost planes, chosen the same way
+// `applyBeamLoad` chooses them and reported through `restraintReaction` the same way.
+//
+// A chain in more than one piece is refused rather than solved: the second piece is a
+// mechanism and the factorisation would report a rigid body mode without saying which
+// of the two it belonged to.
+BeamResponse applyBeamLoad(const Chain& chain, const BeamLoad& load);
+TorsionResponse applyTwist(const Chain& chain, double twist, double reference = 0.0);
+
+// The chain's lowest natural frequencies with both end planes held, rad/s ascending.
+//
+// This is the same boundary condition `reduction::Substructure::fixedInterfaceModes`
+// applies to the same length in one piece, so the two are directly comparable and the
+// monolithic answer owes nothing to any of this. It is an upper bound and it falls as
+// modes are added, which is the property `reduction.hpp` §1 item 3 is about.
+//
+// **It is the instrument that sees whether the sections are joined.** A chain whose
+// interfaces did not match leaves its interior sections held at nothing at all, so
+// its spectrum opens with six near-zero rigid body modes per loose section rather
+// than with an elastic mode. A chain of sections whose *plating* is not tied reads
+// the decks' own frequency instead, which is the failure §2 of this file is about.
+// Neither is visible in `EA` or `EI`.
+std::vector<double> chainFrequencies(const Chain& chain);
 
 }  // namespace sim::section

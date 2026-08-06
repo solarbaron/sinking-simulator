@@ -1698,8 +1698,8 @@ void testTwoComponentsAssembleIntoTheWhole() {
         const std::vector<double> fa = reduction::reduceLoad(sa, sra, loadA);
         const std::vector<double> fb = reduction::reduceLoad(sb, srb, loadB);
         std::vector<double> f(static_cast<std::size_t>(sasm.size()), 0.0);
-        for (std::size_t i = 0; i < fa.size(); ++i) f[static_cast<std::size_t>(sasm.fromA[i])] += fa[i];
-        for (std::size_t i = 0; i < fb.size(); ++i) f[static_cast<std::size_t>(sasm.fromB[i])] += fb[i];
+        for (std::size_t i = 0; i < fa.size(); ++i) f[static_cast<std::size_t>(sasm.fromA()[i])] += fa[i];
+        for (std::size_t i = 0; i < fb.size(); ++i) f[static_cast<std::size_t>(sasm.fromB()[i])] += fb[i];
 
         std::vector<double> x;
         std::string problem;
@@ -1766,7 +1766,7 @@ void testTwoComponentsAssembleIntoTheWhole() {
         // And `componentState` + `recover` put a component's own field back. The
         // boundary part must agree with what was just read out of the assembly,
         // which is the check that the index map is not quietly transposed.
-        const std::vector<double> xa = reduction::componentState(sasm, sasm.fromA, x);
+        const std::vector<double> xa = reduction::componentState(sasm, sasm.fromA(), x);
         expectEqualCount("a component's state is its own reduced size", xa.size(),
                          static_cast<std::size_t>(sra.size()));
         double worstMap = 0;
@@ -1780,7 +1780,7 @@ void testTwoComponentsAssembleIntoTheWhole() {
         // back as a plausible field silently missing its modal content.
         std::vector<double> truncated(x.begin(), x.end() - 1);
         expectTrue("and refuses a state that is not this assembly's",
-                   reduction::componentState(sasm, sasm.fromA, truncated).empty());
+                   reduction::componentState(sasm, sasm.fromA(), truncated).empty());
 
         const std::vector<double> ua = reduction::recover(sa, sra, xa);
         double worstInterior = 0;
@@ -2344,6 +2344,379 @@ void testAttachedMass() {
     }
 }
 
+// --- The position match, asked about on its own -----------------------------------
+//
+// **Every claim `matchBoundaries` makes is invisible through a substructure**, and
+// mutation testing is what said so: deleting the axis check, deleting the "this DOF
+// of B is already taken" mark, and deleting the `break` that keeps the *first* match
+// all survived a suite that only ever matched two real meshes. They survive together
+// because a substructure's boundary DOF come out ordered by node and then by axis, so
+// a greedy first-match walks the two lists in step and lands on the right partner for
+// the wrong reason — and because each of the three mutants is masked by the other two.
+//
+// So the primitive is asked directly, on lists built here, where the order can be
+// wrong and the positions can repeat. Two coincident nodes with the same axis is not
+// a synthetic case: it is what an unwelded seam in a mesh looks like.
+void testBoundaryMatchOnItsOwn() {
+    std::printf("\n--- reduction: the position match, on lists built to break it ---\n");
+    using reduction::BoundaryDof;
+
+    // A: one node's three DOF, in axis order. B: the same node, axes **reversed**.
+    const std::vector<BoundaryDof> a{{{1.0, 2.0, 3.0}, 0}, {{1.0, 2.0, 3.0}, 1}, {{1.0, 2.0, 3.0}, 2}};
+    const std::vector<BoundaryDof> b{{{1.0, 2.0, 3.0}, 2}, {{1.0, 2.0, 3.0}, 1}, {{1.0, 2.0, 3.0}, 0}};
+    const reduction::InterfaceMap crossed = reduction::matchBoundaries(a, b);
+    expectEqualCount("every DOF of a coincident node matches", crossed.shared, 3u);
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        expectTrue("and it matched something", crossed.aToB[i] >= 0);
+        if (crossed.aToB[i] < 0) continue;
+        expectEqual("on the same axis, whatever order the other list is in",
+                    static_cast<long long>(b[static_cast<std::size_t>(crossed.aToB[i])].axis),
+                    static_cast<long long>(a[i].axis));
+    }
+
+    // B with a **duplicate**: two entries at the same place on the same axis, which
+    // is what a mesh with an unwelded seam hands over. Neither may be claimed twice,
+    // and one A DOF may not claim both.
+    const std::vector<BoundaryDof> twice{{{0, 0, 0}, 0}, {{0, 0, 0}, 0}};
+    const std::vector<BoundaryDof> one{{{0, 0, 0}, 0}};
+    const reduction::InterfaceMap oneToTwo = reduction::matchBoundaries(one, twice);
+    expectEqualCount("one DOF matches one DOF, not both of a coincident pair", oneToTwo.shared, 1u);
+    const reduction::InterfaceMap twoToTwo = reduction::matchBoundaries(twice, twice);
+    expectEqualCount("and two match two", twoToTwo.shared, 2u);
+    expectTrue("each on its own partner", twoToTwo.aToB[0] != twoToTwo.aToB[1]);
+    const reduction::InterfaceMap twoToOne = reduction::matchBoundaries(twice, one);
+    expectEqualCount("where only one is on offer, only one is taken", twoToOne.shared, 1u);
+
+    // The tolerance, at and either side of it. Inclusive at exactly the tolerance:
+    // "within" is the word, and pinning it is what stops the comparison drifting.
+    const double tol = 1e-6;
+    for (auto [gap, want] : std::vector<std::pair<double, std::size_t>>{
+             {0.5 * tol, 1u}, {tol, 1u}, {2.0 * tol, 0u}}) {
+        const std::vector<BoundaryDof> near{{{gap, 0, 0}, 0}};
+        const reduction::InterfaceMap m = reduction::matchBoundaries(one, near, tol);
+        expectEqualCount("the tolerance includes its own value and excludes twice it", m.shared,
+                         want);
+        if (want > 0) expectNear("and the gap is reported", m.worstGap, gap, 1e-18);
+    }
+
+    // Nothing shared is a complaint, not silence: two components assembled through an
+    // empty map are two independent models standing side by side.
+    const std::vector<BoundaryDof> elsewhere{{{9, 9, 9}, 0}};
+    const reduction::InterfaceMap apart = reduction::matchBoundaries(one, elsewhere);
+    expectEqualCount("nothing matches", apart.shared, 0u);
+    expectTrue("and it says so", !apart.problems.empty());
+}
+
+// --- Synthesis: more than two components ------------------------------------------
+//
+// The same plate, cut into **three** pieces this time, which is the case the
+// two-component `assemble` cannot express at all -- and the middle piece is what
+// makes it a real test rather than the two-piece one written twice, because its
+// boundary is shared with a *different* component at each end and neither pairwise
+// map says on its own which assembled row a DOF belongs on.
+//
+// The reference is the same monolithic plate the two-component test uses, solved the
+// long way, and the negative controls are the same shape: an unjoined trio has
+// eighteen rigid body modes rather than six, and the assembled model is then three
+// pieces rather than one.
+void testThreeComponentsAssembleIntoTheWhole() {
+    std::printf("\n--- reduction: three components, and the union-find that needs ---\n");
+
+    const double L = 1.2, W = 0.2, T = 0.01;
+    const int NX = 9, NY = 2, NZ = 1;
+    const StructuralMaterial steel = ah36Steel();
+
+    // Three thirds, by element. The node spacing matches by construction: L*i/NX on
+    // the whole is (L/3)*i/(NX/3) on each third.
+    solidshell::HexMesh whole = solidshell::makePlateMesh(L, W, T, NX, NY, NZ);
+    std::vector<solidshell::HexMesh> part;
+    for (int p = 0; p < 3; ++p) {
+        part.push_back(solidshell::makePlateMesh(L / 3, W, T, NX / 3, NY, NZ));
+        for (std::size_t i = 0; i + 2 < part.back().position.size(); i += 3)
+            part.back().position[i] += (L / 3) * p;
+    }
+
+    const std::vector<reduction::Plane> cuts{{{L / 3, 0, 0}, {1, 0, 0}}, {{2 * L / 3, 0, 0}, {1, 0, 0}}};
+    std::vector<reduction::Substructure> substructure;
+    substructure.reserve(3);
+    for (int p = 0; p < 3; ++p)
+        substructure.emplace_back(part[static_cast<std::size_t>(p)], steel,
+                                  reduction::nodesNearPlanes(part[static_cast<std::size_t>(p)],
+                                                             cuts, 1e-9));
+    for (const reduction::Substructure& s : substructure)
+        expectTrue("each third is ready", s.ready());
+    // The middle third is held at both ends and the outer two at one, which is the
+    // asymmetry that makes this three components rather than two done twice.
+    expectEqualCount("the middle third has twice the boundary of an end one",
+                     substructure[1].boundaryCount(), 2 * substructure[0].boundaryCount());
+
+    reduction::Substructure sWhole(whole, steel, reduction::nodesNearPlanes(whole, cuts, 1e-9));
+    expectTrue("the whole plate is ready", sWhole.ready());
+    double parts = 0;
+    for (const reduction::Substructure& s : substructure) parts += s.totalMass();
+    expectNear("the three thirds weigh what the whole plate weighs", parts, sWhole.totalMass(),
+               1e-9 * sWhole.totalMass());
+
+    // The reference spectrum: the whole plate, formed densely and solved once.
+    const std::size_t nFull = sWhole.dofCount();
+    std::vector<double> kFull(nFull * nFull, 0.0), mFull(nFull * nFull, 0.0);
+    {
+        std::vector<double> e(nFull, 0.0), col(nFull, 0.0);
+        for (std::size_t j = 0; j < nFull; ++j) {
+            std::fill(e.begin(), e.end(), 0.0);
+            e[j] = 1.0;
+            sWhole.stiffnessTimes(e, col);
+            for (std::size_t i = 0; i < nFull; ++i) kFull[i * nFull + j] = col[i];
+        }
+        for (std::size_t i = 0; i < nFull; ++i) mFull[i * nFull + i] = sWhole.mass()[i];
+    }
+    const reduction::Eigenpairs exact =
+        reduction::generalisedEigen(kFull, mFull, static_cast<int>(nFull));
+    expectTrue("the reference spectrum converged", exact.converged);
+    expectTrue("the reference spectrum has at least seven modes", exact.value.size() > 6);
+    const double firstElastic = std::sqrt(exact.value[6]);
+    expectTrue("the sixth mode is rigid and the seventh is not, by orders of magnitude",
+               std::sqrt(exact.value[5]) < 1e-4 * firstElastic);
+    const double rigidCutoff = 1e-3 * firstElastic;
+
+    // Matching. `matchComponents` looks at every pair; the outer two share nothing
+    // and must therefore produce no joint at all rather than an empty one.
+    std::vector<reduction::Reduction> reduced;
+    reduction::ReduceParams params;
+    params.modes = 12;
+    params.cutoffFrequency = 0;
+    reduced.reserve(3);
+    for (const reduction::Substructure& s : substructure)
+        reduced.push_back(reduction::craigBampton(s, params));
+
+    std::vector<reduction::Component> component(3);
+    for (int p = 0; p < 3; ++p)
+        component[static_cast<std::size_t>(p)] = {&substructure[static_cast<std::size_t>(p)],
+                                                 &reduced[static_cast<std::size_t>(p)]};
+
+    const std::vector<reduction::Joint> all = reduction::matchComponents(component);
+    expectEqualCount("three components in a row make two joints, not three", all.size(), 2u);
+    for (const reduction::Joint& j : all)
+        expectTrue("and neither of them joins the two ends to each other",
+                   j.b == j.a + 1);
+    const std::vector<reduction::Joint> neighbours = reduction::matchNeighbours(component);
+    expectEqualCount("neighbours-only finds the same two", neighbours.size(), all.size());
+
+    // One cut plane's worth of DOF. An end third touches one of the two planes and
+    // the middle third both, so the boundary sets are 1, 2 and 1 planes and the
+    // assembled union is the **two interior planes** -- the plate's own ends are
+    // interior to their components and are not interface at all.
+    const std::size_t perPlane = 3 * reduction::nodesNearPlanes(part[0], cuts, 1e-9).size();
+    for (const reduction::Joint& j : all)
+        expectEqualCount("each joint shares a whole cut plane", j.map.shared, perPlane);
+
+    const reduction::Assembly trio = reduction::assemble(component, all);
+    expectTrue("the assembly raises nothing", trio.problems.empty());
+    expectEqual("it remembers how many components it has", trio.parts, 3);
+    // Four cut planes' worth of boundary between three thirds: the two ends and the
+    // two interior planes, each counted once.
+    expectEqualCount("the assembly counts each shared boundary DOF once",
+                     static_cast<std::size_t>(trio.boundary), 2 * perPlane);
+    expectEqualCount("and carries an identity for every one of them", trio.boundaryPoint.size(),
+                     static_cast<std::size_t>(trio.boundary));
+    expectNear("nothing was merged across a gap", trio.worstMergedGap, 0.0, 1e-15);
+    expectEqual("nor across axes", trio.axisDisagreements, 0);
+    expectEqual("and it is one piece", reduction::assembledComponents(trio), 1);
+
+    // The identity has to be the substructures' own, not something plausible: every
+    // component's boundary DOF must land on a row whose position and axis are the
+    // ones that DOF has in its own mesh.
+    double worstIdentity = 0;
+    for (int p = 0; p < 3; ++p) {
+        const auto c = static_cast<std::size_t>(p);
+        const std::vector<reduction::BoundaryDof> own = reduction::boundaryIdentity(substructure[c]);
+        for (std::size_t b = 0; b < own.size(); ++b) {
+            const int row = trio.from[c][b];
+            expectTrue("every boundary DOF landed on a boundary row", row >= 0 && row < trio.boundary);
+            if (row < 0 || row >= trio.boundary) continue;
+            const reduction::BoundaryDof& there = trio.boundaryPoint[static_cast<std::size_t>(row)];
+            expectEqual("on the same axis", static_cast<long long>(there.axis),
+                        static_cast<long long>(own[b].axis));
+            worstIdentity = std::max(worstIdentity, length(there.position - own[b].position));
+        }
+    }
+    expectNear("and at the same place", worstIdentity, 0.0, 1e-15);
+
+    std::vector<double> omega = reduction::assembledFrequencies(trio, {});
+    int rigid = 0;
+    for (double w : omega)
+        if (w < rigidCutoff) ++rigid;
+    expectEqual("a free assembly of three components has six rigid body modes, not eighteen",
+                static_cast<long long>(rigid), 6);
+    double worst = 0;
+    for (std::size_t i = 0; i < 4 && 6 + i < exact.value.size(); ++i) {
+        const double got = omega[static_cast<std::size_t>(rigid) + i];
+        const double want = std::sqrt(exact.value[6 + i]);
+        worst = std::max(worst, std::fabs(got - want) / want);
+        expectTrue("an assembled frequency is an upper bound on the true one",
+                   got > want * (1.0 - 1e-6));
+    }
+    std::printf("     three thirds, 12 modes each: worst of the first four elastic modes %.3e\n",
+                worst);
+    // Measured at 7.0e-08. Asserted at 1e-6 rather than at the 1e-4 the two-component
+    // test uses, because a tolerance far looser than the measurement would pass on an
+    // assembly that had lost the property and was merely well converged.
+    expectTrue("and twelve modes a piece gets the assembled spectrum to seven figures",
+               worst < 1e-6);
+
+    // The negative control, and it is the one that matters: three components that
+    // were never joined are still three well-formed reduced models in one matrix.
+    {
+        const reduction::Assembly loose = reduction::assemble(component, {});
+        expectEqualCount("unjoined, nothing is shared and the boundary is the sum",
+                         static_cast<std::size_t>(loose.boundary), 4 * perPlane);
+        expectEqual("and the model is in three pieces", reduction::assembledComponents(loose), 3);
+        int looseRigid = 0;
+        for (double w : reduction::assembledFrequencies(loose, {}))
+            if (w < rigidCutoff) ++looseRigid;
+        expectEqual("three components that float free of each other have eighteen rigid modes",
+                    static_cast<long long>(looseRigid), 18);
+    }
+
+    // --- Folding one component at a time, which is the other route ----------------
+    //
+    // The hypothesis `reduction.hpp` used to carry: carry the boundary identity and
+    // run the same position match against the assembly. It works, and the point of
+    // testing it is that it produces the **same matrix**, so the only thing separating
+    // the two routes is what they cost.
+    {
+        reduction::Assembly fold = reduction::assemble({component[0]}, {});
+        expectTrue("a one-component assembly is a well-formed assembly", !fold.empty());
+        expectEqual("of one piece", reduction::assembledComponents(fold), 1);
+        for (int p = 1; p < 3; ++p) {
+            const auto c = static_cast<std::size_t>(p);
+            const reduction::InterfaceMap map =
+                reduction::matchBoundaries(fold, *component[c].substructure);
+            expectTrue("the match against an assembly raises nothing", map.problems.empty());
+            expectEqualCount("and finds the whole shared plane", map.shared, perPlane);
+            fold = reduction::assemble(fold, component[c], map);
+            expectTrue("the fold raises nothing", fold.problems.empty());
+        }
+        expectEqual("the folded model has the same number of components", fold.parts, trio.parts);
+        expectEqual("and the same boundary", fold.boundary, trio.boundary);
+        expectEqual("and the same size", fold.size(), trio.size());
+        // Bit for bit. Not "close": both routes are the same scatter-add through the
+        // same helper, so anything but equality is an index that disagrees, and an
+        // index that disagrees by one row is a model that is merely a bit wrong.
+        bool identical = fold.stiffness.size() == trio.stiffness.size();
+        double scale = 0;
+        for (std::size_t i = 0; i < trio.stiffness.size() && identical; ++i) {
+            scale = std::max(scale, std::fabs(trio.stiffness[i]));
+            identical = fold.stiffness[i] == trio.stiffness[i] && fold.mass[i] == trio.mass[i];
+        }
+        expectTrue("the two routes produce the same matrices to the last bit", identical);
+        expectTrue("on a matrix that is not all zeros", scale > 0);
+        bool sameMaps = fold.from.size() == trio.from.size();
+        for (std::size_t c = 0; c < trio.from.size() && sameMaps; ++c)
+            sameMaps = fold.from[c] == trio.from[c];
+        expectTrue("and the same component maps", sameMaps);
+        expectEqualCount("and the folded model carries an identity too", fold.boundaryPoint.size(),
+                         static_cast<std::size_t>(fold.boundary));
+
+        // **The fold has its own copy of the axis check and the N-way test does not
+        // reach it.** Deleting it survived everything until this existed, which is
+        // the shape this file keeps finding: two routes to the same answer means two
+        // places for the same guard, and testing one of them tests one of them.
+        reduction::Assembly pair = reduction::assemble({component[0]}, {});
+        pair = reduction::assemble(pair, component[1],
+                                   reduction::matchBoundaries(pair, *component[1].substructure));
+        reduction::InterfaceMap cross = reduction::matchBoundaries(pair, *component[2].substructure);
+        const std::vector<reduction::BoundaryDof> third =
+            reduction::boundaryIdentity(*component[2].substructure);
+        // Two entries **swapped**, not one retargeted. `assemble` inverts the map into
+        // "which assembly row is this component DOF", so retargeting onto a DOF
+        // another entry already names loses the crossing to whichever is written
+        // last; a swap keeps the map a bijection and crosses two axes at once.
+        bool rewiredFold = false;
+        for (std::size_t i = 0; i < cross.aToB.size() && !rewiredFold; ++i) {
+            if (cross.aToB[i] < 0) continue;
+            for (std::size_t k = i + 1; k < cross.aToB.size(); ++k) {
+                if (cross.aToB[k] < 0) continue;
+                const auto j1 = static_cast<std::size_t>(cross.aToB[i]);
+                const auto j2 = static_cast<std::size_t>(cross.aToB[k]);
+                if (third[j1].axis == third[j2].axis) continue;
+                std::swap(cross.aToB[i], cross.aToB[k]);
+                rewiredFold = true;
+                break;
+            }
+        }
+        expectTrue("the crossed fold map was actually built", rewiredFold);
+        const reduction::Assembly wrongFold = reduction::assemble(pair, component[2], cross);
+        expectEqual("folding two rows onto each other's axes is counted, both of them",
+                    wrongFold.axisDisagreements, 2);
+        expectTrue("and said out loud", !wrongFold.problems.empty());
+    }
+
+    // --- The refusals, every one of them a model that would otherwise assemble ----
+    {
+        // An assembly built from two bare reductions has no mesh behind it, so there
+        // is nothing to match against. That is the limit the two-component overload
+        // has always had, and it is now stated rather than implied.
+        const reduction::Assembly bare =
+            reduction::assemble(reduced[0], reduced[1],
+                                reduction::matchBoundaries(substructure[0], substructure[1]));
+        expectTrue("a two-reduction assembly carries no identity", bare.boundaryPoint.empty());
+        const reduction::InterfaceMap none = reduction::matchBoundaries(bare, substructure[2]);
+        expectEqualCount("with nothing matched", none.shared, 0u);
+        // **The refusal is not enough without its reason.** Deleting the identity
+        // guard leaves the match running against an empty list, which raises the
+        // *other* complaint -- "these share no boundary DOF" -- and a test that only
+        // asked whether `problems` was non-empty passed on it. This repository has
+        // recorded that exact shape once already, on a Cholesky failure reported as a
+        // QL failure.
+        bool named = false;
+        for (const std::string& p : none.problems)
+            named = named || p.find("identity") != std::string::npos;
+        expectTrue("and it says the assembly has no identity, not that nothing coincided", named);
+
+        std::vector<reduction::Joint> self = all;
+        self[0].b = self[0].a;
+        expectTrue("a component joined to itself is refused",
+                   !reduction::assemble(component, self).problems.empty());
+
+        std::vector<reduction::Joint> past = all;
+        past[0].b = 7;
+        expectTrue("a joint naming a component that is not there is refused",
+                   !reduction::assemble(component, past).problems.empty());
+
+        // A map shorter than the boundary it claims to describe. This is what a
+        // component whose reduction fell back to empty produces, and accepting it
+        // would join the DOF the map does reach and leave the rest as two unknowns --
+        // a model that assembles, solves, and is torn along the tail of a cut.
+        std::vector<reduction::Joint> truncated = all;
+        truncated[0].map.aToB.pop_back();
+        expectTrue("and so is a map that does not cover its component's boundary",
+                   !reduction::assemble(component, truncated).problems.empty());
+
+        // The one an `InterfaceMap` could never produce and a hand-built `Joint`
+        // can: a merge that couples one axis to another. It assembles, it solves,
+        // and it is a ship whose plating pushes sideways when you pull it.
+        std::vector<reduction::Joint> crossed = all;
+        const std::vector<reduction::BoundaryDof> ia = reduction::boundaryIdentity(substructure[0]);
+        const std::vector<reduction::BoundaryDof> ib = reduction::boundaryIdentity(substructure[1]);
+        bool rewired = false;
+        for (std::size_t i = 0; i < crossed[0].map.aToB.size() && !rewired; ++i) {
+            if (crossed[0].map.aToB[i] < 0) continue;
+            for (std::size_t j = 0; j < ib.size(); ++j)
+                if (ib[j].axis != ia[i].axis) {
+                    crossed[0].map.aToB[i] = static_cast<int>(j);
+                    rewired = true;
+                    break;
+                }
+        }
+        expectTrue("the crossed map was actually built", rewired);
+        const reduction::Assembly wrong = reduction::assemble(component, crossed);
+        expectTrue("an assembled row that merges two axes is counted",
+                   wrong.axisDisagreements > 0);
+        expectTrue("and said out loud", !wrong.problems.empty());
+    }
+}
+
 }  // namespace
 
 // --- The constraint the attachment carries but does not add ------------------------
@@ -2502,6 +2875,8 @@ void runReductionTests() {
     testValidity();
     testFerryPatch();
     testTwoComponentsAssembleIntoTheWhole();
+    testBoundaryMatchOnItsOwn();
+    testThreeComponentsAssembleIntoTheWhole();
     testAttachedStiffness();
     testAttachedMass();
     testConstrainedSubstructure();

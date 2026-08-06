@@ -3418,15 +3418,19 @@ makes, arriving as a frequency.
 
 #### What it does not do yet
 
-1. ~~**There is no whole-ship Tier-1 model.**~~ **Partly done** —
-   `section.{hpp,cpp}`, §*Tier-1 section mesher* below, cuts a region between two
-   transverse planes and hands it over with its longitudinals attached. What it
-   cannot do is *weld a junction*: `makeStructuralMesh` shares no corner between
-   two panel roles, so a hold arrives in seven disconnected pieces, and a
-   solid-shell node pair could not carry a corner even if it did. The section is
-   therefore right for the hull girder's axial and bending stiffness — measured
-   against `hullGirderSection` at 0.3% once the members it cannot attach are
-   accounted for — and wrong for torsion and for every frequency.
+1. ~~**There is no whole-ship Tier-1 model.**~~ **Done** — `section::buildChain`,
+   §*A ship: a chain of sections* below. `section.{hpp,cpp}` cuts a region between
+   two transverse planes and hands it over with its longitudinals attached and its
+   panel roles *tied*, and a chain of those, each reduced once and assembled, is a
+   model of the whole length: measured against the same length in one piece at
+   1e-10 in `EA`, `EI` and `GJ` on the box girder and 4e-10 on the ferry.
+
+   What is left is not the tier's machinery, it is the mesher's reach. Two-bay
+   sections of the reference ferry only reduce between about x = −26.4 and 16.8 m;
+   outside that `buildSection` refuses them with an inverted element, so the chain
+   cannot yet be run bow to stern. And a cut plane is an interface, so it unties the
+   junctions on it — see the section below for what that costs, which is the one
+   thing about a chain that is worse than the monolith rather than equal to it.
 2. ~~**Nothing assembles two substructures.**~~ **Done** — `matchBoundaries()` and
    `assemble()`. Two components meeting at an interface have the same displacement
    there, so their shared boundary DOF *are* the same unknown and coupling is
@@ -3452,17 +3456,24 @@ makes, arriving as a frequency.
 
    Matching requires the **axis** to agree and not merely the position: a
    coincident node would otherwise couple x to y, and the assembled model would be
-   wrong in the way that is hardest to see.
+   wrong in the way that is hardest to see. It is now also checked *after* the fact:
+   a `Joint` is data a caller can build by hand, so `Assembly::axisDisagreements`
+   counts assembled rows that merged two different axes and says so.
 
-   Two limits, named rather than left to be found. It joins **two** components and
-   only two: `InterfaceMap` is expressed in the substructures' boundary DOF and an
-   `Assembly` has no substructure behind it, so there is no way to add a third. The
-   fix is to carry the boundary DOF identity through an assembly rather than to
-   rewrite the scatter-add, which already does not care how many components it is
-   given. The mesher that item 1 was waiting for now exists — `section.{hpp,cpp}` —
-   so there are pieces to join; what stops a *whole-ship* model is the
-   three-component limit above. The junctions inside each piece are tied now — see
-   §*The junction tie* below.
+   ~~It joins **two** components and only two.~~ **Closed** — `assemble(parts,
+   joints)` takes any number, §*A ship: a chain of sections* below. The prediction
+   recorded here was that the fix was to carry the boundary DOF identity through an
+   assembly so the same position match could be run against it. **That was half
+   right, and the half that was wrong is the interesting half.** Carrying the
+   identity is right and `Assembly::boundaryPoint` carries it — a caller needs it to
+   find an assembled row *geometrically*, which is what prescribing a plane-sections
+   field on a chain's end cuts is. But it is not what generalises the assembly: what
+   stopped at two was the bookkeeping, and N components settle it by a **union-find
+   over every pairwise map**, which needs no identity at all because every map is
+   still expressed in the substructures' boundary DOF the caller already has. Both
+   routes are built and tested against each other; they produce the same matrix to
+   the last bit, and folding one component at a time costs O(N³n_b²) against
+   O(N²n_b²) — measured at ×5.1 on a chain of eight.
 3. ~~**A zone's edge is still clamped.**~~ **Done** — `coupling.{hpp,cpp}`,
    §*Tier-1 to Tier-2 coupling* below. What remains is that a reduced model cannot
    represent a zone that has *yielded* without tearing, which is item 6 there.
@@ -3774,6 +3785,16 @@ argued equivalent.** The ones worth recording:
 2. **It takes one material.** A section spanning two is meshed entirely as the first
    and says so; on this ship the weather deck's mild steel differs from AH36 in yield
    alone, so nothing the reduction reads is affected.
+2b. **A member lying on the forward cut plane goes to the next section.** A frame or
+   a deck beam has no extent along x, so it sits on a station, and a station is a cut
+   plane for the sections on both sides of it — taken by both, a chain carries it
+   twice. The rule is half-open at the aft plane, the same one the transverse
+   *plating* already used, and `Section::membersOnForwardPlane` counts what it left
+   behind (70 on a two-bay ferry section). A section standing alone is therefore short
+   one ring of frames, which is worth nothing to the hull girder — an athwartships
+   member carries no longitudinal stress and `hullGirderSection` drops it too — and
+   worth 10.1% of a two-section chain's stiffener mass, which is what the rule exists
+   for.
 3. **A member is only picked up where it runs along a panel seam.** A girder
    positioned off the longitudinal spacing is invisible to a mesh built from panels,
    which is 0.075 m² and 4% of this ferry's section area. It is reported rather than
@@ -3929,6 +3950,236 @@ address zero. It surfaced as a segmentation fault three tests downstream of the
 mutant that provoked it, which is also how the mutation harness was found to be
 wrong: its first version counted `FAIL` lines only, and a crash prints none, so it
 scored **eight false survivors**. A mutation runner has to look at the exit code.
+
+### A ship: a chain of sections — **implemented**
+
+`reduction::assemble(parts, joints)` and `section::buildChain` in
+`engine/sim/{reduction,section}.{hpp,cpp}`, checked by `tests/test_reduction.cpp` and
+`tests/test_section.cpp` — where every box-girder figure below is an assertion — and
+measured at ship scale by `tools/section_probe --chain=N`, which is where every ferry
+figure comes from and how it is re-checked rather than re-quoted. **The whole length,
+cut into N pieces, each reduced once, assembled into one model.**
+
+```cpp
+struct Component { const Substructure*; const Reduction*; };
+struct Joint     { int a, b; InterfaceMap map; };
+std::vector<Joint> matchComponents(const std::vector<Component>&, double tolerance);
+std::vector<Joint> matchNeighbours(const std::vector<Component>&, double tolerance);
+Assembly assemble(const std::vector<Component>&, const std::vector<Joint>&);
+Assembly assemble(const Assembly&, const Component&, const InterfaceMap&);  // the fold
+int      assembledComponents(const Assembly&);
+
+Chain           buildChain(const StructuralMesh&, const ChainParams&);
+BeamResponse    applyBeamLoad(const Chain&, const BeamLoad&);
+TorsionResponse applyTwist(const Chain&, double twist, double reference);
+```
+
+#### The generalisation is a union-find, not the identity
+
+The note this replaced predicted that carrying each assembled boundary row's identity
+through would be the one change needed, "so that the same position match can be run
+against it". Half of that held. The identity **is** worth carrying —
+`Assembly::boundaryPoint` does, and a caller needs it to name an assembled row
+geometrically, which is what prescribing a plane-sections field on a chain's two end
+cuts is. But it is not what generalises the assembly. What stopped at two components
+was the *bookkeeping*: which assembled row a component's boundary DOF belongs on. Two
+components settle that with one `InterfaceMap`; N settle it with a **union-find over
+every pairwise map**, because a DOF shared by A-and-B and by B-and-C is one row and
+no pairwise map says so on its own. Every map is still expressed in the
+substructures' boundary DOF, which the caller has, so that route needs no identity at
+all.
+
+Both routes are built, because "one is better" is a measurement rather than an
+argument. The fold — carry the identity, match against the assembly, add one
+component — **produces the same matrices and the same `from` maps to the last bit**,
+and re-scatters a matrix that grows every fold: O(N³n_b²) against O(N²n_b²). Measured
+on the box girder at ×0.9 for one component, ×1.7 for two, ×3.2 for four and ×5.1 to
+×6.0 for eight — the spread is the timer, the growth is the shape. It is kept because
+a caller that acquires components one at a time has no N to assemble at once, and
+because a route that agrees bit for bit is a stronger test of the index arithmetic
+than any tolerance.
+
+#### It is exact at zero modes, and that is a sharper test than a convergence
+
+The assembled boundary is the union of the cut planes; Guyan condensation is exact
+there for any load with no interior load; the scatter-add approximates nothing. So a
+chain and the same length in one piece are the *same static model*, not a converging
+approximation to it — provided they are the same structure, which means junctions off
+on both, for the reason below.
+
+| like for like, untied | chain / one piece |
+|---|---|
+| box girder, 4 sections, `EA` | −9.9e-13 |
+| box girder, 4 sections, `EI` | +1.4e-10 |
+| box girder, 4 sections, `GJ` | −1.3e-10 |
+| ferry x = −7.2…2.4, 2 sections, `EA` / z_na / `EI` / `GJ` | +2.5e-10 / +1.9e-10 / +4.8e-10 / +3.9e-12 |
+| ferry x = −7.2…16.8, 5 sections, all four | ≤ 6.3e-10 |
+
+Dynamically it converges from above, as one component does: the chain's lowest
+frequency with both end planes held is 0.844705 Hz at zero modes and 0.843943 at two,
+against the monolith's own fixed-interface 0.843941 Hz computed through none of the
+assembly.
+
+#### What a cut plane costs, which `EA` cannot see
+
+**A junction node on a cut plane is an interface degree of freedom, and one of those
+is prescribed rather than derived — so it cannot also be tied.** Cutting a length into
+N pieces turns N−1 interior stations into interfaces and unties every junction on
+them. The previous note hoped an interior cut plane in a chain might stop being an
+interface; it does not, and the effect runs the other way:
+
+| box girder, tied | 1 section | 2 | 4 | 8 |
+|---|---|---|---|---|
+| junction edge joined, of 64.0 m | 58.0 | 52.0 | 40.0 | 16.0 |
+| `EA` against the closed form | 1.2e-12 | 8.5e-14 | 1.5e-12 | 1.1e-12 |
+| `GJ` against one piece | −2.6e-12 | −3.29% | −9.24% | **−19.20%** |
+| `GJ` / Bredt | 1.0986 | 1.0625 | 0.9972 | 0.8876 |
+
+On the ferry the same shape: x = −7.2…2.4 as two sections ties 9.6 m of 134.4 against
+the monolith's 72.0 and loses **3.5%** of `GJ`; x = −7.2…16.8 as five ties 28.8 m of
+336.0 and loses **8.9%**. `EA` moves 2.5e-4 and `EI` 4.5e-5 in the same runs.
+
+**That row of `EA` figures is the whole reason this section is written the way it
+is.** A chain of eight sections that ties nothing to anything reproduces the closed
+form to twelve figures, because prescribing plane sections at the ends makes every
+longitudinal strip carry σ = Eε whatever it is joined to. Any validation of an
+assembly that stops at `EA` and `EI` scores a do-nothing implementation best. It is
+the same trap §*The validation that proves nothing* records for the mesher, and it
+caught this work too — the first version of the ferry comparison agreed to 1e-10 in
+`EA` while `GJ` was 33% out.
+
+The fix that would close it is a tie whose masters all lie *in* the cut plane, which
+both sections would then derive identically from shared boundary DOF. That is a line
+tie through the plating thickness rather than the bilinear face tie the junction work
+built, so it is new machinery rather than a parameter. Until it exists the rule is:
+**cut a ship into as few pieces as the interface cost allows.**
+
+#### The interface is not coincident by construction
+
+Two sections cut on the same frame station agree on every *mid-surface* point of it —
+they come from the same panel corners. They do not agree on the mesh nodes, because a
+node is the mid-surface offset by t/2 along the **nodal normal** and `buildSection`
+averages that normal over the sub-quads inside the section: aft of the plane for one,
+forward for the other. Prismatic hull, same vector, exact coincidence. Shoulder, not:
+
+| plane x | −45.6 | −33.6 | −21.6 | −9.6 | 0 | 12.0 | 24.0 | 36.0 | 48.0 |
+|---|---|---|---|---|---|---|---|---|---|
+| worst gap, m | 6.4e-4 | 3.5e-4 | 3.4e-6 | 0 | 0 | 0 | 1.9e-4 | 7.1e-4 | 1.0e-3 |
+| nodes past 1e-9 | 116 | 112 | 112 | 0 | 0 | 0 | 112 | 116 | 120 |
+
+Most of that row is unreachable and saying so is the honest half of quoting it — the
+mesher already refuses two-bay sections outside about x = −26.4…16.8. What is
+reachable is **x = −21.6**, where the gap is 3.4 µm: three orders of magnitude below
+the plating and three above `matchBoundaries`' 1e-9 default. At the default **336 of
+that plane's 1 170 boundary DOF find no partner**, and a chain assembles out of them,
+solves, and is torn along 29% of the cut. `Chain::unmatched` counts them and
+`ready()` refuses. At 1e-5 the whole plane matches and the chain reproduces the
+monolith to 3.1e-7 in `EA`, 3.0e-7 in `EI` and 1.1e-6 in `GJ` — so joining two nodes
+3.4 µm apart is a legitimate answer, and the reason to set the tolerance is that the
+default silently does something worse.
+
+The fix that needs no tolerance is that a section's node positions should not depend
+on where it was cut: average the nodal normal over a halo of panels one bay beyond
+each plane and mesh only what is inside. It is a change to `buildSection`'s weld
+classes and topology census and belongs with that machinery.
+
+#### Two things a chain got wrong that a total would never have shown
+
+**A ring of frames counted twice.** A member with no extent along x — a frame, a deck
+beam — lies *on* a station, and a station is a cut plane for the sections on both
+sides of it. Both built it. Two four-bay sections of the ferry came to **10.1% more
+stiffener mass** than the same length in one piece: 608 fibres, and their stiffness
+and mass land on shared interface DOF where nothing but a total would see it. The
+transverse *plating* already had the half-open rule that fixes it — a bulkhead is
+taken at the aft plane and not the forward one — and the members simply never got it.
+`tests/test_section.cpp` now asserts additivity: element for element, 4.4e-16 in
+plate mass, 1.5e-14 in stiffener mass, 2 400 + 2 400 = 4 800 fibres, 460 + 460 = 920
+members. Nothing in the suite noticed a 22% change in a section's own `memberMass`
+when the rule landed, which is what a missing identity looks like.
+
+**Two component counts, and neither answers the other.**
+`reduction::assembledComponents` works on the reduced model, where a component's pair
+is dense over its own DOF whether the mesh behind it is one piece or seven — so it
+sees a chain that failed to join at a cut plane and is blind to a section whose decks
+are not tied to its shell. `Section::components` is the other way round. `Chain`
+carries both, and `Chain::components` joins them: a mesh component of one section and
+a mesh component of the next are the same piece of ship when they share an assembled
+boundary row. **That is the one that must be 1.** It is also what
+`applyBeamLoad(Chain)` restrains — three rigid-body restraints per piece, twelve on
+the untied box and twenty-one on an untied ferry section, because prescribing `u_x`
+alone leaves each piece free in y, z and rotation about x.
+
+#### What it costs, measured
+
+The interface is the whole cost and it is set by the cross-section, not by the length:
+a transverse cut of the ferry is **1 170 boundary DOF** at `subdivision = 1`, so a
+chain of N is a *dense* (N+1) × 1 170 reduced model.
+
+| ferry x = −7.2…16.8, ten bays | 5 sections | one piece |
+|---|---|---|
+| assembled / boundary DOF | 7 020 | 2 340 |
+| reduce, untied / tied | 1.62 s / 9.13 s | (57.7 s tied, eleven bays) |
+| assemble | 0.23 s | — |
+| one static solve, untied / tied | 24.4 s dense | 0.13 s / 3.60 s banded |
+
+So cutting a ship into more pieces makes every piece cheaper to reduce and the
+assembly quadratically dearer to *solve*, and that is the trade a caller is making
+whether or not it is stated. It is the right trade only because a reduction is built
+once and used many times; for a single static answer the monolithic banded solve wins
+by two orders of magnitude.
+
+#### What mutation testing found
+
+47 mutants, each a single plausible edit to `reduction.cpp` or `section.cpp`, run
+against the reduction, section, coupling, constraint and solid-shell suites with a
+per-mutant timeout and the verdict taken from the **exit code** rather than from the
+`FAIL` lines — the harness that counted lines scored eight false survivors here once
+already, on a mutant that segfaulted three tests downstream of the one it broke.
+
+The first pass killed 33 of 46 and left 12; the final pass kills **42 of 47** with
+four argued equivalent and one a deliberate no-op control. Of the twelve survivors
+**seven were holes in the suite**, and they cluster in one place:
+
+- **`matchBoundaries` was never asked about on its own.** Deleting the axis check,
+  deleting the "this DOF of B is taken" mark and deleting the `break` that keeps the
+  *first* match all survived. They survive **together**: a substructure's boundary
+  DOF come out ordered by node and then by axis, so a greedy first-match walks the
+  two lists in step and lands on the right partner for the wrong reason, and each of
+  the three mutants is masked by the other two. Two coincident nodes on the same axis
+  — an unwelded seam — separates them, and so does a list whose axes are in the other
+  order. Asking the primitive directly, on lists built here, kills all three.
+- **A refusal is not enough without its reason**, for the second time in this
+  document. Deleting the "this assembly carries no identity" guard from
+  `matchBoundaries(Assembly, Substructure)` leaves the match running against an empty
+  list, which raises the *other* complaint — "these share no boundary DOF" — so a
+  test that only asked whether `problems` was non-empty passed on it.
+- **An interface map shorter than the boundary it claims to describe** was accepted.
+  That is what a component whose reduction fell back to empty produces, and it joins
+  the DOF the map reaches and leaves the rest as two unknowns.
+- **`Assembly::worstMergedGap` was never non-zero**, because nothing else in the
+  suite merges two DOF that are not exactly coincident. Replacing `max` with `min`
+  survived. The ferry shoulder at a 1e-5 tolerance is the case with something in it.
+- **Two routes mean two copies of the same guard**, and testing one tests one. The
+  fold's axis check survived everything the N-way one killed. Closing it also turned
+  up a real asymmetry: the fold *counted* a crossed axis and said nothing about it,
+  where the N-way route complained.
+
+The remaining survivors are argued **equivalent**, and saying why is more useful than
+a score:
+
+- **The bounds check in `boundaryIdentity`** (`3n+2 >= size` against `>`) can only
+  differ when `3n+2 == 3N` exactly, which has no integer solution.
+- **Transposing the scatter's read** cannot matter: `Reduction::stiffness` and `mass`
+  are symmetric to the last bit by construction — the analytically symmetric blocks
+  are computed on one triangle and mirrored — which is stated in `reduction.hpp` and
+  is what this mutant measures.
+- **Either root choice in the union-find** is a valid merge.
+- **`matchComponents` in place of `matchNeighbours`** in `buildChain` is equivalent in
+  *result* on a chain and not in cost: two sections two bays apart share no boundary
+  DOF, so the extra pairs produce no joints and only a 1 170 × 1 170 distance sweep
+  each. It is kept as the deliberate difference between the two calls.
+- One is the **no-op control**, because a harness that reports everything killed is
+  reporting nothing.
 
 ### Tier-1 to Tier-2 coupling — **implemented**
 
