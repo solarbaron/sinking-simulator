@@ -996,6 +996,360 @@ void testSectionAtAFrameStationIsNotDoubleCounted() {
     expectNear("the forward end still has a section", stem.area, on.area, 1e-6 * on.area);
 }
 
+// One cut, with the two element populations kept apart. A total on its own cannot
+// tell "the plating vanished" from "the taper moved": the defect these tests were
+// written for took the ferry's section at x = 19.2 down to 23.8% of its neighbours,
+// which is not a wrong number so much as exactly the stiffeners' share of the
+// section with all the plating gone.
+struct SectionCut {
+    double area = 0, neutralAxis = 0, secondMoment = 0;
+    double plateArea = 0;
+    int plate = 0, stiffener = 0;
+};
+
+SectionCut cutSection(const StructuralMesh& mesh, double x) {
+    SectionCut c;
+    const HullGirderSection g = hullGirderSection(mesh, x);
+    c.area = g.area;
+    c.neutralAxis = g.neutralAxis;
+    c.secondMoment = g.secondMoment;
+    for (const SectionElement& e : sectionElements(mesh, x)) {
+        if (e.stiffener) {
+            ++c.stiffener;
+        } else {
+            ++c.plate;
+            c.plateArea += e.area;
+        }
+    }
+    return c;
+}
+
+// The same frame station, named four ways, must give the same section.
+//
+// The ferry is 120 m over 50 bays, and `-60 + 120*33/50` comes out at
+// 19.200000000000003 -- one unit in the last place above the 19.2 a drawing says.
+// A cut asked for at 19.2 therefore sits 3.6e-15 m *aft* of the bay that owns the
+// seam. The membership test in `sectionElements` tolerates that by 1e-9 and admits
+// the bay; the crossing search that follows it was exact, found no panel edge
+// changing sign across the plane, and dropped all 188 plate panels. All 181
+// stiffeners survived, because the member branch clamps its interpolation
+// parameter into the member and so was never exposed to the same question. What
+// came back was 23.8% of the area with a neutral axis -- a ratio -- still looking
+// perfectly correct.
+//
+// Eleven of the ferry's 51 stations were affected and forty were not, and which is
+// which is decided by nothing more than the direction the division rounds. So the
+// station is asked for every way a caller might write it.
+void testTheSectionDoesNotDependOnHowAStationIsSpelled() {
+    const StructuralMesh mesh = makeStructuralMesh(game::buildFerry().hull, ferryScantlings());
+
+    int spelledDifferently = 0;
+    for (double station : mesh.frameStations) {
+        // A micrometre is finer than any station is ever placed, so this is the
+        // number a drawing would carry.
+        const double drawing = std::round(station * 1e6) / 1e6;
+        if (drawing != station) ++spelledDifferently;
+
+        const SectionCut want = cutSection(mesh, station);
+        expectTrue("every station has both plating and stiffening",
+                   want.plate > 60 && want.stiffener > 60);
+
+        for (double x : {drawing, std::nextafter(station, -1e300),
+                         std::nextafter(station, 1e300)}) {
+            const SectionCut got = cutSection(mesh, x);
+            expectEqual("the same station names the same plate panels", got.plate, want.plate);
+            expectEqual("and the same stiffeners", got.stiffener, want.stiffener);
+            // The spellings differ by at most 7e-15 m and the section's own taper is
+            // under 0.02 m2 per metre along this hull, so the answers can only
+            // differ by round-off. Measured, the worst disagreement over all 51
+            // stations is 1.3e-15 relative; most are bit-identical, because a cut
+            // within the seam tolerance is taken at the seam itself.
+            expectNear("and the same area", got.area, want.area, 1e-13 * want.area);
+            expectNear("the same second moment", got.secondMoment, want.secondMoment,
+                       1e-13 * want.secondMoment);
+            expectNear("and the same neutral axis", got.neutralAxis, want.neutralAxis,
+                       1e-13 * want.neutralAxis);
+        }
+    }
+
+    // Otherwise vacuous: if every station's stored value already were the decimal a
+    // drawing gives, the loop above would have asked the same question twice. 23 of
+    // the ferry's 51 do not land on their decimal.
+    expectTrue("the stored stations and a drawing's decimals really do differ",
+               spelledDifferently >= 5);
+}
+
+// A sweep, not a point.
+//
+// A single cut cannot say whether a station is wrong, because there is nothing to
+// compare it with; the ferry's midship area is 1.80 m2 and so was the value at
+// every station either side of the broken one. Walking x finely along the whole
+// length and requiring the section to move no faster than the hull's own taper is
+// what turns "this number looks plausible" into a test.
+void testTheSectionSweepIsContinuousAlongTheLength() {
+    const Scantlings description = ferryScantlings();
+    const StructuralMesh mesh = makeStructuralMesh(game::buildFerry().hull, description);
+
+    // Every 100 mm, plus every frame station both as stored and as a drawing writes
+    // it, because that pair is exactly where the seam arithmetic bites.
+    std::vector<double> xs;
+    const double xLo = mesh.frameStations.front(), xHi = mesh.frameStations.back();
+    const int steps = 1200;
+    for (int i = 0; i <= steps; ++i) xs.push_back(xLo + (xHi - xLo) * i / steps);
+    for (double station : mesh.frameStations) {
+        xs.push_back(station);
+        xs.push_back(std::round(station * 1e6) / 1e6);
+    }
+    std::sort(xs.begin(), xs.end());
+    xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
+
+    // Lipschitz bounds on the section, measured over this hull's own bays with the
+    // element population held fixed: 0.0198 m2/m, 1.00 m4/m and 0.125 m/m. They are
+    // properties of the ferry rather than converging quantities, so they carry
+    // enough room for a re-tessellation and no more. The failure they exist to catch
+    // moved the area by 1.37 m2 across a 30 mm step -- a slope of 45 m2/m.
+    constexpr double kAreaSlope = 0.03;    // m2 per m
+    constexpr double kSecondSlope = 2.0;   // m4 per m
+    constexpr double kAxisSlope = 0.2;     // m per m
+
+    SectionCut previous{};
+    double previousX = 0;
+    double worstAreaSlope = 0;
+    for (std::size_t i = 0; i < xs.size(); ++i) {
+        const SectionCut c = cutSection(mesh, xs[i]);
+
+        // Count, do not just total. A section with stiffeners and no plating at all
+        // is what the defect produced, and it is not a ship's section: plating is
+        // three quarters of the area of every station on this hull, the thinnest of
+        // them at the stem being 71.3%.
+        expectTrue("every cut has plating", c.plate > 0);
+        expectTrue("every cut has stiffening", c.stiffener > 0);
+        expectTrue("and the plating carries most of the section",
+                   c.area > 0 && c.plateArea > 0.65 * c.area);
+
+        if (i > 0 && previous.plate == c.plate && previous.stiffener == c.stiffener) {
+            const double h = xs[i] - previousX;
+            if (h > 0) {
+                worstAreaSlope = std::max(worstAreaSlope, std::abs(c.area - previous.area) / h);
+                expectTrue("area moves no faster than the taper",
+                           std::abs(c.area - previous.area) <= kAreaSlope * h);
+                expectTrue("nor does the second moment",
+                           std::abs(c.secondMoment - previous.secondMoment) <= kSecondSlope * h);
+                expectTrue("nor the neutral axis",
+                           std::abs(c.neutralAxis - previous.neutralAxis) <= kAxisSlope * h);
+            }
+        }
+        previous = c;
+        previousX = xs[i];
+    }
+
+    // The bound has to be doing work: if the section were constant along the whole
+    // length the loop above would pass on any implementation that returned the same
+    // answer everywhere, including a wrong one.
+    expectTrue("the hull really does taper", worstAreaSlope > 1e-3);
+    expectTrue("the sweep is fine enough to straddle every station",
+               xs.size() > 4 * mesh.frameStations.size());
+
+    // --- The parallel middle body, where the population may not change at all ------
+    //
+    // Nothing in the description starts or stops inside |x| < 34 -- the innermost
+    // boundary is the weather deck's forward end and the wing bulkhead's -- so over
+    // a range well inside that, every station must present the same elements as
+    // midship. This is the flat form of the assertion above and it is what the
+    // defect tripped over: at x = 19.2 the plate count went from 188 to 0.
+    constexpr double kParallel = 26.4;   // m either side of midship: 23 frame stations
+    for (const Deck& d : description.decks)
+        expectTrue("no deck begins or ends inside the parallel body",
+                   std::abs(d.xFrom) > kParallel && std::abs(d.xTo) > kParallel);
+    for (const Girder& g : description.girders)
+        expectTrue("no girder does either",
+                   std::abs(g.xFrom) > kParallel && std::abs(g.xTo) > kParallel);
+    for (const ShellRegion& r : description.shell)
+        expectTrue("nor a plating region",
+                   std::abs(r.xFrom) > kParallel && std::abs(r.xTo) > kParallel);
+    // Bulkheads are not in that list on purpose: the ferry has transverse ones at
+    // -8 m and 20 m, and a transverse plate has no extent along x, so the hull
+    // girder never sees it however close to midship it stands.
+
+    const SectionCut midship = cutSection(mesh, 0.0);
+    expectTrue("the midship section is a full one", midship.plate > 150 && midship.stiffener > 150);
+
+    int stationsInside = 0, sampled = 0;
+    for (double station : mesh.frameStations)
+        if (std::abs(station) <= kParallel) ++stationsInside;
+    for (double x : xs) {
+        if (std::abs(x) > kParallel) continue;
+        ++sampled;
+        const SectionCut c = cutSection(mesh, x);
+        expectEqual("the parallel body presents the same plate panels everywhere", c.plate,
+                    midship.plate);
+        expectEqual("and the same stiffeners", c.stiffener, midship.stiffener);
+    }
+    expectTrue("the parallel body really does contain a run of stations", stationsInside >= 20);
+    expectTrue("and the sweep samples it densely", sampled >= 400);
+}
+
+// Exactly once, across a chain: the property the half-open rule exists for.
+//
+// `sectionElements` gives a cut landing on a frame seam to the bay *forward* of it,
+// so that the two bays either side do not both build it. Asserted directly here by
+// making the bays tell themselves apart -- one plating thickness per bay, reported
+// back on every element -- so a cut that took two bays, or none, is visible rather
+// than inferred from a total. Both mistakes have happened: counting both doubled
+// the section, and counting neither dropped every plate panel.
+void testEachBayServesExactlyOneFrameStation() {
+    const TriMesh hull = boxHull();
+
+    // The stations have to be known before the description can name them, so the
+    // mesh is built twice: once to lay out the frames, once with a plating band per
+    // bay. The bands are widened by a micron so the girth stays covered at the
+    // seams; a band is chosen by the bay's midpoint, which is unambiguous.
+    const std::vector<double> stations = makeStructuralMesh(hull, bareBoxScantlings()).frameStations;
+    const std::size_t bays = stations.size() - 1;
+
+    Scantlings banded = bareBoxScantlings();
+    banded.shell.clear();
+    for (std::size_t k = 0; k < bays; ++k) {
+        ShellRegion r;
+        r.name = "bay_" + std::to_string(k);
+        r.xFrom = stations[k] - 1e-6;
+        r.xTo = stations[k + 1] + 1e-6;
+        r.thickness = 0.010 + 0.001 * static_cast<double>(k);
+        r.stiffened = false;
+        banded.shell.push_back(r);
+    }
+
+    std::vector<std::string> problems;
+    const StructuralMesh mesh = makeStructuralMesh(hull, banded, &problems);
+    expectTrue("a plating band per bay builds without complaint", problems.empty());
+    expectTrue("there are enough bays for the chain to mean anything", bays >= 10);
+
+    // The box's girth is a closed form: the flat of bottom plus both sides.
+    const double girth = kBoxBeam + 2.0 * kBoxDepth;
+
+    // Which bay served the cut, read off the elements rather than assumed.
+    const auto served = [&](double x) {
+        std::vector<double> thickness;
+        double area = 0;
+        for (const SectionElement& e : sectionElements(mesh, x)) {
+            area += e.area;
+            if (std::find_if(thickness.begin(), thickness.end(), [&](double t) {
+                    return std::abs(t - e.thickness) < 1e-12;
+                }) == thickness.end())
+                thickness.push_back(e.thickness);
+        }
+        return std::pair<std::vector<double>, double>{thickness, area};
+    };
+
+    for (std::size_t k = 0; k < stations.size(); ++k) {
+        // The forward-most station has no bay ahead of it, so the cut interval
+        // closes there and the last bay serves it.
+        const std::size_t owner = std::min(k, bays - 1);
+        const double want = banded.shell[owner].thickness;
+
+        // Every way of landing on the seam: on it, a hair aft of it but inside the
+        // seam tolerance, and clear of it on the forward side.
+        std::vector<double> spellings{stations[k], stations[k] - 1e-12, stations[k] + 1e-6};
+        if (k + 1 == stations.size()) spellings.pop_back();   // past the stem
+        for (double x : spellings) {
+            const auto [thickness, area] = served(x);
+            expectEqual("a cut on a seam is served by exactly one bay",
+                        static_cast<long long>(thickness.size()), 1);
+            if (thickness.size() != 1) continue;
+            expectNear("and it is the bay forward of the seam", thickness[0], want, 1e-12);
+            // The area is the closed form, so neither a doubled bay nor a dropped
+            // one can hide inside it. The 1e-7 is the ray nudge `sampleSection`
+            // uses to keep off the transom and the deck cap.
+            expectNear("with the whole girth plated exactly once", area, girth * want,
+                       3e-7 * girth * want);
+        }
+
+        // And a hair aft of the seam, outside the tolerance, must be the bay astern
+        // -- otherwise "exactly one" would be satisfied by one bay owning everything.
+        if (k > 0) {
+            const double astern = banded.shell[k - 1].thickness;
+            const auto [thickness, area] = served(stations[k] - 1e-6);
+            expectEqual("just aft of a seam it is the other bay",
+                        static_cast<long long>(thickness.size()), 1);
+            if (thickness.size() == 1)
+                expectNear("namely the one astern", thickness[0], astern, 1e-12);
+            expectNear("which plates the whole girth in its turn", area, girth * astern,
+                       3e-7 * girth * astern);
+        }
+    }
+
+    // Vacuous unless the bays are actually distinguishable.
+    expectTrue("the bays really do differ",
+               banded.shell.front().thickness < 0.5 * banded.shell.back().thickness);
+}
+
+// A strip of plating narrow enough to look like a rounding error is still plating.
+//
+// The cut through a panel is rejected below a length, because a chord of zero
+// across a girth band the hull has closed to nothing is not a section element. That
+// guard sits between "numerically degenerate" and "thin", and where it is put is a
+// decision: raised to a centimetre it silently eats a gunwale strake and moves
+// nothing else enough to notice. `SectionElement::width` is the field that says so,
+// and it is checked here because nothing else in the engine reads it -- a written
+// and never-read field is exactly where a wrong value survives.
+void testANarrowStrakeStillReachesTheSection() {
+    Scantlings s = bareBoxScantlings();
+    ShellRegion main = s.shell[0];
+    main.girthTo = 0.99975;              // 19.995 m of the box's 20 m half-girth
+    ShellRegion gunwale = s.shell[0];
+    gunwale.name = "gunwale";
+    gunwale.girthFrom = 0.99975;         // and 5 mm at the deck edge
+    gunwale.thickness = 0.030;
+    s.shell = {main, gunwale};
+
+    std::vector<std::string> problems;
+    const StructuralMesh mesh = makeStructuralMesh(boxHull(), s, &problems);
+    expectTrue("a hull with a gunwale strake builds without complaint", problems.empty());
+
+    double plateWidth = 0, plateArea = 0, widthTimesThickness = 0;
+    double narrowest = 1e300, widest = 0;
+    int narrow = 0, plate = 0, stiffenerWithWidth = 0;
+    for (const SectionElement& e : sectionElements(mesh, 2.5)) {
+        if (e.stiffener) {
+            if (e.width != 0.0) ++stiffenerWithWidth;
+            continue;
+        }
+        ++plate;
+        plateWidth += e.width;
+        plateArea += e.area;
+        widthTimesThickness += e.width * e.thickness;
+        narrowest = std::min(narrowest, e.width);
+        widest = std::max(widest, e.width);
+        if (e.width < 0.01) ++narrow;
+    }
+
+    // The contract of the field: a plating strip's area *is* its girth times its
+    // thickness, and a stiffener spans no girth at all. Exact, not approximate --
+    // both come from the same two numbers.
+    expectEqual("a stiffener spans no girth", stiffenerWithWidth, 0);
+    expectNear("a strip's area is its girth times its thickness", widthTimesThickness, plateArea,
+               1e-12 * plateArea);
+
+    // The gunwale strake is 5 mm of a 40 m girth: one strip each side, and no other
+    // strip anywhere near that narrow.
+    expectEqual("the gunwale strake reaches the section, both sides", narrow, 2);
+    expectNear("at the width it was asked for", narrowest, 0.005, 1e-9);
+    expectTrue("and it really is the odd one out", widest > 100.0 * narrowest);
+    expectTrue("the rest of the girth is plated too", plate > 20);
+
+    // The box's girth is B + 2D, and the strips must tile it: never long, because
+    // that would mean a strip counted twice, and short only by what one strip per
+    // side loses chording across the right angle at the bilge. A band of `w` across
+    // a square corner is at worst w/sqrt(2) of it, so the whole girth cannot fall
+    // below B + 2D - 2*w*(1 - 1/sqrt(2)); it is measured at 5 mm short of 40 m,
+    // because the knuckle happens to land near a band seam rather than mid-band.
+    const double girth = kBoxBeam + 2.0 * kBoxDepth;
+    const double chordLoss = 2.0 * widest * (1.0 - 1.0 / std::sqrt(2.0));
+    expectTrue("no girth is plated twice", plateWidth <= girth + 1e-9);
+    expectTrue("and none is left bare beyond the chord across the bilge",
+               plateWidth >= girth - chordLoss);
+}
+
 // Transverse members carry no longitudinal stress, so nothing athwartships may
 // appear in the hull girder. The routine decides that from geometry rather than
 // from a label, which is checked here by adding a great deal of transverse steel
@@ -1304,6 +1658,10 @@ void runScantlingTests() {
     testHullGirderSectionAgainstHandCalculation();
     testHullGirderTakesTheAxisTheWebActuallyPresents();
     testSectionAtAFrameStationIsNotDoubleCounted();
+    testTheSectionDoesNotDependOnHowAStationIsSpelled();
+    testTheSectionSweepIsContinuousAlongTheLength();
+    testEachBayServesExactlyOneFrameStation();
+    testANarrowStrakeStillReachesTheSection();
     testTransverseStructureStaysOutOfTheHullGirder();
     testSectionPropertiesConvergeUnderFrameRefinement();
     testFerryMidshipSectionMeetsTheRuleMinimum();

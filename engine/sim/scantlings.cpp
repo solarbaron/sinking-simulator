@@ -969,6 +969,17 @@ std::vector<SectionElement> sectionElements(const StructuralMesh& mesh, double x
         // put it into the hull girder.
         if (!straddles(xLo, xHi)) continue;
 
+        // `straddles` is tolerant by kFlat and the crossing search below is exact,
+        // so the plane can be admitted while lying a hair *outside* this panel --
+        // and then no edge changes sign and the panel is silently dropped. One ULP
+        // is enough: the ferry's station 33 is 19.200000000000003, so a cut asked
+        // for at 19.2 sits 3.6e-15 aft of the bay that owns it and lost all 188
+        // plate panels while all 181 stiffeners survived, because the member branch
+        // below already clamps. Cut at the panel's own edge instead -- that is the
+        // section at the seam, and the plane moves by at most kFlat, because
+        // anything further out was rejected above.
+        const double xCut = std::clamp(x, xLo, xHi);
+
         // The cut through a convex quad is a segment; take the two crossings
         // furthest apart, which is robust when an edge lies in the plane.
         Vec3 crossing[4];
@@ -976,7 +987,7 @@ std::vector<SectionElement> sectionElements(const StructuralMesh& mesh, double x
         for (int e = 0; e < 4 && count < 4; ++e) {
             const Vec3& a = p.corner[e];
             const Vec3& b = p.corner[(e + 1) % 4];
-            const double da = a.x - x, db = b.x - x;
+            const double da = a.x - xCut, db = b.x - xCut;
             if ((da <= 0 && db >= 0) || (da >= 0 && db <= 0)) {
                 const double denominator = da - db;
                 const double u = std::abs(denominator) > 1e-15 ? da / denominator : 0.0;
@@ -1025,6 +1036,9 @@ std::vector<SectionElement> sectionElements(const StructuralMesh& mesh, double x
         const double xLo = std::min(m.a.x, m.b.x), xHi = std::max(m.a.x, m.b.x);
         if (!straddles(xLo, xHi)) continue;
 
+        // Clamped for the same reason the plate cut above is: a plane admitted
+        // within the seam tolerance can lie a hair outside the member, and the root
+        // then wants to be the member's own end rather than an extrapolation of it.
         const double u = std::clamp((x - m.a.x) / (m.b.x - m.a.x), 0.0, 1.0);
         const Vec3 root = m.a + (m.b - m.a) * u;
         const ProfileSection ps = profileSection(m.profile);
