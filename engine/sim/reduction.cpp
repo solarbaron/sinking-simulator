@@ -601,6 +601,14 @@ struct Substructure::Impl {
     double attachedMass = 0;
     std::vector<std::string> problems;
 
+    // What each attached member is carrying, as a linear form on the displacement
+    // field: `memberForm[m][k]` multiplies `u[memberDof[m][k]]`. The blocks
+    // themselves are scattered into the CSR and thrown away -- a rank-one block
+    // `s v v^T` has forgotten how to separate the stress from the volume it acts
+    // in -- so this is kept rather than reconstructed. See §9.
+    std::vector<std::vector<std::uint32_t>> memberDof;
+    std::vector<std::vector<double>> memberForm;
+
     // The slot for (row, col), or `value.size()` when the pattern has no such
     // entry. **The miss is reported rather than assumed away**: `lower_bound` on a
     // column the row does not carry returns the slot of the next one, so an
@@ -700,8 +708,44 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
             "attached stiffness with no attached mass: the reduced model is stiffer than the "
             "plating but no heavier, so its frequencies come out high -- "
             "`constraint::lumpFiberMass` is what fills this in");
+
+    // The stress forms, checked the same way and for the same reason (§9). A form
+    // paired with the wrong block reads the right degrees of freedom for a
+    // *different* member and reports a number that is plausible and wrong, which
+    // is worse than reporting none -- so a list that is not parallel to the blocks
+    // is refused rather than truncated to the shorter of the two.
+    if (!attached.stress.empty()) {
+        if (attached.stress.size() != attached.stiffness.size()) {
+            s.problems.push_back(
+                "the attachment has " + std::to_string(attached.stress.size()) +
+                " stress forms for " + std::to_string(attached.stiffness.size()) +
+                " stiffness blocks; they are parallel, so it must be either count or empty");
+            return;
+        }
+        for (std::size_t b = 0; b < attached.stress.size(); ++b)
+            if (attached.stress[b].size() != attached.stiffness[b].dof.size()) {
+                s.problems.push_back("attached stress form " + std::to_string(b) + " has " +
+                                     std::to_string(attached.stress[b].size()) +
+                                     " entries for a block naming " +
+                                     std::to_string(attached.stiffness[b].dof.size()) +
+                                     " degrees of freedom");
+                return;
+            }
+    } else if (!attached.stiffness.empty()) {
+        s.problems.push_back(
+            "attached stiffness with no stress forms: `checkValidity` cannot see what these "
+            "members are carrying, so a stiffened region is judged by its plating and its "
+            "utilisation comes out low -- `constraint::attachedForms` is what fills this in");
+    }
+
     s.attachedBlocks = attached.stiffness.size();
     for (double m : attached.mass) s.attachedMass += m;
+    s.memberDof.reserve(attached.stress.size());
+    s.memberForm.reserve(attached.stress.size());
+    for (std::size_t b = 0; b < attached.stress.size(); ++b) {
+        s.memberDof.push_back(attached.stiffness[b].dof);
+        s.memberForm.push_back(attached.stress[b]);
+    }
 
     // --- The constraints, and what a node stands for once they are applied ---
     s.expansion = solidshell::DofExpansion(s.dofs, attached.constrained);
@@ -1120,6 +1164,20 @@ const std::vector<double>& Substructure::mass() const { return impl_->massDiag; 
 const solidshell::HexMesh& Substructure::mesh() const { return *impl_->mesh; }
 const StructuralMaterial& Substructure::material() const { return impl_->material; }
 solidshell::Formulation Substructure::formulation() const { return impl_->form; }
+const solidshell::DofExpansion& Substructure::expansion() const { return impl_->expansion; }
+
+std::size_t Substructure::attachedMembers() const { return impl_->memberForm.size(); }
+
+double Substructure::memberStress(std::size_t member,
+                                  const std::vector<double>& displacement) const {
+    if (member >= impl_->memberForm.size()) return 0.0;
+    const std::vector<double>& form = impl_->memberForm[member];
+    const std::vector<std::uint32_t>& dof = impl_->memberDof[member];
+    double stress = 0;
+    for (std::size_t k = 0; k < form.size() && k < dof.size(); ++k)
+        if (dof[k] < displacement.size()) stress += form[k] * displacement[dof[k]];
+    return stress;
+}
 
 // **The two accessors below are bounded by what was actually built, not by
 // `nodes`, and that is a fix rather than a nicety.** Every early `return` in the
@@ -1635,6 +1693,16 @@ std::vector<double> recover(const Substructure& sub, const Reduction& reduced,
         for (std::size_t j = 0; j < m; ++j) sum += reduced.normalModes[p * m + j] * state[nb + j];
         out[sub.interiorDof()[p]] = sum;
     }
+    // A degree of freedom an `Attachment::constrained` eliminated is in neither
+    // partition, so nothing above has written it. Leaving it at zero is not a
+    // small error: it is a hole in the middle of the displacement field, and every
+    // element and every fibre touching that node then sees an artificial gradient
+    // across one element length. Measured on a plate with one interior node tied
+    // to two neighbours, `checkValidity` came back with 850 788 MPa against the
+    // 427 MPa the same state really carries -- a factor of 1992 -- and it would have
+    // done so on every tied section `section.cpp` builds. Same call `solveStatic`
+    // already makes for the same reason.
+    sub.expansion().recover(out);
     return out;
 }
 
@@ -1726,12 +1794,30 @@ Validity checkValidity(const Substructure& sub, const Reduction& reduced,
         solidshell::elementStress(nodePos, displacement, sub.material(), sub.formulation(), stress);
         for (int g = 0; g < kGauss; ++g) {
             const double mises = vonMises(stress + g * 6);
-            if (mises > out.peakVonMises) {
-                out.peakVonMises = mises;
+            if (mises > out.platingVonMises) {
+                out.platingVonMises = mises;
                 out.worstElement = static_cast<int>(e);
             }
         }
     }
+
+    // The other half of the structure (§9). A fibre is an axial bar, so its stress
+    // tensor has one non-zero entry and its von Mises is `|sigma|` identically --
+    // the same equivalent stress the elements are measured by, not an analogue of
+    // it. The magnitude is taken here and not in `memberStress`, which reports the
+    // sign because which side of the neutral axis a fibre is on is information.
+    const std::size_t members = sub.attachedMembers();
+    for (std::size_t m = 0; m < members; ++m) {
+        const double mises = std::fabs(sub.memberStress(m, u));
+        if (mises > out.memberVonMises) {
+            out.memberVonMises = mises;
+            out.worstMember = static_cast<int>(m);
+        }
+    }
+
+    // With no members this is `platingVonMises` to the last bit, which is what
+    // makes the whole of §9 inert on a substructure that has none.
+    out.peakVonMises = std::max(out.platingVonMises, out.memberVonMises);
     const double yield = sub.material().yieldStrength;
     out.utilisation = yield > 0.0 ? out.peakVonMises / yield : 0.0;
     out.linear = out.utilisation < 1.0;

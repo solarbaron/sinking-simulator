@@ -203,12 +203,19 @@ constraint::Stiffening stiffenSeam(const solidshell::HexMesh& mesh,
 // the integration §8 describes: two calls into `constraint.hpp` and nothing else.
 reduction::Attachment attachmentOf(const constraint::Stiffening& stiffening,
                                    const solidshell::HexMesh& mesh,
-                                   const StructuralMaterial& material, bool withMass) {
+                                   const StructuralMaterial& material, bool withMass,
+                                   bool withStress = true) {
     const constraint::RestFibers forms = constraint::restFibers(stiffening, mesh.position);
     expectTrue("every fibre has a rest length", forms.ok);
+    constraint::AttachedForms built =
+        constraint::attachedForms(stiffening, mesh.position, forms, material.youngsModulus);
     reduction::Attachment attached;
-    attached.stiffness = constraint::stiffnessBlocks(stiffening, mesh.position, forms,
-                                                     material.youngsModulus);
+    attached.stiffness = std::move(built.stiffness);
+    // `withStress == false` is the substructure this file had before §9: the
+    // members are in the stiffness and invisible to `checkValidity`. It is kept
+    // because it is the *only* way to reproduce the old, low utilisation, and a
+    // regression test for a number needs the wrong number to still be reachable.
+    if (withStress) attached.stress = std::move(built.stress);
     if (withMass) {
         attached.mass.assign(mesh.nodeCount(), 0.0);
         constraint::lumpFiberMass(stiffening, forms, material.density, attached.mass);
@@ -2173,58 +2180,6 @@ void testAttachedStiffness() {
                     100.0 * stiffening / barePeak, std::max(worstBoundary, worstInterior), peak);
     }
 
-    // --- What the promotion trigger does not see --------------------------------
-    //
-    // `checkValidity` walks the elements, so an attached member's own stress is not
-    // in the peak von Mises. That is a sentence in §6 and §8, and nothing tests a
-    // sentence, so it is measured: the fibre stress is taken here from the
-    // recovered field through the same rank-one form `constraint::fiberStiffness`
-    // builds, and compared against what the trigger reports.
-    {
-        const constraint::RestFibers forms = constraint::restFibers(seam, mesh.position);
-        solidshell::HexMesh pinned = testPlate();
-        std::vector<double> load(sub.dofCount(), 0.0);
-        std::vector<std::uint32_t> held;
-        for (std::size_t b = 0; b < sub.boundaryCount(); ++b) {
-            const std::uint32_t d = sub.boundaryDof()[b];
-            if (mesh.position[(d / 3) * 3] < 0.5 * kLx) {
-                held.push_back(static_cast<std::uint32_t>(b));
-                pinned.pin(d / 3, static_cast<int>(d % 3), 0.0);
-            } else if (d % 3 == 2) {
-                load[d] = 1000.0;
-            }
-        }
-        ReduceParams params;
-        params.modes = 8;
-        const Reduction reduced = craigBampton(sub, params);
-        std::vector<double> state;
-        std::string problem;
-        expectTrue("the stiffened cantilever solves",
-                   reduction::staticSolve(reduced, reduction::reduceLoad(sub, reduced, load), held,
-                                          state, &problem));
-        const std::vector<double> u = reduction::recover(sub, reduced, state);
-        const reduction::Validity validity = reduction::checkValidity(sub, reduced, state);
-
-        double peakFibre = 0;
-        for (std::size_t i = 0; i < seam.fiberCount(); ++i) {
-            const double restLength = forms.length[i];
-            const constraint::FiberStiffness form = constraint::fiberStiffness(
-                seam.fiber[i], mesh.position, restLength, steel.youngsModulus);
-            if (!(form.scale > 0)) continue;
-            double elongation = 0;
-            for (int k = 0; k < 12; ++k) elongation += form.vector[k] * u[form.dof[k]];
-            peakFibre = std::max(peakFibre,
-                                 std::fabs(steel.youngsModulus * elongation / restLength));
-        }
-        expectTrue("the load stresses the plating", validity.peakVonMises > 1e6);
-        expectTrue("and the stiffener carries more of it than the plating does, unreported",
-                   peakFibre > validity.peakVonMises);
-        std::printf("     checkValidity reports %.2f MPa in the plating and cannot see the "
-                    "%.2f MPa in the member: utilisation %.3f against a true %.3f\n",
-                    1e-6 * validity.peakVonMises, 1e-6 * peakFibre, validity.utilisation,
-                    std::max(peakFibre, validity.peakVonMises) / steel.yieldStrength);
-    }
-
     // --- What a malformed attachment does. Refused, not skipped: a stiffener that
     // quietly does not arrive is indistinguishable from bare plating, which is the
     // whole failure this section closes.
@@ -2251,6 +2206,774 @@ void testAttachedStiffness() {
                                   attachmentOf(seam, mesh, steel, false));
         expectTrue("stiffness with no mass is allowed but not silent",
                    silent.ready() && !silent.problems().empty());
+
+        // And the same, for the stress forms §9 added. A form list that is not
+        // parallel to the blocks would read the right degrees of freedom for the
+        // *wrong* member -- a number that is plausible and wrong -- so it is
+        // refused, not truncated to the shorter of the two.
+        reduction::Attachment shortStress = attached;
+        shortStress.stress.pop_back();
+        const Substructure refusedStress(mesh, steel, endInterface(mesh), shortStress);
+        expectTrue("a stress form list shorter than the block list is refused",
+                   !refusedStress.ready() && !refusedStress.problems().empty());
+
+        reduction::Attachment longStress = attached;
+        longStress.stress.push_back(longStress.stress.back());
+        const Substructure refusedLong(mesh, steel, endInterface(mesh), longStress);
+        expectTrue("and one longer than it",
+                   !refusedLong.ready() && !refusedLong.problems().empty());
+
+        reduction::Attachment ragged = attached;
+        ragged.stress[0].pop_back();
+        const Substructure refusedRagged(mesh, steel, endInterface(mesh), ragged);
+        expectTrue("and a form with fewer entries than its block names degrees of freedom",
+                   !refusedRagged.ready() && !refusedRagged.problems().empty());
+
+        const Substructure blind(mesh, steel, endInterface(mesh),
+                                 attachmentOf(seam, mesh, steel, true, false));
+        expectTrue("stiffness with no stress form is allowed but not silent either",
+                   blind.ready() && !blind.problems().empty());
+        expectEqualCount("and it carries no members to read", blind.attachedMembers(), 0u);
+        expectEqualCount("while still carrying every block", blind.attachedBlocks(),
+                         seam.fiberCount());
+    }
+}
+
+// --- 11b. What the promotion trigger reads (§9) -----------------------------------
+//
+// `checkValidity` used to walk the elements alone, so a stiffened region was
+// judged by its plating -- and the plating is the softer half, so the utilisation
+// came out low in the *unsafe* direction. That is what decides whether a region is
+// promoted to the nonlinear Tier-2 model, so reading it low means staying linear
+// after the structure has stopped being linear.
+//
+// What is asserted here, and each answers a different way of getting it wrong:
+//
+//   * **That the two halves are comparable at all.** A bar's stress tensor has one
+//     non-zero entry and the von Mises of that state is `|sigma|` identically --
+//     asserted as an equality of bits through the same formula the element half is
+//     measured by, because it is algebra rather than a limit. With it, the bound on
+//     what the fibre model *omits*: a transverse stress makes von Mises
+//     `|s| sqrt(1 - a + a^2)`, which is 0.866 |s| at `a = 1/2` and sqrt(3) |s| at
+//     `a = -1`, so the omission has no fixed sign in either direction.
+//   * **The closed form**, which owes this file nothing. Under a prescribed
+//     `u_x = (eps + kappa z) g(x)` the tie puts a fibre at offset `e` at exactly
+//     `(eps + kappa e) g(x)`, so a fibre spanning `x_a` to `x_b` carries
+//     `E (eps + kappa e) (g(x_b) - g(x_a)) / (x_b - x_a)`. Choose `eps` to put the
+//     section in pure bending and the offset term is `E kappa (e - z_na)` with
+//     `z_na` the combined neutral axis -- and `z_na` derived from the fibre
+//     stations is compared against `scantlings::stiffenedSection`'s, computed from
+//     the rectangle dimensions in a different file by a different formula.
+//   * **The regression case**, 58.2 MPa in the plating against 65.2 in the member:
+//     utilisation 0.1838 where it used to be 0.1639.
+//   * **The negative control**, bit for bit: with no attachment `checkValidity`
+//     must return exactly what it returned before §9, not something close to it.
+//   * **The vacuity guard, in both directions.** A test in which the member always
+//     governs would pass on an implementation that reported the member and ignored
+//     the plating. So the *same* profile under the *same* load is run with the seam
+//     moved to the plate edge, where the plating governs by 2.5x, and the answer
+//     has to follow the structure.
+//   * **That the tie is filled in.** A degree of freedom `Attachment::constrained`
+//     eliminated is in neither partition, and `recover` leaving it at zero put a
+//     hole in the field that read as 850 788 MPa on a plate carrying 427.
+//
+// The cases that look synthetic -- a seam of one fibre, the same fibre twice, a
+// diagonal brace -- are each here because mutation testing showed the sixteen-fibre
+// seam could not reach the predicate they test. Their reasons are beside them.
+void testMemberValidity() {
+    std::printf("\n--- reduction: what the promotion trigger reads (§9) ---\n");
+    const solidshell::HexMesh mesh = testPlate();
+    const StructuralMaterial steel = ah36Steel();
+    const StiffenerProfile profile = flatBar(0.200, 0.010);
+
+    // --- The identity that makes the two halves comparable at all ---
+    //
+    // A fibre is an axial bar, so its stress tensor has one non-zero entry, and the
+    // von Mises of that state is `|sigma|` *identically*. Asserted through the same
+    // formula the element half is measured by rather than restated, and asserted as
+    // an equality of bits: it is algebra, not a limit. Both signs, because
+    // `sqrt(...)` of a squared difference would agree on one of them by accident.
+    for (double s : {355.0e6, -355.0e6, 1.0, -1e-30}) {
+        const double uniaxial[6] = {s, 0, 0, 0, 0, 0};
+        const double transverse[6] = {0, s, 0, 0, 0, 0};
+        expectTrue("a uniaxial stress state's von Mises is exactly its own magnitude",
+                   misesOf(uniaxial) == std::fabs(s) && misesOf(transverse) == std::fabs(s));
+    }
+    // ...and the bound on what the fibre model leaves out, which is the reason the
+    // equality above is a statement about the *model* and not about the member: a
+    // transverse stress beside the axial one changes von Mises to
+    // `|s| sqrt(1 - a + a^2)`, whose minimum over `a` is at a = 1/2. So ignoring
+    // biaxiality has no fixed sign, and the header says so rather than claiming the
+    // fibre stress is conservative.
+    {
+        const double s = 100.0e6;
+        const double half[6] = {s, 0.5 * s, 0, 0, 0, 0};
+        const double opposed[6] = {s, -s, 0, 0, 0, 0};
+        expectNear("a transverse tension of half the axial lowers von Mises to sqrt(3)/2",
+                   misesOf(half) / s, std::sqrt(0.75), 1e-15);
+        expectNear("and a transverse compression of equal size raises it to sqrt(3)",
+                   misesOf(opposed) / s, std::sqrt(3.0), 1e-15);
+    }
+
+    // --- The closed form, against `scantlings::stiffenedSection` -----------------
+    //
+    // Two independent routes to the neutral axis. `stiffenedSection` takes it from
+    // the rectangle dimensions; the route here takes it from the fibre stations the
+    // constraint machinery actually built, by requiring the section to carry no net
+    // axial force under a pure curvature -- `sum A_j (e_j - z_na) + b t (0 - z_na)
+    // = 0`. The two agree only if the two-point Gauss stations reproduce the
+    // profile's area and first moment exactly, which is `constraint.hpp` §2's claim
+    // and not this file's.
+    {
+        const constraint::Stiffening seam = stiffenSeam(mesh, steel, profile, kNy / 2, 1);
+        const Substructure sub(mesh, steel, endInterface(mesh),
+                               attachmentOf(seam, mesh, steel, true));
+        expectTrue("the stiffened substructure factors", sub.ready());
+        expectEqualCount("and carries a stress form for every block", sub.attachedMembers(),
+                         sub.attachedBlocks());
+
+        const constraint::ProfileFibers stations = constraint::profileFibers(profile, kThickness, 1.0);
+        double stationArea = 0, stationFirstMoment = 0;
+        for (int i = 0; i < stations.count; ++i) {
+            stationArea += stations.area[i];
+            stationFirstMoment += stations.area[i] * stations.offset[i];
+        }
+        const double neutralAxis = stationFirstMoment / (kLy * kThickness + stationArea);
+        const StiffenedSection panel = stiffenedSection(profile, kThickness, kLy);
+        // The measurement is 3.5e-18 m, which is **one ulp** of an answer of
+        // 0.0230 m: the two formulas agree as exactly as double precision allows.
+        // The tolerance is five ulp rather than one, because that is the room two
+        // different orderings of the same arithmetic need across the three
+        // optimisation levels the gate compiles at. A per-cent tolerance would pass
+        // on a section that had lost the plate's own area, which moves this by 60%.
+        expectNear("the fibre stations and stiffenedSection agree about the neutral axis",
+                   neutralAxis, panel.neutralAxis, 8e-16 * panel.neutralAxis);
+
+        // Prescribe the field. Every fibre lies along x and the tie reads only the
+        // x components, so the tied point at offset `e` moves by `(eps + kappa e)
+        // g(x)` exactly -- that is what `tieWeight` is defined to deliver -- and a
+        // fibre spanning `x_a` to `x_b` therefore carries
+        //
+        //     sigma = E (eps + kappa e) (g(x_b) - g(x_a)) / (x_b - x_a)
+        //
+        // **`g` is `x + x^2 / (2 c)` and not `x`, and that is a vacuity this test
+        // was carrying.** With `g(x) = x` every segment of the seam elongates by the
+        // same amount, so every fibre at a given offset carries the *same* stress
+        // -- and a recovery that read the neighbouring segment's degrees of freedom
+        // instead of its own returned exactly the right number. Mutation testing
+        // found it: the mutant "reads the wrong member's dof list" survived a test
+        // that checked every one of the sixteen fibres. Adding the quadratic term
+        // makes each segment's elongation its own while keeping the closed form
+        // closed, because `(x_b^2 - x_a^2) / (x_b - x_a)` is `x_a + x_b`.
+        const double kappa = 2.0e-3;
+        const double strain = -kappa * neutralAxis;
+        const double kTaper = 3.0 * kLx;  // `c`: a 20% spread of elongation over the seam
+        const auto along = [&](double x) { return x + x * x / (2.0 * kTaper); };
+        std::vector<double> u(sub.dofCount(), 0.0);
+        for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+            const double x = mesh.position[n * 3], z = mesh.position[n * 3 + 2];
+            u[n * 3] = (strain + kappa * z) * along(x);
+        }
+        double worst = 0, biggest = 0, netForce = 0, plateForce = 0;
+        double mostTension = 0, mostCompression = 0, spread = 0, leastFactor = 1e30;
+        for (std::size_t m = 0; m < sub.attachedMembers(); ++m) {
+            const double got = sub.memberStress(m, u);
+            const double offset = seam.fiber[m].offset;
+            const double xa = constraint::tiedPoint(seam.fiber[m].end[0], mesh.position).x;
+            const double xb = constraint::tiedPoint(seam.fiber[m].end[1], mesh.position).x;
+            const double factor = 1.0 + (xa + xb) / (2.0 * kTaper);
+            const double want = steel.youngsModulus * kappa * (offset - neutralAxis) * factor;
+            worst = std::max(worst, std::fabs(got - want));
+            biggest = std::max(biggest, std::fabs(want));
+            mostTension = std::max(mostTension, got);
+            mostCompression = std::min(mostCompression, got);
+            spread = std::max(spread, factor);
+            leastFactor = std::min(leastFactor, factor);
+            // The axial force this fibre carries is `sigma A`, and the plating over
+            // the same span carries `E eps b t` times the same factor. They cancel
+            // exactly when the neutral axis is right, which is what makes the closed
+            // form above a statement and not a definition. Half the plate's share
+            // per fibre, because each segment carries two of them.
+            netForce += got * seam.fiber[m].area;
+            plateForce += 0.5 * factor * steel.youngsModulus * strain * kLy * kThickness;
+        }
+        netForce /= static_cast<double>(kNx);   // one station's worth of fibres
+        plateForce /= static_cast<double>(kNx);
+        expectTrue("the prescribed curvature stresses the members", biggest > 10.0e6);
+        // The guard on the vacuity above: the segments must actually differ, or the
+        // quadratic term has bought nothing and the test is the old one again.
+        expectTrue("and the segments of the seam carry visibly different stress",
+                   spread > 1.15 * leastFactor);
+        // 1e-13 relative, where the measurement is 5.3e-15 -- there is no solve in
+        // this at all, only a twelve-term dot product against a field built by two
+        // multiplications, so the floor is a few ulp of the largest term rather than
+        // anything that converges. The headroom over the measurement is for the
+        // gate's other optimisation levels, which are free to contract the multiply
+        // and add differently. A 1e-6 tolerance would pass on a stiffener whose
+        // fibres had all been put at the profile centroid, which loses `I_own` --
+        // 23% of the second moment.
+        expectTrue("every fibre reports E kappa (e - z_na), the closed form",
+                   worst < 1e-13 * biggest);
+        expectTrue("the section carries no net axial force, so z_na really is the neutral axis",
+                   std::fabs(netForce + plateForce) < 1e-14 * std::fabs(plateForce));
+
+        // **Every fibre comes out in tension, and that is not a bug in the test.**
+        // The neutral axis is 23.0 mm above the plate mid-surface -- inside the web,
+        // whose root is at 6.0 mm -- but two-point Gauss puts the lowest station at
+        // 48.3 mm, so no fibre station is below it. The section straddles the
+        // neutral axis through the *plating*, which carries all of the compression,
+        // and the sign guard therefore has to be taken between the two halves rather
+        // than within the member. (It also means the fibre model never samples the
+        // part of the web that is in compression: it integrates the energy exactly,
+        // which is what §2 of `constraint.hpp` claims, but it cannot report a stress
+        // there.)
+        expectTrue("the members are in tension and the plating carries the compression",
+                   mostTension > 0 && plateForce < 0 && mostCompression >= 0);
+        // The neutral axis is not a rounding on this section: dropping it would move
+        // every fibre stress by E kappa z_na, 16% of the peak. Without this the
+        // closed form would be satisfied by an implementation that ignored z_na and
+        // a test whose `strain` happened to be small.
+        expectTrue("and it is worth far more than the tolerance the closed form is asserted at",
+                   steel.youngsModulus * kappa * neutralAxis > 0.1 * biggest);
+
+        // Reverse the curvature: every fibre stress must flip sign exactly. A
+        // recovery that returned a magnitude -- `|sigma|` instead of `sigma` --
+        // passes every assertion above and fails this one, and it is the mistake
+        // `checkValidity` itself makes on purpose one layer up.
+        std::vector<double> reversed(sub.dofCount(), 0.0);
+        for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+            const double x = mesh.position[n * 3], z = mesh.position[n * 3 + 2];
+            reversed[n * 3] = -(strain + kappa * z) * along(x);
+        }
+        double worstFlip = 0;
+        for (std::size_t m = 0; m < sub.attachedMembers(); ++m)
+            worstFlip = std::max(worstFlip, std::fabs(sub.memberStress(m, reversed) +
+                                                      sub.memberStress(m, u)));
+        expectNear("and reversing the curvature reverses every fibre's stress, exactly",
+                   worstFlip, 0.0, 0.0);
+
+        // Out of range is zero, not the entry past the end of the array. Asked for
+        // rather than assumed: the guard is a `>=` one index away from undefined
+        // behaviour, and ASan is what would say so if it slipped to `>`.
+        expectNear("a member index the substructure does not have reads zero",
+                   sub.memberStress(sub.attachedMembers(), u), 0.0, 0.0);
+        expectNear("and so does one far past the end",
+                   sub.memberStress(sub.attachedMembers() + 1000, u), 0.0, 0.0);
+
+        std::printf("     prescribed kappa %g about z_na %.9f m: closed form to %.1e Pa of "
+                    "%.3e Pa, net axial force %.2e N against a plate's %.6e N, fibres "
+                    "%.2f to %+.2f MPa (all above z_na)\n",
+                    kappa, neutralAxis, worst, biggest, netForce + plateForce, plateForce,
+                    1e-6 * mostCompression, 1e-6 * mostTension);
+    }
+
+    // --- The 58.2 / 65.2 MPa case, which is the regression test ------------------
+    //
+    // The stiffened cantilever: the plate held along x = 0, 1000 N up on every node
+    // of the far end, eight modes. The member carries 12% more than the plating, so
+    // the utilisation the trigger reports moves from 0.164 to 0.184.
+    //
+    // The seam row is swept, because the same profile under the same load has the
+    // plating governing at the plate edge and the member governing at mid width.
+    // Without that the assertion would pass on an implementation that reported the
+    // member and forgot the plating entirely.
+    struct Reading {
+        double plating = 0, member = 0, utilisation = 0, blindUtilisation = 0;
+        int worstMember = -1, members = 0;
+        double offSeam = 0;     // m, the worst element's centroid from the seam line
+        double biaxiality = 0;  // its von Mises over its own axial component
+    };
+    // `heldEnd` is which end is built in. Both are run because the peak member has
+    // to be found at *both* ends of the fibre list or a loop bound off by one at
+    // either end goes unnoticed -- which is exactly what mutation testing showed:
+    // with the root at x = 0 the worst fibre is index 1 of sixteen, so a loop that
+    // stopped one short still found it.
+    const auto cantilever = [&](int seamRow, double heldEnd) {
+        const constraint::Stiffening seam = stiffenSeam(mesh, steel, profile, seamRow, 1);
+        const Substructure sub(mesh, steel, endInterface(mesh),
+                               attachmentOf(seam, mesh, steel, true));
+        // The same substructure with the stress forms withheld: this is what the
+        // trigger read before §9, and it is what the 0.164 has to come out of.
+        const Substructure blind(mesh, steel, endInterface(mesh),
+                                 attachmentOf(seam, mesh, steel, true, false));
+        expectTrue("the seam-row substructures factor", sub.ready() && blind.ready());
+
+        std::vector<double> load(sub.dofCount(), 0.0);
+        std::vector<std::uint32_t> held;
+        for (std::size_t b = 0; b < sub.boundaryCount(); ++b) {
+            const std::uint32_t d = sub.boundaryDof()[b];
+            const double x = mesh.position[(d / 3) * 3];
+            if (std::fabs(x - heldEnd) < 0.5 * kLx)
+                held.push_back(static_cast<std::uint32_t>(b));
+            else if (d % 3 == 2)
+                load[d] = 1000.0;
+        }
+        ReduceParams params;
+        params.modes = 8;
+        const Reduction reduced = craigBampton(sub, params);
+        const Reduction blindReduced = craigBampton(blind, params);
+        std::vector<double> state, blindState;
+        std::string problem;
+        expectTrue("the stiffened cantilever solves",
+                   reduction::staticSolve(reduced, reduction::reduceLoad(sub, reduced, load), held,
+                                          state, &problem));
+        reduction::staticSolve(blindReduced, reduction::reduceLoad(blind, blindReduced, load), held,
+                               blindState, &problem);
+        const reduction::Validity v = reduction::checkValidity(sub, reduced, state);
+        const reduction::Validity b = reduction::checkValidity(blind, blindReduced, blindState);
+
+        // The plating half must be untouched by the members being visible: the two
+        // substructures have the same stiffness and the same mass, so their element
+        // stresses are the same bits. That is what says §9 added a reading rather
+        // than perturbing the model.
+        expectTrue("making the members visible does not move the plating's own stress",
+                   v.platingVonMises == b.peakVonMises && v.worstElement == b.worstElement);
+        expectTrue("and the invariants hold",
+                   v.peakVonMises == std::max(v.platingVonMises, v.memberVonMises) &&
+                       v.utilisation == v.peakVonMises / steel.yieldStrength &&
+                       v.linear == (v.utilisation < 1.0));
+
+        // **`worstMember` names the member, and `memberVonMises` is the peak over
+        // *every* one of them.** Re-derived here from the same recovered field
+        // through `memberStress`, which the closed form above has already pinned to
+        // `E kappa (e - z_na)` -- so this is the sweep inside `checkValidity` under
+        // test, not the arithmetic it sweeps. Without it a loop that read one member
+        // too few, or that recorded the wrong index, passed everything.
+        const std::vector<double> u = reduction::recover(sub, reduced, state);
+        double independent = 0;
+        int argmax = -1;
+        for (std::size_t m = 0; m < sub.attachedMembers(); ++m) {
+            const double s = std::fabs(sub.memberStress(m, u));
+            if (s > independent) { independent = s; argmax = static_cast<int>(m); }
+        }
+        expectNear("the member peak is the peak over every member, to the last bit",
+                   v.memberVonMises, independent, 0.0);
+        expectTrue("and worstMember names the one it came from",
+                   v.worstMember == argmax && v.worstMember >= 0 &&
+                       std::fabs(sub.memberStress(static_cast<std::size_t>(v.worstMember), u)) ==
+                           v.memberVonMises);
+        // Where the plating's governing point is, and what kind of stress it is.
+        // §9 claims the two halves peak in different places and different states;
+        // nothing tests a claim, so it is measured here and asserted below.
+        double nodePos[24], disp[24], stress[48], centroid[3] = {0, 0, 0};
+        mesh.gather(static_cast<std::size_t>(v.worstElement), mesh.position, nodePos);
+        mesh.gather(static_cast<std::size_t>(v.worstElement), u, disp);
+        for (int n = 0; n < 8; ++n)
+            for (int k = 0; k < 3; ++k) centroid[k] += nodePos[n * 3 + k] / 8.0;
+        solidshell::elementStress(nodePos, disp, steel, solidshell::Formulation::SolidShell,
+                                  stress);
+        double atPeak = 0, axialThere = 0;
+        for (int g = 0; g < 8; ++g) {
+            const double m = misesOf(stress + g * 6);
+            if (m > atPeak) { atPeak = m; axialThere = std::fabs(stress[g * 6]); }
+        }
+        expectNear("the element sweep here finds the same peak checkValidity did", atPeak,
+                   v.platingVonMises, 0.0);
+        const double seamY = kLy * static_cast<double>(seamRow) / kNy;
+        return Reading{v.platingVonMises, v.memberVonMises, v.utilisation, b.utilisation,
+                       v.worstMember, static_cast<int>(sub.attachedMembers()),
+                       std::fabs(centroid[1] - seamY), atPeak / axialThere};
+    };
+
+    const Reading middle = cantilever(kNy / 2, 0.0);
+    const Reading flipped = cantilever(kNy / 2, kLx);
+    const Reading edge = cantilever(0, 0.0);
+
+    // The two cantilevers are mirror images, so they must report the same numbers
+    // from opposite ends of the fibre list -- and between them the worst member is
+    // found near both ends of it. That is what makes the sweep's bounds tested
+    // rather than merely exercised.
+    expectNear("the mirrored cantilever reports the same member stress",
+               flipped.member, middle.member, 1e-9 * middle.member);
+    expectTrue("from the other end of the fibre list",
+               middle.worstMember < middle.members / 4 &&
+                   flipped.worstMember >= 3 * flipped.members / 4);
+
+    // 1e-4 relative on quantities printed to four figures in `reduction.hpp` §8;
+    // the run reproduces them to 58.1962 and 65.2402 MPa.
+    expectNear("the plating reports 58.2 MPa", 1e-6 * middle.plating, 58.196, 1e-3);
+    expectNear("and the member carries 65.2 MPa", 1e-6 * middle.member, 65.240, 1e-3);
+    // 1e-6 absolute on a number the run reproduces as 0.183775 and 0.163933. It is
+    // the headline of §8 and of `docs/02-simulation.md`, so it is asserted to every
+    // figure those quote rather than to the two the prose rounds to.
+    expectNear("so the utilisation is 0.183775, not the 0.163933 the plating alone gives",
+               middle.utilisation, 0.183775, 1e-6);
+    expectNear("and the old number is still exactly what a blind substructure reports",
+               middle.blindUtilisation, 0.163933, 1e-6);
+    // The guard the whole case rests on: if the plating governed at mid width the
+    // assertion above would be satisfied by the plating alone.
+    expectTrue("the member really is the governing half at mid width",
+               middle.member > middle.plating && middle.worstMember >= 0);
+    expectTrue("and it is 11% low without it, in the unsafe direction",
+               middle.blindUtilisation < middle.utilisation &&
+                   middle.blindUtilisation > 0.88 * middle.utilisation);
+
+    // **The two halves are not two readings of one stress**, which is the whole
+    // reason `Validity` reports them apart. The member's peak is pure axial, at the
+    // far fibre, on the seam. The plating's is one element *off* the seam and is
+    // dominated by transverse bending: its von Mises is three times its own axial
+    // component there. A single peak would hide both facts.
+    expectTrue("the plating's governing point is off the seam, not on it",
+               middle.offSeam > 0.5 * (kLy / kNy) && middle.offSeam < 1.5 * (kLy / kNy));
+    expectTrue("and it is not an axial stress at all -- von Mises is 3x its own sigma_xx",
+               middle.biaxiality > 2.5 && middle.biaxiality < 3.5);
+    std::printf("     the plating's peak is %.4f m off the seam and its von Mises is %.4fx its "
+                "own axial component; the member's is pure axial\n",
+                middle.offSeam, middle.biaxiality);
+
+    // ...and the other direction. Same profile, same load, seam moved to the plate
+    // edge: the plating governs by 2.5x and the answer must follow the structure.
+    expectTrue("with the seam at the plate edge the plating is the governing half",
+               edge.plating > 2.0 * edge.member);
+    expectNear("so the trigger reports the plating's number", edge.utilisation,
+               edge.plating / steel.yieldStrength, 1e-15 * edge.utilisation);
+    expectNear("which is exactly what it reported before the members were visible",
+               edge.blindUtilisation, edge.utilisation, 0.0);
+    expectTrue("and the member is still read, it simply does not govern",
+               edge.member > 1e6 && edge.worstMember >= 0);
+    std::printf("     mid width: plating %.4f MPa, member %.4f MPa, utilisation %.6f "
+                "(was %.6f)\n",
+                1e-6 * middle.plating, 1e-6 * middle.member, middle.utilisation,
+                middle.blindUtilisation);
+    std::printf("     plate edge: plating %.3f MPa, member %.3f MPa, utilisation %.5f "
+                "(was %.5f) -- the plating governs\n",
+                1e-6 * edge.plating, 1e-6 * edge.member, edge.utilisation, edge.blindUtilisation);
+    std::printf("     worst member: index %d of %d held at x = 0, %d of %d held at x = L\n",
+                middle.worstMember, middle.members, flipped.worstMember, flipped.members);
+
+    // --- `linear` at exactly one -------------------------------------------------
+    //
+    // The one place `utilisation < 1` and `utilisation <= 1` differ is at exactly
+    // one, and no scaled load lands there: the utilisation is a quotient and
+    // scaling it to 1 leaves a rounding. So the *yield* is moved instead, to the
+    // peak the state already carries -- `x / x` is exactly 1.0 in IEEE arithmetic
+    // for any finite non-zero `x`, and `yieldStrength` does not enter
+    // `elementStress`, so the stress is bit for bit the same state.
+    {
+        const constraint::Stiffening seam = stiffenSeam(mesh, steel, profile, kNy / 2, 1);
+        const Substructure sub(mesh, steel, endInterface(mesh),
+                               attachmentOf(seam, mesh, steel, true));
+        std::vector<double> load(sub.dofCount(), 0.0);
+        std::vector<std::uint32_t> held = heldAtOrigin(sub, mesh);
+        for (std::size_t b = 0; b < sub.boundaryCount(); ++b) {
+            const std::uint32_t d = sub.boundaryDof()[b];
+            if (mesh.position[(d / 3) * 3] >= 0.5 * kLx && d % 3 == 2) load[d] = 1000.0;
+        }
+        ReduceParams params;
+        params.modes = 8;
+        const Reduction reduced = craigBampton(sub, params);
+        std::vector<double> state;
+        std::string problem;
+        reduction::staticSolve(reduced, reduction::reduceLoad(sub, reduced, load), held, state,
+                               &problem);
+        const reduction::Validity loose = reduction::checkValidity(sub, reduced, state);
+        StructuralMaterial atYield = steel;
+        atYield.yieldStrength = loose.peakVonMises;
+        const Substructure judged(mesh, atYield, endInterface(mesh),
+                                  attachmentOf(seam, mesh, atYield, true));
+        const Reduction judgedReduced = craigBampton(judged, params);
+        std::vector<double> judgedState;
+        reduction::staticSolve(judgedReduced, reduction::reduceLoad(judged, judgedReduced, load),
+                               held, judgedState, &problem);
+        const reduction::Validity v = reduction::checkValidity(judged, judgedReduced, judgedState);
+        expectNear("moving the yield does not move the stress", v.peakVonMises, loose.peakVonMises,
+                   0.0);
+        expectNear("so the utilisation is exactly one", v.utilisation, 1.0, 0.0);
+        expectTrue("and exactly one is not linear", !v.linear);
+        expectTrue("while a hair under it is",
+                   loose.linear == (loose.utilisation < 1.0) && loose.utilisation < 1.0);
+        std::printf("     yield set to the peak: utilisation %.17g, linear %d\n", v.utilisation,
+                    static_cast<int>(v.linear));
+    }
+
+    // --- The two producers cannot drift apart ------------------------------------
+    //
+    // `stiffnessBlocks` is `attachedForms(...).stiffness` and nothing else, so the
+    // stress forms are built in the same loop behind the same skip test and cannot
+    // come back paired with the wrong block. Asserted bit for bit, and with a
+    // *degenerate* fibre in the set so the skip test's verdict actually changes --
+    // without one the branch is never taken and the mutant that widens it to
+    // `scale >= 0` is indistinguishable.
+    {
+        constraint::Stiffening seam = stiffenSeam(mesh, steel, profile, kNy / 2, 1);
+        const std::size_t sound = seam.fiberCount();
+        constraint::Fiber dead = seam.fiber.front();
+        dead.area = 0.0;  // no area, so EA/L is zero and the fibre carries nothing
+        seam.fiber.push_back(dead);
+        constraint::Fiber collapsed = seam.fiber.front();
+        collapsed.end[1] = collapsed.end[0];  // no length either
+        seam.fiber.push_back(collapsed);
+
+        const constraint::RestFibers forms = constraint::restFibers(seam, mesh.position);
+        expectTrue("a fibre with coincident ends has no rest length", !forms.ok);
+        const constraint::AttachedForms built =
+            constraint::attachedForms(seam, mesh.position, forms, steel.youngsModulus);
+        expectEqualCount("the degenerate fibres are dropped from the blocks", built.stiffness.size(),
+                         sound);
+        expectEqualCount("and from the stress forms, by the same test", built.stress.size(), sound);
+
+        const std::vector<solidshell::DofBlock> alone =
+            constraint::stiffnessBlocks(seam, mesh.position, forms, steel.youngsModulus);
+        bool same = alone.size() == built.stiffness.size();
+        for (std::size_t b = 0; b < alone.size() && same; ++b) {
+            same = alone[b].dof == built.stiffness[b].dof &&
+                   alone[b].stiffness.size() == built.stiffness[b].stiffness.size();
+            for (std::size_t e = 0; e < alone[b].stiffness.size() && same; ++e)
+                same = alone[b].stiffness[e] == built.stiffness[b].stiffness[e];
+        }
+        expectTrue("and `stiffnessBlocks` is that same list, to the last bit", same);
+        std::printf("     %zu sound fibres plus one with no area and one with no length: "
+                    "%zu blocks, %zu stress forms\n",
+                    sound, built.stiffness.size(), built.stress.size());
+    }
+
+    // `Attachment::empty()` has to know about the stress forms too, or an
+    // attachment carrying nothing else reports itself as nothing at all.
+    {
+        reduction::Attachment onlyStress;
+        onlyStress.stress.push_back({1.0, 2.0, 3.0});
+        expectTrue("an attachment carrying only stress forms is not empty", !onlyStress.empty());
+        expectTrue("and one carrying nothing is", reduction::Attachment{}.empty());
+    }
+
+    // --- A member that is not axis aligned --------------------------------------
+    //
+    // Every fibre a `SeamRun` builds on a flat plate runs along the plating, so its
+    // direction has no through-thickness component and the last four entries of the
+    // twelve-term stress form are *identically zero*. Mutation testing said so: the
+    // mutant that drops the twelfth term survived everything above, and it is
+    // equivalent on any seam lying in a plane -- `0.0 * u` is a no-op.
+    //
+    // A `constraint::Fiber` is not restricted to that. Tying one end to the -zeta
+    // face and the other to the +zeta face of the next column is a diagonal brace,
+    // and its direction has all three components. It is checked against the
+    // *geometric* definition of an axial strain -- the change in the distance
+    // between the two tied points, taken through `constraint::tiedPoint` on the
+    // displacement array -- which is a different route to the number from the
+    // condensed rank-one form the stress is recovered through.
+    {
+        const constraint::Stiffening full = stiffenSeam(mesh, steel, profile, kNy / 2, 1);
+        constraint::Stiffening brace = full;
+        brace.fiber.clear();
+        constraint::Fiber diagonal;
+        diagonal.end[0] = constraint::Tie{plateNode(0, kNy / 2, 0), plateNode(0, kNy / 2, 1), 0.0};
+        diagonal.end[1] = constraint::Tie{plateNode(1, kNy / 2, 0), plateNode(1, kNy / 2, 1), 1.0};
+        diagonal.area = 1.0e-4;
+        diagonal.offset = 0.0;
+        brace.fiber.push_back(diagonal);
+
+        const constraint::RestFibers forms = constraint::restFibers(brace, mesh.position);
+        expectTrue("the diagonal brace has a rest length", forms.ok);
+        const constraint::AttachedForms built =
+            constraint::attachedForms(brace, mesh.position, forms, steel.youngsModulus);
+        expectEqualCount("and one block and one stress form", built.stress.size(), 1u);
+        // The guard: without a through-thickness component the last four terms are
+        // zero and this whole case proves nothing about them.
+        expectTrue("the brace really does run through the thickness",
+                   std::fabs(built.stress[0][11]) > 1e-3 * std::fabs(built.stress[0][9]));
+
+        const Substructure sub(mesh, steel, endInterface(mesh),
+                               attachmentOf(brace, mesh, steel, true));
+        expectTrue("the braced substructure factors", sub.ready());
+
+        // A field with all three components moving, so every one of the twelve terms
+        // multiplies something non-zero.
+        std::vector<double> u(sub.dofCount(), 0.0);
+        for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+            const double x = mesh.position[n * 3], y = mesh.position[n * 3 + 1];
+            const double z = mesh.position[n * 3 + 2];
+            u[n * 3] = 1.1e-4 * x + 3.0e-4 * z + 7.0e-5 * y;
+            u[n * 3 + 1] = -5.0e-5 * x + 9.0e-5 * z;
+            u[n * 3 + 2] = 4.0e-5 * x - 2.0e-5 * y + 6.0e-4 * z;
+        }
+        const Vec3 restSpan = constraint::tiedPoint(diagonal.end[1], mesh.position) -
+                              constraint::tiedPoint(diagonal.end[0], mesh.position);
+        const double restLength = length(restSpan);
+        const Vec3 axis = restSpan / restLength;
+        const Vec3 moved = constraint::tiedPoint(diagonal.end[1], u) -
+                           constraint::tiedPoint(diagonal.end[0], u);
+        const double want =
+            steel.youngsModulus * (moved.x * axis.x + moved.y * axis.y + moved.z * axis.z) /
+            restLength;
+        const double got = sub.memberStress(0, u);
+        expectTrue("the brace is stressed", std::fabs(want) > 1e6);
+        // 1e-13 relative, measured at 4e-16: two twelve-term sums of the same
+        // products in different orders, so the floor is a couple of ulp.
+        expectNear("a member that is not axis aligned reports the change in its own length", got,
+                   want, 1e-13 * std::fabs(want));
+        std::printf("     diagonal brace: axis (%.4f, %.4f, %.4f), %.4f MPa against a geometric "
+                    "%.4f MPa\n",
+                    axis.x, axis.y, axis.z, 1e-6 * got, 1e-6 * want);
+    }
+
+    // --- One member, and two that tie -------------------------------------------
+    //
+    // Both are here because mutation testing found the sweep's *first* index and its
+    // tie-break untested, and neither can be reached by the sixteen-fibre seam
+    // above: under bending the worst fibre is always the one furthest from the
+    // neutral axis, which is never index 0 and never ties with anything.
+    //
+    //   * A region carrying **one** member has to report it. A sweep starting one
+    //     index late reports no member at all and a `worstMember` of -1, which is
+    //     indistinguishable from a region that has none -- the exact failure §8
+    //     exists to prevent, one layer up.
+    //   * Two **identical** members tie to the last bit, and the tie-break is then
+    //     what `worstMember` means. Two identical longitudinals either side of a
+    //     symmetric section under a symmetric load do this for real, so it is
+    //     specified here -- the *first* of the tied members -- rather than left to
+    //     whichever comparison the sweep happens to use.
+    {
+        const constraint::Stiffening full = stiffenSeam(mesh, steel, profile, kNy / 2, 1);
+        for (int which = 0; which < 2; ++which) {
+            constraint::Stiffening cut = full;
+            cut.fiber.assign(1, full.fiber[1]);  // the far fibre of the first segment
+            if (which == 1) cut.fiber.push_back(cut.fiber.front());  // ...twice over
+            const Substructure sub(mesh, steel, endInterface(mesh),
+                                   attachmentOf(cut, mesh, steel, true));
+            expectTrue("the one-member substructure factors", sub.ready());
+            expectEqualCount("and carries exactly the members it was given",
+                             sub.attachedMembers(), which == 0 ? 1u : 2u);
+
+            std::vector<double> load(sub.dofCount(), 0.0);
+            std::vector<std::uint32_t> held = heldAtOrigin(sub, mesh);
+            for (std::size_t b = 0; b < sub.boundaryCount(); ++b) {
+                const std::uint32_t d = sub.boundaryDof()[b];
+                if (mesh.position[(d / 3) * 3] >= 0.5 * kLx && d % 3 == 2) load[d] = 1000.0;
+            }
+            ReduceParams params;
+            params.modes = 8;
+            const Reduction reduced = craigBampton(sub, params);
+            std::vector<double> state;
+            std::string problem;
+            expectTrue("and solves",
+                       reduction::staticSolve(reduced, reduction::reduceLoad(sub, reduced, load),
+                                              held, state, &problem));
+            const reduction::Validity v = reduction::checkValidity(sub, reduced, state);
+            const std::vector<double> u = reduction::recover(sub, reduced, state);
+            expectTrue("the single member is stressed and is read", v.memberVonMises > 1e6);
+            expectNear("at exactly what `memberStress` says it carries", v.memberVonMises,
+                       std::fabs(sub.memberStress(0, u)), 0.0);
+            expectEqual("and it is member zero that is named", v.worstMember, 0);
+            if (which == 1)
+                expectNear("the duplicate really does tie it, to the last bit",
+                           sub.memberStress(1, u), sub.memberStress(0, u), 0.0);
+        }
+    }
+
+    // --- The negative control, bit for bit --------------------------------------
+    //
+    // With nothing attached, `checkValidity` must return *exactly* what it returned
+    // before §9 -- not close. Every field, compared against a substructure that
+    // cannot have a member at all, and the derived fields compared against the
+    // element half rather than against a remembered constant.
+    {
+        const Substructure bare(mesh, steel, endInterface(mesh));
+        ReduceParams params;
+        params.modes = 8;
+        const Reduction reduced = craigBampton(bare, params);
+        std::vector<double> load(bare.dofCount(), 0.0);
+        std::vector<std::uint32_t> held = heldAtOrigin(bare, mesh);
+        for (std::size_t b = 0; b < bare.boundaryCount(); ++b) {
+            const std::uint32_t d = bare.boundaryDof()[b];
+            if (mesh.position[(d / 3) * 3] >= 0.5 * kLx && d % 3 == 2) load[d] = 1000.0;
+        }
+        std::vector<double> state;
+        std::string problem;
+        expectTrue("the bare cantilever solves",
+                   reduction::staticSolve(reduced, reduction::reduceLoad(bare, reduced, load), held,
+                                          state, &problem));
+        const reduction::Validity v = reduction::checkValidity(bare, reduced, state);
+        // Against `peakVonMises` computed here, over the same recovered field: a
+        // second implementation of the element half, so this is not the new code
+        // agreeing with itself.
+        const std::vector<double> u = reduction::recover(bare, reduced, state);
+        const StressPeak independent = peakVonMises(mesh, steel, u);
+        expectTrue("with nothing attached there are no members to read",
+                   bare.attachedMembers() == 0 && bare.attachedBlocks() == 0);
+        expectTrue("the load stresses the bare plate", v.peakVonMises > 1e6);
+        expectTrue("and the member half is exactly absent",
+                   v.memberVonMises == 0.0 && v.worstMember == -1);
+        expectTrue("so the peak is the plating's, to the last bit",
+                   v.peakVonMises == v.platingVonMises);
+        expectNear("and it is the peak an independent sweep of the same field finds",
+                   v.platingVonMises, independent.mises, 0.0);
+        expectTrue("with the utilisation the old formula gives, to the last bit",
+                   v.utilisation == v.platingVonMises / steel.yieldStrength);
+        std::printf("     no attachment: %.6f MPa, utilisation %.9f, member half exactly absent\n",
+                    1e-6 * v.peakVonMises, v.utilisation);
+    }
+
+    // --- A tie leaves a hole in the recovered field, and it is not a small one ---
+    //
+    // A degree of freedom `Attachment::constrained` eliminated is in neither
+    // partition, so `recover` used to leave it at zero -- a hole in the middle of
+    // the displacement field that every element touching that node reads as an
+    // enormous gradient. It is not a curiosity: `section.cpp` ties every junction
+    // of a hold this way, so `checkValidity` would have reported every tied section
+    // as thousands of times past yield.
+    {
+        const auto node = [](int i, int j, int k) {
+            return static_cast<std::uint32_t>((i * (kNy + 1) + j) * 2 + k);
+        };
+        const std::uint32_t slave = node(4, 2, 0), first = node(3, 2, 0), second = node(5, 2, 0);
+        reduction::Attachment tied;
+        for (int k = 0; k < 3; ++k) {
+            solidshell::Mpc mpc;
+            mpc.slave = slave * 3u + static_cast<std::uint32_t>(k);
+            mpc.master = {first * 3u + static_cast<std::uint32_t>(k),
+                          second * 3u + static_cast<std::uint32_t>(k)};
+            mpc.weight = {0.5, 0.5};
+            tied.constrained.push_back(mpc);
+        }
+        const Substructure sub(mesh, steel, endInterface(mesh), tied);
+        expectTrue("the tied substructure factors", sub.ready());
+        expectEqualCount("and really did eliminate three degrees of freedom",
+                         sub.expansion().eliminatedCount(), 3u);
+
+        std::vector<double> load(sub.dofCount(), 0.0);
+        std::vector<std::uint32_t> held = heldAtOrigin(sub, mesh);
+        for (std::size_t b = 0; b < sub.boundaryCount(); ++b) {
+            const std::uint32_t d = sub.boundaryDof()[b];
+            if (mesh.position[(d / 3) * 3] >= 0.5 * kLx && d % 3 == 2) load[d] = 1000.0;
+        }
+        ReduceParams params;
+        params.modes = 0;
+        const Reduction reduced = craigBampton(sub, params);
+        std::vector<double> state;
+        std::string problem;
+        expectTrue("the tied cantilever solves",
+                   reduction::staticSolve(reduced, reduction::reduceLoad(sub, reduced, load), held,
+                                          state, &problem));
+        const std::vector<double> u = reduction::recover(sub, reduced, state);
+        double worst = 0, scale = 0;
+        for (int k = 0; k < 3; ++k) {
+            const std::size_t s = slave * 3 + static_cast<std::size_t>(k);
+            const double want = 0.5 * u[first * 3 + static_cast<std::size_t>(k)] +
+                                0.5 * u[second * 3 + static_cast<std::size_t>(k)];
+            worst = std::max(worst, std::fabs(u[s] - want));
+            scale = std::max(scale, std::fabs(want));
+        }
+        expectTrue("the tie has something to carry", scale > 1e-6);
+        expectNear("a constrained degree of freedom comes back as its masters say, exactly", worst,
+                   0.0, 0.0);
+        const reduction::Validity v = reduction::checkValidity(sub, reduced, state);
+        // The hole put the peak at 850 788 MPa on this case, so anything within
+        // three orders of the plate's real stress says it is gone. Asserted against
+        // the *unconstrained* plate rather than a remembered number: the tie is
+        // between two neighbours of a node, so it stiffens the plate a little and
+        // must not change its stress by orders.
+        const Substructure loose(mesh, steel, endInterface(mesh));
+        const Reduction looseReduced = craigBampton(loose, params);
+        std::vector<double> looseState;
+        reduction::staticSolve(looseReduced, reduction::reduceLoad(loose, looseReduced, load), held,
+                               looseState, &problem);
+        const reduction::Validity untied = reduction::checkValidity(loose, looseReduced, looseState);
+        expectTrue("and the tied plate's peak stress is the untied one's, to within the tie",
+                   v.peakVonMises < 2.0 * untied.peakVonMises &&
+                       v.peakVonMises > 0.5 * untied.peakVonMises);
+        std::printf("     one node tied to two neighbours: peak %.3f MPa against %.3f MPa "
+                    "untied; unfilled it read 850 788 MPa\n",
+                    1e-6 * v.peakVonMises, 1e-6 * untied.peakVonMises);
     }
 }
 
@@ -2962,6 +3685,7 @@ void runReductionTests() {
     testBoundaryMatchOnItsOwn();
     testThreeComponentsAssembleIntoTheWhole();
     testAttachedStiffness();
+    testMemberValidity();
     testAttachedMass();
     testConstrainedSubstructure();
 }

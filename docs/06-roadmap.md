@@ -323,7 +323,9 @@ The longest and highest-risk phase.
   same patch at Tier 2. What it cannot do is yield, tear, buckle, contact or
   rotate — it is linear by construction — so `checkValidity` exists to say when the
   region has to be promoted, and it under-predicts a concentration so the warning
-  is late rather than early
+  is late rather than early. It reads the attached members' own stress as well as
+  the elements', and reports the two halves apart: judging a stiffened region by
+  its plating alone put the utilisation 11% low, in the unsafe direction
 
 - ~~Co-rotational elasticity and J2 plasticity~~ — done: `engine/sim/solid_shell.hpp`
   and `engine/sim/plasticity.hpp`, measured in `02-simulation.md` §3. Radial return
