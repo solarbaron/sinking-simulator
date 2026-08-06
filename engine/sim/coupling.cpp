@@ -14,50 +14,7 @@ bool prescribedStaticSolve(const reduction::Assembly& assembly, const std::vecto
                            const std::vector<std::uint32_t>& held,
                            const std::vector<Prescribed>& prescribed, std::vector<double>& state,
                            std::string* problem) {
-    const std::size_t n = static_cast<std::size_t>(assembly.size());
-    state.assign(n, 0.0);
-    if (n == 0 || assembly.stiffness.size() != n * n) {
-        if (problem) *problem = "the assembly is empty";
-        return false;
-    }
-
-    // The prescribed field, zero everywhere else. Written by DOF rather than
-    // pushed, so a caller naming the same DOF twice gets the last value instead of
-    // two contributions to the right-hand side.
-    std::vector<double> xp(n, 0.0);
-    std::vector<std::uint8_t> isPrescribed(n, 0u);
-    for (const Prescribed& p : prescribed) {
-        if (p.dof >= n) {
-            if (problem) *problem = "a prescribed DOF is past the end of the assembly";
-            return false;
-        }
-        xp[p.dof] = p.value;
-        isPrescribed[p.dof] = 1u;
-    }
-
-    // f_f - (K x_p)_f. The rows belonging to held or prescribed DOF are discarded
-    // by the solve below, so they are computed and thrown away rather than skipped;
-    // the assembly is dense and small and the branch would cost more than the
-    // multiply.
-    std::vector<double> rhs(n, 0.0);
-    for (std::size_t i = 0; i < n; ++i) {
-        double sum = i < load.size() ? load[i] : 0.0;
-        const double* row = &assembly.stiffness[i * n];
-        for (std::size_t j = 0; j < n; ++j)
-            if (isPrescribed[j]) sum -= row[j] * xp[j];
-        rhs[i] = sum;
-    }
-
-    // A DOF that is both held and prescribed is prescribed: held is the special
-    // case value zero, and the other resolution would discard the value silently.
-    std::vector<std::uint32_t> fixed = held;
-    fixed.reserve(fixed.size() + prescribed.size());
-    for (const Prescribed& p : prescribed) fixed.push_back(p.dof);
-
-    if (!reduction::assembledStaticSolve(assembly, rhs, fixed, state, problem)) return false;
-    for (std::size_t d = 0; d < n; ++d)
-        if (isPrescribed[d]) state[d] = xp[d];
-    return true;
+    return reduction::assembledStaticSolve(assembly, load, held, prescribed, state, problem);
 }
 
 // --- 2. Matching a zone to the structure round it --------------------------------
@@ -90,10 +47,10 @@ Coupling couple(const reduction::Substructure& surroundings,
     out.surroundDof.assign(static_cast<std::size_t>(reducedSurroundings.boundary), -1);
     for (int i = 0; i < reducedSurroundings.boundary; ++i)
         out.surroundDof[static_cast<std::size_t>(i)] =
-            out.assembly.fromA[static_cast<std::size_t>(i)];
+            out.assembly.fromA()[static_cast<std::size_t>(i)];
     out.zoneDof.assign(static_cast<std::size_t>(reducedZone.boundary), -1);
     for (int j = 0; j < reducedZone.boundary; ++j)
-        out.zoneDof[static_cast<std::size_t>(j)] = out.assembly.fromB[static_cast<std::size_t>(j)];
+        out.zoneDof[static_cast<std::size_t>(j)] = out.assembly.fromB()[static_cast<std::size_t>(j)];
 
     out.zoneShared.assign(static_cast<std::size_t>(reducedZone.boundary), 0u);
     for (int j : out.map.aToB)

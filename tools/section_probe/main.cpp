@@ -18,6 +18,7 @@
 // output.
 //
 //   ./section_probe [--from=X] [--to=X] [--sub=N] [--sweep=N] [--reduce] [--modes=N]
+//                   [--chain=N] [--match=M]
 #include "engine/sim/girder.hpp"
 #include "engine/sim/reduction.hpp"
 #include "engine/sim/scantlings.hpp"
@@ -49,6 +50,16 @@ struct Options {
     int sweep = 3;       // refine to this subdivision; 0 skips the sweep
     bool reduce = true;  // build the substructure and reduce it
     int modes = 0;       // -1 takes ReduceParams' frequency cutoff
+    // Cut [from, to] into this many sections, reduce each and assemble them, against
+    // the same length in one piece. 0 skips it. It is off by default because the
+    // assembled model is dense at (N+1) x 1 170 boundary DOF on this ship and the
+    // Cholesky at the end of it is the most expensive thing this program does.
+    int chain = 0;
+    // How far apart two boundary DOF on a shared cut plane may be and still be the
+    // same unknown. `matchBoundaries`' 1e-9 default is right amidships and leaves a
+    // third of the interface unmatched at the ends -- see `section.hpp` §6 note 1,
+    // and the `--from=36 --to=48` run, which is what measured it.
+    double match = 1e-9;
 };
 
 bool parse(int argc, char** argv, Options& o) {
@@ -63,6 +74,8 @@ bool parse(int argc, char** argv, Options& o) {
         else if (const char* v = value("sub")) o.subdivision = std::atoi(v);
         else if (const char* v = value("sweep")) o.sweep = std::atoi(v);
         else if (const char* v = value("modes")) o.modes = std::atoi(v);
+        else if (const char* v = value("chain")) o.chain = std::atoi(v);
+        else if (const char* v = value("match")) o.match = std::atof(v);
         else if (a == "--no-reduce") o.reduce = false;
         else if (a == "--reduce") o.reduce = true;
         else {
@@ -260,6 +273,101 @@ int main(int argc, char** argv) {
                         stretched.axialStiffness / youngs,
                         stretched.bendingMoment / stretched.axialForce + girder.neutralAxis,
                         bent.bendingStiffness / youngs, twisted.torsionalStiffness, now() - start);
+            std::fflush(stdout);
+        }
+    }
+
+    // --- A ship: the same length as a chain of sections ------------------------------
+    //
+    // The end-to-end claim of the tier, at ship scale: cut a length into N pieces,
+    // reduce each once, assemble, and get the model the same length in one piece
+    // gives. The reference here owes nothing to the assembly -- it is
+    // `applyBeamLoad` and `applyTwist` on the monolithic section, through
+    // `solidshell::solveStatic`.
+    //
+    // Everything is untied unless asked otherwise, because tied at ship scale is a
+    // band of 1 520 and a 5.3 s banded factorisation per section, and the two
+    // questions -- does the assembly reproduce the monolith, and what do the cut
+    // planes cost the ties -- are answered separately below.
+    if (options.chain > 0) {
+        std::printf("\n=== a chain of %d sections against the same length in one piece ===\n",
+                    options.chain);
+        for (int tie = 0; tie < 2; ++tie) {
+            sim::section::ChainParams chainParams;
+            chainParams.section = params;
+            chainParams.section.junctions = tie != 0;
+            chainParams.reduce.modes = 0;
+            chainParams.reduce.cutoffFrequency = 0;
+            chainParams.matchTolerance = options.match;
+            for (int i = 0; i <= options.chain; ++i)
+                chainParams.station.push_back(options.from + (options.to - options.from) * i /
+                                                                 options.chain);
+
+            const double start = now();
+            const sim::section::Chain chain = sim::section::buildChain(structure, chainParams);
+            std::printf("  %-5s built in %.2f s (mesh %.2f, reduce %.2f, assemble %.2f):"
+                        " %d pieces, %d assembled boundary DOF, size %d\n",
+                        tie ? "tied" : "cut", now() - start, chain.meshSeconds,
+                        chain.reduceSeconds, chain.assembleSeconds, chain.components,
+                        chain.assembly.boundary, chain.assembly.size());
+            std::size_t unmatched = 0;
+            for (std::size_t u : chain.unmatched) unmatched += u;
+            std::printf("  %-5s interior planes: %zu shared DOF each, %zu unmatched, worst gap"
+                        " %.3e m; ties %.1f m of %.1f m of junction edge\n",
+                        "", chain.shared.empty() ? 0 : chain.shared.front(), unmatched,
+                        chain.worstGap, chain.tiedEdges, chain.junctionEdges);
+            for (const std::string& problem : chain.problems)
+                std::printf("      ! %s\n", problem.c_str());
+            std::fflush(stdout);
+            if (!chain.ready()) continue;
+
+            sim::section::SectionParams monoParams = params;
+            monoParams.junctions = tie != 0;
+            const sim::section::Section mono = sim::section::buildSection(structure, monoParams);
+            std::printf("  %-5s one piece: %d components, ties %.1f m of %.1f m\n", "",
+                        mono.components, mono.tiedEdges, mono.junctionEdges);
+
+            sim::section::BeamLoad axial;
+            axial.strain = 1e-6;
+            axial.reference = girder.neutralAxis;
+            sim::section::BeamLoad bending;
+            bending.curvature = 1e-6;
+            bending.reference = girder.neutralAxis;
+
+            double at = now();
+            const sim::section::BeamResponse chainAxial =
+                sim::section::applyBeamLoad(chain, axial);
+            const double chainSolve = now() - at;
+            at = now();
+            const sim::section::BeamResponse monoAxial =
+                sim::section::applyBeamLoad(mono, material, axial);
+            const double monoSolve = now() - at;
+            const sim::section::BeamResponse chainBend = sim::section::applyBeamLoad(chain, bending);
+            const sim::section::BeamResponse monoBend =
+                sim::section::applyBeamLoad(mono, material, bending);
+            const sim::section::TorsionResponse chainTwist =
+                sim::section::applyTwist(chain, 1e-6, girder.neutralAxis);
+            const sim::section::TorsionResponse monoTwist =
+                sim::section::applyTwist(mono, material, 1e-6, girder.neutralAxis);
+            if (!chainAxial.ok || !monoAxial.ok) {
+                std::printf("      ! %s / %s\n", chainAxial.problem.c_str(),
+                            monoAxial.problem.c_str());
+                continue;
+            }
+            std::printf("  %-5s %-8s %14s %14s %10s\n", "", "", "chain", "one piece", "relative");
+            const auto line = [&](const char* what, double a, double b) {
+                std::printf("  %-5s %-8s %14.6e %14.6e %+10.3e\n", "", what, a, b,
+                            b != 0 ? a / b - 1.0 : 0.0);
+            };
+            line("EA", chainAxial.axialStiffness, monoAxial.axialStiffness);
+            line("z_na", chainAxial.bendingMoment / chainAxial.axialForce + girder.neutralAxis,
+                 monoAxial.bendingMoment / monoAxial.axialForce + girder.neutralAxis);
+            line("EI", chainBend.bendingStiffness, monoBend.bendingStiffness);
+            line("GJ", chainTwist.torsionalStiffness, monoTwist.torsionalStiffness);
+            std::printf("  %-5s dense assembled solve %.2f s against a banded monolithic %.2f s;"
+                        " chain restraint reaction %.2e N, residual %.2e N\n",
+                        "", chainSolve, monoSolve, chainAxial.restraintReaction,
+                        chainAxial.residual);
             std::fflush(stdout);
         }
     }

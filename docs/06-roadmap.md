@@ -578,18 +578,28 @@ The longest and highest-risk phase.
   `collision.hpp`'s to supply.
 
   With the zone solver, the Tier-0 coupling and the Craig–Bampton reduction done,
-  **the largest thing outstanding in Phase 3 is the Tier-1 coupling** — three
-  pieces, none of which is the reduction itself. A ~~**mesher** that can produce a
-  hold-sized substructure, since the only one that exists is `zone::buildPatch`:
-  plating only, within a radius, stopping at thickness seams~~ — **done**,
-  `engine/sim/section.{hpp,cpp}`, with the junctions between panel roles **tied**
-  rather than left open. An **assembly** pass
-  that matches two substructures' interfaces and stacks their modal blocks, which
-  is what makes component mode synthesis a synthesis. And a **two-way zone
+  the largest thing outstanding in Phase 3 was **the Tier-1 coupling** — three
+  pieces, none of which is the reduction itself, and all three are now built. A
+  ~~**mesher** that can produce a hold-sized substructure, since the only one that
+  exists is `zone::buildPatch`: plating only, within a radius, stopping at
+  thickness seams~~ — **done**, `engine/sim/section.{hpp,cpp}`, with the junctions
+  between panel roles **tied** rather than left open. An ~~**assembly** pass that
+  matches two substructures' interfaces and stacks their modal blocks, which is
+  what makes component mode synthesis a synthesis~~ — **done**, and it takes any
+  number of components rather than two: `section::buildChain` cuts a length at N+1
+  frame stations, reduces each piece once and assembles them, reproducing the same
+  length in one piece to 1e-10 in `EA`, `EI` and `GJ`. And a ~~**two-way zone
   interface**, so a promoted zone is driven by the structure around it instead of
-  clamped on a boundary that cannot move. Until those exist, a hull girder that
-  has lost a bay still learns about it through a section rather than through the
-  interface DOF where the load actually redistributes.
+  clamped on a boundary that cannot move~~ — **done**,
+  `engine/sim/coupling.{hpp,cpp}`.
+
+  What is left before a hull girder that has lost a bay learns about it through the
+  interface DOF rather than through a section is **reach, not machinery**: two-bay
+  sections of the reference ferry only reduce between about x = −26.4 and 16.8 m,
+  and outside that `buildSection` refuses them with an inverted element. And a cut
+  plane unties the junctions on it, which costs a five-section chain 8.9% of its
+  torsional stiffness — invisible in `EA` and `EI`, which is exactly the trap
+  `docs/02-simulation.md` §*A ship: a chain of sections* is written around.
 
 This is the phase the whole concept is named for. If it works, everything after
 it is addition; if it does not, the project is a very good flooding simulator and

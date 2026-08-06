@@ -747,7 +747,25 @@ Validity checkValidity(const Substructure& substructure, const Reduction& reduce
 // the sum is the mass the unsplit model had. Splitting a mesh by *node* instead of
 // by element would double it, which is the mistake this note exists to prevent.
 
-// Which boundary DOF of two substructures are the same physical DOF.
+// What a reduced model's boundary row *is*: where it sits and which axis it drives.
+//
+// A `Substructure` knows this from its mesh, and the two-component `assemble` below
+// therefore never needed it written down. An assembled model has no mesh behind it,
+// which is exactly why it could not be joined to anything -- so this is the shape
+// the identity has to take to be carried, and `Assembly::boundaryPoint` carries it.
+//
+// **Position, not "node n of mesh m".** A shared boundary row is a node of *every*
+// component that shares it, so naming one of them is a choice with no defence; and a
+// node index means nothing without the mesh it indexes, which is the thing an
+// assembly does not have. Position and axis are what the match reads anyway.
+struct BoundaryDof {
+    Vec3 position{};
+    std::uint32_t axis = 0;  // 0, 1, 2
+};
+
+std::vector<BoundaryDof> boundaryIdentity(const Substructure& substructure);
+
+// Which boundary DOF of two reduced models are the same physical DOF.
 //
 // Matched by position, because two independently built meshes share no numbering.
 // A DOF matches only if the node coincides within `tolerance` **and the axis is the
@@ -762,45 +780,78 @@ struct InterfaceMap {
     std::vector<std::string> problems;
 };
 
+InterfaceMap matchBoundaries(const std::vector<BoundaryDof>& a, const std::vector<BoundaryDof>& b,
+                             double tolerance = 1e-9);
 InterfaceMap matchBoundaries(const Substructure& a, const Substructure& b,
                              double tolerance = 1e-9);
 
-// Two reduced components coupled at their shared boundary.
+// Reduced components coupled at their shared boundaries.
 //
-// Assembled DOF are ordered: A's boundary, then B's *unshared* boundary, then A's
-// modal coordinates, then B's. `fromA` and `fromB` give the assembled index of
-// each component reduced DOF, which is what a caller needs to place a load or read
-// a component's state back out.
+// Assembled DOF are ordered **every boundary DOF, then every modal coordinate**, and
+// within each block the components are taken in the order they were given: a
+// component's boundary DOF claims the next free assembled row unless some earlier
+// component already claimed the row it shares. `from[c]` gives the assembled index
+// of each of component `c`'s reduced DOF, which is what a caller needs to place a
+// load or read a component's state back out. For two components that ordering is
+// exactly what it always was -- A's boundary, then B's unshared boundary, then A's
+// modes, then B's -- so `fromA()` and `fromB()` still mean what they meant.
 struct Assembly {
-    int boundary = 0;  // the union of the two boundary sets, shared counted once
-    int modes = 0;     // a.modes + b.modes
+    int boundary = 0;  // the union of every boundary set, a shared DOF counted once
+    int modes = 0;     // the sum over the components
     int size() const { return boundary + modes; }
+    int parts = 0;     // how many components went in
 
     std::vector<double> stiffness;  // N/m
     std::vector<double> mass;       // kg
 
-    std::vector<int> fromA;  // size = reduction A's size()
-    std::vector<int> fromB;  // size = reduction B's size()
+    // Per component, per reduced DOF: where it landed. `from[c].size()` is component
+    // c's `Reduction::size()`.
+    std::vector<std::vector<int>> from;
+
+    // What each assembled boundary row is, in the sense `BoundaryDof` defines --
+    // empty when it could not be known, which is the two-component `assemble` below,
+    // whose arguments are two `Reduction`s and no mesh at all. **An assembly with no
+    // identity cannot be joined to anything**, and that is the whole of the limit the
+    // note below this struct used to describe.
+    std::vector<BoundaryDof> boundaryPoint;
+
+    // The furthest apart two boundary DOF merged onto one assembled row actually
+    // were, and how many merges disagreed about the axis. A `Joint` is data a caller
+    // can build by hand, and `matchBoundaries` is not the only way to get one; an
+    // axis disagreement is a model that couples x to y and still solves.
+    double worstMergedGap = 0;  // m
+    int axisDisagreements = 0;
 
     std::vector<std::string> problems;
     bool empty() const { return size() == 0; }
+
+    // The two-component names, for callers that have two. Empty -- not a throw and
+    // not undefined -- when the assembly failed, because every other accessor here
+    // reports failure by coming back empty and one that aborted instead would be the
+    // only thing in the file a caller had to guard differently.
+    const std::vector<int>& fromA() const;
+    const std::vector<int>& fromB() const;
 };
 
-// **Two components, and only two.** There is no way to join an `Assembly` to a
-// third component, because `InterfaceMap` is expressed in the *substructures'*
-// boundary DOF and an `Assembly` has no substructure behind it. A ship is many
-// components, so this is a real limit and not a simplification for exposition.
+// **Two components, and only two.** There is no way to join an `Assembly` built by
+// *this* overload to a third component, because `InterfaceMap` is expressed in the
+// *substructures'* boundary DOF and this call is given two `Reduction`s and no mesh.
+// It is kept because it is what `coupling::couple` wants -- a zone and the plating
+// round it is two components and never three -- and because it is the negative
+// control for the identity: an assembly with an empty `boundaryPoint` is exactly the
+// object the note below is about.
 //
-// Generalising it wants one change rather than a rewrite: an assembled model needs
-// to carry the boundary DOF identity its components had -- which global DOF of
-// which mesh each assembled boundary row *is* -- so that the same position match
-// can be run against it. The scatter-add underneath already does not care how many
-// components it is given.
-//
-// **There is now a pair worth assembling**, which there was not when the note
-// above was written: `coupling.{hpp,cpp}` joins a Tier-2 zone to the plating round
-// it and drives the zone's perimeter from the result. Two components is exactly
-// enough for that, so the three-component limit is no longer the binding one.
+// **The generalisation is the next section, and the hypothesis this comment used to
+// carry was half right.** It said an assembled model needs to carry its components'
+// boundary DOF identity "so that the same position match can be run against it".
+// Carrying the identity is right and `Assembly::boundaryPoint` carries it; running
+// the same position match against an assembly is *a* way to generalise and it is not
+// the one that generalises. Measured on a chain of eight box sections: folding one
+// component at a time re-scatters a matrix that grows every fold and costs
+// O(N^3 n_b^2) where assembling all N at once costs O(N^2 n_b^2), and the fold has
+// to compose a `from` map per fold to answer the question `from[c]` answers
+// directly. Both routes are here, both are tested, and they agree to the last bit --
+// which is what makes the cost the only thing separating them. See §Assembling many.
 //
 // **And the mesher exists now too** -- `section.{hpp,cpp}` cuts a region between two
 // transverse planes and hands it over with `nodesNearPlanes`' interface and an
@@ -833,11 +884,126 @@ bool assembledStaticSolve(const Assembly& assembly, const std::vector<double>& l
                           const std::vector<std::uint32_t>& held, std::vector<double>& state,
                           std::string* problem = nullptr);
 
+// Solve K x = f with `held` fixed at zero and `prescribed` held at a value.
+//
+// A coupling needs a boundary condition that is not zero -- a punch is a prescribed
+// motion, and so is one section of a ship pulling on the cut it shares with the
+// next. It is done by elimination rather than by penalty,
+//
+//     K_ff x_f = f_f - (K x_p)_f
+//
+// which is a right-hand side and nothing else, so it reuses the solve above unchanged
+// instead of introducing a second factorisation path or a penalty stiffness that no
+// measurement sets.
+//
+// A DOF listed in both is prescribed: `held` is the special case value zero, and
+// resolving the clash the other way would silently discard the value.
+//
+// This lives here rather than in `coupling.hpp`, where it was written, because it
+// only ever touched an `Assembly` and there are now two callers on opposite sides of
+// that file. `coupling::prescribedStaticSolve` is this function.
+struct Prescribed {
+    std::uint32_t dof = 0;  // index into the assembled model
+    double value = 0;       // m
+};
+
+bool assembledStaticSolve(const Assembly& assembly, const std::vector<double>& load,
+                          const std::vector<std::uint32_t>& held,
+                          const std::vector<Prescribed>& prescribed, std::vector<double>& state,
+                          std::string* problem = nullptr);
+
 // The part of an assembled state belonging to one component, in that component's
 // own reduced DOF order -- what `recover()` wants. Empty if `state` is not this
 // assembly's: every index is otherwise in range, so a short state would come back
 // as a plausible field quietly missing its modal content.
 std::vector<double> componentState(const Assembly& assembly, const std::vector<int>& from,
                                    const std::vector<double>& state);
+
+// --- Assembling many -------------------------------------------------------------
+//
+// A ship is a chain of sections, not a pair, and the scatter-add above never cared
+// how many components it was given: what stopped at two was the *bookkeeping* --
+// which assembled row a component's boundary DOF belongs on. Two components can
+// settle that by one `InterfaceMap`; N components settle it by a union-find over
+// every pairwise map, because a boundary DOF shared by three components is one row
+// and no pairwise map says so on its own.
+//
+// **That is the whole of the generalisation, and it needs no identity on the
+// assembly at all** -- every map is still expressed in the *substructures'* boundary
+// DOF, which the caller has. What the identity buys is different and is worth
+// separating: it is how a caller finds an assembled row *geometrically*, which is
+// what prescribing a plane-sections field on a chain's two end planes is, and it is
+// what lets an assembly be joined to something later.
+
+// One component going in: the substructure that knows where its boundary DOF are,
+// and the reduction that carries its matrices. Both are borrowed and must outlive
+// the call; neither is copied.
+//
+// `substructure` may be null, in which case that component contributes no identity
+// and the assembly comes back with an empty `boundaryPoint`, exactly as the
+// two-`Reduction` overload does. It is not optional for `matchComponents`.
+struct Component {
+    const Substructure* substructure = nullptr;
+    const Reduction* reduced = nullptr;
+};
+
+// One join between two components, in those components' own boundary DOF indices.
+// `a` and `b` index the component list.
+struct Joint {
+    int a = 0, b = 0;
+    InterfaceMap map;  // a's boundary -> b's boundary
+};
+
+// Every pair of components matched by position. O(k^2) pairs and O(n_b^2) per pair,
+// which is why a chain should hand `assemble` the joints it knows about rather than
+// asking for all of them: on the reference ferry a pair is 1 170 x 1 170 distance
+// tests and the chain only ever joins neighbours.
+//
+// A pair that shares nothing produces no joint, and `matchBoundaries`' "these share
+// no boundary DOF" complaint is dropped for that reason -- here it is the expected
+// answer for a component two bays away rather than a problem.
+std::vector<Joint> matchComponents(const std::vector<Component>& parts, double tolerance = 1e-9);
+
+// Consecutive pairs only, which is what a chain of sections wants and what makes
+// the difference a cost rather than an answer: two sections two bays apart share
+// nothing, so the joints are the same either way.
+std::vector<Joint> matchNeighbours(const std::vector<Component>& parts, double tolerance = 1e-9);
+
+Assembly assemble(const std::vector<Component>& parts, const std::vector<Joint>& joints);
+
+// --- ...and the other way, one component at a time -------------------------------
+//
+// The route the note above `assemble(a, b, map)` used to propose. Both exist because
+// the claim that one is better than the other is a measurement, not an argument, and
+// because a caller that genuinely acquires components one at a time -- a ship being
+// lengthened rather than built -- has no N to assemble at once.
+
+// The same position match, run against an assembled model. This is what
+// `Assembly::boundaryPoint` is for, and it comes back empty-handed with a complaint
+// on an assembly that has no identity.
+InterfaceMap matchBoundaries(const Assembly& a, const Substructure& b, double tolerance = 1e-9);
+
+// One more component onto an existing assembly. The assembled ordering is preserved
+// -- every existing row keeps its index -- so a caller's `held` list, prescribed DOF
+// and `from` maps all survive the fold, which is the one thing this route has that
+// the N-way one does not.
+Assembly assemble(const Assembly& a, const Component& b, const InterfaceMap& map);
+
+// --- Is it one piece? ------------------------------------------------------------
+
+// How many disconnected pieces an assembled model is in.
+//
+// **Structural, not numerical, and the difference is the point.** A component's
+// reduced pair is dense over its own DOF whether or not any particular entry happens
+// to be zero, so the pieces are the classes of "shares a component with", which is
+// exact arithmetic over `from` rather than a threshold on a stiffness. A threshold
+// would report a joined ship as two pieces the moment a coupling term cancelled.
+//
+// **It is blind in one direction and `Section::components` is blind in the other.**
+// This sees a chain that failed to join at a cut plane; it cannot see inside a
+// component, because a reduced pair is dense over its own DOF whether the mesh behind
+// it is one piece or seven. `Section::components` is the reverse. `section::Chain`
+// carries both and joins them, and that third count is the one a ship is judged by.
+int assembledComponents(const Assembly& assembly);
 
 }  // namespace sim::reduction

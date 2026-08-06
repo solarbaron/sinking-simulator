@@ -430,7 +430,7 @@ Coupled solveCoupled(const Fixture& f, const HexMesh& zoneMesh,
     // the half of the coupling that only exists if the zone's stiffness is really
     // in the assembled model.
     out.surroundField = reduction::recover(
-        surroundings, rs, reduction::componentState(link.assembly, link.assembly.fromA, state));
+        surroundings, rs, reduction::componentState(link.assembly, link.assembly.fromA(), state));
     return out;
 }
 
