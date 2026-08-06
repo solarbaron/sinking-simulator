@@ -225,6 +225,16 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
     // `sectionElements` uses so that two adjacent sections do not both own it.
     const double eps = params.weldTolerance;
     std::vector<int> candidate;
+    // Of the requested roles, outside the section, and touching the window in x: the
+    // halo of §8. Exact -- a panel that reaches a node of an inside sub-quad has a
+    // grid point at that node's x, which is between the planes, so its own extent must
+    // reach them -- and it needs to stay tight for two reasons rather than one.
+    // Widening it mostly costs time, since the extra plating welds to nothing and is
+    // compacted away below; but the surface walk runs over the halo as well, and
+    // plating the section does not contain could join two surfaces it does through a
+    // path outside the window. Mutation testing says both bounds are equivalent on
+    // this ship and neither is equivalent in principle.
+    std::vector<int> nearby;
     for (std::size_t i = 0; i < structure.panels.size(); ++i) {
         const PlatePanel& p = structure.panels[i];
         if (p.role == PanelRole::Shell && !params.shell) continue;
@@ -235,16 +245,19 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
             lo = std::min(lo, p.corner[c].x);
             hi = std::max(hi, p.corner[c].x);
         }
-        if (hi - lo <= eps) {  // a transverse plate: half-open at the aft plane
-            if (lo >= params.xFrom - eps && lo < params.xTo - eps)
-                candidate.push_back(static_cast<int>(i));
+        // A transverse plate -- zero extent along x -- is half-open at the aft plane;
+        // one with extent belongs when it lies wholly between the planes.
+        const bool transverse = hi - lo <= eps;
+        const bool owns = transverse ? (lo >= params.xFrom - eps && lo < params.xTo - eps)
+                                     : (lo >= params.xFrom - eps && hi <= params.xTo + eps);
+        if (owns) {
+            candidate.push_back(static_cast<int>(i));
             continue;
         }
-        if (lo >= params.xFrom - eps && hi <= params.xTo + eps) {
-            candidate.push_back(static_cast<int>(i));
-        } else if (hi > params.xFrom + eps && lo < params.xTo - eps) {
+        if (!transverse && hi > params.xFrom + eps && lo < params.xTo - eps)
             ++section.straddlingPanels;
-        }
+        if (hi >= params.xFrom - eps && lo <= params.xTo + eps)
+            nearby.push_back(static_cast<int>(i));
     }
     if (section.straddlingPanels > 0)
         report(std::to_string(section.straddlingPanels) +
@@ -254,6 +267,49 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
         report("no plating of the requested roles lies between the cut planes");
         return section;
     }
+    const std::size_t insidePanels = candidate.size();
+
+    // --- The halo, see §8 ---------------------------------------------------------
+    //
+    // A node is the mid-surface offset by `t/2` along the nodal normal, and both the
+    // normal and the thickness are averages over the sub-quads that reach that node.
+    // Averaged over the sub-quads *inside* the section they are properties of the
+    // **cut**, so the same station meshes to different node positions from either
+    // side of it and a chain does not close. Averaged over one bay beyond each plane
+    // as well they are properties of the ship, and the same station meshes to the
+    // same nodes whatever window contains it.
+    //
+    // **One bay is not a distance and it is not a corner test either.** The halo is
+    // every panel whose extent along x reaches the window, and the *weld* decides what
+    // that is worth: a halo panel's grid points go through the same `Welder` as the
+    // section's own, so one that lands on a node of an inside sub-quad joins that
+    // node's averages and one that does not contributes to nodes nobody keeps and is
+    // compacted away below. Nothing has to be predicted.
+    //
+    // The bound is exact, which is why it can be a bound: a panel that reaches a node
+    // of an inside sub-quad has a grid point at that node's x, which lies between the
+    // planes, so its own extent must reach them. **A corner test would not be exact.**
+    // It was written that way first and mutation testing said so: "shares a welded
+    // corner with a panel inside" is only the same set when every node is a panel
+    // corner, and at `subdivision > 1` a node can sit part way along an edge, where a
+    // panel butting mid-edge reaches it and shares no corner at all. Deleting the
+    // predicate is cheaper than assuming it, and the mutants that used to survive on
+    // it -- widening it, an off-by-one in it, a second weld tolerance inside it -- are
+    // survivors this file no longer has anywhere to hide.
+    std::vector<std::uint8_t> owned(candidate.size(), 1u);
+    if (params.halo && !nearby.empty()) {
+        // **Ascending panel index, inside and halo together.** Every nodal sum below
+        // is formed in this order, so a node reached by the same panels from either
+        // side of a cut has its normal and its thickness accumulated in the same
+        // order and comes out bit for bit identical rather than merely close. That is
+        // what lets the invariance be asserted at zero instead of at a tolerance.
+        candidate.insert(candidate.end(), nearby.begin(), nearby.end());
+        std::sort(candidate.begin(), candidate.end());
+        owned.assign(candidate.size(), 0u);
+        for (std::size_t s = 0; s < candidate.size(); ++s)
+            owned[s] = static_cast<std::uint8_t>(
+                !std::binary_search(nearby.begin(), nearby.end(), candidate[s]));
+    }
 
     // Material. One `StructuralMaterial` goes to `reduction::Substructure`, so a
     // section spanning two of them is only honest when they differ in nothing the
@@ -261,8 +317,11 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
     // mild steel differing from AH36 in yield alone.
     {
         std::set<int> used;
-        for (int index : candidate)
-            used.insert(structure.panels[static_cast<std::size_t>(index)].material);
+        // The section's own plating only: a halo panel is looked at, never meshed,
+        // and a material it alone carries is not one this section spans.
+        for (std::size_t s = 0; s < candidate.size(); ++s)
+            if (owned[s])
+                used.insert(structure.panels[static_cast<std::size_t>(candidate[s])].material);
         const int first = *used.begin();
         section.material = first >= 0 && first < static_cast<int>(structure.materials.size())
                                ? structure.materials[static_cast<std::size_t>(first)]
@@ -335,7 +394,10 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
                         normalize(structure.panels[static_cast<std::size_t>(candidate[other])].normal());
                     const double aligned = dot(nq, ns);
                     if (std::abs(aligned) < std::cos(params.foldLimit)) {
-                        ++foldStops;
+                        // Counted only where the section's own plating is on one side
+                        // of it: a fold between two halo panels is a fact about the
+                        // ship beyond the cut and not about this section.
+                        if (owned[s] || owned[other]) ++foldStops;
                         continue;
                     }
                     surfaceOf[other] = surfaces;
@@ -346,7 +408,6 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
         }
         ++surfaces;
     }
-    section.surfaces = surfaces;
     if (foldStops > 0)
         report(std::to_string(foldStops) + " panel edges fold further than " +
                std::to_string(params.foldLimit) +
@@ -365,6 +426,11 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
     std::map<std::pair<int, long long>, Welder> welders;
     std::vector<SubQuad> quads;
     quads.reserve(candidate.size() * static_cast<std::size_t>(n) * static_cast<std::size_t>(n));
+    // Per sub-quad: inside the section, or halo. Parallel to `quads` rather than a
+    // field of it, because it lives only as far as the compaction below -- after
+    // that every sub-quad is inside and nothing downstream may ask.
+    std::vector<std::uint8_t> quadOwned;
+    quadOwned.reserve(quads.capacity());
     std::vector<std::uint32_t> grid(static_cast<std::size_t>(n + 1) * static_cast<std::size_t>(n + 1));
 
     for (std::size_t s = 0; s < candidate.size(); ++s) {
@@ -396,6 +462,7 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
                 };
                 quads.push_back({{at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)},
                                  panelIndex, surfaceOf[s], orientation[s]});
+                quadOwned.push_back(owned[s]);
             }
     }
     if (quads.empty()) {
@@ -412,6 +479,13 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
     // the taper lands inside the one element either side of it, measured below. See
     // the header §3 for why stopping instead -- which is what `zone.cpp` does -- is
     // not available to a section.
+    //
+    // **Over the halo as well, which is the whole of why the halo exists.** These two
+    // averages are the only things in this file a sub-quad beyond a cut plane is
+    // allowed to touch, and between them they place every node: `mid +/- t/2` along
+    // the normal. Take them over the inside alone and a node's position is a
+    // statement about the window; take them over everything that reaches the node and
+    // it is a statement about the ship. See §8.
     std::vector<Vec3> nodeNormal(mid.size(), Vec3{0, 0, 0});
     std::vector<double> nodeThickness(mid.size(), 0.0), nodeWeight(mid.size(), 0.0);
     // Which surface a node belongs to. Single-valued by construction -- the weld
@@ -448,6 +522,83 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
     for (std::size_t i = 0; i < mid.size(); ++i) {
         nodeNormal[i] = normalize(nodeNormal[i]);
         if (nodeWeight[i] > 0) nodeThickness[i] /= nodeWeight[i];
+    }
+
+    // --- Drop the halo, having taken the two averages it was there for -------------
+    //
+    // **Nothing below this line may see a sub-quad outside the section**, and the
+    // header's warning about blast radius is exactly that list: the free-edge count,
+    // the junction search, the surface walk's census, the component walk and the
+    // member runs all read `quads` and `mid`, and a halo left in them would put
+    // elements, steel, topology and ties into a section that does not contain them.
+    // So the halo is deleted here rather than filtered at each of those, which is one
+    // place to be right instead of six.
+    //
+    // The surviving nodes keep their **relative order**, because "ascending
+    // mid-surface order" is what decides which side of a junction becomes the slave
+    // and it has to stay a property of the mesh. A kept node's place in that order is
+    // set by the lowest-indexed panel that reaches it, and every panel that reaches it
+    // is in `candidate` whatever the window, so the order agrees across a cut too.
+    if (candidate.size() != insidePanels) {
+        constexpr std::uint32_t kDropped = 0xffffffffu;
+        std::vector<std::uint8_t> keep(mid.size(), 0u);
+        for (std::size_t k = 0; k < quads.size(); ++k) {
+            if (!quadOwned[k]) continue;
+            for (int c = 0; c < 4; ++c) keep[quads[k].node[static_cast<std::size_t>(c)]] = 1u;
+        }
+        // **The halo panels that were worth looking at**, which is not the same as the
+        // ones looked at: a panel of the pool that reached no node the section keeps
+        // contributed to nothing. Counted here because here is where it is known, and
+        // reported because a test of the halo on a window that had no halo is a test
+        // of nothing -- `Section::haloPanels`.
+        {
+            std::set<int> reached;
+            for (std::size_t k = 0; k < quads.size(); ++k) {
+                if (quadOwned[k]) continue;
+                for (int c = 0; c < 4; ++c)
+                    if (keep[quads[k].node[static_cast<std::size_t>(c)]])
+                        reached.insert(quads[k].panel);
+            }
+            section.haloPanels = static_cast<int>(reached.size());
+        }
+        std::vector<std::uint32_t> renumber(mid.size(), kDropped);
+        std::uint32_t next = 0;
+        for (std::size_t i = 0; i < mid.size(); ++i) {
+            if (!keep[i]) continue;
+            renumber[i] = next;
+            mid[next] = mid[i];
+            nodeNormal[next] = nodeNormal[i];
+            nodeThickness[next] = nodeThickness[i];
+            nodeWeight[next] = nodeWeight[i];
+            nodeSurface[next] = nodeSurface[i];
+            ++next;
+        }
+        mid.resize(next);
+        nodeNormal.resize(next);
+        nodeThickness.resize(next);
+        nodeWeight.resize(next);
+        nodeSurface.resize(next);
+        std::size_t written = 0;
+        for (std::size_t k = 0; k < quads.size(); ++k) {
+            if (!quadOwned[k]) continue;
+            SubQuad q = quads[k];
+            for (int c = 0; c < 4; ++c)
+                q.node[static_cast<std::size_t>(c)] =
+                    renumber[q.node[static_cast<std::size_t>(c)]];
+            quads[written++] = q;
+        }
+        quads.resize(written);
+        if (quads.empty()) {
+            report("the section meshed no elements");
+            return section;
+        }
+    }
+    // The section's own surfaces, counted after the halo is gone: a surface reached
+    // only by halo plating is not one this section is made of.
+    {
+        std::set<int> reached;
+        for (const SubQuad& q : quads) reached.insert(q.surface);
+        section.surfaces = static_cast<int>(reached.size());
     }
 
     // --- Element edges, and which of them nothing is on the other side of ----------
