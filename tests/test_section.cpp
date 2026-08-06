@@ -2345,9 +2345,26 @@ void testMesherReachesTheEndsOfTheShip() {
         expectedPlating(station.from, station.to, area, mass);
         expectNear(std::string(station.label) + " meshes the plating those panels have",
                    piece.area, area, 1e-9 * area);
-        expectNear(std::string(station.label) + " carries the steel those panels have",
-                   piece.plateMass, mass, 1e-9 * mass);
         expectTrue(std::string(station.label) + " is a real piece of ship", area > 100.0);
+
+        // **The steel is exact against that count only without the halo, and saying
+        // why is the point.** `A_e * mean(t at its corners)` telescopes back to
+        // `sum A_p t_p` precisely when the nodal thickness is averaged over the
+        // sub-quads the section meshes. The halo of §8 averages over one bay beyond
+        // each plane as well, so a cut plane where the strake steps carries the
+        // *mean* of the two -- §3's taper, now reaching the plane -- and this window
+        // hands its neighbour whatever it takes. What replaces the identity is
+        // conservation across the cut, which is exact and is asserted below.
+        section::SectionParams unaveraged = params;
+        unaveraged.halo = false;
+        const section::Section owned = section::buildSection(structure, unaveraged);
+        expectNear(std::string(station.label) + " carries the steel those panels have",
+                   owned.plateMass, mass, 1e-9 * mass);
+        // And with the halo it is off by the seam it moved across the plane, which is
+        // parts per million: three orders of magnitude below the 0.3% of plating a
+        // dropped wedge would be, which is what this check exists to catch.
+        expectNear(std::string(station.label) + " carries it to a seam's redistribution",
+                   piece.plateMass, mass, 3e-6 * mass);
 
         if (piece.collapsedElements > 0) ++withWedges;
         ++reached;
@@ -2370,29 +2387,26 @@ void testMesherReachesTheEndsOfTheShip() {
                 middle.collapsedElements, 0);
     expectEqual("nor an inverted one", middle.invertedElements, 0);
 
-    // --- What the reach exposes, which is not the reach ------------------------------
+    // --- What the reach exposed, and what the halo does about it ---------------------
     //
-    // Cutting a window in two conserves the plating exactly and the **stiffener steel
-    // only where the plating does not change thickness**, and reaching the ends is
-    // what makes that visible. `nodeThickness` is an area-weighted mean over the
-    // sub-quads *inside the section*, so a station where the strake steps carries one
-    // thickness to the section aft of it, another to the section forward of it, and
-    // the mean of the two to a section that spans it. A member run stops at a
-    // thickness change (§3), so the spanning section stops runs the two halves never
-    // see, and the seam node's run of one is dropped.
+    // **A section is worth what it is worth wherever it was cut.** Cutting a window in
+    // two used to conserve the plating exactly and the stiffener steel only where the
+    // plating does not change thickness: `nodeThickness` was an area-weighted mean over
+    // the sub-quads *inside the section*, so a station where the strake steps carried
+    // one thickness to the section aft of it, another to the one forward of it, and the
+    // mean of the two to a section that spanned it. A member run stops at a thickness
+    // change (§3), so the spanning section stopped runs the two halves never saw and
+    // dropped the seam node's run of one. **The spanning section is the one that
+    // lost**, which is the direction the header states the mechanism in and the
+    // opposite of the direction its summary states the figures in: one piece carried
+    // 1.9% less than its two halves at x = -24 .. -19.2 -- inside the range that always
+    // worked -- and **25.2%** less at the bow shoulder.
     //
-    // **It is not new and it is not the collapsed element.** It is the nodal-thickness
-    // twin of `section.hpp` §6 note 1's nodal normal, and it is measurable inside the
-    // range that always worked -- 1.9% at x = -24 .. -19.2. The ends are where it
-    // stops being a rounding: at the bow shoulder the spanning section carries **25%
-    // less** stiffener steel than the two halves it is made of.
-    const auto cut = [&](double from, double to) {
-        section::SectionParams p;
-        p.xFrom = from;
-        p.xTo = to;
-        p.junctions = false;
-        return section::buildSection(structure, p);
-    };
+    // `SectionParams::halo` averages both nodal fields over one bay beyond each plane
+    // as well (§8), so the seam is in the same place whatever window contains it, and
+    // the identity below is exact everywhere. The `halo = false` column is the negative
+    // control: it is the old mesher, it still shows the whole defect, and it is what
+    // keeps this from being a test of two numbers that were never going to differ.
     struct Split {
         const char* label;
         double from, middle, to;
@@ -2401,41 +2415,62 @@ void testMesherReachesTheEndsOfTheShip() {
     for (const Split& split : {Split{"amidships", -7.2, -2.4, 2.4, true},
                                Split{"old reach", -24.0, -21.6, -19.2, false},
                                Split{"bow shoulder", 40.8, 43.2, 45.6, false}}) {
-        const section::Section aft = cut(split.from, split.middle);
-        const section::Section forward = cut(split.middle, split.to);
-        const section::Section whole = cut(split.from, split.to);
-        // The plating, the elements and the wedges conserve whatever the thickness
-        // does. Only the members are at issue.
-        expectEqualCount(std::string(split.label) + ": two sections have one section's elements",
-                         aft.elementCount() + forward.elementCount(), whole.elementCount());
-        expectNear(std::string(split.label) + ": and its plating", aft.plateMass + forward.plateMass,
-                   whole.plateMass, 1e-9);
-        expectEqual(std::string(split.label) + ": and its collapsed elements",
-                    aft.collapsedElements + forward.collapsedElements, whole.collapsedElements);
+        const auto cut = [&](double from, double to, bool halo) {
+            section::SectionParams p;
+            p.xFrom = from;
+            p.xTo = to;
+            p.junctions = false;
+            p.halo = halo;
+            return section::buildSection(structure, p);
+        };
+        double loose = 0;
+        for (int halo = 1; halo >= 0; --halo) {
+            const section::Section aft = cut(split.from, split.middle, halo != 0);
+            const section::Section forward = cut(split.middle, split.to, halo != 0);
+            const section::Section whole = cut(split.from, split.to, halo != 0);
+            // The plating, the elements and the wedges conserve whatever the thickness
+            // does, with the halo or without it. Only the members were ever at issue.
+            expectEqualCount(std::string(split.label) + ": two sections have one section's elements",
+                             aft.elementCount() + forward.elementCount(), whole.elementCount());
+            expectNear(std::string(split.label) + ": and its plating",
+                       aft.plateMass + forward.plateMass, whole.plateMass, 1e-9);
+            expectEqual(std::string(split.label) + ": and its collapsed elements",
+                        aft.collapsedElements + forward.collapsedElements, whole.collapsedElements);
 
-        const double halves = aft.memberMass + forward.memberMass;
-        const double shortfall = 1.0 - whole.memberMass / halves;
-        const int splitHalves =
-            aft.memberRunsSplitByThickness + forward.memberRunsSplitByThickness;
-        std::printf("     %-13s stiffener steel: halves %8.1f kg, one piece %8.1f (%+.1f%%);"
-                    " runs stopped at a seam %d against %d\n",
-                    split.label, halves, whole.memberMass, -100.0 * shortfall,
-                    whole.memberRunsSplitByThickness, splitHalves);
-        if (split.uniform) {
+            const double halves = aft.memberMass + forward.memberMass;
+            const double shortfall = 1.0 - whole.memberMass / halves;
+            const int splitHalves =
+                aft.memberRunsSplitByThickness + forward.memberRunsSplitByThickness;
+            std::printf("     %-13s halo %d: stiffener steel halves %8.1f kg, one piece %8.1f"
+                        " (%+.1f%%); runs stopped at a seam %d against %d, halo panels %d\n",
+                        split.label, halo, halves, whole.memberMass, -100.0 * shortfall,
+                        whole.memberRunsSplitByThickness, splitHalves, whole.haloPanels);
+            if (halo == 0) {
+                loose = shortfall;
+                continue;
+            }
+            // **The property, asserted directly**: the same steel, and the same runs
+            // stopped, however the length was cut. Exact, because the halo makes the
+            // nodal thickness a function of the ship rather than of the window and
+            // every run therefore breaks in the same places.
             expectNear(std::string(split.label) + ": the stiffener steel conserves exactly",
                        whole.memberMass, halves, 1e-9 * halves);
             expectEqual(std::string(split.label) + ": and no extra run is stopped",
                         whole.memberRunsSplitByThickness, splitHalves);
+            // The halo has to have been made of something, or the two builds are the
+            // same build and the control below proves nothing.
+            expectTrue(std::string(split.label) + ": and the halo had plating to average",
+                       whole.haloPanels > 0 && aft.haloPanels > 0);
+        }
+        if (split.uniform) {
+            // The guard against the whole comparison being vacuous: amidships the old
+            // mesher conserved too, so a station where it did not is what says the
+            // identity above is about the fix and not about the ship.
+            expectTrue(std::string(split.label) + ": and the old mesher conserved here as well",
+                       std::abs(loose) < 1e-9);
         } else {
-            // The direction is the whole point: the *spanning* section is the one
-            // that loses, because it is the one that sees the seam. A test that
-            // asserted only "they differ" would pass on the opposite sign, which
-            // would be double-counted steel rather than dropped steel.
-            expectTrue(std::string(split.label) + ": the spanning section stops more runs",
-                       whole.memberRunsSplitByThickness > splitHalves);
-            expectTrue(std::string(split.label) + ": and is the one short of steel",
-                       whole.memberMass < halves);
-            expectTrue(std::string(split.label) + ": by a real fraction of it", shortfall > 0.01);
+            expectTrue(std::string(split.label) + ": which the old mesher did not",
+                       loose > 0.01);
         }
     }
 }
@@ -2513,14 +2548,21 @@ void testJunctionWeightLimitRefusesTheNodeAndNotTheSection() {
                middle.worstJunctionWeight > 1.5 && middle.worstJunctionWeight <= 2.0);
 }
 
-// **The interface is not coincident by construction, and the parallel middle body is
-// what hides it.** See `section.hpp` §6 note 1. A node is the mid-surface offset by
-// `t/2` along a normal this file averages over the sub-quads *inside* the section, so
-// two sections cut on the same station disagree about where that node is wherever the
-// hull is not prismatic. It is 3.4 µm at the outermost plane a chain can still be
-// built on -- and 3.4 µm is three orders of magnitude above the default tolerance.
-void testFerryChainInterfaceIsNotCoincidentByConstruction() {
-    std::printf("\n--- section: where two sections stop agreeing about the cut plane ---\n");
+// **The interface is coincident because the halo makes it so, and the parallel middle
+// body is what used to hide that it was not.** See `section.hpp` §6 note 1 and §8. A
+// node is the mid-surface offset by `t/2` along the nodal normal; averaged over the
+// sub-quads *inside* the section, both that normal and that thickness are statements
+// about the window, so two sections cut on the same station disagreed about where the
+// node was wherever the hull is not prismatic -- 3.4 µm at x = -21.6, three orders of
+// magnitude above `matchBoundaries`' default, and 336 of the plane's 1 170 boundary
+// DOF finding no partner at all.
+//
+// Averaged over one bay beyond the plane as well they are statements about the ship,
+// and the two sections agree **bit for bit**: not to a tolerance, because they sum the
+// same contributions from the same panels in the same order. `halo = false` below is
+// the old mesher and is what keeps this from being a comparison of two zeros.
+void testHaloMakesTheCutPlanesCoincide() {
+    std::printf("\n--- section: two sections agreeing about the cut plane ---\n");
     const StructuralMesh structure = ferryStructure();
     section::ChainParams params;
     params.section.subdivision = 1;
@@ -2530,40 +2572,49 @@ void testFerryChainInterfaceIsNotCoincidentByConstruction() {
     params.reduce.cutoffFrequency = 0;
     params.station = {-26.4, -21.6, -16.8};
 
-    const section::Chain strict = section::buildChain(structure, params);
-    expectEqualCount("the chain meshed two sections", strict.section.size(), 2u);
-    expectEqualCount("one interior plane", strict.unmatched.size(), 1u);
-    const std::size_t planeDof = 3 * strict.section[0].forwardNodes.size();
+    const section::Chain joined = section::buildChain(structure, params);
+    expectEqualCount("the chain meshed two sections", joined.section.size(), 2u);
+    expectEqualCount("one interior plane", joined.unmatched.size(), 1u);
+    const std::size_t planeDof = 3 * joined.section[0].forwardNodes.size();
     expectEqualCount("of 1170 boundary DOF", planeDof, 1170u);
-    std::printf("     at 1e-9: %zu of %zu unmatched, worst matched gap %.4e m\n",
-                strict.unmatched[0], planeDof, strict.worstGap);
-    expectTrue("at the default tolerance a large part of the plane finds no partner",
-               strict.unmatched[0] > planeDof / 4);
-    expectTrue("so the chain is refused rather than solved", !strict.ready());
-
-    section::ChainParams loose = params;
-    loose.matchTolerance = 1e-5;
-    const section::Chain joined = section::buildChain(structure, loose);
-    expectTrue("a tolerance the size of the disagreement joins the whole plane",
-               joined.ready());
-    expectEqualCount("with nothing left over", joined.unmatched[0], 0u);
-    expectEqualCount("and the whole plane shared", joined.shared[0], planeDof);
-    std::printf("     at 1e-5: 0 unmatched, worst matched gap %.4e m\n", joined.worstGap);
+    std::printf("     halo on:  %zu of %zu unmatched at 1e-9, worst matched gap %.4e m\n",
+                joined.unmatched[0], planeDof, joined.worstGap);
+    // **The sharpest check available, and it needs no new instrument.**
+    expectEqualCount("at matchBoundaries' own default nothing is left over", joined.unmatched[0],
+                     0u);
+    expectEqualCount("and the whole plane is shared", joined.shared[0], planeDof);
+    expectTrue("so the chain is ready without a tolerance being chosen for it", joined.ready());
+    // Exactly zero, not nearly: the two sections form the same sums from the same
+    // panels in the same order, so the node is at the same double.
+    expectNear("the two sections put the node at the same double", joined.worstGap, 0.0, 0.0);
     // The assembly's own account of it, which is a different measurement of the same
     // thing: `Chain::worstGap` comes from the interface map, `worstMergedGap` from
     // comparing the identities of the DOF that actually landed on one assembled row.
-    // Nothing else in the suite ever merges two DOF that are not exactly coincident,
-    // so without this the two are indistinguishable from zero and from each other.
     expectNear("and the assembly reports the same gap on the rows it merged",
                joined.assembly.worstMergedGap, joined.worstGap, 1e-15);
     expectEqual("with no axis crossed", joined.assembly.axisDisagreements, 0);
+    expectTrue("and the halo had plating beyond the cut to average",
+               joined.section[0].haloPanels > 0 && joined.section[1].haloPanels > 0);
 
+    // --- The negative control: the same chain built the way it used to be -----------
+    section::ChainParams unaveraged = params;
+    unaveraged.section.halo = false;
+    const section::Chain strict = section::buildChain(structure, unaveraged);
+    std::printf("     halo off: %zu of %zu unmatched at 1e-9\n", strict.unmatched[0], planeDof);
+    expectEqualCount("without the halo 336 of the plane's 1170 DOF find no partner",
+                     strict.unmatched[0], 336u);
+    expectTrue("and the chain is refused rather than solved", !strict.ready());
+    section::ChainParams loose = unaveraged;
+    loose.matchTolerance = 1e-5;
+    const section::Chain tolerated = section::buildChain(structure, loose);
+    expectTrue("a tolerance the size of the disagreement joins it instead", tolerated.ready());
     // Measured at 3.4021e-06 m. Bracketed rather than asserted at a point, because it
     // is a property of this hull's shoulder -- but bracketed tightly enough that a
     // mesher which had started averaging its normals across the cut would fail it,
-    // which is the fix §6 names.
-    expectTrue("and the disagreement is microns, not the plate thickness",
-               joined.worstGap > 1e-6 && joined.worstGap < 1e-5);
+    // which is exactly what the halo does and what the assertion above says it did.
+    expectTrue("and the disagreement it is covering is microns, not the plate thickness",
+               tolerated.worstGap > 1e-6 && tolerated.worstGap < 1e-5);
+
     // The guard against the whole test being about nothing: amidships the same
     // measurement is exactly zero, so this is the hull's shape and not the mesher's
     // arithmetic.
@@ -2598,14 +2649,399 @@ void testFerryChainInterfaceIsNotCoincidentByConstruction() {
     std::printf("     ship scale: GJ chain %.6e against one piece %.6e (%+.2e)\n",
                 chainTwist.torsionalStiffness, monoTwist.torsionalStiffness,
                 chainTwist.torsionalStiffness / monoTwist.torsionalStiffness - 1);
-    // Measured at 3.9e-12 relative. Asserted at 1e-9 -- three decades above the
-    // measurement and six below anything a lost interface could hide in.
+    // Measured at 1.4e-11 relative, with the halo and without it -- the comment this
+    // replaces said 3.9e-12 and no run of this file has produced that figure, which is
+    // what a tolerance three decades wide lets happen to a number nothing asserts.
+    // Asserted at 1e-9, two decades above the measurement and six below anything a
+    // lost interface could hide in.
     expectNear("two ferry sections carry the torque one ferry section carries",
                chainTwist.torsionalStiffness, monoTwist.torsionalStiffness,
                1e-9 * monoTwist.torsionalStiffness);
     // Vacuity: an open cell and a closed one differ by orders of magnitude, so this
     // is a comparison of something rather than of two zeros.
     expectTrue("and it is a real torque", monoTwist.torsionalStiffness > 1e11);
+
+    // --- And the same, on the shoulder, which is what the halo buys ----------------
+    //
+    // The comparison above is the middle body, where the interface always matched.
+    // This is the one that could not be made at the default tolerance at all: the
+    // chain across x = -21.6 against the same length in one piece. Torsion again,
+    // because `EA` would be exact on a chain torn along 29% of its cut.
+    const section::Section shoulder = section::buildSection(structure, [&] {
+        section::SectionParams p = params.section;
+        p.xFrom = -26.4;
+        p.xTo = -16.8;
+        return p;
+    }());
+    expectEqual("the shoulder chain and its monolith are the same pieces", joined.components,
+                shoulder.components);
+    const section::TorsionResponse shoulderChain = section::applyTwist(joined, 1e-6, 6.86);
+    const section::TorsionResponse shoulderMono =
+        section::applyTwist(shoulder, shoulder.material, 1e-6, 6.86);
+    expectTrue("both shoulder twists ran", shoulderChain.ok && shoulderMono.ok);
+    std::printf("     shoulder:   GJ chain %.6e against one piece %.6e (%+.2e)\n",
+                shoulderChain.torsionalStiffness, shoulderMono.torsionalStiffness,
+                shoulderChain.torsionalStiffness / shoulderMono.torsionalStiffness - 1);
+    // Measured at 1.4e-9 relative, against 1.4e-11 amidships, and the hundredfold is
+    // the solve rather than the assembly: the same two loads report a residual of
+    // 3.7e-5 N here against 1.0e-7 N amidships, because a shoulder section is a worse
+    // conditioned mesh than a prismatic one. Asserted at 1e-8 -- seven times the
+    // measurement and five decades below the 29% of a cut that used to be torn.
+    expectNear("two shoulder sections carry the torque one shoulder section carries",
+               shoulderChain.torsionalStiffness, shoulderMono.torsionalStiffness,
+               1e-8 * shoulderMono.torsionalStiffness);
+    expectTrue("and it too is a real torque", shoulderMono.torsionalStiffness > 1e11);
+}
+
+// **The halo reaches exactly as far as the weld does, and nothing on the ferry could
+// say so.** Whether a panel joins the halo is decided by welding its corners against
+// the section's own, and the reference ship's panel corners are *bit* identical where
+// they meet -- they come from the same evaluation of the same station -- so the
+// distance in that test is never exercised and any tolerance at all would pass. That
+// is the shape of the mutant that survived everything in `zone.cpp`: a probe that
+// reaches less far than the tolerance leaves a crack down the middle of any mesh whose
+// duplicates sit between 0.75 and 1 tolerance apart.
+//
+// So: a strip of plating that **kinks** at its middle station -- so a node there has
+// two different normals to average and its position depends on whether the halo
+// reached -- with the forward bay's aft corners nudged sideways by a fraction of
+// `weldTolerance`. The weld joins them; the halo has to agree, and at 0.75 it is the
+// only thing being asked.
+StructuralMesh makeKinkedStrip(double nudge, double slope = 0.5) {
+    StructuralMesh mesh;
+    // A second material for the forward bay, differing in the two things the section
+    // census reads. It is the halo's material and never the section's, which is the
+    // only way to ask whether a halo panel can make a section report spanning a
+    // material it does not contain.
+    StructuralMaterial soft = ah36Steel();
+    soft.name = "halo steel";
+    soft.youngsModulus *= 0.5;
+    soft.density *= 0.5;
+    mesh.materials = {ah36Steel(), soft};
+    mesh.frameSpacing = 1.0;
+    // Flat aft of x = 1 and rising forward of it. At `slope = 0.5` that is 26.6
+    // degrees -- inside `foldLimit`, so the two bays are one surface and their nodes
+    // weld. A node at the kink is then 0.44 rad of normal away from either answer,
+    // which is what makes its position depend on whether the halo reached it. At
+    // `slope = 4` it is 76 degrees and the two bays are two surfaces.
+    const auto height = [&](double x) { return x <= 1.0 ? 0.0 : (x - 1.0) * slope; };
+    for (int i = 0; i < 2; ++i) {
+        // Both panels of the forward bay carry the same nudge, so they still share
+        // their own corners exactly and only the *seam between the bays* is opened.
+        const double x0 = i, x1 = i + 1, shift = i == 1 ? nudge : 0.0;
+        for (int j = 0; j < 3; ++j) {
+            const double y0 = 0.5 * j, y1 = 0.5 * (j + 1);
+            PlatePanel p;
+            p.corner[0] = {x0, y0 + shift, height(x0)};
+            p.corner[1] = {x1, y0, height(x1)};
+            p.corner[2] = {x1, y1, height(x1)};
+            p.corner[3] = {x0, y1 + shift, height(x0)};
+            p.thickness = 0.010;
+            p.material = i;
+            p.role = PanelRole::Shell;
+            p.source = 0;
+            mesh.panels.push_back(p);
+        }
+    }
+    mesh.frameStations = {0.0, 1.0, 2.0};
+    return mesh;
+}
+
+void testHaloReachesAsFarAsTheWeld() {
+    std::printf("\n--- section: the halo reaches as far as the weld, not as far as a cell ---\n");
+    const auto planeGap = [](double nudge, int& haloPanels) {
+        const StructuralMesh strip = makeKinkedStrip(nudge);
+        const auto cut = [&](double from, double to) {
+            section::SectionParams p;
+            p.xFrom = from;
+            p.xTo = to;
+            p.subdivision = 1;
+            p.members = false;
+            p.junctions = false;
+            return section::buildSection(strip, p);
+        };
+        const section::Section aft = cut(0.0, 1.0), forward = cut(1.0, 2.0);
+        haloPanels = aft.haloPanels;
+        double worst = 0;
+        for (std::uint32_t a : aft.forwardNodes) {
+            const Vec3 at{aft.mesh.position[a * 3], aft.mesh.position[a * 3 + 1],
+                          aft.mesh.position[a * 3 + 2]};
+            double nearest = 1e300;
+            for (std::uint32_t b : forward.aftNodes)
+                nearest = std::min(
+                    nearest, length(at - Vec3{forward.mesh.position[b * 3],
+                                              forward.mesh.position[b * 3 + 1],
+                                              forward.mesh.position[b * 3 + 2]}));
+            worst = std::max(worst, nearest);
+        }
+        return worst;
+    };
+
+    // The default `weldTolerance` is 1e-6 m.
+    int panels = 0;
+    const double joined = planeGap(0.0, panels);
+    std::printf("     corners coincident:      halo %d panels, plane gap %.3e m\n", panels, joined);
+    expectTrue("coincident corners put the halo in reach", panels > 0);
+    expectNear("and the kink's nodes land at the same double from either side", joined, 0.0, 0.0);
+
+    // **0.75 of the tolerance**, which is the gap a probe reaching one cell instead of
+    // one tolerance would miss. Nothing else in this file puts a corner there.
+    const double nudged = planeGap(0.75e-6, panels);
+    std::printf("     corners 0.75e-6 m apart: halo %d panels, plane gap %.3e m\n", panels, nudged);
+    expectTrue("a corner three quarters of a tolerance away is still in reach", panels > 0);
+    expectNear("and the kink's nodes still land at the same double", nudged, 0.0, 0.0);
+
+    // The control, and it is what says the two above measure a distance rather than
+    // passing by construction: past the tolerance the corners are genuinely two
+    // corners, the weld does not join them either, and the plane comes apart.
+    const double apart = planeGap(4e-6, panels);
+    std::printf("     corners 4e-6 m apart:    halo %d panels, plane gap %.3e m\n", panels, apart);
+    expectEqual("past the tolerance the panel is not in the halo at all", panels, 0);
+    expectTrue("and the two sections stop agreeing about the plane", apart > 1e-4);
+    // A millimetre and not a micron: the kink is what makes the disagreement a
+    // *normal* rather than a corner offset, so this is the defect the halo removes
+    // rather than the nudge itself showing through.
+    expectTrue("by the plating's own half-thickness, not by the nudge", apart > 1e-3);
+
+    // --- What the halo is looked at for, and nothing else ---------------------------
+    //
+    // The forward bay carries a second material, half the modulus and half the
+    // density. It is the halo's and never the section's, so the aft section must
+    // report one material and mesh at the first -- a section that took its material
+    // census over the halo would report spanning two and hand `reduction::Substructure`
+    // a stiffness that is not its own. Nothing on the ferry could say so: its two
+    // materials differ in yield alone, which the census does not read.
+    const StructuralMesh twoMaterials = makeKinkedStrip(0.0);
+    section::SectionParams aftHalf;
+    aftHalf.xFrom = 0.0;
+    aftHalf.xTo = 1.0;
+    aftHalf.subdivision = 1;
+    aftHalf.members = false;
+    aftHalf.junctions = false;
+    const section::Section aft = section::buildSection(twoMaterials, aftHalf);
+    expectTrue("the halo is there to be miscounted", aft.haloPanels > 0);
+    expectNear("the section is meshed at its own plating's modulus",
+               aft.material.youngsModulus, ah36Steel().youngsModulus, 0.0);
+    bool spanned = false;
+    for (const std::string& problem : aft.problems)
+        spanned = spanned || problem.find("spans materials") != std::string::npos;
+    expectTrue("and does not report spanning the halo's", !spanned);
+    // The control: the section that really does contain both reports it, so the
+    // assertion above is about the halo and not about a check that never fires.
+    section::SectionParams both = aftHalf;
+    both.xTo = 2.0;
+    const section::Section whole = section::buildSection(twoMaterials, both);
+    bool reported = false;
+    for (const std::string& problem : whole.problems)
+        reported = reported || problem.find("spans materials") != std::string::npos;
+    expectTrue("a section that does contain both says so", reported);
+
+    // --- And a fold the halo is on the far side of ----------------------------------
+    //
+    // At 76 degrees the two bays are two surfaces, so the halo cannot weld to the
+    // section's nodes and cannot -- and must not -- make them agree: a shared node
+    // pair has one thickness direction and two plates at that angle need two. What it
+    // must still do is *say* so. The fold count is a fact about the section's own
+    // boundary, so an edge with the section on one side of it and the halo on the
+    // other belongs in it; on the ferry no fold on a cut plane exists to check that.
+    const StructuralMesh folded = makeKinkedStrip(0.0, 4.0);
+    const section::Section overFold = section::buildSection(folded, aftHalf);
+    bool saidFold = false;
+    for (const std::string& problem : overFold.problems)
+        saidFold = saidFold || problem.find("fold further than") != std::string::npos;
+    std::printf("     across a 76 degree fold: halo %d panels, %d surfaces, fold reported %d\n",
+                overFold.haloPanels, overFold.surfaces, static_cast<int>(saidFold));
+    expectTrue("a fold between the section and its halo is the section's fold", saidFold);
+    // And the halo on the far side of it reaches nothing, which is what a weld class
+    // keyed on the surface is for.
+    expectEqual("while the plating past it joins no node of this section",
+                overFold.haloPanels, 0);
+    expectEqual("so the section is the one surface it is made of", overFold.surfaces, 1);
+}
+
+// **The property the halo exists for, asserted directly**: a section's nodes are where
+// they are because of the ship, not because of where it was cut. `section.hpp` §8.
+//
+// The two symptoms this repository had recorded -- an interface 3.4 µm out at
+// x = -21.6, and 25.2% of the stiffener steel appearing or disappearing at the bow
+// shoulder depending on the window -- are both consequences of its absence, so this
+// asserts the cause and they follow. It is asserted at **zero**: the same node is
+// reached by the same panels whichever window contains it, the halo makes `candidate`
+// hold all of them in ascending panel order whichever window it is, and the nodal sums
+// are therefore formed from the same terms in the same order. Anything less than a bit
+// would mean one of those three had stopped being true.
+void testNodePositionsDoNotDependOnWhereTheSectionWasCut() {
+    std::printf("\n--- section: a node is where the ship puts it, not where the cut does ---\n");
+    const StructuralMesh structure = ferryStructure();
+
+    // Every mesh node position of a section, sorted, so two sections built with
+    // different numberings can be compared term by term. Positions and not indices:
+    // the numbering is chosen for bandwidth and owes nothing to the ship.
+    const auto positions = [](const section::Section& s, const std::vector<std::uint32_t>& nodes) {
+        std::vector<std::array<double, 3>> out;
+        out.reserve(nodes.size());
+        for (std::uint32_t n : nodes)
+            out.push_back({s.mesh.position[static_cast<std::size_t>(n) * 3],
+                           s.mesh.position[static_cast<std::size_t>(n) * 3 + 1],
+                           s.mesh.position[static_cast<std::size_t>(n) * 3 + 2]});
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+
+    struct Where {
+        const char* label;
+        double station;   // the plane three windows are cut on
+        double bay;       // how far either side each window reaches
+        int subdivision;
+    };
+    // Two stations, and they fail in different ways without the halo: the hull turns
+    // at x = -21.6 and the nodal *normal* is what disagrees, while the plating steps
+    // at x = 43.2 and the nodal *thickness* is. A halo that averaged only one of the
+    // two would pass one of these and fail the other.
+    //
+    // The third is the second station refined, and it asks a question one element per
+    // panel cannot. The halo is "every panel sharing a welded corner with one
+    // inside", which is exactly the set that can reach a node **when every node is a
+    // panel corner**. At `subdivision = 2` a node can also sit part way along a panel
+    // edge, where the panels that reach it are the ones sharing that edge -- two
+    // corners rather than one, so still inside the rule, but nothing tested it.
+    for (const Where& where : {Where{"stern shoulder, the normal turns", -21.6, 4.8, 1},
+                               Where{"bow shoulder, the plating steps", 43.2, 2.4, 1},
+                               Where{"bow shoulder, refined", 43.2, 2.4, 2}}) {
+        double loose = 0;
+        for (int halo = 1; halo >= 0; --halo) {
+            const auto cut = [&](double from, double to) {
+                section::SectionParams p;
+                p.xFrom = from;
+                p.xTo = to;
+                p.subdivision = where.subdivision;
+                p.junctions = false;
+                p.halo = halo != 0;
+                return section::buildSection(structure, p);
+            };
+            const section::Section aft = cut(where.station - where.bay, where.station);
+            const section::Section forward = cut(where.station, where.station + where.bay);
+            const section::Section whole =
+                cut(where.station - where.bay, where.station + where.bay);
+            expectTrue(std::string(where.label) + ": all three meshed",
+                       !aft.empty() && !forward.empty() && !whole.empty());
+
+            // The aft section's forward plane, the forward section's aft plane, and
+            // the same station seen from inside the section that spans it. Three
+            // different windows, one physical ring of nodes.
+            const std::vector<std::array<double, 3>> fromAft = positions(aft, aft.forwardNodes);
+            const std::vector<std::array<double, 3>> fromForward =
+                positions(forward, forward.aftNodes);
+            expectEqualCount(std::string(where.label) + ": the plane has the same nodes both ways",
+                             fromAft.size(), fromForward.size());
+            // **Nearest neighbour, not term by term.** Sorting by coordinate is only a
+            // usable pairing once the two agree; a micron of disagreement in x
+            // reorders the sort and the term-by-term difference becomes the width of
+            // the ship rather than the error. This is the same question
+            // `matchBoundaries` asks, asked without a tolerance.
+            double worst = 0;
+            for (const std::array<double, 3>& a : fromAft) {
+                double nearest = 1e300;
+                for (const std::array<double, 3>& b : fromForward) {
+                    const double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+                    nearest = std::min(nearest, std::sqrt(dx * dx + dy * dy + dz * dz));
+                }
+                worst = std::max(worst, nearest);
+            }
+            std::printf("     %-34s halo %d: %3zu nodes on the plane, furthest from its"
+                        " partner %.3e m, halo panels %d\n",
+                        where.label, halo, fromAft.size(), worst, whole.haloPanels);
+            if (halo == 0) {
+                loose = worst;
+                continue;
+            }
+            expectNear(std::string(where.label) + ": and puts them at the same doubles", worst,
+                       0.0, 0.0);
+            expectTrue(std::string(where.label) + ": on a plane that carries a ship's worth"
+                                                  " of nodes",
+                       fromAft.size() > 100);
+            expectTrue(std::string(where.label) + ": with a halo to average", whole.haloPanels > 0);
+
+            // And the stronger statement, which the plane alone does not make: the
+            // section that *spans* the station agrees with both halves about every
+            // node either of them has, not only the ones on the shared cut.
+            std::vector<std::uint32_t> all(whole.mesh.nodeCount());
+            for (std::uint32_t i = 0; i < whole.mesh.nodeCount(); ++i) all[i] = i;
+            std::vector<std::array<double, 3>> spanning = positions(whole, all);
+            std::vector<std::uint32_t> everyAft(aft.mesh.nodeCount()),
+                everyForward(forward.mesh.nodeCount());
+            for (std::uint32_t i = 0; i < aft.mesh.nodeCount(); ++i) everyAft[i] = i;
+            for (std::uint32_t i = 0; i < forward.mesh.nodeCount(); ++i) everyForward[i] = i;
+            std::vector<std::array<double, 3>> halves = positions(aft, everyAft);
+            const std::vector<std::array<double, 3>> other = positions(forward, everyForward);
+            halves.insert(halves.end(), other.begin(), other.end());
+            std::sort(halves.begin(), halves.end());
+            // The shared plane is in both halves and once in the monolith, so the
+            // halves carry it twice. Deduplicating by value would hide a genuine
+            // duplicate; removing exactly the plane's nodes once does not.
+            bool inBoth = true;
+            for (const std::array<double, 3>& p : fromForward) {
+                const auto found = std::lower_bound(halves.begin(), halves.end(), p);
+                if (found == halves.end() || *found != p) {
+                    inBoth = false;
+                    break;
+                }
+                halves.erase(found);
+            }
+            expectTrue(std::string(where.label) + ": the shared plane is in both halves", inBoth);
+            expectEqualCount(std::string(where.label) + ": two halves have one section's nodes",
+                             halves.size(), spanning.size());
+            bool identical = halves.size() == spanning.size();
+            for (std::size_t i = 0; i < halves.size() && i < spanning.size(); ++i)
+                identical = identical && halves[i] == spanning[i];
+            expectTrue(std::string(where.label) + ": every one of them at the same double",
+                       identical);
+        }
+        // The guard, and it is the load-bearing one: without the halo this station
+        // disagrees by microns to millimetres, so "they agree" is a statement about
+        // the fix rather than about a hull that was prismatic all along.
+        std::printf("     %-34s without the halo the same plane is %.3e m out\n", where.label,
+                    loose);
+        expectTrue(std::string(where.label) + ": and the old mesher did not agree",
+                   loose > 1e-9);
+    }
+
+    // Amidships, where it was always true. The two builds have to be the *same* there
+    // or the halo has moved a mesh that had nothing wrong with it -- which is the one
+    // way this change could regress the part of the ship every published figure in
+    // `section.hpp` was measured on.
+    const auto midship = [&](bool halo) {
+        section::SectionParams p;
+        p.xFrom = -7.2;
+        p.xTo = 2.4;
+        p.subdivision = 1;
+        p.junctions = false;
+        p.halo = halo;
+        return section::buildSection(structure, p);
+    };
+    const section::Section withHalo = midship(true), without = midship(false);
+    expectEqualCount("amidships the halo changes no node count", withHalo.mesh.nodeCount(),
+                     without.mesh.nodeCount());
+    double moved = 0;
+    for (std::size_t d = 0; d < withHalo.mesh.position.size() &&
+                            d < without.mesh.position.size();
+         ++d)
+        moved = std::max(moved, std::abs(withHalo.mesh.position[d] - without.mesh.position[d]));
+    std::printf("     amidships the halo moves the mesh by %.3e m\n", moved);
+    // **Rounding, and the bound is derived rather than chosen.** The middle body is
+    // prismatic, so the halo's sub-quads carry the same normal and the same thickness
+    // as the ones inside: the average is the same vector formed from twice as many
+    // terms, which differs from it by a few ulps before `normalize`. A node is that
+    // unit vector times `t/2`, so the move is bounded by a handful of ulps of half the
+    // plating -- 8 eps * 0.008 m = 1.4e-17. Measured at 1.7e-18, which is one.
+    //
+    // It is fourteen orders of magnitude below the millimetre the halo removes at the
+    // ends and eight below anything `matchBoundaries` would notice, so "the middle
+    // body did not move" is a statement and not a tolerance.
+    expectTrue("and moves no node amidships beyond the rounding of a longer sum",
+               moved < 2e-17);
+    expectEqual("nor changes what is collapsed there", withHalo.collapsedElements, 0);
+    expectTrue("though it did average a halo there too", withHalo.haloPanels > 0);
 }
 
 }  // namespace
@@ -2639,5 +3075,7 @@ void runSectionTests() {
     testMesherReachesTheEndsOfTheShip();
     testJunctionWeightLimitRefusesTheNodeAndNotTheSection();
     testFerryChainConservesTheStructure();
-    testFerryChainInterfaceIsNotCoincidentByConstruction();
+    testHaloReachesAsFarAsTheWeld();
+    testNodePositionsDoNotDependOnWhereTheSectionWasCut();
+    testHaloMakesTheCutPlanesCoincide();
 }

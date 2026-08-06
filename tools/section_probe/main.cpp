@@ -18,7 +18,7 @@
 // output.
 //
 //   ./section_probe [--from=X] [--to=X] [--sub=N] [--sweep=N] [--reduce] [--modes=N]
-//                   [--chain=N] [--match=M] [--scan=BAYS]
+//                   [--chain=N] [--match=M] [--scan=BAYS] [--invariance=BAYS]
 #include "engine/sim/girder.hpp"
 #include "engine/sim/reduction.hpp"
 #include "engine/sim/scantlings.hpp"
@@ -56,9 +56,13 @@ struct Options {
     // Cholesky at the end of it is the most expensive thing this program does.
     int chain = 0;
     // How far apart two boundary DOF on a shared cut plane may be and still be the
-    // same unknown. `matchBoundaries`' 1e-9 default is right amidships and leaves a
-    // third of the interface unmatched at the ends -- see `section.hpp` §6 note 1,
-    // and the `--from=36 --to=48` run, which is what measured it.
+    // same unknown. `matchBoundaries`' 1e-9 default used to be right amidships and to
+    // leave a third of the interface unmatched at the ends -- see `section.hpp` §6
+    // note 1 and the `--from=36 --to=48` run, which is what measured it. Since the
+    // halo of §8 the two sections put that plane's nodes at the same double, so it is
+    // not a tolerance any more and the default matches everything. It stays an option
+    // because `--invariance` runs the mesher with the halo off, and that is the
+    // configuration it was ever needed for.
     double match = 1e-9;
     // **The reach.** Slide a window this many frame bays long along the whole ship
     // and report, station by station, whether the mesher delivers something that
@@ -67,6 +71,17 @@ struct Options {
     // work (`section.hpp` §7) the answer was 21 windows of 49 -- 62.4 m of 120 in
     // five islands, whose longest unbroken run was 26.4 m.
     int scan = 0;
+    // **The invariance.** At every frame station of the ship, mesh the window aft of
+    // it, the window forward of it and the window spanning it, and ask whether the
+    // three agree about the station they share. They did not: a node is the
+    // mid-surface offset by t/2 along the nodal normal, both of which `buildSection`
+    // averaged over the sub-quads *inside* the window, so the same node came out in a
+    // different place from either side -- up to 1.0 mm at the bow -- and the
+    // stiffener steel of a window depended on where it was cut, by 25.2% at the bow
+    // shoulder. `SectionParams::halo` is the fix; this is the sweep that says so
+    // along the whole hull rather than at the two stations the unit suite can afford.
+    // 0 skips it. Meshing only: no solve, no reduction.
+    int invariance = 0;
 };
 
 bool parse(int argc, char** argv, Options& o) {
@@ -84,6 +99,7 @@ bool parse(int argc, char** argv, Options& o) {
         else if (const char* v = value("chain")) o.chain = std::atoi(v);
         else if (const char* v = value("match")) o.match = std::atof(v);
         else if (const char* v = value("scan")) o.scan = std::atoi(v);
+        else if (const char* v = value("invariance")) o.invariance = std::atoi(v);
         else if (a == "--no-reduce") o.reduce = false;
         else if (a == "--reduce") o.reduce = true;
         else {
@@ -115,6 +131,134 @@ int main(int argc, char** argv) {
                 middle, girder.area, girder.neutralAxis, girder.secondMoment);
     std::printf("             so EA = %.5e N, EI = %.5e N m^2\n\n", youngs * girder.area,
                 youngs * girder.secondMoment);
+
+    // --- The invariance: a section is worth what it is worth wherever it was cut ----
+    //
+    // Slide along the hull a station at a time and, at each, mesh the window aft of
+    // it, the window forward of it and the window spanning both. Two questions, and
+    // they fail in different places:
+    //
+    //   * **Do the two halves put the shared plane's nodes in the same place?** They
+    //     did not, wherever the hull turns: the nodal normal was averaged over the
+    //     sub-quads inside the window, so it leaned aft for one section and forward
+    //     for the other. Reported as the furthest any node on the plane is from its
+    //     partner across it -- the same question `matchBoundaries` asks, asked
+    //     without a tolerance.
+    //   * **Does the spanning window carry the steel its two halves carry?** It did
+    //     not, wherever the plating steps: the nodal thickness was averaged the same
+    //     way, so a run of stiffener broke in the spanning window and not in either
+    //     half. Reported as the relative disagreement in `memberMass`.
+    //
+    // `SectionParams::halo` averages both over one bay beyond each plane and meshes
+    // only what is inside. The node gap then reads **exactly zero**, and "exactly" is
+    // the claim rather than a rounding: the same node is reached by the same panels in
+    // the same order whichever window contains it, so its normal and its thickness are
+    // formed from the same terms and come out at the same double. The steel is the
+    // same fibres summed in a different order and agrees to 3.9e-14 of itself, which
+    // is why that one is counted against 1e-9 and the node against nothing at all.
+    if (options.invariance > 0) {
+        double lo = 1e300, hi = -1e300;
+        for (const sim::PlatePanel& p : structure.panels)
+            for (int c = 0; c < 4; ++c) {
+                lo = std::min(lo, p.corner[c].x);
+                hi = std::max(hi, p.corner[c].x);
+            }
+        const double bay = structure.frameSpacing;
+        const double span = options.invariance * bay;
+        std::printf("=== invariance: %g m windows either side of every station, halo on and off"
+                    " ===\n", span);
+        std::printf("  %8s %6s %7s %13s %13s %11s %11s\n", "station", "halo", "nodes", "worst gap m",
+                    "steel halves", "one piece", "relative");
+        const auto cut = [&](double from, double to, bool halo) {
+            sim::section::SectionParams p;
+            p.xFrom = from;
+            p.xTo = to;
+            p.subdivision = options.subdivision;
+            p.junctions = false;  // the tie moves no node and this is about nodes
+            p.halo = halo;
+            return sim::section::buildSection(structure, p);
+        };
+        int stations = 0, moved[2] = {0, 0}, lost[2] = {0, 0}, withHalo = 0;
+        double worstGap[2] = {0, 0}, worstSteel[2] = {0, 0};
+        for (double x = std::floor(lo / bay + 0.5) * bay + span; x + span <= hi + 1e-9; x += bay) {
+            ++stations;
+            for (int halo = 1; halo >= 0; --halo) {
+                const sim::section::Section aft = cut(x - span, x, halo != 0);
+                const sim::section::Section forward = cut(x, x + span, halo != 0);
+                const sim::section::Section whole = cut(x - span, x + span, halo != 0);
+                if (aft.empty() || forward.empty() || whole.empty()) continue;
+                if (halo == 1 && whole.haloPanels > 0) ++withHalo;
+                // Every node of the aft section's forward plane, against the nearest
+                // node of the forward section's aft plane. Nearest and not "the same
+                // index": the two meshes are numbered for bandwidth and share no
+                // numbering at all.
+                const auto place = [](const sim::section::Section& s, std::uint32_t node) {
+                    return sim::Vec3{s.mesh.position[node * 3], s.mesh.position[node * 3 + 1],
+                                     s.mesh.position[node * 3 + 2]};
+                };
+                double gap = 0;
+                for (std::uint32_t a : aft.forwardNodes) {
+                    double nearest = 1e300;
+                    for (std::uint32_t b : forward.aftNodes)
+                        nearest = std::min(nearest, sim::length(place(aft, a) - place(forward, b)));
+                    gap = std::max(gap, nearest);
+                }
+                const double halves = aft.memberMass + forward.memberMass;
+                const double steel = halves > 0 ? std::abs(whole.memberMass / halves - 1.0) : 0.0;
+                const auto slot = static_cast<std::size_t>(halo);
+                worstGap[slot] = std::max(worstGap[slot], gap);
+                worstSteel[slot] = std::max(worstSteel[slot], steel);
+                if (gap > 1e-9) ++moved[slot];
+                if (steel > 1e-9) ++lost[slot];
+                if (halo == 0 && (gap > 1e-9 || steel > 1e-9))
+                    std::printf("  %8.1f %6d %7zu %13.3e %13.1f %11.1f %+11.3e\n", x, halo,
+                                aft.forwardNodes.size(), gap, halves, whole.memberMass,
+                                halves > 0 ? whole.memberMass / halves - 1.0 : 0.0);
+            }
+            std::fflush(stdout);
+        }
+        std::printf("\n  %d stations swept at subdivision %d\n", stations, options.subdivision);
+        for (int halo = 1; halo >= 0; --halo) {
+            const auto slot = static_cast<std::size_t>(halo);
+            std::printf("  halo %s: %3d stations move a node (worst %.3e m), %3d lose stiffener"
+                        " steel (worst %.3e)\n",
+                        halo ? "on " : "off", moved[slot], worstGap[slot], lost[slot],
+                        worstSteel[slot]);
+        }
+
+        // --- The success contract -------------------------------------------------
+        //
+        // Zero, and two guards against zero being free. The first is that the halo
+        // was made of something; the second is that the *same sweep without it* is
+        // not zero, because a hull with no shoulder and no strake step would report a
+        // clean sweep from a mesher that had never been fixed.
+        if (moved[1] != 0 || lost[1] != 0) {
+            std::printf("       ! %d stations put a node in a different place depending on the"
+                        " window (worst %.3e m) and %d carry different stiffener steel (worst"
+                        " %.3e): a section is not a property of the ship\n",
+                        moved[1], worstGap[1], lost[1], worstSteel[1]);
+            return 1;
+        }
+        if (withHalo != stations) {
+            std::printf("       ! only %d of %d stations had any plating beyond the cut to"
+                        " average, so the sweep is a statement about nothing\n",
+                        withHalo, stations);
+            return 1;
+        }
+        if (moved[0] == 0 || lost[0] == 0) {
+            std::printf("       ! without the halo the same sweep moves %d nodes and loses steel"
+                        " at %d stations. Both have to be non-zero or this ship cannot tell a"
+                        " fixed mesher from an unfixed one\n",
+                        moved[0], lost[0]);
+            return 1;
+        }
+        if (stations < 8) {
+            std::printf("       ! %d stations is not a ship\n", stations);
+            return 1;
+        }
+        std::printf("\nok\n");
+        return 0;
+    }
 
     // --- The reach: how much of the ship can be meshed at all ----------------------
     //
@@ -296,7 +440,9 @@ int main(int argc, char** argv) {
                 hold.junctionsChained, hold.junctionsOutsideFace);
     std::printf("  worst tie: overshoot %.4f of a face, through-thickness weight %.4f\n",
                 hold.worstJunctionOvershoot, hold.worstJunctionWeight);
-    std::printf("  panels straddling a cut plane: %d\n", hold.straddlingPanels);
+    std::printf("  panels straddling a cut plane: %d; halo panels averaged into the nodal"
+                " normals and thicknesses and then dropped: %d\n",
+                hold.straddlingPanels, hold.haloPanels);
     std::printf("  members: %d attached, %d refused, %d missed; effective area attached %.5f"
                 " + missed %.5f = %.5f m^2\n",
                 hold.membersAttached, hold.membersRefused, hold.membersMissed,

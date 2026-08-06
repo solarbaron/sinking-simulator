@@ -200,9 +200,18 @@ fi
 # count, because `section.hpp` §2 shows EA and EI are exact on a section whose
 # plating is joined to nothing. `--no-reduce` skips the Craig-Bampton block, which
 # is 70 s and which the unit suite already covers at unit scale.
+#
+# The third run is the **invariance** and it is 2 s: at every frame station of the
+# ship, the window aft of it, the window forward of it and the window spanning both,
+# asked whether they agree about the station they share. They did not — up to 1.0 mm
+# of node displacement and 25.2% of the stiffener steel depended on where the section
+# was cut — and the unit suite can only afford two stations. This sweeps 47, with the
+# `halo = false` control alongside so that "every station agreed" cannot be reported
+# by a mesher that was never fixed.
 if [ -x ./build/section_probe ]; then
-  expect_ok "section_probe reach" '^ok$' ./build/section_probe --scan=2
-  expect_ok "section_probe tie"   '^ok$' ./build/section_probe --sweep=0 --no-reduce
+  expect_ok "section_probe reach"      '^ok$' ./build/section_probe --scan=2
+  expect_ok "section_probe invariance" '^ok$' ./build/section_probe --invariance=2
+  expect_ok "section_probe tie"        '^ok$' ./build/section_probe --sweep=0 --no-reduce
 else
   skip "section_probe not built"
 fi
@@ -233,8 +242,25 @@ for scenario in none doors full; do
 done
 
 section "repeat runs (concurrency must not be flaky)"
+# **Keep the evidence.** This step used to discard every run's output, so a failure
+# here said "1 of 6 runs failed" and nothing else -- which is the one thing a flake
+# report must not do, because a flake that cannot be named cannot be told from a
+# regression and the next run is the only chance to see it. The exit code separates a
+# crash (`>= 128`, a signal) from a failed assertion, and the failing run's own `FAIL`
+# lines say which.
 flaky=0
-for _ in $(seq 1 6); do ./build/shipsim_tests >/dev/null 2>&1 || flaky=$((flaky + 1)); done
+repeatlog="$(mktemp)"
+for run in $(seq 1 6); do
+  ./build/shipsim_tests >"$repeatlog" 2>&1
+  status=$?
+  [ "$status" -eq 0 ] && continue
+  flaky=$((flaky + 1))
+  printf '      run %d exited %d%s\n' "$run" "$status" \
+         "$([ "$status" -ge 128 ] && echo " (signal $((status - 128)))")"
+  grep -E '^  FAIL' "$repeatlog" | head -5
+  tail -1 "$repeatlog"   # the check/failure count, or the last line before a crash
+done
+rm -f "$repeatlog"
 [ "$flaky" -eq 0 ] && pass "6/6 stable" || fail "$flaky of 6 runs failed"
 
 if [ "$LEVEL" = "full" ]; then

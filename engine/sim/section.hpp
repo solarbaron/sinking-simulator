@@ -160,16 +160,27 @@
 //
 //     subdivision  elements  A_eff m^2   z_na m    I_eff m^4   GJ N m^2
 //     ------------------------------------------------------------------
-//         1          2 068    1.73122    6.85797    43.8749    3.6165e12
-//         2          8 272    1.73222    6.85626    43.9042    3.5999e12
-//         3         18 612    1.73255    6.85567    43.9127    3.5948e12
-//         4         33 088    1.73271    6.85535    43.9165    3.5924e12
+//         1          2 068    1.72945    6.86238    43.8169    3.6164e12
+//         2          8 272    1.73081    6.85933    43.8598    3.5998e12
+//         3         18 612    1.73126    6.85828    43.8728    3.5947e12
+//         4         33 088    1.73148    6.85777    43.8787    3.5923e12
+//
+// **The four columns above are what `tools/section_probe --sweep=4 --no-reduce`
+// prints, and the ones they replace were not.** Before the halo the same tool gave
+// 1.73075, 6.85784, 43.86283 at `subdivision = 1` against a published 1.73122,
+// 6.85797, 43.8749 -- a table that had drifted from the program it names and that no
+// gate re-ran, which is the failure CLAUDE.md records four times over. The halo moved
+// it again, by rather less than the drift: the hold's forward plane at x = 19.2 is a
+// strake seam, and a section that can now see it stops four member runs there.
 //
 // **One element per panel is converged**: from `subdivision = 1` to 4 the area
-// moves 0.086%, the neutral axis 2.6 mm and the second moment 0.095%, while the
+// moves 0.12%, the neutral axis 4.6 mm and the second moment 0.14%, while the
 // element count moves sixteenfold. The torsional stiffness -- the one quantity here
-// with plate bending in it -- moves 0.67%, seven times as much, which is the same
-// split §2 makes between membrane and bending questions.
+// with plate bending in it -- moves 0.67%, five times as much, which is the same
+// split §2 makes between membrane and bending questions. The first three move about
+// half again as much as they did before the halo, and for a reason worth stating: a
+// thickness seam costs a **fixed** two dropped fibre segments per member per seam
+// (§3), so refining the mesh dilutes it, and a coarse mesh is where it is dearest.
 //
 // So a hold-sized Tier-1 section is **2 068 elements**, a quarter of the Tier-2
 // ceiling, and the ceiling was never the binding constraint. What binds is the
@@ -251,7 +262,7 @@
 //             **2.3026 Hz** -- above the decks' 0.7785 *and* the shell's 1.6999,
 //             which is what a joined structure does.
 //
-// `GJ` goes 3.6165e12 to 5.2388e12 N m^2, +44.9%. `A_eff` moves +0.19% and `I_eff`
+// `GJ` goes 3.6164e12 to 5.2387e12 N m^2, +44.9%. `A_eff` moves +0.19% and `I_eff`
 // +0.12%, which is the same local consistency error the box shows and is why §2's
 // warning stands: **neither of those two could have told you the junction was
 // open.**
@@ -394,6 +405,17 @@ struct SectionParams {
     bool members = true;
 
     ThicknessSeam thicknessSeam = ThicknessSeam::Taper;
+
+    // Average the nodal normal and the nodal thickness over a bay of plating
+    // **beyond** each cut plane as well, and mesh only what is inside. See §8: it is
+    // what makes a node's position a property of the ship rather than of the window,
+    // and it is what lets a chain match its interface at `matchBoundaries`' own
+    // default instead of at a tolerance chosen to cover the disagreement.
+    //
+    // Off is the negative control §8's measurements are made against, and it is what
+    // this file did before the halo existed. It is never the right answer for a
+    // section that is going to be one link of a chain.
+    bool halo = true;
 
     // Two sub-quads share a node when their positions agree to this and their
     // normals agree to `foldLimit`. Matches `zone::MeshParams::weldTolerance`.
@@ -588,6 +610,14 @@ struct Section {
     double worstJunctionWeight = 0;
 
     int straddlingPanels = 0;   // panels a cut plane passed through, and dropped
+    // Panels outside the section that reached one of its nodes, were averaged into
+    // that node's normal and thickness, and were then thrown away -- the halo of §8.
+    // **Reached, not looked at**: the halo is drawn from every panel whose extent
+    // touches the window and the weld decides which of them land on anything, so this
+    // is the count that says the halo did something. Zero for a section that contains
+    // the whole of every surface it touches -- and an invariance test on a window with
+    // no halo is a test of nothing, which is why it is reported at all.
+    int haloPanels = 0;
     // Members with no extent along x -- frames, deck beams -- lying on the forward
     // cut plane, left to the section forward of it. A station is a cut plane for the
     // sections on **both** sides of it, so a member sitting on one belongs to
@@ -825,16 +855,19 @@ TorsionResponse applyTwist(const Section& section, const StructuralMaterial& mat
 //     than their ratio. Fixing it belongs with `girder.hpp`, and it moves published
 //     figures.
 //   * **The thickness-seam rule costs five times more at the ends than amidships,
-//     and how much depends on where the section was cut.** `nodeThickness` is an
+//     and how much depends on where the section was cut.** `nodeThickness` was an
 //     area-weighted mean over the sub-quads *inside* the section, so a station where
-//     a strake steps carries one thickness to the section aft of it, another to the
+//     a strake steps carried one thickness to the section aft of it, another to the
 //     one forward of it, and the mean to a section spanning it. A member run stops at
-//     a thickness change (§3), so a spanning section stops runs its two halves never
-//     see and drops the seam node's run of one. Measured: cutting a window in two
-//     conserves the stiffener steel **exactly** amidships, loses 1.9% at
-//     x = -24 .. -19.2 -- inside the range that always worked, so this is older than
-//     the reach -- and loses **25.2%** at the bow shoulder. It is the nodal-thickness
-//     twin of §6 note 1's nodal normal and it has the same fix: a halo.
+//     a thickness change (§3), so a spanning section stopped runs its two halves never
+//     saw and dropped the seam node's run of one. Measured: cutting a window in two
+//     conserved the stiffener steel **exactly** amidships, and at x = -24 .. -19.2 --
+//     inside the range that always worked, so this is older than the reach -- and at
+//     the bow shoulder it did not. **The direction is the spanning section's**: the
+//     one piece carries 1.9% less than its two halves at x = -24 .. -19.2 and
+//     **25.2%** less at x = 40.8 .. 45.6, because the one piece is the one that sees
+//     the seam. It is the nodal-thickness twin of §6 note 1's nodal normal and it has
+//     the same fix: a halo, which is §8 and is now built.
 //
 // --- What mutation testing said about §7 -------------------------------------------
 //
@@ -876,6 +909,138 @@ TorsionResponse applyTwist(const Section& section, const StructuralMaterial& mat
 // lines would have scored them as survivors, which is the mistake §5's run records
 // making the first time round.
 //
+// --- 8. The halo: a section is a property of the ship, not of the window -----------
+//
+// **A node is the mid-surface offset by `t/2` along the nodal normal, and both of
+// those were averages over the sub-quads inside the section.** So both were
+// statements about the *cut*, and the same physical station came out in a different
+// place depending on which window contained it. §6 note 1 records one half of that --
+// a nodal normal leaning aft for one section and forward for the other, 1.0 mm at the
+// bow and 336 of a plane's 1 170 boundary DOF finding no partner at
+// `matchBoundaries`' default. §7's third bullet records the other -- a nodal
+// thickness that made a member run break in a spanning section and not in either
+// half, 25.2% of the stiffener steel at the bow shoulder. They are one defect.
+//
+// The fix is to average both over a **halo**: one bay of plating beyond each cut
+// plane, taken into the two nodal averages and then thrown away, so that the section
+// meshes only what is inside but places its nodes knowing what is outside.
+//
+// **A bay is not a distance, and it is not a corner test either.** The halo is every
+// panel whose extent along x reaches the window, and the **weld** decides what that
+// is worth: a halo panel's grid points go through the same `Welder` as the section's
+// own, so one that lands on a node of an inside sub-quad joins that node's averages,
+// and one that does not contributes only to nodes nobody keeps and is compacted away.
+// Nothing has to be predicted and there is no second notion of "the same point" --
+// which is the trapdoor CLAUDE.md records `sectionElements` falling through.
+//
+// The bound is exact, which is why it is allowed to be a bound: a panel reaching a
+// node of an inside sub-quad has a grid point at that node's x, which is between the
+// planes, so its own extent must reach them.
+//
+// **This was a corner test first, and mutation testing is what said it should not
+// be.** "Shares a welded corner with a panel inside" is the same set only when every
+// node is a panel corner; at `subdivision > 1` a node can sit part way along an edge,
+// where a panel butting mid-edge reaches it and shares no corner at all. Three
+// mutants survived on that predicate -- widening it, an off-by-one in it, a second
+// weld tolerance inside it -- all equivalent on a conforming hull and none of them
+// equivalent in general. Deleting it is cheaper than assuming it, in code and in
+// time: 50 one-bay windows of the ferry mesh in 0.15 s rather than 0.19.
+//
+// **It is exact rather than close, and that is worth the one line it costs.** The
+// halo's panels join `candidate` in ascending panel index, so a node reached by the
+// same panels from either side of a cut has its normal and its thickness accumulated
+// from the same terms in the same order and comes out at **the same double**. The
+// interface test is therefore `worstGap == 0`, not `worstGap < tol`; and
+// `tools/section_probe --invariance=2` sweeps 47 stations of the ferry and finds not
+// one node moved. A tolerance there would have been a place for the next defect to
+// hide.
+//
+//     ferry, 4.8 m windows either side of a station        before        after
+//     ---------------------------------------------------------------------------
+//     stations where a node on the plane moves            32 of 47      0 of 47
+//     the furthest it moved                               2.5e-3 m      0
+//     unmatched boundary DOF at x = -21.6, at 1e-9        336 / 1170    0 / 1170
+//     stations whose stiffener steel depends on the cut   32 of 47      0 of 47
+//     the worst of that                                   12.2%         3.9e-14
+//     stiffener steel, whole ship in 1-bay windows        517 629 kg    501 263 kg
+//                                          2-bay          501 427 kg    501 263 kg
+//                                          5-bay          501 206 kg    501 263 kg
+//                                     one 120 m piece     501 263 kg    501 263 kg
+//
+// And the solved consequence, on the same plane, `tools/section_probe --chain=2
+// --from=-26.4 --to=-16.8`: a chain of two against the same length in one piece, at
+// the tolerance each can actually use.
+//
+//                    before, at 1e-5      after, at the 1e-9 default
+//     ---------------------------------------------------------------
+//     EA               +3.081e-7                  +3.217e-10
+//     z_na             +2.323e-7                  +5.363e-10
+//     EI               +3.013e-7                  +4.966e-9
+//     GJ               -1.051e-6                  +4.161e-12
+//
+// The tolerance was not free: merging two DOF 3.4 µm apart is a legitimate answer and
+// costs about what the gap is worth. Not needing it is worth three orders in `EA` and
+// six in `GJ`, and at the default the same chain used to be refused outright.
+//
+// **The stiffener block above is the one that says the halo is right rather than
+// merely consistent.** Cut the ship four ways and the halo gives one answer; it is the
+// answer the whole ship in one piece gives, which is the only one of the four that
+// never had a cut to depend on. Without the halo a 1-bay partition carried 3.3%
+// *more* steel than the monolith and a 5-bay partition slightly less, because a
+// section that cannot see across its own cut does not know there is a strake seam
+// there and keeps a run the ship does not have. The steel the shoulder appears to
+// lose -- 18 270 kg over two 2.4 m windows becoming 13 669 -- is that steel, and it
+// was never there.
+//
+// What remains is §3's own cost, unchanged and now uniform: 501 263 kg of the
+// members' own 631 451 kg, **79.4%**, of which the thickness-seam rule is part and
+// `membersMissed` and `membersRefused` are the rest. The fix for that half is still
+// the per-station thickness in `constraint::SeamRun` §3 names, and the halo has made
+// it worth more rather than less -- it is now the only reason a run breaks at a seam
+// at all, and it costs the same wherever the section was cut.
+//
+// **The blast radius is one deletion.** The halo's sub-quads are dropped, and the
+// nodes only they reached are compacted out, immediately after the two averages are
+// formed and before anything else in `buildSection` runs. The free-edge count, the
+// junction search, the surface census, the component walk and the member runs
+// therefore see exactly the sub-quad list they always saw -- which is what the
+// warning in §6 was about, answered by being right in one place instead of six.
+// `Section::surfaces` is counted after the compaction for the same reason, so a
+// surface reached only by halo plating is not one the section is made of.
+//
+// **What it does not move.** Amidships the halo's sub-quads carry the same normal and
+// the same thickness as the ones inside, so the average is the same vector formed
+// from twice as many terms and a node moves by 1.7e-18 m -- a few ulps of `t/2`, and
+// fourteen orders below the millimetre it removes at the ends. The reach is unchanged
+// at 49 of 49 windows and 46 of them in one piece; the ferry hold's first
+// fixed-interface mode (0.7785 untied, 2.3026 tied), its DOF half-bandwidth (146 and
+// 1 520), its component count (7 and 1) and its 309.6 m of tied edge are unchanged to
+// every digit, and its `GJ` moves 3e-5 -- 5.2388e12 to 5.2387e12 tied. A chain of
+// four reproduces the same length in one piece exactly as well as it did: EA 9.9e-13,
+// EI 1.4e-10, GJ 1.3e-10 on the box, all three unmoved.
+//
+// **What it does move, and it is not a rounding.** The hold's forward plane at
+// x = 19.2 is a strake seam, so a hold-length section can now see one, and four
+// members lying wholly in the bay against it are left in runs of two stations of
+// different thickness -- no run at all. `A_eff` goes 1.73394 to 1.73266 and `I_eff`
+// 43.913 to 43.868, both about a tenth of a percent, and `missedMemberArea` 0.07464
+// to 0.07576 m^2. That is the *consistent* answer rather than a worse one -- it is
+// what the same plating gives in any other window containing x = 19.2 -- and the
+// resolution table in §4 has been re-measured against it. A section's plate mass is
+// likewise no longer exactly `sum A_p t_p` over the panels it owns, because §3's
+// taper now reaches the cut plane: a window at a strake step hands its neighbour what
+// it takes, parts per million, and the sum over any partition of the ship is
+// unchanged at 1 084 106 kg.
+//
+// Meshing the whole ship costs 0.44 s against 0.45 s, and 50 one-bay windows of it
+// 0.15 s against 0.11 s: one more panel row through the grid, and nothing else.
+//
+// `SectionParams::halo` turns it off, and off is the negative control every figure
+// above is measured against. It is what this file did before, it still reproduces
+// every number in §6 note 1's table, and the tests and the probe both run it
+// alongside so that "the two agree" cannot be reported by a hull that was prismatic
+// all along.
+//
 // --- 6. A ship: a chain of sections ----------------------------------------------
 //
 // One section is a component and a component is not a ship. A ship is the whole
@@ -895,14 +1060,15 @@ TorsionResponse applyTwist(const Section& section, const StructuralMaterial& mat
 //
 // --- What a chain is not, measured on the reference ferry -------------------------
 //
-// **1. The interface nodes are not coincident by construction, and the parallel
-// middle body is what hides it.** Two sections cut on the same frame station agree
-// on every *mid-surface* point of that station -- they come from the same panel
-// corners. They do not agree on the mesh nodes, because a node is the mid-surface
-// offset by `t/2` along the **nodal normal**, and this file averages that normal
-// over the sub-quads *inside the section*: aft of the plane for one, forward of it
-// for the other. Where the hull is prismatic those are the same vector and the nodes
-// land on top of each other exactly. Where it is not they do not:
+// **1. The interface nodes were not coincident by construction, and the parallel
+// middle body is what hid it. §8 is the fix and this is what it was fixing.** Two
+// sections cut on the same frame station agree on every *mid-surface* point of that
+// station -- they come from the same panel corners. They did not agree on the mesh
+// nodes, because a node is the mid-surface offset by `t/2` along the **nodal
+// normal**, and this file averaged that normal over the sub-quads *inside the
+// section*: aft of the plane for one, forward of it for the other. Where the hull is
+// prismatic those are the same vector and the nodes land on top of each other
+// exactly. Where it is not they did not:
 //
 //     plane x       -45.6  -33.6  -21.6   -9.6    0.0   12.0   24.0   36.0   48.0
 //     worst gap m   6.4e-4 3.5e-4 3.4e-6    0      0      0   1.9e-4 7.1e-4 1.0e-3
@@ -915,23 +1081,20 @@ TorsionResponse applyTwist(const Section& section, const StructuralMaterial& mat
 // where they were measured and quoting them anywhere else would be a different claim.
 // The gap there is 3.4e-6 m -- three orders
 // of magnitude below the plating and three above `matchBoundaries`' default. At that
-// default **336 of the plane's 1 170 boundary DOF find no partner**, and a chain
-// assembles out of them, solves, and is torn along 29% of the cut. So `Chain` counts
+// default **336 of the plane's 1 170 boundary DOF found no partner**, and a chain
+// assembled out of them, solved, and was torn along 29% of the cut. So `Chain` counts
 // what did not match rather than trusting the tolerance.
 //
-// **What the tolerance costs is measured rather than argued.** At 1e-5 the whole
+// **What the tolerance costs was measured rather than argued.** At 1e-5 the whole
 // plane matches and the chain reproduces the same length in one piece to 3.1e-7 in
 // `EA`, 3.0e-7 in `EI` and 1.1e-6 in `GJ` -- so joining two nodes 3.4 µm apart is a
-// legitimate answer and the reason to set the tolerance is that the default silently
-// does something worse.
+// legitimate answer and the reason to set the tolerance was that the default silently
+// did something worse.
 //
-// The fix that needs no tolerance is that a section's node positions should not
-// depend on where it was cut: average the nodal normal over a halo of panels one bay
-// beyond each plane and mesh only what is inside. That is a change to
-// `buildSection`'s own weld classes and topology census -- the free-edge count, the
-// junction search and the surface walk all read the sub-quad list it would widen --
-// so it belongs with that machinery rather than here, in the same way
-// `constraint::SeamRun`'s per-station thickness belongs with `constraint.hpp` (§3).
+// **The whole row is now zero and the tolerance is not needed at all** --
+// `SectionParams::halo`, §8. The table above is kept because it is the negative
+// control the fix is measured against and `halo = false` still reproduces every
+// figure in it.
 //
 // One warning that cost a day: **which boundary DOF are on a cut plane is a question
 // for the mesher and not for a position test.** `Section::aftNodes` and
@@ -985,9 +1148,12 @@ struct ChainParams {
     reduction::ReduceParams reduce;
 
     // How far apart two boundary DOF on a shared cut plane may be and still be the
-    // same unknown. The default is `matchBoundaries`' own, which is right for a
-    // prismatic region and wrong everywhere else -- see note 1 above, and
-    // `Chain::unmatched`, which is what says so rather than leaving it to be assumed.
+    // same unknown. The default is `matchBoundaries`' own, and with
+    // `SectionParams::halo` on it is not a tolerance at all: two sections cut on the
+    // same station put that station's nodes at the same double, so the whole plane
+    // matches at any positive value. It was 3.4 µm out at x = -21.6 and 1.0 mm at the
+    // bow before -- see note 1 and §8 -- which is what `Chain::unmatched` exists to
+    // say rather than leave to be assumed, and it still says it under `halo = false`.
     double matchTolerance = 1e-9;
 };
 
