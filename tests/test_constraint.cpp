@@ -785,6 +785,542 @@ void testTheFibreYieldsOnItsFlowCurve() {
     }
 }
 
+// --- 5b. The fibre tears, on two closed forms and one length --------------------
+
+// The failure criterion, against everything that can be written down about it.
+//
+// A bar in tension is the one case where the whole of `plasticity.hpp`'s failure
+// model collapses to closed forms: the triaxiality is exactly the reference, the
+// Rice-Tracey multiplier is therefore exactly one, and the fibre fails at its
+// regularised strain unmodified -- at which point its stress is `sigma_y(eps_f)`,
+// which is the *second*, independent route to the same event.
+void testAFibreTearsOnItsOwnClosedForm() {
+    std::printf("\n   one fibre, pulled to destruction: the failure criterion's closed forms\n");
+
+    // --- The triaxiality, both ways ----------------------------------------------
+    //
+    // `constraint::fiberTriaxiality` is a closed form; `plasticity::triaxiality` of
+    // the assembled uniaxial Voigt stress is the general route. They agree to a ULP
+    // and *not always to the bit*, and the header records why the closed form is the
+    // one on the hot path: the compression branch is a `<=` against the cutoff.
+    plasticity::Material material = plasticity::shipSteel();
+    double worstUlps = 0;
+    int exact = 0, total = 0;
+    for (double sigma : {1.0, -1.0, 355.0e6, -355.0e6, 123.456789e6, -987.654321e6, 1.0e-9,
+                         -7.7e11}) {
+        double voigt[6] = {sigma, 0, 0, 0, 0, 0};
+        const double closed = constraint::fiberTriaxiality(sigma);
+        const double general = plasticity::triaxiality(voigt);
+        ++total;
+        if (closed == general) ++exact;
+        worstUlps = std::max(worstUlps, std::abs(closed - general) / 5.55e-17);
+        expectNear("a bar's triaxiality is +/-1/3 whichever way it is computed", general, closed,
+                   4e-16);
+        // The consequence, and the reason for the closed form. Both routes have to
+        // land on the *same side* of the cutoff, and one of them does so by
+        // construction while the other does so by luck.
+        expectTrue("and both land on the same side of the damage cutoff",
+                   (general <= material.failure.cutoffTriaxiality) ==
+                       (closed <= material.failure.cutoffTriaxiality));
+    }
+    // A stress of zero has no direction, and the closed form says so -- the same
+    // answer `plasticity::triaxiality` gives when the von Mises stress is zero. It is
+    // unreachable from `uniaxialReturn`, where a fibre that has flowed carries
+    // `sigma_y > 0` by construction, so it is a statement about this function's own
+    // contract; mutation testing found it untested.
+    {
+        double zero[6] = {0, 0, 0, 0, 0, 0};
+        expectTrue("a bar carrying nothing has no triaxiality, as the general route agrees",
+                   constraint::fiberTriaxiality(0.0) == 0.0 &&
+                       plasticity::triaxiality(zero) == 0.0);
+    }
+    std::printf("     the closed form and plasticity::triaxiality agree exactly in %d of %d"
+                " cases, worst disagreement %.1f ulp\n", exact, total, worstUlps);
+    // **And the closed form lands on the two boundary constants exactly, which the
+    // general route does not.** This is the property the criterion rests on, and it
+    // is the assertion to make rather than "the two routes disagree" -- that would be
+    // a claim about this platform's `sqrt`, and it would fail on a machine where the
+    // general route happened to be exact while nothing was wrong. Swapping
+    // `fiberTriaxiality` for `plasticity::triaxiality` of an assembled stress fails
+    // *this* pair, which is the substitution worth catching.
+    bool onTheBoundary = true;
+    for (double sigma : {1.0, 355.0e6, 1.234568e8, 7.7e11, 1e-9}) {
+        onTheBoundary = onTheBoundary &&
+                        constraint::fiberTriaxiality(sigma) ==
+                            material.failure.referenceTriaxiality &&
+                        constraint::fiberTriaxiality(-sigma) == material.failure.cutoffTriaxiality;
+    }
+    expectTrue("a fibre in tension sits exactly on the reference triaxiality and one in"
+               " compression exactly on the cutoff, at every magnitude", onTheBoundary);
+
+    // The two multipliers, exactly. In tension the Rice-Tracey factor is 1 -- not
+    // approximately, *exactly*, because a bar's triaxiality is the reference the
+    // tensile test measured the constants at. In compression it is infinite, so a
+    // squashed stiffener accumulates no damage at all.
+    const double tension = plasticity::triaxialityFactor(material.failure,
+                                                          constraint::fiberTriaxiality(1.0));
+    const double squash = plasticity::triaxialityFactor(material.failure,
+                                                         constraint::fiberTriaxiality(-1.0));
+    std::printf("     Rice-Tracey on a bar: tension x%.17g, compression x%g\n", tension, squash);
+    expectTrue("a bar in tension gets the Rice-Tracey multiplier exactly 1", tension == 1.0);
+    expectTrue("and a bar in compression gets no damage at all", !std::isfinite(squash));
+
+    // --- The regularisation, and the length it is on ------------------------------
+    //
+    // What is mesh-invariant is the *necking elongation*: `(eps_f(L) - eps_g) * L`
+    // is the fibre's rectangle thickness times the local fracture strain's excess,
+    // whatever L is. That identity is the whole content of the length choice, and it
+    // is asserted rather than described -- exactly as `plasticity.hpp` asserts the
+    // plating's.
+    const double web = 0.010, plate = 0.012;
+    const double invariant =
+        (material.failure.fractureStrain - material.failure.uniformStrain) * web;
+    // **The tolerance is on what was cancelled, not on what came out.** `eps_f - eps_g`
+    // subtracts two numbers that are nearly equal for a long fibre -- at L = 0.7 m it
+    // is 0.0093 out of 0.158 -- so the difference inherits `eps_f`'s absolute rounding
+    // error and its *relative* error grows without bound as L does. Measured over
+    // 0.01 m to 3 m, the identity holds to 1.07e-16 of `eps_f * L`, which is one unit
+    // in the last place of the quantity the subtraction destroyed, and to 5.3e-15 of
+    // the invariant at L = 3 m. Asserting 1e-15 of the invariant looks tighter and is
+    // simply a statement about cancellation rather than about the model.
+    std::printf("     %8s %12s %12s %14s %10s\n", "L (m)", "fibre eps_f", "plate eps_f",
+                "(eps_f-eps_g)L", "err/eps_f L");
+    for (double span : {0.010, 0.050, 0.100, 0.150, 0.300, 0.700, 3.000}) {
+        const double fibre = constraint::fiberFailureStrain(material.failure, span, web);
+        const double plating = plasticity::regularisedFailureStrain(material.failure, span, plate);
+        const double got = (fibre - material.failure.uniformStrain) * span;
+        std::printf("     %8.3f %12.6f %12.6f %14.6e %10.2e\n", span, fibre, plating, got,
+                    std::abs(got - invariant) / (fibre * span));
+        if (span < web) continue;  // below the neck width the clamp bites, as it must
+        expectNear("the fibre's necking elongation is its own thickness', whatever its length",
+                   got, invariant, 2e-16 * fibre * span);
+    }
+    // Vacuity: the regularisation has to be doing something at the length a zone
+    // actually uses, or this whole section is asserting `eps_f == eps_f`.
+    const double reference = constraint::fiberFailureStrain(material.failure, 0.150, web);
+    std::printf("     at the zone's 0.15 m: fibre %.6f, plate %.6f -- %.1f%% apart, and the"
+                " unregularised ends are %.6f and %.6f\n", reference,
+                plasticity::regularisedFailureStrain(material.failure, 0.150, plate),
+                100.0 * (plasticity::regularisedFailureStrain(material.failure, 0.150, plate) /
+                             reference - 1.0),
+                material.failure.uniformStrain, material.failure.fractureStrain);
+    expectTrue("the regularised strain is strictly between the two measured ends",
+               reference > 1.2 * material.failure.uniformStrain &&
+                   reference < 0.5 * material.failure.fractureStrain);
+    // A fibre shorter than its own web is thick resolves the neck and sees the local
+    // fracture strain exactly, which is the clamp's whole justification.
+    expectTrue("and a fibre no longer than its rectangle is thick sees the local strain exactly",
+               constraint::fiberFailureStrain(material.failure, 0.5 * web, web) ==
+                   material.failure.fractureStrain);
+    // Nothing at all is not zero: a degenerate fibre falls to the unregularised end
+    // rather than reporting "fails instantly", the same failure-open `plasticity.hpp`
+    // chose for a bad Jacobian.
+    expectTrue("a fibre with no neck width falls to the local fracture strain, not to zero",
+               constraint::fiberFailureStrain(material.failure, 0.150, 0.0) ==
+                   material.failure.fractureStrain);
+
+    // **A tee has two neck widths in it, and the flange's is the flange's.** Each
+    // fibre is a Gauss station of one rectangle and localises across *that*
+    // rectangle's thickness, so a 300x11 web and a 150x16 flange fail at different
+    // strains on the same seam. Checked through `addStiffener` as well as through
+    // `profileFibers`, because the wiring between them is where a station could
+    // quietly be handed its neighbour's thickness -- mutation testing found exactly
+    // that edit surviving a suite that only ever built flat bars.
+    {
+        const StiffenerProfile profile = tee(0.300, 0.011, 0.150, 0.016);
+        const constraint::ProfileFibers stations = constraint::profileFibers(profile, plate, -1.0);
+        expectEqual("a tee has four stations", static_cast<long long>(stations.count), 4LL);
+        int webs = 0, flanges = 0;
+        for (int i = 0; i < stations.count; ++i) {
+            if (stations.width[i] == profile.webThickness) ++webs;
+            if (stations.width[i] == profile.flangeThickness) ++flanges;
+        }
+        expectEqual("two of them localise across the web", static_cast<long long>(webs), 2LL);
+        expectEqual("and two across the flange", static_cast<long long>(flanges), 2LL);
+
+        const std::vector<double> seam{0,     0, -0.5 * plate, 0,     0, 0.5 * plate,
+                                       0.150, 0, -0.5 * plate, 0.150, 0, 0.5 * plate};
+        constraint::SeamRun run;
+        run.bottom = {0, 2};
+        run.top = {1, 3};
+        run.sign = -1.0;
+        constraint::Stiffening built;
+        built.material = ah36Steel();
+        constraint::addStiffener(run, profile, plate, seam, built);
+        double webStrain = 0, flangeStrain = 0;
+        for (const constraint::Fiber& f : built.fiber) {
+            const double got = constraint::fiberFailureStrain(material.failure, 0.150, f.neckWidth);
+            if (f.neckWidth == profile.webThickness) webStrain = got;
+            if (f.neckWidth == profile.flangeThickness) flangeStrain = got;
+        }
+        std::printf("     a 300x11 + 150x16 tee: web fibres fail at %.6f, flange fibres at"
+                    " %.6f -- %.1f%% apart on the same 0.15 m seam\n", webStrain, flangeStrain,
+                    100.0 * (flangeStrain / webStrain - 1.0));
+        expectNear("the web fibres take the web's thickness", webStrain,
+                   constraint::fiberFailureStrain(material.failure, 0.150, profile.webThickness),
+                   0.0);
+        expectNear("and the flange fibres the flange's", flangeStrain,
+                   constraint::fiberFailureStrain(material.failure, 0.150,
+                                                  profile.flangeThickness),
+                   0.0);
+        // The gap has a closed form of its own: only the *excess* over `eps_g` is
+        // regularised, so the two stations differ by `(eps_frac - eps_g)(t_f - t_w)/L`
+        // and by nothing else. 11.1% on this tee, not the 45% the thickness ratio
+        // alone would suggest -- which is why the assertion is the identity rather
+        // than a factor picked to look convincing.
+        expectNear("and the gap between them is exactly the thickness gap, regularised",
+                   flangeStrain - webStrain,
+                   (material.failure.fractureStrain - material.failure.uniformStrain) *
+                       (profile.flangeThickness - profile.webThickness) / 0.150,
+                   2e-16 * flangeStrain);
+        expectTrue("which is a difference no swap could hide", flangeStrain > 1.1 * webStrain);
+    }
+
+    // --- The bar itself, pulled through it ----------------------------------------
+    //
+    // Linear hardening, so `sigma_y(eps_p)` is a line and every number below is
+    // arithmetic rather than a Newton solve.
+    material.flow = plasticity::linearHardening(355.0e6, 2.0e9);
+    material.youngsModulus = 206.0e9;
+    const double youngs = material.youngsModulus;
+    const double span = 0.150, area = 2.0e-3;
+    const double failureStrain = constraint::fiberFailureStrain(material.failure, span, web);
+
+    constraint::Stiffening stiffening;
+    stiffening.material = ah36Steel();
+    constraint::Fiber fibre;
+    fibre.area = area;
+    fibre.offset = 0.0;
+    fibre.neckWidth = web;
+    fibre.end[0] = {0, 1, 0.5};
+    fibre.end[1] = {2, 3, 0.5};
+    stiffening.fiber.push_back(fibre);
+    const std::vector<double> rest{0,    0, -0.5 * plate, 0,    0, 0.5 * plate,
+                                   span, 0, -0.5 * plate, span, 0, 0.5 * plate};
+    const constraint::RestFibers forms = constraint::restFibers(stiffening, rest);
+
+    // Pull to a total strain in `steps` equal increments; return the stress the
+    // fibre puts on its far end.
+    const auto pull = [&](double strain, int steps, std::vector<constraint::FiberState>& state,
+                          bool allowFailure = true) {
+        double stress = 0;
+        for (int s = 1; s <= steps; ++s) {
+            std::vector<double> current = rest;
+            const double reached = strain * s / steps;
+            current[6] += reached * span;
+            current[9] += reached * span;
+            std::vector<double> force(4 * 3, 0.0);
+            constraint::fiberForces(stiffening, forms, current, material, &state, force,
+                                    allowFailure);
+            stress = -(force[6] + force[9]) / area;
+        }
+        return stress;
+    };
+
+    // The two-sided boundary. `totalAt(p)` is the total strain at which a linear
+    // curve's return map leaves exactly `p` of plastic strain: `p + sigma_y(p)/E`.
+    const auto totalAt = [&](double plastic) {
+        return plastic + plasticity::flowStress(material.flow, plastic) / youngs;
+    };
+    const double gap = 1e-9;
+    const double stressAtFailure = plasticity::flowStress(material.flow, failureStrain);
+    std::printf("     eps_f = %.6f, so the bar fails at eps_total = %.6f carrying"
+                " %.4f MPa\n", failureStrain, totalAt(failureStrain), stressAtFailure / 1e6);
+
+    {
+        std::vector<constraint::FiberState> state(1);
+        const double got = pull(totalAt(failureStrain * (1.0 - gap)), 1, state);
+        std::printf("     one part in 1e9 below it: damage %.12f, failed %d, %.4f MPa\n",
+                    state[0].damage, static_cast<int>(state[0].failed), got / 1e6);
+        expectTrue("a hair below the failure strain the fibre is intact", !state[0].failed);
+        // Route one: damage is exactly the plastic strain over the failure strain,
+        // because the multiplier is exactly one and the path is monotone.
+        expectNear("and its damage is exactly eps_p / eps_f", state[0].damage, 1.0 - gap, 1e-12);
+        // Route two, independent of the first: the stress it is carrying is its flow
+        // curve's value at that plastic strain, which is where the bar's own
+        // uniaxial closed form lives.
+        expectNear("carrying its flow stress at that strain", got,
+                   plasticity::flowStress(material.flow, failureStrain * (1.0 - gap)),
+                   1e-9 * stressAtFailure);
+        expectNear("which is the failure stress to a part in 1e9", got, stressAtFailure,
+                   1e-6 * stressAtFailure);
+    }
+    {
+        std::vector<constraint::FiberState> state(1);
+        const double got = pull(totalAt(failureStrain * (1.0 + gap)), 1, state);
+        std::printf("     one part in 1e9 above it: damage %.12f, failed %d, %.4f MPa\n",
+                    state[0].damage, static_cast<int>(state[0].failed), got / 1e6);
+        expectTrue("a hair above it the fibre has torn", state[0].failed);
+        expectTrue("its damage is clamped at one", state[0].damage == 1.0);
+        expectTrue("and it carries nothing at all", got == 0.0);
+    }
+
+    // **Step independence of the damage**, which is the same property the flow rule
+    // has and for the same reason: damage is `sum d eps_p / eps_f` and `eps_p` at a
+    // given total strain does not depend on how many steps reached it.
+    {
+        std::vector<constraint::FiberState> one(1), many(1);
+        const double target = totalAt(0.5 * failureStrain);
+        pull(target, 1, one);
+        pull(target, 200, many);
+        std::printf("     half way there: one step damage %.15f, two hundred steps %.15f\n",
+                    one[0].damage, many[0].damage);
+        expectNear("damage does not depend on the step count", one[0].damage, many[0].damage,
+                   1e-12);
+        expectNear("and it is eps_p / eps_f", one[0].damage,
+                   one[0].equivalentPlasticStrain / failureStrain, 1e-15);
+        expectTrue("and it really accumulated", one[0].damage > 0.4);
+    }
+
+    // **The negative control, and it is exact rather than close.** Below failure the
+    // damage variable changes nothing: the stress and the plastic strain are
+    // bit-identical to the same pull with failure switched off.
+    {
+        std::vector<constraint::FiberState> live(1), immortal(1);
+        const double target = totalAt(0.9 * failureStrain);
+        const double a = pull(target, 37, live);
+        const double b = pull(target, 37, immortal, false);
+        std::printf("     below failure: %.17g Pa with damage, %.17g Pa without\n", a, b);
+        expectTrue("a load below failure is bit-identical with the criterion and without it",
+                   a == b && live[0].plasticStrain == immortal[0].plasticStrain &&
+                       live[0].equivalentPlasticStrain == immortal[0].equivalentPlasticStrain);
+        expectTrue("while the damage variable itself did move", live[0].damage > 0.85);
+        expectTrue("and the control accumulated none", immortal[0].damage == 0.0);
+    }
+
+    // **Compression, however hard, never tears a fibre.** The triaxiality is exactly
+    // the cutoff, so voids close rather than grow and no damage accumulates. A
+    // stiffener on the far side of a dent is squashed, and it does not go away.
+    {
+        std::vector<constraint::FiberState> state(1);
+        const double got = pull(-5.0 * totalAt(failureStrain), 50, state);
+        std::printf("     squashed to %.1f%% strain: eps_p %+.4f, damage %.1e, failed %d,"
+                    " %.1f MPa\n", -500.0 * totalAt(failureStrain),
+                    state[0].plasticStrain, state[0].damage, static_cast<int>(state[0].failed),
+                    got / 1e6);
+        expectTrue("compression accumulates exactly no damage", state[0].damage == 0.0);
+        expectTrue("so a squashed fibre never tears", !state[0].failed);
+        // Vacuity: it has to have yielded far past the failure strain, or this
+        // passes on a fibre that never flowed.
+        expectTrue("and it flowed well past what would have torn it in tension",
+                   -state[0].plasticStrain > 3.0 * failureStrain);
+        expectTrue("carrying compression all the while", got < -stressAtFailure);
+    }
+
+    // **Damage of one means torn, and the test is `>=` and not `>`.** A fibre whose
+    // state *arrives* at the limit -- a solve resumed from a committed state, which
+    // `zone::Solver::adopt` does -- has to be gone, not one increment away from gone.
+    // The discriminator is a fibre that then yields in **compression**: it accumulates
+    // exactly no further damage, so a `>` would leave it standing at damage 1 for
+    // ever, carrying its full flow stress. Mutation testing found that edit surviving
+    // every other assertion in this file.
+    {
+        std::vector<constraint::FiberState> state(1);
+        state[0].damage = 1.0;
+        const double got = pull(-0.01, 1, state);
+        std::printf("     a fibre arriving at damage 1.0 and then squashed: failed %d,"
+                    " carrying %.3e Pa\n", static_cast<int>(state[0].failed), got);
+        expectTrue("a fibre already at damage one is torn on its next increment",
+                   state[0].failed);
+        expectTrue("and carries nothing from that increment on", got == 0.0);
+    }
+
+    // **Failure is irreversible, and unloading does not heal it.** Same statement as
+    // `plasticity::update`'s, and it is structural: the torn branch is the first
+    // thing the return map tests.
+    {
+        std::vector<constraint::FiberState> state(1);
+        pull(totalAt(failureStrain * 1.001), 1, state);
+        expectTrue("the fibre tore", state[0].failed);
+        const double back = pull(0.0, 1, state);
+        const double squashed = pull(-0.01, 1, state);
+        std::printf("     released to zero strain a torn fibre carries %.3e Pa, and squashed"
+                    " to -1%% it carries %.3e Pa\n", back, squashed);
+        expectTrue("released, it carries nothing", back == 0.0);
+        expectTrue("and it does not come back in compression either", squashed == 0.0);
+        expectTrue("its history is frozen", state[0].damage == 1.0);
+    }
+
+    // **What `FiberForces` reports about the tearing, asserted directly.** These are
+    // the counters a caller reads to learn a member has gone, and `zone::Solver` no
+    // longer reads all of them -- it recounts from the committed state in
+    // `collectTorn` so that `adopt` cannot tip a fibre over by reading it. That makes
+    // them public API with no in-tree consumer, which is exactly the shape mutation
+    // testing found untested twice over.
+    {
+        std::vector<constraint::FiberState> state(1);
+        const auto step = [&](double total) {
+            std::vector<double> current = rest;
+            current[6] += total * span;
+            current[9] += total * span;
+            std::vector<double> force(4 * 3, 0.0);
+            return constraint::fiberForces(stiffening, forms, current, material, &state, force);
+        };
+        const constraint::FiberForces intactStep = step(totalAt(0.5 * failureStrain));
+        expectEqual("a fibre short of failure reports nothing torn",
+                    static_cast<long long>(intactStep.torn), 0LL);
+        expectEqual("and nothing torn this increment",
+                    static_cast<long long>(intactStep.tornNow), 0LL);
+        expectTrue("and no volume gone", intactStep.tornVolume == 0.0);
+        expectEqual("but it did yield", static_cast<long long>(intactStep.yielded), 1LL);
+
+        const constraint::FiberForces breaking = step(totalAt(failureStrain * 1.001));
+        expectEqual("the increment that tears it reports it torn now",
+                    static_cast<long long>(breaking.tornNow), 1LL);
+        expectEqual("and standing torn", static_cast<long long>(breaking.torn), 1LL);
+        // The volume is the fibre's own steel: its area times its rest length, not
+        // its area and not its length.
+        std::printf("     the increment that tears it reports %.6e m3 gone, against the fibre's"
+                    " own A L = %.6e m3\n", breaking.tornVolume, area * span);
+        expectNear("and the volume it names is the fibre's area times its rest length",
+                   breaking.tornVolume, area * span, 0.0);
+
+        const constraint::FiberForces after = step(totalAt(failureStrain * 1.002));
+        expectEqual("a later increment still counts it torn",
+                    static_cast<long long>(after.torn), 1LL);
+        expectEqual("but not torn *now*, which is the edge a caller triggers on",
+                    static_cast<long long>(after.tornNow), 0LL);
+        expectNear("and the standing volume does not double", after.tornVolume, area * span, 0.0);
+        expectEqual("and a torn fibre does not yield again",
+                    static_cast<long long>(after.yielded), 0LL);
+    }
+
+    // A fibre solved elastically has nowhere to keep damage and therefore never
+    // fails -- the same convention as a null plastic state, and the path every
+    // geometric test in this file takes.
+    {
+        std::vector<double> current = rest;
+        current[6] += 10.0 * span;
+        current[9] += 10.0 * span;
+        std::vector<double> force(4 * 3, 0.0);
+        const constraint::FiberForces elastic =
+            constraint::fiberForces(stiffening, forms, current, material, nullptr, force);
+        expectEqual("an elastic fibre stretched tenfold tears nothing",
+                    static_cast<long long>(elastic.torn), 0LL);
+        expectTrue("and carries the elastic stress", std::abs(force[6]) > 0);
+    }
+}
+
+// What a torn fibre does to the things that read a fibre set: the reduced model's
+// stiffness, the member stress `reduction::checkValidity` takes a maximum over, and
+// the per-member roll-up `promotion::reduce` consumes.
+void testATornFibreLeavesTheFormsAndTheMemberRollUp() {
+    std::printf("\n   what a torn fibre takes with it\n");
+    const double thickness = 0.012;
+    const zone::Patch patch =
+        stiffenedPatch(2.0, 1.4, thickness, 4, 2, flatBar(0.200, 0.010), true, 3);
+    expectTrue("the stiffened patch meshed", !patch.empty() && !patch.stiffening.empty());
+    const constraint::RestFibers forms =
+        constraint::restFibers(patch.stiffening, patch.mesh.position);
+    const double youngs = ah36Steel().youngsModulus;
+
+    // Nothing failed: `state` present but empty of failure has to give bit-for-bit
+    // the forms a null state gives, or the negative control is a tolerance.
+    std::vector<constraint::FiberState> state(patch.stiffening.fiberCount());
+    const constraint::AttachedForms clean =
+        constraint::attachedForms(patch.stiffening, patch.mesh.position, forms, youngs);
+    const constraint::AttachedForms unfailed =
+        constraint::attachedForms(patch.stiffening, patch.mesh.position, forms, youngs, &state);
+    bool identical = clean.stiffness.size() == unfailed.stiffness.size() &&
+                     clean.stress.size() == unfailed.stress.size();
+    for (std::size_t b = 0; identical && b < clean.stiffness.size(); ++b) {
+        identical = clean.stiffness[b].dof == unfailed.stiffness[b].dof &&
+                    clean.stiffness[b].stiffness == unfailed.stiffness[b].stiffness &&
+                    clean.stress[b] == unfailed.stress[b];
+    }
+    std::printf("     %zu fibres, %zu blocks with no state and %zu with an intact one\n",
+                patch.stiffening.fiberCount(), clean.stiffness.size(), unfailed.stiffness.size());
+    expectTrue("an intact state builds bit-for-bit the forms no state builds", identical);
+
+    // Tear the fibres of one profile station -- the outermost, which is the one a
+    // real solve loses first -- and check that both halves lose exactly those and
+    // that they stay paired.
+    const constraint::ProfileFibers stations =
+        constraint::profileFibers(flatBar(0.200, 0.010), thickness, -1.0);
+    expectEqual("a flat bar has two stations", static_cast<long long>(stations.count), 2LL);
+    std::size_t killed = 0;
+    double outermost = 0;
+    for (const constraint::Fiber& f : patch.stiffening.fiber)
+        outermost = std::max(outermost, std::abs(f.offset));
+    for (std::size_t i = 0; i < patch.stiffening.fiberCount(); ++i)
+        if (std::abs(std::abs(patch.stiffening.fiber[i].offset) - outermost) < 1e-12) {
+            state[i].failed = true;
+            state[i].damage = 1.0;
+            ++killed;
+        }
+    expectTrue("the outer station is half the fibres", killed * 2 == patch.stiffening.fiberCount());
+
+    const constraint::AttachedForms torn =
+        constraint::attachedForms(patch.stiffening, patch.mesh.position, forms, youngs, &state);
+    std::printf("     tearing the %zu outer fibres leaves %zu blocks of %zu\n", killed,
+                torn.stiffness.size(), clean.stiffness.size());
+    expectEqual("a torn fibre leaves the stiffness", static_cast<long long>(torn.stiffness.size()),
+                static_cast<long long>(clean.stiffness.size() - killed));
+    expectEqual("and the stress form beside it, so the two never disagree",
+                static_cast<long long>(torn.stress.size()),
+                static_cast<long long>(torn.stiffness.size()));
+    // The pairing, checked rather than assumed: every surviving block's stress form
+    // has to name the same degrees of freedom as the block it sits beside. A skip
+    // applied to one list and not the other reports a plausible number for the wrong
+    // member, which is the defect the single skip test exists to prevent.
+    bool paired = true;
+    for (std::size_t b = 0; b < torn.stiffness.size(); ++b)
+        paired = paired && torn.stress[b].size() == torn.stiffness[b].dof.size();
+    expectTrue("and every surviving stress form is as long as its own block", paired);
+
+    // `stiffnessBlocks` is `attachedForms(...).stiffness` and must stay so under the
+    // new argument, or a caller that takes only the blocks sees a different set of
+    // fibres from one that takes both.
+    const std::vector<solidshell::DofBlock> blocks = constraint::stiffnessBlocks(
+        patch.stiffening, patch.mesh.position, forms, youngs, &state);
+    bool same = blocks.size() == torn.stiffness.size();
+    for (std::size_t b = 0; same && b < blocks.size(); ++b)
+        same = blocks[b].dof == torn.stiffness[b].dof &&
+               blocks[b].stiffness == torn.stiffness[b].stiffness;
+    expectTrue("stiffnessBlocks drops the same fibres, to the last bit", same);
+
+    // **The stiffness the reduced model loses.** A rank-one block's trace is
+    // `scale * |v|^2`, and summing it over the set is the honest scalar for "how
+    // much axial stiffness is in this bundle of bars".
+    const auto trace = [](const std::vector<solidshell::DofBlock>& list) {
+        double sum = 0;
+        for (const solidshell::DofBlock& block : list)
+            for (std::size_t d = 0; d < block.dof.size(); ++d)
+                sum += block.stiffness[d * block.dof.size() + d];
+        return sum;
+    };
+    const double before = trace(clean.stiffness), after = trace(torn.stiffness);
+    std::printf("     the fibre bundle's assembled diagonal falls %.4e -> %.4e N/m (%.1f%%)\n",
+                before, after, 100.0 * (1.0 - after / before));
+    expectTrue("losing the outer station costs the reduced model real stiffness",
+               after < 0.7 * before);
+
+    // The per-member roll-up. Every fibre here belongs to member 0, and half the
+    // *volume* is gone -- the two Gauss stations of a rectangle carry equal area by
+    // construction, so tearing one station is exactly half the steel.
+    const std::vector<constraint::MemberFibers> rolled =
+        constraint::memberDamage(patch.stiffening, forms, state);
+    expectEqualCount("one member", rolled.size(), 1u);
+    std::printf("     member %d: %d fibres, %d torn, %.6f m3 of %.6f m3 carrying,"
+                " effectiveness %.6f\n", rolled[0].member, rolled[0].fibers, rolled[0].torn,
+                rolled[0].carrying, rolled[0].volume, rolled[0].effectiveness);
+    expectEqual("named by the mesher", static_cast<long long>(rolled[0].member), 0LL);
+    expectNear("half its steel is gone, because the two Gauss stations carry equal area",
+               rolled[0].effectiveness, 0.5, 1e-12);
+    // The volume is the profile's own area times the length the zone meshed, which
+    // is a second route to the same number and does not go through the fibres.
+    expectNear("and the volume it accounted for is the profile's area times its length",
+               rolled[0].volume, profileSection(flatBar(0.200, 0.010)).area * patch.stiffening.length,
+               1e-9 * rolled[0].volume);
+
+    // An empty state is "nothing failed", not "everything failed": an elastic solve
+    // keeps no fibre state at all, and reading past its end would report a torn ship.
+    const std::vector<constraint::MemberFibers> none =
+        constraint::memberDamage(patch.stiffening, forms, {});
+    expectEqualCount("an empty state still rolls up", none.size(), 1u);
+    expectTrue("and reports nothing torn", none[0].torn == 0 && none[0].effectiveness == 1.0);
+}
+
 // A run of exactly two stations is one segment and one fibre per profile station,
 // and it has to build: a member that crosses a single element of the patch is a
 // member. The check is on `addStiffener` directly because a zone big enough to
@@ -1172,6 +1708,8 @@ void runConstraintTests() {
     testTrippingIsNotAZeroEnergyMode();
     testTheSeamRotationStiffnessIsThePlatings();
     testTheFibreYieldsOnItsFlowCurve();
+    testAFibreTearsOnItsOwnClosedForm();
+    testATornFibreLeavesTheFormsAndTheMemberRollUp();
     testAOneSegmentRunStillBuildsFibres();
     testAFibreCarriesNoForceUnderRigidMotion();
     testTheFibresMassAndTheStepTheyCost();

@@ -32,12 +32,24 @@ Vec3 nodeAt(const std::vector<double>& nodal, std::uint32_t node) {
 // `-sigma_y(eps_p)` rather than at `sigma - 2 sigma_y0`; that is the same choice
 // `plasticity.hpp` defaults to and for the same reason -- there is no measurement
 // that sets a kinematic modulus.
-double uniaxialReturn(const plasticity::Material& material, double strain, FiberState& state,
-                      double* dissipationPerVolume) {
+//
+// `failureStrain` is the regularised value from `fiberFailureStrain`, passed rather
+// than looked up because it belongs to the fibre and not to the material -- exactly
+// as `plasticity::update` takes it. `plasticity::kNeverFails` exercises the flow rule
+// alone.
+double uniaxialReturn(const plasticity::Material& material, double failureStrain, double strain,
+                      FiberState& state, double* dissipationPerVolume, bool* failedNow) {
+    if (dissipationPerVolume) *dissipationPerVolume = 0.0;
+    if (failedNow) *failedNow = false;
+    // A torn fibre carries nothing and learns nothing. Checked before anything else
+    // so that "unloading does not heal it" is structural rather than a consequence
+    // of the arithmetic below -- the same shape, and for the same reason, as
+    // `plasticity::update`'s first branch.
+    if (state.failed) return 0.0;
+
     const double youngs = material.youngsModulus;
     const double trial = youngs * (strain - state.plasticStrain);
     const double yield = plasticity::flowStress(material.flow, state.equivalentPlasticStrain);
-    if (dissipationPerVolume) *dissipationPerVolume = 0.0;
     if (std::abs(trial) <= yield) return trial;
 
     // First estimate is exact for a linear curve, so the loop below confirms it and
@@ -61,10 +73,45 @@ double uniaxialReturn(const plasticity::Material& material, double strain, Fiber
     state.plasticStrain += direction * increment;
     state.equivalentPlasticStrain += increment;
     if (dissipationPerVolume) *dissipationPerVolume = std::abs(stress) * increment;
+
+    // --- Damage ------------------------------------------------------------------
+    //
+    // Accumulated rather than compared, so a path that yields in tension, unloads and
+    // yields again spends the right fraction of its life in each -- and so that
+    // compression, which contributes no damage at all, does not un-do what tension
+    // did. The same two lines as `plasticity::update`'s, with the bar's own closed
+    // form for the triaxiality: exactly `referenceTriaxiality` in tension and exactly
+    // `cutoffTriaxiality` in compression. See the header §2b.
+    const double critical =
+        failureStrain * plasticity::triaxialityFactor(material.failure, fiberTriaxiality(stress));
+    if (critical > 0.0 && std::isfinite(critical)) state.damage += increment / critical;
+
+    if (state.damage >= 1.0) {
+        state.damage = 1.0;
+        state.failed = true;
+        if (failedNow) *failedNow = true;
+        // The stress drops discontinuously, which an explicit scheme feels as a
+        // small shock -- element deletion, on one bar.
+        return 0.0;
+    }
     return stress;
 }
 
 }  // namespace
+
+double fiberTriaxiality(double axialStress) {
+    if (axialStress == 0.0) return 0.0;
+    // `+/-(1.0/3.0)` to the bit: `1.0/3.0` here rounds identically to the `1.0/3.0`
+    // and `-1.0/3.0` the `Failure` defaults are built from, and negation is exact. So
+    // tension lands exactly on `referenceTriaxiality` -- multiplier exactly 1 -- and
+    // compression exactly on `cutoffTriaxiality`, whose branch is a `<=`.
+    return (axialStress > 0.0 ? 1.0 : -1.0) / 3.0;
+}
+
+double fiberFailureStrain(const plasticity::Failure& failure, double restLength,
+                          double neckWidth) {
+    return plasticity::regularisedFailureStrain(failure, restLength, neckWidth);
+}
 
 // --- 1. The tie ----------------------------------------------------------------
 
@@ -105,13 +152,20 @@ ProfileFibers profileFibers(const StiffenerProfile& profile, double plateThickne
     // weak-axis second moment, which fibres on the stiffener line do not carry, so
     // the two decompose identically here. Recorded because it is a real omission,
     // not because it is free.
-    struct Rect { double from, to, area; };
+    //
+    // `width` is the rectangle's own thickness -- the dimension a neck localises
+    // across, and the fibre's half of the plating's `elementSize` pair. It is taken
+    // from the profile here rather than derived from `area` and the station spacing
+    // downstream, because a derivation would divide by a height that a degenerate
+    // profile can make zero.
+    struct Rect { double from, to, area, width; };
     Rect part[2];
     int count = 0;
     if (webHeight > 0 && webThickness > 0)
-        part[count++] = Rect{0.0, webHeight, webHeight * webThickness};
+        part[count++] = Rect{0.0, webHeight, webHeight * webThickness, webThickness};
     if (flanged)
-        part[count++] = Rect{webHeight, webHeight + flangeThickness, flangeWidth * flangeThickness};
+        part[count++] = Rect{webHeight, webHeight + flangeThickness, flangeWidth * flangeThickness,
+                             flangeThickness};
 
     const double faceOffset = 0.5 * plateThickness;
     for (int i = 0; i < count; ++i) {
@@ -121,6 +175,7 @@ ProfileFibers profileFibers(const StiffenerProfile& profile, double plateThickne
             const double height = centre + side * kGaussOffset * extent;
             fibers.offset[fibers.count] = sign * (faceOffset + height);
             fibers.area[fibers.count] = 0.5 * part[i].area;
+            fibers.width[fibers.count] = part[i].width;
             ++fibers.count;
         }
     }
@@ -142,7 +197,8 @@ RestFibers restFibers(const Stiffening& stiffening, const std::vector<double>& r
 
 FiberForces fiberForces(const Stiffening& stiffening, const RestFibers& forms,
                         const std::vector<double>& current, const plasticity::Material& material,
-                        std::vector<FiberState>* state, std::vector<double>& force) {
+                        std::vector<FiberState>* state, std::vector<double>& force,
+                        bool allowFailure) {
     FiberForces out;
     const double youngs = material.youngsModulus;
     if (state != nullptr && state->size() < stiffening.fiber.size())
@@ -168,10 +224,25 @@ FiberForces fiberForces(const Stiffening& stiffening, const RestFibers& forms,
         double stress = 0;
         if (state != nullptr) {
             double dissipationPerVolume = 0;
+            bool failedNow = false;
             const double before = (*state)[i].equivalentPlasticStrain;
-            stress = uniaxialReturn(material, strain, (*state)[i], &dissipationPerVolume);
+            // The failure strain is the fibre's own -- its rest length as the
+            // averaging length, its rectangle's thickness as the neck width. Both
+            // are properties of *this* fibre, so it is computed here rather than
+            // once for the set: a run over a curved patch has fibres of different
+            // lengths, and a member with a flange has two neck widths in it.
+            const double failureStrain =
+                allowFailure ? fiberFailureStrain(material.failure, restLength, fiber.neckWidth)
+                             : plasticity::kNeverFails;
+            stress = uniaxialReturn(material, failureStrain, strain, (*state)[i],
+                                    &dissipationPerVolume, &failedNow);
             out.dissipation += dissipationPerVolume * fiber.area * restLength;
             if ((*state)[i].equivalentPlasticStrain > before) ++out.yielded;
+            if (failedNow) ++out.tornNow;
+            if ((*state)[i].failed) {
+                ++out.torn;
+                out.tornVolume += fiber.area * restLength;
+            }
         } else {
             stress = youngs * strain;
         }
@@ -245,19 +316,22 @@ double fiberFrequencySquared(const FiberStiffness& stiffness,
 }
 
 AttachedForms attachedForms(const Stiffening& stiffening, const std::vector<double>& rest,
-                            const RestFibers& forms, double youngsModulus) {
+                            const RestFibers& forms, double youngsModulus,
+                            const std::vector<FiberState>* state) {
     AttachedForms out;
     out.stiffness.reserve(stiffening.fiber.size());
     out.stress.reserve(stiffening.fiber.size());
     for (std::size_t i = 0; i < stiffening.fiber.size(); ++i) {
         const double restLength = i < forms.length.size() ? forms.length[i] : 0.0;
+        const bool gone = state != nullptr && i < state->size() && (*state)[i].failed;
         const FiberStiffness fiber =
             fiberStiffness(stiffening.fiber[i], rest, restLength, youngsModulus);
         // One skip test for both halves. Splitting this loop in two would let the
         // two lists disagree about which fibres they dropped, and then every
         // stress after the first disagreement would belong to a different member
         // from the block beside it -- a plausible number for the wrong fibre.
-        if (!(fiber.scale > 0)) continue;
+        // A torn fibre is one more clause on that same test, never a second one.
+        if (gone || !(fiber.scale > 0)) continue;
         solidshell::DofBlock block;
         block.dof.assign(fiber.dof, fiber.dof + 12);
         block.stiffness.assign(144, 0.0);
@@ -281,8 +355,47 @@ AttachedForms attachedForms(const Stiffening& stiffening, const std::vector<doub
 
 std::vector<solidshell::DofBlock> stiffnessBlocks(const Stiffening& stiffening,
                                                   const std::vector<double>& rest,
-                                                  const RestFibers& forms, double youngsModulus) {
-    return attachedForms(stiffening, rest, forms, youngsModulus).stiffness;
+                                                  const RestFibers& forms, double youngsModulus,
+                                                  const std::vector<FiberState>* state) {
+    return attachedForms(stiffening, rest, forms, youngsModulus, state).stiffness;
+}
+
+std::vector<MemberFibers> memberDamage(const Stiffening& stiffening, const RestFibers& forms,
+                                       const std::vector<FiberState>& state) {
+    std::vector<MemberFibers> out;
+    const auto slot = [&](int member) -> MemberFibers& {
+        for (MemberFibers& entry : out)
+            if (entry.member == member) return entry;
+        out.push_back(MemberFibers{});
+        out.back().member = member;
+        return out.back();
+    };
+
+    for (std::size_t i = 0; i < stiffening.fiber.size(); ++i) {
+        const Fiber& fiber = stiffening.fiber[i];
+        const double restLength = i < forms.length.size() ? forms.length[i] : 0.0;
+        // The same skip test `fiberForces` and `attachedForms` use, so a fibre that
+        // carries nothing by geometry is not counted as a member that tore.
+        if (!(restLength > 0) || !(fiber.area > 0)) continue;
+        MemberFibers& entry = slot(fiber.member);
+        const double volume = fiber.area * restLength;
+        entry.volume += volume;
+        ++entry.fibers;
+        // A short state is "nothing failed" -- an elastic solve keeps no state at
+        // all, and reading past its end as failure would report a torn ship.
+        if (i < state.size() && state[i].failed) {
+            ++entry.torn;
+            entry.lost += volume;
+        } else {
+            entry.carrying += volume;
+        }
+    }
+
+    for (MemberFibers& entry : out)
+        entry.effectiveness = entry.volume > 0 ? entry.carrying / entry.volume : 1.0;
+    std::sort(out.begin(), out.end(),
+              [](const MemberFibers& a, const MemberFibers& b) { return a.member < b.member; });
+    return out;
 }
 
 double criticalTimestep(const Stiffening& stiffening, const RestFibers& forms,
@@ -331,6 +444,8 @@ std::size_t addStiffener(const SeamRun& run, const StiffenerProfile& profile,
             }
             fiber.area = profileSet.area[j];
             fiber.offset = profileSet.offset[j];
+            fiber.neckWidth = profileSet.width[j];
+            fiber.member = run.member;
             // The fibre's own length, which on a curved patch is not the seam's:
             // the tie extrapolates away from the mid-surface, so a fibre on the
             // inside of a bend is shorter than the plating it is welded to. That

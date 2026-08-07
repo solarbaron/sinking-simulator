@@ -478,6 +478,16 @@ struct SolveParams {
     // to an identity.
     bool plastic = true;
 
+    // Whether the stiffeners' fibres can tear -- `constraint.hpp` §2b. True is the
+    // model. **False is the control**, and it is kept for one reason: it is the
+    // un-conservative model that shipped before the fibres carried damage, and the
+    // size of the error it makes is a measurement that has to stay re-runnable
+    // rather than re-readable. It reaches the fibres and nothing else: the plating's
+    // own tearing is untouched, so an A/B isolates the stiffeners exactly. Same
+    // spirit as `coupling::Modulus::Tangent`, which is kept as the control for the
+    // modulus the docs used to prescribe.
+    bool fiberFailure = true;
+
     // Seconds over which a driven perimeter -- `Patch::mesh.prescribed`, which
     // `coupling.hpp` writes -- rises from the meshed position to its full value.
     // Zero imposes it on the first step.
@@ -588,6 +598,18 @@ struct SolveResult {
     double tornArea = 0;             // m^2 of deleted element
     std::vector<int> tornPanels;     // ascending indices into StructuralMesh::panels
     double tornPanelArea = 0;        // m^2 of those panels, as `breach.hpp` will see it
+
+    // The stiffeners' half of the same account. A fibre fails on axial damage --
+    // `constraint.hpp` §2b -- and a failed one carries no stress and no stiffness for
+    // the rest of the run. Reported beside the plating's rather than folded into it
+    // because the two fail at very different strains for a reason that is *not* their
+    // failure strains: those are within 12% of each other. It is Rice-Tracey. A
+    // fibre's triaxiality is exactly the reference, so its multiplier is exactly 1;
+    // a plate element under a punch is not, and measured on the reference strip the
+    // first plate point tears at 7.8% of its own regularised failure strain while the
+    // first fibre tears at 100.0% of its.
+    int tornFibers = 0;
+    double tornFiberVolume = 0;      // m^3 of stiffener steel that has gone
 
     // Cost, measured. The figures are for printing and for `estimatedCost`, never
     // for asserting on: `test_plasticity.cpp` records what a tight timing assertion

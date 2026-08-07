@@ -2512,6 +2512,105 @@ hinge leaves it free — the web is forced to follow the plate's cross-section
 exactly. That is the opposite error, and lateral-torsional buckling of a stiffener
 stays `buckling.hpp`'s question.
 
+**The stiffener tears, and the criterion is the plating's with two different
+arguments.** This section used to end "the stiffener never tears", and that was the
+last named gap in Phase 3: a ram could take the plating out from under a
+longitudinal and the longitudinal kept full axial stiffness, which is the
+un-conservative direction, and everything downstream inherited it. `FiberState` now
+carries the same `damage` and `failed` that `plasticity::State` does and
+`fiberForces` runs the same accumulation, `Δd = Δε_p / (ε_f · f(η))`. Nothing about
+the *criterion* is new. The two arguments it takes are, and establishing them was
+the work:
+
+- **The length is the fibre's own rest length, not the seam's.** A fibre reports
+  strain as `(l − L)/L` with `L` its tied-point-to-tied-point length, so that is the
+  length the neck's elongation is averaged over. On a curved patch it is *not* the
+  seam segment: the tie extrapolates, so the outer fibre of a 200 mm bar is longer
+  than the seam it is welded to by the eccentricity times the plating's turning
+  angle. `RestFibers::length` is already exactly the right number.
+- **The neck forms across the profile rectangle's own thickness, not the plate's.**
+  The plating's rule — the neck is as wide as the member is thick, the element
+  averages over its in-plane size — carries over unchanged; only the numbers move,
+  to the web thickness for a web station and the flange thickness for a flange one.
+
+The mesh invariant is therefore `(ε_f(L) − ε_g)·L = (ε_frac − ε_g)·t_w`, and it is
+asserted rather than described. It holds to **1.07 × 10⁻¹⁶ of `ε_f·L`** over lengths
+from 0.01 m to 3 m — one unit in the last place of the quantity the subtraction
+destroys. Asserting it against the *invariant* instead looks tighter and is a
+statement about cancellation: at `L = 3 m`, where `ε_f` is 1.4% above `ε_g`, the same
+data reads 5.3 × 10⁻¹⁵.
+
+**A bar's triaxiality is ±1/3 and both ends land exactly on a boundary of
+`Failure`.** A uniaxial stress has `σ_m = σ/3` and `σ_eq = |σ|`, so `η = sign(σ)/3`.
+In tension that is exactly `referenceTriaxiality` and the Rice–Tracey multiplier is
+**exactly 1** — a fibre fails at its regularised strain unmodified, where the
+plating under a punch is in a biaxial state the multiplier knocks down. In
+compression it is exactly `cutoffTriaxiality`, so a **squashed fibre accumulates no
+damage at all**: voids close rather than grow, and a stiffener on the far side of a
+dent does not tear however hard it is compressed. Measured: at the zone's 0.15 m
+element a fibre of a 200×10 bar fails at `ε_f = 0.1918` against the plating's
+`0.2004` — 4.5% apart, so the *failure strains* are not what separates them. The
+stress state is.
+
+**That closed form is on the hot path rather than `plasticity::triaxiality` of an
+assembled Voigt stress, and one ULP is the reason.** `vonMises([σ,0,0,0,0,0])` is
+**not** identically `|σ|` — measured, it is exact for 3.55 × 10⁸ and 1.234568 × 10⁸ and
+one unit in the last place low for 1.0 and −9.876543 × 10⁸, four of eight sampled
+magnitudes. Tension survives that (5 × 10⁻¹⁷ on the multiplier). Compression is a
+`<=` against the cutoff, and an `η` that rounded *inside* it by one ULP would take
+the multiplier from infinite to `exp(1)` — a compressed fibre would go from never
+failing to failing at 37% of its tensile failure strain. A criterion must not flip
+on the last bit of a square root. `test_constraint.cpp` asserts the two routes
+against each other and records the ULP.
+
+**Tearing and softening do not compose, exactly as for elements — but a fibre needs
+no separate softening path to say so.** `coupling.hpp` §5 skips torn elements because
+its block is a *negative correction* to a stiffness somebody else assembled, so
+`−K_e` on a dead element leaves rows nothing supports. A fibre's `attachedForms`
+block is not a correction; it is the whole of the member's stiffness, added to a
+plating assembly that supports those rows itself. So a torn fibre is **dropped**, and
+dropping it is exact rather than singular. The distinction survives in the other
+direction: `−K_fibre` would be wrong for the same reason, and nothing forms one.
+
+**What it was worth.** On the reference ferry, a ram opening 125.6 m² of side shell
+amidships over 72 panels and the 163 m of longitudinal running through them:
+
+| | plating only | with the longitudinals | ratio |
+|---|---|---|---|
+| section area lost | 6.861% | **8.455%** | 1.23× |
+| second moment lost | 5.429% | **6.590%** | 1.21× |
+| hogging ultimate moment lost | 5.711% | **7.068%** | 1.24× |
+| sagging ultimate moment lost | 11.846% | **17.507%** | **1.48×** |
+
+So about a fifth of what a collision takes out of her hull girder was invisible, and
+about a third of it in sagging — where it bites hardest because a panel that has lost
+its stiffener buckles far earlier than one that has merely thinned. The member
+selection is the place that measurement can go vacuous and it is guarded: picking
+members by distance from the impact alone catches deck beams and bulkhead stiffeners
+metres inboard and reports 2.5× rather than 1.2×, so only shell longitudinals lying
+on an opened panel count, and the test checks that the length picked up divides the
+opened area by the ferry's own 0.70 m longitudinal spacing.
+
+At the zone, against the same solve with `SolveParams::fiberFailure` off — the model
+that shipped before this, kept as a control: the un-conservative run leaves the
+longitudinal at `ε_p = 0.513`, **2.83× its own failure strain**, still at full
+section, carrying 2.23× the nodal force and 5.74× the stored energy, and costing the
+ram **25.3% more energy to open the same hole**. `reduce()` folds the loss in by
+scaling the profile's web *and* flange thicknesses by the effectiveness — area,
+`I_own` and the Steiner term are all linear in them at fixed height, so one factor
+moves all three and the centroid does not move at all, which is the exact analogue of
+a plate's thickness. Scaling the web alone leaves a tee's flange floating on nothing
+with its full area still counted.
+
+**Where it stops.** A fibre fails on axial damage alone. A longitudinal welded to
+plating that has been *deleted* from under it is unsupported, not merely undamaged,
+and that is `coupling::withoutTornElements`' question. The knockdown is uniform over
+the profile while the fibre that tears first is the *outer* one, carrying the most of
+`I_own` — so a partly torn member reads slightly strong about its own axis, and about
+the hull girder's, which is the axis Tier 0 asks about, the error is the ratio of
+`I_own` to `A d²` and is small. And the tie is rigid by construction, so weld failure
+is outside the model rather than approximated by it.
+
 **The stiffener re-introduces an in-plane length scale into the stable step, and
 that is a cost decision.** `§1`'s "thickness-governed, flat in the in-plane element
 size" is a property of the *plating*. A fibre's is not: the tie amplifies its

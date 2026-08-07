@@ -284,10 +284,10 @@ The longest and highest-risk phase.
   it adds no degrees of freedom and therefore no zero-energy mode — the stiffened
   patch has the same six as the bare one, measured on the whole spectrum.
 
-  Three things it does not do, and one cost. It cannot represent tripping: the
+  Two things it does not do, and one cost. It cannot represent tripping: the
   fibres contribute exactly zero to it and the plating alone restrains it, at the
   closed-form `16 D / b`, so the formulation *over*-restrains where the hinge
-  leaves free. It carries no weak-axis second moment. The stiffener never tears.
+  leaves free. It carries no weak-axis second moment.
   And it re-introduces an in-plane length scale into a stable step that was
   thickness-governed: free at the ferry's resolution, 2.4× at a four-times finer
   one. **What it leaves ready**: the Tier-1/Tier-2 interface coupling below, which
@@ -376,12 +376,36 @@ The longest and highest-risk phase.
   2.3026 Hz — where untied it was the decks' own frequency to four figures, the shell
   contributing nothing. It costs the assembled band 146 → 1 520.
   The section
-  reduction also carries plating only, because the zone meshed plating only — a collision that opens
-  fourteen bays leaves their longitudinals at full strength, which is the
-  un-conservative direction. The multi-point constraint that blocked it now exists
-  and `zone::Stiffeners::Modelled` uses it; what is still missing is
-  `promotion::reduce` consuming the fibres' state, which it cannot until the
-  fibres carry damage
+  reduction used to carry plating only, so a collision that opened fourteen bays left
+  their longitudinals at full strength — the un-conservative direction, and the last
+  named gap in Phase 3. **It is closed**: the fibres carry damage
+  (`constraint.hpp` §2b, `02-simulation.md` §3 under *Eccentric stiffeners*), and
+  `promotion::reactionOf`/`reduce` consume it, naming the member back to
+  `StructuralMesh::members` and scaling its web and flange thicknesses — which moves
+  area, `I_own` and the Steiner term together and leaves the centroid alone, the
+  exact analogue of a plate's thickness. **What it was worth**, on the ferry, for a
+  ram opening 125.6 m² of her side and the 163 m of longitudinal in it: the section
+  area lost goes 6.861% → **8.455%**, the second moment 5.429% → **6.590%**, the
+  hogging ultimate moment 5.711% → **7.068%** and the sagging one 11.846% →
+  **17.507%**. So about a fifth of what a collision takes out of her hull girder was
+  invisible, and about a third of it in sagging — stiffener loss bites hardest in
+  compression, because a panel that has lost its stiffener buckles far earlier than
+  one that has merely thinned. At the zone, against the same solve with the control
+  `SolveParams::fiberFailure` off, the old model left the longitudinal at
+  `ε_p = 0.513` — **2.83× its own failure strain** — still at full section, carrying
+  2.23× the force and costing the ram **25.3% more energy to open the same hole**.
+
+  The criterion is the plating's with two different arguments, and establishing them
+  was the work: the averaging length is the **fibre's own rest length** (not the
+  seam's — the tie extrapolates, so on a curved patch they differ), and the neck
+  width is the **profile rectangle's thickness** (not the plate's). A bar's
+  triaxiality is `±1/3` exactly, so the Rice–Tracey multiplier is **exactly 1** in
+  tension and **infinite** in compression — a squashed stiffener never tears. That
+  closed form is used rather than `plasticity::triaxiality` of a Voigt stress
+  because `vonMises` of a uniaxial stress is *not* identically `|σ|` (measured: one
+  ULP low in four of eight sampled magnitudes) and the compression branch is a `<=`
+  on the cutoff, where one ULP is the difference between never failing and failing
+  at 37% of the tensile strain
 
   **The "200 m² is two core-hours per simulated second" figure needs its element
   size beside it or it says nothing.** It assumes 50 mm elements; the same 200 m²

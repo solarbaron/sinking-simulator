@@ -239,18 +239,42 @@
 //     where it is -- which is why the claim asserted is "never more than intact"
 //     and not "monotone".
 //
-// **What the reduction does not carry**, in the un-conservative direction and
-// worth being loud about: the stiffeners running through a torn panel are left at
-// full strength. A collision that opens fourteen bays of side shell has certainly
-// destroyed the longitudinals in them, and `reduce()` will not say so.
+// **The reduction now carries the stiffeners too, and this is where the
+// un-conservative direction used to be.** It used to read: the members running
+// through a torn panel are left at full strength, so a collision that opens
+// fourteen bays of side shell leaves their longitudinals intact and `reduce()` will
+// not say so. The multi-point constraint had arrived and `zone::Stiffeners::Modelled`
+// was meshing the member; what was missing was on the other side -- a fibre had no
+// damage variable and was never deleted, so there was no "this longitudinal is
+// gone" to read. `constraint.hpp` §2b closed that, and this consumes it.
 //
-// The multi-point constraint this used to wait on now exists -- `constraint.hpp`,
-// and `zone::Stiffeners::Modelled` meshes the member -- so a zone can have webs in
-// it. What is still missing is on the *other* side: a fibre yields and hardens but
-// carries no damage variable and is never deleted, so there is no "this
-// longitudinal is gone" for `reduce()` to read even when the plating around it has
-// torn. Closing this means giving the fibres a failure criterion, not building
-// more constraint machinery.
+// A member is reduced **exactly as a panel is**: `MemberDamage::effectiveness` is
+// the share of the steel the zone meshed for it that is still carrying, the part
+// nobody looked at counts as intact, and `reduce()` folds it in by scaling the
+// profile's **thicknesses** -- web and flange together. That is the exact analogue
+// of scaling a plate's thickness, and for the same reason: area, the profile's own
+// second moment and its Steiner term `A d^2` are all *linear* in the rectangle
+// thicknesses at fixed height, so one factor moves all three consistently and the
+// profile's centroid does not move at all. Scaling the web *height* instead would
+// move the centroid and is a different damage.
+//
+// **Both thicknesses, and snapped to zero together.** `profileSection` reads a tee's
+// flange whenever `flangeThickness > 0` regardless of the web, so scaling the web
+// alone to nothing leaves a flange floating on no web with area and a Steiner term
+// intact. `sectionElements` already drops a member whose `ProfileSection::area` is
+// zero, which is what makes a fully torn longitudinal leave the hull girder
+// altogether rather than linger as an epsilon -- the same trap `reactionOf`'s
+// `1e-6` snap exists for on the plating side, and the same fix.
+//
+// **What it still does not carry.** The knockdown is uniform over the profile, and
+// the fibre that tears first is the *outer* one -- the one furthest from the plate,
+// carrying the most of the member's own second moment. So a partly torn member is
+// reported slightly strong about its own axis. About the hull girder's axis, which
+// is the one Tier 0 asks about, the error is the ratio of `I_own` to `A d^2` and for
+// a 200 mm bar metres from the neutral axis it is small. And a fibre fails on axial
+// damage alone: a longitudinal whose plating has been *deleted* from under it is
+// unsupported, not merely undamaged, and that is `coupling::withoutTornElements`'
+// question rather than this one.
 //
 // The other thing it does not carry is that a **dented** panel is far weaker in
 // compression than a merely thinner one, because the dent is an initial
@@ -517,16 +541,36 @@ struct PanelDamage {
     double tornArea = 0;        // m^2 of it deleted
 };
 
+// The same statement about a stiffener. `effectiveness` is the share of the
+// member's *section* still carrying, measured on the steel volume the zone's fibres
+// stand for -- see the header, and `constraint::memberDamage` for why volume rather
+// than any other weighting.
+struct MemberDamage {
+    int member = -1;
+    double effectiveness = 1;   // share of its section still carrying, in [0, 1]
+    double meshedFraction = 0;  // how much of the member's steel the zone looked at
+    double lostVolume = 0;      // m^3 of stiffener steel deleted
+    int fibers = 0, tornFibers = 0;
+};
+
 struct SectionReduction {
     std::vector<PanelDamage> panels;  // ascending by panel index
+    std::vector<MemberDamage> members;  // ascending by member index
     double xLo = 0, xHi = 0;          // m, the longitudinal reach of the damage
     double lostPlateArea = 0;         // m^2 of mid-surface no longer carrying
-    double lostSteelMass = 0;         // kg
+    double lostSteelMass = 0;         // kg, plating and stiffeners together
     double worstEffectiveness = 1;
+    double worstMemberEffectiveness = 1;
     double worstOutOfPlane = 0;       // m
     std::vector<std::string> problems;
 
+    // Still "are there damaged panels": the plating is what `breach.hpp` and the
+    // flooding model read, and a reduction with members in it and no panels is a
+    // zone that bent its longitudinals without opening anything. `nothing()` is the
+    // stricter question, for a caller that wants to know whether `reduce()` would
+    // change the ship at all.
     bool empty() const { return panels.empty(); }
+    bool nothing() const { return panels.empty() && members.empty(); }
 };
 
 // What a solved zone says about the section it sits in. The solver is needed, not

@@ -22,6 +22,7 @@
 #include "harness.hpp"
 
 #include "engine/sim/promotion.hpp"
+#include "engine/sim/solid_shell.hpp"
 #include "game/prototype/ferry.hpp"
 
 #include <algorithm>
@@ -113,7 +114,8 @@ std::vector<double> stationsAlong(double from, double to, int count) {
 // A flat strip as a `StructuralMesh`, the same fixture `test_zone.cpp` uses --
 // built directly rather than through `makeStructuralMesh` because a rectangle's
 // area is `lengthX * spanY` and nothing else.
-StructuralMesh flatStrip(double lengthX, double spanY, double thickness, int nx, int ny) {
+StructuralMesh flatStrip(double lengthX, double spanY, double thickness, int nx, int ny,
+                         const StiffenerProfile* profile = nullptr) {
     StructuralMesh mesh;
     mesh.materials.push_back(ah36Steel());
     mesh.frameSpacing = lengthX;
@@ -133,6 +135,19 @@ StructuralMesh flatStrip(double lengthX, double spanY, double thickness, int nx,
             p.role = PanelRole::Shell;
             mesh.panels.push_back(p);
         }
+    if (profile != nullptr) {
+        // One longitudinal down the seam at y = 0, its web rising *inward* against
+        // the patch's +z outward normal -- the sign a shell longitudinal has, and
+        // the one every tie in `constraint.cpp` has to survive.
+        StructuralMember member;
+        member.a = {-0.5 * lengthX, 0.0, 0.0};
+        member.b = {0.5 * lengthX, 0.0, 0.0};
+        member.rise = {0, 0, -1};
+        member.profile = *profile;
+        member.attachedPlateThickness = thickness;
+        member.role = MemberRole::Longitudinal;
+        mesh.members.push_back(member);
+    }
     return mesh;
 }
 
@@ -1190,6 +1205,480 @@ void testThePreLoadIsTheGirdersOwnStress() {
     }
 }
 
+// --- 9b. What leaving the longitudinals at full strength was worth ---------------
+
+// **The headline of the fibre-damage work: how wrong the section reduction was.**
+//
+// `06-roadmap.md` recorded the gap as "a collision that opens fourteen bays leaves
+// their longitudinals at full strength, which is the un-conservative direction", and
+// said nothing about how far un-conservative. This measures it, on the reference
+// ferry, and the answer is not small: about a fifth of the strength a ram removes
+// from the hull girder was invisible, and in sagging about a third.
+//
+// Driven synthetically -- the panels and the members are set to nothing rather than
+// solved to nothing -- for the same reason `testTheReductionMakesTierZeroReportLessStrength`
+// below is: what is under test is the *coupling* into Tier 0, and a solve would only
+// make it slower and less severe. `testASolvedZoneNamesTheLongitudinalItTore` is the
+// end-to-end half.
+void testTheLongitudinalsARamDestroysAreWorthAFifthOfTheGirder() {
+    std::printf("\n   what leaving a ram's longitudinals at full strength was worth\n");
+    const StructuralMesh& structure = ferryStructure();
+    const Scantlings scantlings = ferryScantlings();
+
+    // A ram amidships on the port side at the sheer: every shell panel within 8 m,
+    // and the shell longitudinals actually running through them.
+    const Vec3 centre{0.0, -9.0, 13.0};
+    promotion::SectionReduction plateOnly, both;
+    double panelArea = 0, memberLength = 0;
+    for (std::size_t i = 0; i < structure.panels.size(); ++i) {
+        const PlatePanel& p = structure.panels[i];
+        if (p.role != PanelRole::Shell) continue;
+        if (length(p.centroid() - centre) > 8.0) continue;
+        promotion::PanelDamage damage;
+        damage.panel = static_cast<int>(i);
+        damage.effectiveness = 0.0;
+        plateOnly.panels.push_back(damage);
+        both.panels.push_back(damage);
+        panelArea += p.area();
+    }
+    // **The member selection is where this test could go vacuous, and it is checked
+    // rather than trusted.** Picking members by distance from the centre alone
+    // catches deck beams and bulkhead stiffeners metres inboard that the ram never
+    // touched, and over-states the loss by construction -- measured, that selection
+    // reported a 2.5x error where the honest one reports 1.2x. So a member counts
+    // only if it is a shell longitudinal whose midpoint lands on a panel that was
+    // opened, and the guard below is that the length picked up divides the opened
+    // area by the ferry's own longitudinal spacing.
+    for (std::size_t i = 0; i < structure.members.size(); ++i) {
+        const StructuralMember& member = structure.members[i];
+        if (member.role != MemberRole::Longitudinal) continue;
+        const Vec3 mid = (member.a + member.b) * 0.5;
+        bool onOpenedPlating = false;
+        for (const promotion::PanelDamage& damage : plateOnly.panels)
+            if (length(mid - structure.panels[static_cast<std::size_t>(damage.panel)].centroid()) <
+                0.75) {
+                onOpenedPlating = true;
+                break;
+            }
+        if (!onOpenedPlating || length(mid - centre) > 8.0) continue;
+        promotion::MemberDamage damage;
+        damage.member = static_cast<int>(i);
+        damage.effectiveness = 0.0;
+        both.members.push_back(damage);
+        memberLength += member.length();
+    }
+
+    const double spacing = panelArea / memberLength;
+    std::printf("     the ram opens %.1f m2 of shell over %zu panels and %.1f m of longitudinal"
+                " over %zu members -- %.3f m apart, against a design spacing of %.3f m\n",
+                panelArea, plateOnly.panels.size(), memberLength, both.members.size(), spacing,
+                scantlings.longitudinalSpacing);
+    expectTrue("the sweep covers a real patch of her side", plateOnly.panels.size() > 40);
+    expectTrue("and the longitudinals it picks up are the ones on that plating, at her own"
+               " spacing", spacing > 0.5 * scantlings.longitudinalSpacing &&
+                               spacing < 1.6 * scantlings.longitudinalSpacing);
+
+    struct Row { double area, second, modulusDeck, hog, sag; };
+    const auto measure = [&](const promotion::SectionReduction& reduction) {
+        const StructuralMesh damaged = promotion::reduce(structure, reduction);
+        const HullGirderSection section = hullGirderSection(damaged, 0.0);
+        const std::vector<CollapseElement> elements = collapseElementsAt(damaged, scantlings, 0.0);
+        return Row{section.area, section.secondMoment, section.modulusDeck,
+                   collapseCurve(elements, 1.0).ultimateMoment,
+                   std::abs(collapseCurve(elements, -1.0).ultimateMoment)};
+    };
+    const Row intact = measure(promotion::SectionReduction{});
+    const Row plating = measure(plateOnly);
+    const Row all = measure(both);
+
+    std::printf("     %-14s %10s %10s %10s %13s %13s\n", "", "area (m2)", "I (m4)", "Zdeck (m3)",
+                "M_hog (N m)", "M_sag (N m)");
+    const auto say = [&](const char* label, const Row& row) {
+        std::printf("     %-14s %10.5f %10.4f %10.5f %13.5e %13.5e\n", label, row.area, row.second,
+                    row.modulusDeck, row.hog, row.sag);
+    };
+    say("intact", intact);
+    say("plating only", plating);
+    say("+ members", all);
+
+    const auto lost = [](double damaged, double whole) { return 1.0 - damaged / whole; };
+    struct Gap { const char* name; double plate, both_; };
+    const Gap gaps[] = {
+        {"section area", lost(plating.area, intact.area), lost(all.area, intact.area)},
+        {"second moment", lost(plating.second, intact.second), lost(all.second, intact.second)},
+        {"hogging ultimate moment", lost(plating.hog, intact.hog), lost(all.hog, intact.hog)},
+        {"sagging ultimate moment", lost(plating.sag, intact.sag), lost(all.sag, intact.sag)},
+    };
+    double worstRatio = 1.0;
+    for (const Gap& gap : gaps) {
+        std::printf("     %-26s plating alone %.3f%%, with the longitudinals %.3f%%  (%.2fx)\n",
+                    gap.name, 100.0 * gap.plate, 100.0 * gap.both_, gap.both_ / gap.plate);
+        expectTrue("losing the longitudinals too costs strictly more, on every measure",
+                   gap.both_ > gap.plate);
+        worstRatio = std::max(worstRatio, gap.both_ / gap.plate);
+    }
+    // The direction is the whole point: the model that left the longitudinals alone
+    // reported *more* strength left than there is, never less.
+    expectTrue("and every quantity falls when the members go", all.area < plating.area &&
+                                                                   all.second < plating.second &&
+                                                                   all.hog < plating.hog &&
+                                                                   all.sag < plating.sag);
+    // Non-vacuous in the other direction: the error has to be worth reporting. A
+    // ratio near 1.0 would mean the longitudinals never mattered and this whole task
+    // bought nothing.
+    std::printf("     so the un-conservative error was 1.2x on the section properties and %.2fx"
+                " at worst -- about a fifth of what the ram takes out of her, and about a third"
+                " of it in sagging, was invisible\n", worstRatio);
+    expectTrue("the error is a fifth of the damage at least, not a rounding one",
+               gaps[0].both_ > 1.15 * gaps[0].plate);
+    expectTrue("and the sagging ultimate moment is where it bites hardest, because a panel that"
+               " has lost its stiffener buckles far earlier than one that has merely thinned",
+               gaps[3].both_ / gaps[3].plate > 1.35);
+    // The reduction is not allowed to invent material: a member with no damage in the
+    // list is left exactly as it was, bit for bit.
+    const StructuralMesh damaged = promotion::reduce(structure, both);
+    bool untouchedElsewhere = damaged.members.size() == structure.members.size();
+    std::size_t changed = 0;
+    for (std::size_t i = 0; untouchedElsewhere && i < structure.members.size(); ++i) {
+        const bool named = std::any_of(both.members.begin(), both.members.end(),
+                                       [&](const promotion::MemberDamage& d) {
+                                           return static_cast<std::size_t>(d.member) == i;
+                                       });
+        const bool same =
+            damaged.members[i].profile.webThickness == structure.members[i].profile.webThickness &&
+            damaged.members[i].profile.flangeThickness ==
+                structure.members[i].profile.flangeThickness;
+        if (named && !same) ++changed;
+        if (!named && !same) untouchedElsewhere = false;
+    }
+    expectTrue("a member nobody named comes back bit-identical", untouchedElsewhere);
+    testing::expectEqual("and every member that was named is thinner",
+                         static_cast<long long>(changed),
+                         static_cast<long long>(both.members.size()));
+    // A member reduced to nothing has to leave the section outright, not linger as
+    // an epsilon of area -- the same trap the plating's `1e-6` snap exists for.
+    expectTrue("and one reduced to nothing has no section left at all",
+               profileSection(damaged.members[static_cast<std::size_t>(both.members[0].member)]
+                                  .profile)
+                       .area == 0.0);
+}
+
+// The end-to-end half: a real solve, a real tear, and the member named back to the
+// structure. Plus the control -- `SolveParams::fiberFailure` false is the model that
+// shipped before the fibres carried damage -- so the size of the zone-level error is
+// a measurement rather than an inference from the section one.
+void testASolvedZoneNamesTheLongitudinalItTore() {
+    std::printf("\n   a solved zone names the longitudinal it tore\n");
+    // **The strip is three times the zone on purpose.** A longitudinal runs on past
+    // the damage, and the part of it nobody looked at has to count as intact -- the
+    // same rule the plating has, and the defect `indentation.hpp` records when it is
+    // missing, where the zone *radius* would decide how much of the ship is broken. A
+    // fixture whose member the zone meshes end to end cannot tell the two apart:
+    // mutation testing found the rule deleted and surviving on exactly that fixture.
+    const double lengthX = 4.8, spanY = 0.8, thickness = 0.012, depth = 0.42;
+    const StiffenerProfile bar = flatBar(0.200, 0.010);
+    const StructuralMesh strip = flatStrip(lengthX, spanY, thickness, 12, 4, &bar);
+    const plasticity::Material steel = plasticity::shipSteel();
+    const double memberLength = strip.members[0].length();
+
+    struct Run {
+        double work = 0, fibreEnergy = 0, bundleForce = 0, peakPlastic = 0, peakDamage = 0;
+        int tornElements = 0, tornFibers = 0;
+        double tornVolume = 0, lostVolume = 0, meshedFraction = 0;
+        double memberEffectiveness = 1, memberArea = 0;
+        double firstPlateTear = 0, plateFailureStrain = 0;
+        double lostSteelMass = 0, lostPlateMass = 0;
+        std::size_t members = 0, panels = 0;
+        std::size_t anonymousMembers = 0, anonymousProblems = 0;
+        bool anonymousDiagnosed = false;
+        std::size_t strangerMembers = 0;
+        bool strangerDiagnosed = false;
+    };
+    const auto go = [&](bool allowFailure) {
+        zone::MeshParams params = flatParams(2);
+        params.radius = 0.9;
+        params.stiffeners = zone::Stiffeners::Modelled;
+        params.edge = zone::Edge::Clamped;
+        const zone::Patch patch = zone::buildPatch(strip, {0, 0, 0}, params);
+        expectTrue("the stiffened patch meshed with fibres on it",
+                   !patch.empty() && !patch.stiffening.empty());
+
+        zone::SolveParams solve;
+        solve.indenter.halfLength = 0.08;
+        solve.indenter.halfWidth = 1e3;
+        solve.indenter.speed = 20.0;
+        solve.indenter.rampTime = 1.0e-3;
+        solve.indenter.stopAt = depth;
+        solve.fiberFailure = allowFailure;
+        zone::Solver solver(patch, steel, solve);
+        const zone::SolveResult& result = solver.run();
+        // **`run()` on a finished solve is idempotent**, and the fibre counters have
+        // to be too. It steps nothing and re-runs `collectTorn`, so a count that
+        // accumulated instead of being reset would double here -- which is exactly
+        // what mutation testing found, on a counter that is otherwise only ever read
+        // once. The plating's `tornElements` has the same property and is checked
+        // alongside so the two cannot drift apart.
+        const int tornOnce = result.tornFibers, elementsOnce = result.tornElements;
+        const double volumeOnce = result.tornFiberVolume;
+        solver.run();
+        testing::expectEqual("running a finished solve again does not double the torn fibre count",
+                    static_cast<long long>(result.tornFibers), static_cast<long long>(tornOnce));
+        testing::expectEqual("nor the torn element count",
+                    static_cast<long long>(result.tornElements),
+                    static_cast<long long>(elementsOnce));
+        expectNear("nor the volume of stiffener steel it says has gone",
+                   result.tornFiberVolume, volumeOnce, 0.0);
+
+        Run out;
+        out.work = result.work;
+        out.tornElements = result.tornElements;
+        out.tornFibers = result.tornFibers;
+        out.tornVolume = result.tornFiberVolume;
+        out.fibreEnergy = solver.fiberStrainEnergy();
+        for (const constraint::FiberState& state : solver.fiberState()) {
+            out.peakPlastic = std::max(out.peakPlastic, state.equivalentPlasticStrain);
+            out.peakDamage = std::max(out.peakDamage, state.damage);
+        }
+        // The plating's own failure strain, off its own geometry, and the strain the
+        // *first* plate point actually tore at. The two together are the measurement
+        // behind "the failure strains are not what separates the plating from the
+        // stiffener" -- see below.
+        {
+            double nodes[solidshell::kDof], inPlane = 0, thick = 0;
+            patch.mesh.gather(0, patch.mesh.position, nodes);
+            solidshell::elementSize(nodes, &inPlane, &thick);
+            out.plateFailureStrain =
+                plasticity::regularisedFailureStrain(steel.failure, inPlane, thick);
+        }
+        out.firstPlateTear = std::numeric_limits<double>::infinity();
+        for (const solidshell::ElementPlasticState& element : solver.elementState())
+            for (int gp = 0; gp < solidshell::kGauss; ++gp)
+                if (element.point[gp].failed)
+                    out.firstPlateTear =
+                        std::min(out.firstPlateTear, element.point[gp].equivalentPlasticStrain);
+        // What the bundle of bars is putting into the plating right now, as the norm
+        // of the nodal force it contributes. It is the honest scalar for "how much
+        // load is this longitudinal still taking", and unlike the punch reaction it
+        // is not an instantaneous sample of a ringing explicit solve.
+        std::vector<double> force(patch.nodeCount() * 3, 0.0);
+        std::vector<constraint::FiberState> copy = solver.fiberState();
+        constraint::fiberForces(patch.stiffening, solver.restFibers(), solver.position(), steel,
+                                &copy, force, allowFailure);
+        double sum = 0;
+        for (double f : force) sum += f * f;
+        out.bundleForce = std::sqrt(sum);
+
+        const promotion::SectionReduction reduction = promotion::reactionOf(strip, patch, solver);
+        out.lostSteelMass = reduction.lostSteelMass;
+        // The plating's share of that mass, computed here from the panel damages the
+        // same reduction reports. What is left over must be the stiffener's, and the
+        // stiffener's must be its lost volume times its density -- so the split is
+        // checked rather than the total, and a member share with the wrong sense of
+        // `effectiveness` cannot hide inside a plating figure ten times its size.
+        for (const promotion::PanelDamage& damage : reduction.panels) {
+            const PlatePanel& panel = strip.panels[static_cast<std::size_t>(damage.panel)];
+            out.lostPlateMass += (1.0 - damage.effectiveness) * panel.area() * panel.thickness *
+                                 strip.materials[0].density;
+        }
+
+        // **Fibres with no member index cannot be reduced, and must not be.** The
+        // same solve read through a patch whose fibres have been made anonymous: the
+        // fibre list, its order and the state all line up, only the label is gone.
+        // `reactionOf` has to name no member and say so, because a zone that built
+        // fibres without member indices would otherwise be indistinguishable from a
+        // zone whose stiffeners are fine.
+        zone::Patch anonymous = patch;
+        for (constraint::Fiber& fibre : anonymous.stiffening.fiber) fibre.member = -1;
+        const promotion::SectionReduction unnamed =
+            promotion::reactionOf(strip, anonymous, solver);
+        // And the other end of the same guard: a member index the structure does not
+        // have. `buildPatch` cannot produce one, but a patch and a structure that
+        // have drifted apart can, and the alternative to checking is indexing a
+        // vector out of bounds. The panel path already carries the same check for
+        // the same reason.
+        zone::Patch stranger = patch;
+        for (constraint::Fiber& fibre : stranger.stiffening.fiber) fibre.member = 9999;
+        const promotion::SectionReduction lost =
+            promotion::reactionOf(strip, stranger, solver);
+        out.strangerMembers = lost.members.size();
+        for (const std::string& problem : lost.problems)
+            if (problem.find("does not have") != std::string::npos)
+                out.strangerDiagnosed = true;
+        out.anonymousMembers = unnamed.members.size();
+        out.anonymousProblems = unnamed.problems.size();
+        // **The diagnosis, not just the count.** Deleting the `member < 0` branch
+        // leaves `-1` to fall through to the range check, where the cast to
+        // `size_t` makes it enormous and the reduction reports "the patch names a
+        // member the structure does not have" -- one problem either way, and a
+        // caller told the wrong thing about its own mesh. Mutation testing found
+        // that edit surviving a count-only assertion, so the text is what is
+        // checked.
+        for (const std::string& problem : unnamed.problems)
+            if (problem.find("no member index") != std::string::npos)
+                out.anonymousDiagnosed = true;
+
+        out.panels = reduction.panels.size();
+        out.members = reduction.members.size();
+        out.memberEffectiveness = reduction.worstMemberEffectiveness;
+        if (!reduction.members.empty()) {
+            out.lostVolume = reduction.members[0].lostVolume;
+            out.meshedFraction = reduction.members[0].meshedFraction;
+        }
+        out.memberArea =
+            profileSection(promotion::reduce(strip, reduction).members[0].profile).area;
+        return out;
+    };
+
+    const Run live = go(true);
+    const Run immortal = go(false);
+    const double failureStrain = constraint::fiberFailureStrain(steel.failure, 0.200, 0.010);
+    const double whole = profileSection(bar).area;
+
+    std::printf("     %-24s %12s %12s\n", "", "fibres tear", "control");
+    const auto say = [&](const char* label, double a, double b, const char* fmt) {
+        std::printf("     %-24s ", label);
+        std::printf(fmt, a);
+        std::printf(" ");
+        std::printf(fmt, b);
+        std::printf("\n");
+    };
+    say("punch work (J)", live.work, immortal.work, "%12.5e");
+    say("torn plate elements", live.tornElements, immortal.tornElements, "%12.0f");
+    say("torn fibres", live.tornFibers, immortal.tornFibers, "%12.0f");
+    say("peak fibre eps_p", live.peakPlastic, immortal.peakPlastic, "%12.4f");
+    say("fibre strain energy (J)", live.fibreEnergy, immortal.fibreEnergy, "%12.5e");
+    say("fibre nodal force (N)", live.bundleForce, immortal.bundleForce, "%12.5e");
+    say("member section left (m2)", live.memberArea, immortal.memberArea, "%12.5e");
+
+    // **Vacuity, both halves.** The fibres have to be carrying real load, and the
+    // case has to actually fail them. A patch where the plating governed would pass
+    // on any implementation at all.
+    expectTrue("the plating really tore", live.tornElements > 0);
+    expectTrue("and the fibres really tore too", live.tornFibers > 0);
+    expectTrue("and they were carrying a real share of the load, not a token one",
+               live.bundleForce > 1.0e6);
+    expectTrue("the two runs tore the same plating, so the difference is the stiffeners alone",
+               live.tornElements == immortal.tornElements);
+
+    // **What separates the plating from the stiffener is not their failure strains.**
+    // They are within 12% of each other at these sizes. It is Rice-Tracey: a bar's
+    // triaxiality is exactly the reference so its multiplier is exactly one, while a
+    // plate point under a punch is somewhere else entirely and tears at a small
+    // fraction of its own regularised strain. Asserting it here rather than only
+    // writing it in `02-simulation.md` -- nothing tests a comment.
+    std::printf("     the plate's own eps_f is %.6f and its first point tore at %.6f (%.1f%% of"
+                " it); the fibre's is %.6f and it tore at %.6f (%.1f%%)\n",
+                live.plateFailureStrain, live.firstPlateTear,
+                100.0 * live.firstPlateTear / live.plateFailureStrain, failureStrain,
+                live.peakPlastic, 100.0 * live.peakPlastic / failureStrain);
+    expectTrue("the two failure strains are close, so they are not the difference",
+               live.plateFailureStrain < 1.2 * failureStrain &&
+                   failureStrain < 1.2 * live.plateFailureStrain);
+    expectTrue("but the plating tears at a small fraction of its own, where the fibre tears at"
+               " all of its -- which is Rice-Tracey and nothing else",
+               live.firstPlateTear < 0.2 * live.plateFailureStrain);
+
+    // **The un-conservative direction, at the zone.** The control drives the
+    // longitudinal to a plastic strain multiples of its own failure strain and still
+    // reports it whole.
+    std::printf("     the control leaves the longitudinal at eps_p = %.4f, %.2fx its own"
+                " regularised failure strain of %.4f, and still reports it at full section\n",
+                immortal.peakPlastic, immortal.peakPlastic / failureStrain, failureStrain);
+    expectTrue("the control carries a longitudinal well past the strain that fails it",
+               immortal.peakPlastic > 2.0 * failureStrain);
+    // **It caps it to one increment, not to the bit, and that is the criterion
+    // rather than a defect.** Damage is accumulated and tested at the end of a step,
+    // so the step that crosses one leaves `eps_p` past `eps_f` by whatever that step
+    // added -- exactly as `plasticity::update` does for an element. What *is* exact
+    // is the damage variable, which is why the assertion below is on that.
+    std::printf("     the criterion stops it at eps_p = %.6f against eps_f = %.6f: one step's"
+                " increment past, %.3f%% -- damage is accumulated and tested at the end of a"
+                " step, as it is for an element\n", live.peakPlastic, failureStrain,
+                100.0 * (live.peakPlastic / failureStrain - 1.0));
+    expectTrue("the criterion stops it within one increment of its failure strain",
+               live.peakPlastic >= failureStrain && live.peakPlastic < 1.01 * failureStrain);
+    expectTrue("and the damage it accumulated reached one exactly", live.peakDamage == 1.0);
+    testing::expectEqual("while the control tore nothing", static_cast<long long>(immortal.tornFibers), 0LL);
+
+    std::printf("     so the un-conservative model claims %.2fx the fibre force, %.2fx the stored"
+                " energy, and %.1f%% more punch work to open the same hole\n",
+                immortal.bundleForce / live.bundleForce, immortal.fibreEnergy / live.fibreEnergy,
+                100.0 * (immortal.work / live.work - 1.0));
+    expectTrue("the control has the longitudinal carrying substantially more force",
+               immortal.bundleForce > 1.5 * live.bundleForce);
+    expectTrue("and storing substantially more energy",
+               immortal.fibreEnergy > 3.0 * live.fibreEnergy);
+    expectTrue("and it costs the ram more energy to reach the same penetration, which is the"
+               " un-conservative direction on the collision as well as on the section",
+               immortal.work > 1.1 * live.work);
+
+    // **And it reaches `reduce()`, which is the thing the roadmap said was missing.**
+    expectTrue("the reduction names the longitudinal", live.members == 1);
+    testing::expectEqual("and the control names none", static_cast<long long>(immortal.members), 0LL);
+    expectTrue("its section is reduced", live.memberArea < whole);
+    expectTrue("and the control's is untouched, bit for bit", immortal.memberArea == whole);
+    // **The closed form for what is left, and it goes through the unmeshed part.**
+    // The member is `whole = A * L_member` of steel; the zone tore `tornFiberVolume`
+    // of it and looked at the rest of what it meshed; everything outside the zone is
+    // intact because nothing looked at it. So the section left is
+    // `1 - tornVolume / whole`, and the zone's radius does not appear.
+    const double wholeVolume = whole * memberLength;
+    const double predicted = 1.0 - live.tornVolume / wholeVolume;
+    std::printf("     the zone meshed %.1f%% of a %.2f m longitudinal and tore %.5e m3 of its"
+                " %.5e m3; that leaves %.6f of its section, and the reduction says %.6f\n",
+                100.0 * live.meshedFraction, memberLength, live.tornVolume, wholeVolume,
+                predicted, live.memberArea / whole);
+    // Vacuity for the rule this fixture exists to test: the zone must *not* have
+    // meshed the whole member, or "the part nobody looked at is intact" is untested.
+    expectTrue("the zone looked at part of the longitudinal and not all of it",
+               live.meshedFraction > 0.1 && live.meshedFraction < 0.9);
+    expectNear("what is left is the untorn share of the whole member, unmeshed part included",
+               live.memberArea / whole, predicted, 1e-12);
+    // Two independent routes to the volume that went: the solver's own running total
+    // over the fibres, and the reduction's roll-up per member. They are computed in
+    // different files from the same state and must agree exactly.
+    expectNear("the solver and the reduction agree on how much steel went", live.tornVolume,
+               live.lostVolume, 0.0);
+    expectTrue("and it is a real volume, not a count", live.tornVolume > 0);
+    expectTrue("the plating went too, so this is the case the roadmap describes",
+               live.panels > 0);
+
+    // **The lost mass splits, and the stiffener's half is its lost steel.** `1 - eff`
+    // is `lost / whole` by construction, so `(1 - eff) * whole * density` is exactly
+    // the torn volume times the density -- a closed form for a number that would
+    // otherwise be a plausible-looking total.
+    const double memberMass = live.lostSteelMass - live.lostPlateMass;
+    const double wantMemberMass = live.tornVolume * ah36Steel().density;
+    std::printf("     the reduction says %.4f kg of steel is gone, of which the plating is %.4f"
+                " and the longitudinal %.4f (its torn volume x density is %.4f)\n",
+                live.lostSteelMass, live.lostPlateMass, memberMass, wantMemberMass);
+    expectNear("the stiffener's share of the lost mass is its torn volume times its density",
+               memberMass, wantMemberMass, 1e-9 * wantMemberMass);
+    expectTrue("and it is a real share, not a rounding residue", memberMass > 0.5);
+    // The control has no member damage at all, so its total is the plating's alone.
+    expectNear("the control's lost mass is the plating's and nothing else",
+               immortal.lostSteelMass, immortal.lostPlateMass, 1e-9 * immortal.lostSteelMass);
+
+    // Anonymous fibres: named nothing, reported loudly.
+    std::printf("     read through a patch whose fibres carry no member index the same solve"
+                " names %zu members and files %zu problems\n", live.anonymousMembers,
+                live.anonymousProblems);
+    testing::expectEqual("fibres with no member index reduce nothing",
+                         static_cast<long long>(live.anonymousMembers), 0LL);
+    expectTrue("but the reduction says so rather than reporting healthy stiffeners",
+               live.anonymousProblems > 0);
+    expectTrue("and it names the right fault -- fibres with no member index, not a member the"
+               " structure does not have", live.anonymousDiagnosed);
+    // Vacuity: the named read of the same solve *did* find a damaged member, so the
+    // zero above is the missing label and not a zone that tore nothing.
+    testing::expectEqual("while the same solve read with its labels names one",
+                         static_cast<long long>(live.members), 1LL);
+    testing::expectEqual("a member index the structure does not have reduces nothing either",
+                         static_cast<long long>(live.strangerMembers), 0LL);
+    expectTrue("and is diagnosed as that rather than indexed out of bounds",
+               live.strangerDiagnosed);
+}
+
 // --- 10. The reaction back: conservative, in the right direction ----------------
 
 void testTheReductionMakesTierZeroReportLessStrength() {
@@ -1714,6 +2203,8 @@ void runPromotionTests() {
     testAPreLoadSpendsYieldCapacityExactly();
     testAPreLoadedZoneYieldsEarlierUnderAPunch();
     testThePreLoadIsTheGirdersOwnStress();
+    testTheLongitudinalsARamDestroysAreWorthAFifthOfTheGirder();
+    testASolvedZoneNamesTheLongitudinalItTore();
     testTheReductionMakesTierZeroReportLessStrength();
     testASolvedZoneReportsTheThicknessItHasLeft();
     testACollapseSweepReachesThePeakOnADamagedSection();
