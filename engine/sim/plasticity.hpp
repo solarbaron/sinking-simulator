@@ -238,6 +238,73 @@ struct Material {
 // arrives. They move the failure strain and nothing else.
 Material shipSteel();
 
+// --- What a yielded point has left, as an elastic modulus ------------------------
+//
+// A linear model of a region that has flowed needs one number from this file: how
+// much stiffness is left. There are two candidates and they are **not** two
+// approximations to the same thing -- they answer different questions, and
+// `coupling.hpp` §5 measures which question a reduced model is asking.
+//
+// **Secant.** The modulus that reproduces the *total* strain a point is carrying
+// from the stress it is carrying, sigma = E_s eps. In uniaxial terms the total
+// strain at flow is eps = sigma_y(eps_p)/E + eps_p, so
+//
+//     1/E_s = 1/E + eps_p / sigma_y(eps_p)
+//
+// exactly. Plastic flow is deviatoric -- the return map never touches the trace --
+// so the bulk modulus is untouched and the whole of the softening is in the shear
+// modulus. Using 1/E = 1/(9K) + 1/(3G), the pair (K unchanged, G_s) delivers that
+// E_s identically when
+//
+//     1/G_s = 1/G + 3 eps_p / sigma_y(eps_p)
+//
+// which is what `secantShearModulus` returns. That identity is the test: an
+// isotropic pair built from (K, G_s) has to come back with exactly the uniaxial
+// secant, not nearly.
+//
+// At `eps_p == 0` it returns G **exactly**, and by an early return rather than by
+// the arithmetic: `1/(1/G)` is not `G` for every double, only for most of them.
+// That matters because a caller builds a stiffness correction out of the
+// difference, and a difference that is only nearly zero on an unyielded element is
+// a coupling that has stopped being exact where it used to be. It is one line, and
+// a mutant that deleted it survived the whole suite until the test below swept
+// moduli the reciprocal round trip loses.
+//
+// **Tangent.** The modulus that relates an *increment* of stress to an increment
+// of strain, 1/E_t = 1/E + 1/H' with H' = `flowSlope`, and by the same identity
+//
+//     1/G_t = 1/G + 3 / H'
+//
+// It is the modulus of a point that **is** flowing. An elastic point's tangent is
+// G, and G is *not* the limit of this as eps_p goes to zero -- H' is finite there,
+// so G_t drops by a finite step the instant a point flows at all, where G_s leaves
+// G continuously. Which points are flowing is the caller's to know; this returns
+// the flowing value at any argument, including zero, so that the size of that step
+// can be read off directly.
+// For AH36 at the first increment of flow that step is a factor of 34 -- G_t/G =
+// 0.0296 against G_s/G = 0.999999, measured in `tests/test_plasticity.cpp`. A model
+// that has to reproduce a *total* displacement under a *total* load and reaches for
+// the tangent is therefore not making a small error at small plastic strain; it is
+// making its largest error there.
+//
+// Both clamp at zero: a perfectly plastic curve has H' = 0 and no tangent
+// stiffness at all, and a curve with no strength has no secant one.
+double secantShearModulus(const Material& material, double equivalentPlasticStrain);
+double tangentShearModulus(const Material& material, double equivalentPlasticStrain);
+
+// The uniaxial partner of the two above, exposed because it is the closed form the
+// isotropic pair is checked against rather than a second route to the same answer.
+double secantYoungsModulus(const Material& material, double equivalentPlasticStrain);
+
+// (E, nu) of the isotropic pair with these moduli -- the inverse of
+// `Material::bulkModulus` and `shearModulus`, and how a softened shear modulus
+// becomes something `StructuralMaterial` and therefore `solidshell::
+// elementStiffness` can carry. Not a member of `Material` because the pair a
+// caller softens belongs to the *elastic* material its stiffness was assembled
+// from, which is a `StructuralMaterial` and has no flow curve.
+void isotropicFromBulkShear(double bulkModulus, double shearModulus, double* youngsModulus,
+                            double* poissonRatio);
+
 // --- State ---------------------------------------------------------------------
 //
 // One per integration point. Trivially copyable on purpose: probing the law with a

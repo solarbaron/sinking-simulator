@@ -1924,9 +1924,11 @@ growing crack, a region is *promoted*: the reduced model is replaced by genuine
 the retained interface DOF. Inside that region the physics is uncompromised —
 real stress tensors, real plasticity, real fracture. Budget 10⁵–10⁶ elements
 across all active zones. **The interface coupling is implemented**
-(`coupling.{hpp,cpp}`) and is exact for a linear zone; what it cannot yet carry
-back to Tier 1 is plastic softening short of a tear, because a reduction is linear
-and the Tier-2 explicit solver forms no tangent operator.
+(`coupling.{hpp,cpp}`) and is exact for a linear zone; a torn zone goes back as
+element deletion and a *yielded* one as a secant knockdown built from the plastic
+strain the explicit solver already carries. What is left is that the knockdown is
+isotropic where a J2 secant is not, which measures at 10% of the surroundings'
+displacement against 57% for reporting nothing.
 
 This is not a compromise on the answer where the answer matters. A collision
 loads a 20 m stretch of side shell; the response of the bow 200 m away is linear
@@ -1992,6 +1994,25 @@ construction that looks natural is wrong and is kept as a guard: taking `ε₀ =
 σ_y/E`, the elastic strain at yield, puts the curve **21% high at 0.2 plastic
 strain**, because a power law forced through the yield point of a steel that has a
 plateau is far too steep.
+
+**What a yielded point has left, as an elastic modulus.** Two closed forms, added
+because a linear model of a region that has flowed needs exactly one number from
+this file and there are two candidates that answer different questions:
+
+```
+secant   1/G_s = 1/G + 3 eps_p / sigma_y(eps_p)     total stress from total strain
+tangent  1/G_t = 1/G + 3 / H'(eps_p)                stress increment from strain increment
+```
+
+They are checked against the uniaxial closed form `1/E_s = 1/E + eps_p/sigma_y`,
+which the isotropic pair `(K unchanged, G_s)` reproduces to **1.3e-16 relative** —
+that identity is why "keep the bulk modulus, soften the shear one" is the right
+split and not merely a plausible one, since J2 flow never touches the trace. The
+secant leaves `G` **exactly** at zero plastic strain, by a shortcut rather than by
+arithmetic that happens to be exact; the tangent does not and cannot, dropping to
+`0.0296 G` at the first increment of flow. `coupling.{hpp,cpp}` §5 is the consumer
+and §*Direction 2b* is the measurement that says which of the two a static coupling
+wants.
 
 #### Element size is the failure criterion, not a detail
 
@@ -2722,15 +2743,18 @@ reach, which is exactly what that change was for.
 
 #### What it does not do yet
 
-1. ~~**No coupling to Tier 1.**~~ **Done, and linear on the way back** —
+1. ~~**No coupling to Tier 1.**~~ **Done, and it carries damage both ways now** —
    `coupling.{hpp,cpp}`, §*Tier-1 to Tier-2 coupling*. The patch's perimeter is
    driven from a Craig–Bampton model of the plating round it instead of being
-   clamped, and a torn zone goes back to that model as a mesh with the dead
-   elements deleted, so the surroundings feel the damage. What still does not go
-   back is **plastic softening short of a tear**: a reduction is linear by
-   construction and this solver forms no tangent operator, so between first yield
-   and first tear the surroundings are told the zone is stiffer than it is — in the
-   unsafe direction. Coupling to Tier 0 is unchanged and remains
+   clamped; a torn zone goes back to that model as a mesh with the dead elements
+   deleted, and a **yielded** one as a secant stiffness knockdown built from the
+   equivalent plastic strain this solver carries per integration point. This item
+   said the second could not be done without a tangent operator the solver does not
+   form. Both halves of that were wrong — see §*Direction 2b* — and what it got
+   right is the direction: reporting nothing drags the surroundings **1.95×** as far
+   as they really go. What is left is that the knockdown is isotropic where a J2
+   secant is not, and that the zone's state and the interface displacement set each
+   other, so the loop is staggered. Coupling to Tier 0 is unchanged and remains
    `promotion.{hpp,cpp}`'s.
 2. **The indenter is kinematic and rigid** — a prescribed rectangular punch, no
    contact search, no friction, no release, and the striking body does not crush. A
@@ -4691,6 +4715,8 @@ bool        prescribedStaticSolve(const Assembly&, load, held, prescribed, state
 EdgeDrive   edgeDrive(const Coupling&, const Substructure& zone, assembledState);
 std::size_t applyEdgeDrive(const EdgeDrive&, HexMesh&);
 DamagedMesh withoutTornElements(const zone::Patch&, const zone::Solver&);
+Softening   softening(const zone::Patch&, const zone::Solver&, const plasticity::Material&,
+                      Modulus = Modulus::Secant);
 ```
 
 #### It is exact, not close, and that is the whole design of the tests
@@ -4772,13 +4798,172 @@ matches the monolithic slit plate to **6.6e-15 m**. The control is the field a
 one-way coupling would still be reporting: the *intact* surroundings, which are
 wrong by 10⁹ times that tolerance.
 
+#### Direction 2b: what a *yielded* zone hands back, and why not a tangent
+
+This item stood in the list below as "closing it needs a reduction built from a
+tangent the solver does not form". **Both halves of that were wrong**, and the
+measurement that says so is `testPlasticSofteningGoesBack` in
+`tests/test_coupling.cpp`.
+
+*A static coupling does not want a tangent.* The assembled solve is `K x = f` on a
+**total** load, so the operator that makes it right is the one for which
+`K u = f_int(u)` at the state the zone is in — a **secant**. A tangent answers
+`K du = df`. And the two are not two approximations to the same thing: the secant
+leaves the elastic modulus continuously at first yield while the tangent drops by a
+finite step, measured at `G_t/G = 0.0296` against `G_s/G = 0.999999` at the first
+increment of flow — a factor of **34**.
+
+*And nothing had to be formed.* The secant shear modulus of a J2 point is a closed
+form in its equivalent plastic strain, `1/G_s = 1/G + 3 ε_p / σ_y(ε_p)`, which
+`zone::Solver` has carried per integration point since it existed. What was missing
+was arithmetic, not an operator. It reaches Tier 1 with **no change to
+`reduction.{hpp,cpp}` at all**: a `reduction::Attachment` block is scatter-added
+into the same CSR the elements go into, and nothing requires a block to be
+positive, so `ΔK_e = K_e(E_s, ν_s) − K_e(E, ν)` on the element's own 24 DOF is a
+correction that leaves the sparsity, the bandwidth and the interior renumbering
+untouched.
+
+##### The measurement
+
+A 1.2 m square plate, 8 × 8 solid-shell elements, 12 mm, clamped rim, with the
+middle quarter as the zone. The punch is dragged **in plane**, because out of plane
+a plate reaching the deflections that yield it is membrane-stiffening — measured,
+the punch reaction per unit travel rises 21% between 0.2 mm and 8 mm of push with
+nothing yielded — and the geometric nonlinearity would swamp the material one. In
+plane the reaction per unit travel is constant to four figures until the steel
+yields.
+
+**The reference is the monolithic plate solved nonlinearly**, by incremental
+modified Newton on `elementPlasticUpdate`, and the experiment is controlled in
+exactly one place: the surroundings are given the same elastic constants at ten
+times the yield strength, so they cannot flow. A reduced model is linear by
+construction, so a reference whose surroundings had yielded would be measuring two
+errors at once and only one of them is closable here.
+
+| travel | peak ε_p | damage | error in the surroundings, % of their own peak displacement | | | | perimeter pull ÷ monolithic | | |
+|---|---|---|---|---|---|---|---|---|---|
+| | | | elastic (before) | secant | tangent | geometric floor | elastic | secant | tangent |
+| 0.6 mm | 0.00017 | 0.0010 | 1.14% | 0.37% | 31.3% | 0.034% | 1.0040 | 1.0013 | 0.811 |
+| 0.8 mm | 0.00116 | 0.0085 | 10.7% | 3.66% | 62.8% | 0.045% | 1.114 | 1.027 | 0.265 |
+| 2.0 mm | 0.00729 | 0.167 | 56.7% | 9.73% | 37.6% | 0.112% | 1.955 | 1.077 | 0.396 |
+| 2.6 mm | 0.01071 | 0.447 | **66.5%** | **9.22%** | 31.3% | 0.146% | **2.266** | **1.058** | 0.451 |
+
+Every row is printed by the gate. It costs 5.4 s — four monolithic references, four
+increment controls, four rigid controls and thirty-six coupled solves — which is the
+most expensive single measurement in the suite, and the test prints its own wall
+time for that reason.
+
+Five things in that table are worth more than the headline.
+
+**The band is not where the failure strain suggests.** The regularised failure
+strain is 0.2004 and the zone here tears at an equivalent plastic strain of
+**0.0145** — the state under an in-plane drag is nearly biaxial and
+`plasticity.hpp`'s Rice–Tracey factor cuts the failure strain about fourteenfold.
+Damage, not plastic strain, is the coordinate that says how far into the band a
+case sits; the first element tears between 3.2 and 3.6 mm of travel (measured with
+the same harness at 48 increments, outside the gate — the gate stops at 2.6 mm
+because a reference past the tear is a reference that is localising). So the sweep
+above runs from the first increment of flow (damage 0.001) to **45% of the way to a
+tear**, and not through the first per cent of the band as the strain column
+suggests.
+
+**Zero plastic strain reproduces the old answer exactly, and by construction rather
+than by tolerance.** An element that has not flowed gets **no block at all** — not a
+block of zeros — so the softened substructure is the unsoftened one bit for bit,
+which `test_coupling.cpp` asserts over every entry of the reduced stiffness. The
+floor column is not coupling error: with nothing yielded the coupled surroundings
+are the *linear* monolithic plate's own to **1.55e-15 m of 2.28e-4 m**, and the
+0.03–0.15% in that column is the co-rotational element's own second-order geometry.
+The absolute error is quadratic in the travel and the peak grows linearly, so the
+column is *linear*: **0.056% of the peak per mm, flat to under 2% over a 4.3× range
+of load**, which is asserted, and which is what says the floor is geometry rather
+than a residue of the coupling or of the reference.
+
+**The exactness of that zero is one line of code and it survived mutation testing
+only after the test was strengthened.** `1/(1/x)` is not the identity in floating
+point but it is the identity for *most* doubles, and AH36's shear modulus is one of
+them — so a version of `secantShearModulus` with its exact-zero shortcut deleted
+passed a test that checked ship steel alone. One unit in the last place makes the
+knockdown ratio 0.999…89 instead of 1, which emits a block of near-zeros where there
+should be no block, and the bit-identity above is gone. The test sweeps six Young's
+moduli now and carries a guard that at least one of them is a modulus the reciprocal
+round trip loses; 206 GPa survives it and 127 GPa does not.
+
+**The direction is measured, not asserted.** The docs claimed the old model erred
+"in the stiff direction" and never checked. It does: the surroundings are dragged
+**1.95×** as far as they really go at 2.0 mm and 2.27× at 2.6 mm. A worst-error norm
+throws that sign away, which is why the perimeter pull is reported beside it.
+
+**The tangent is not a worse version of the secant, it is the wrong object.** It
+over-softens by a factor of two to four — the perimeter follows at 0.27–0.81 of the
+true travel where the elastic model follows at 1.00–2.27 — and it is at its *worst
+where the softening is smallest*: at 0.6 mm it is wrong by 31% where changing
+nothing is wrong by 1.1%, so the fix the docs prescribed would have been
+**twenty-seven times worse than the problem**. That is the finite step at first
+yield, arriving as a number.
+
+**What the secant leaves is a model error, not a convergence one, and the same run
+says so.** The staggered loop — zone state sets the softening, softening sets the
+interface displacement, interface displacement sets the zone state — already
+computes every pass, so keeping what each one recovered costs nothing. At the
+deepest case three passes leave 9.22% and six leave 8.55%; the sixth pass moves the
+field by **0.018% of the peak against the third-to-sixth 1.27%**, a factor of 72, so
+the loop has closed. The secant column reports the third pass at every load, because
+that is what a caller would plausibly buy, and the difference between it and the
+converged answer is under a tenth of the figure it reports. The residual is the isotropic
+knockdown standing in for a J2 secant that is not isotropic, and it stops
+growing — 9.7% at 2.0 mm and 9.2% at 2.6 mm, where the model it replaces is still
+climbing.
+
+##### Where it stops
+
+**Torn elements are skipped, and that is not an omission.** A torn element's secant
+stiffness is not small, it is absent, and handing back `−K_e` leaves rows no element
+supports — the singular interior that direction 2 drops an orphan node to avoid, and
+that `reduction.hpp` records the banded factorisation does not reliably catch.
+Tearing goes back through `withoutTornElements` and softening through this, in that
+order; `tests/test_coupling.cpp` asserts the composition, including that a zone with
+a tear and no flow reproduces the deletion route with an empty correction.
+
+**A secant is a statement about the state it was measured at.** It is exact where
+the point is at yield, which is every point of a monotonically loaded zone. A point
+that has yielded and unloaded is reported with the stiffness it had at its peak,
+because the secant is built from `σ_y(ε_p)` rather than from the stress the point
+currently carries — the bounded, monotone choice, where the ratio of the two runs to
+zero as an unloaded point's stress does.
+
+##### One trap worth writing down
+
+`elementPlasticUpdate` measures its enhanced-strain Newton against
+`yieldStrength × volume`. The obvious way to build the elastic control above is a
+material that cannot yield, and a yield strength of 1e30 loosens that tolerance
+until the enhanced modes stop being solved for: measured at **1.45% of the peak
+displacement, flat in the load**, which is the signature of a tolerance and not of
+physics — measured at 0.025, 0.05, 0.1, 0.2 and 0.4 mm of travel, outside the gate.
+It put a 1.45% floor under the first version of this whole measurement. Ten times
+the real strength is enough to keep the surroundings elastic and leaves the floor at
+0.02%, and there the error goes as travel squared, which is what says it is
+geometry.
+
 #### What it does not do yet
 
-1. **Plastic softening short of a tear does not go back.** A reduction is linear
-   (§*Tier 1*, what a reduced region cannot do) and the Tier-2 explicit solver
-   forms no tangent operator, so between first yield and first tear the
-   surroundings are told the zone is stiffer than it is — the unsafe direction.
-   Closing it needs a reduction built from a tangent the solver does not form.
+1. **The secant knockdown is isotropic and the loop is staggered.** A J2 secant is
+   not isotropic — the material stays elastic in directions orthogonal to the flow —
+   and the correction here replaces the element's two isotropic moduli, keeping the
+   bulk one and softening the shear one. That is what the residual 9% above is. The
+   operator that would remove it is the algorithmic tangent `plasticity::update`
+   already returns, integrated over the element with a per-Gauss-point 6×6, which is
+   a new element stiffness path in `solid_shell.{hpp,cpp}` rather than anything this
+   file could do. A second edge of the same approximation: keeping `K` and softening
+   `G` drives the secant Poisson ratio towards a half, and the sweep above only
+   reaches `G_s/G = 0.480`, which is `ν_s = 0.397`. A knockdown of ten would be
+   `ν_s = 0.477` and near enough incompressible that the element's own EAS block is
+   what stands between it and volumetric locking. Nothing measures that yet.
+
+   Separately, the zone's state and the interface displacement set each other, so a
+   caller runs passes. Six closes the loop on the plate above and three gets within
+   a tenth of it, and nothing in `coupling.{hpp,cpp}` runs them, because how many
+   are affordable is a caller's decision and each one costs a zone re-solve.
 2. **A stiffener has to be handed to Tier 1 explicitly, and a caller who does not
    still gets the bare plating.** A zone under `Stiffeners::Modelled` carries its
    members as `constraint::Stiffening` — fibres condensed onto the plating's own
@@ -4870,6 +5055,33 @@ and seven of those were guards nothing reached:
   quietly free.
 - **A repeated prescribed DOF** takes the last value rather than the sum, and
   nothing named one twice.
+
+**A second round, 44 mutants, for §*Direction 2b*.** Every one killed — but only
+after the suite grew the two guards the earlier passes exposed. The survivor was the
+deletion of `secantShearModulus`'s exact-zero shortcut, which is the single line the
+whole negative control rests on, and it survived because `1/(1/G) == G` happens to
+hold for AH36's shear modulus. That is the shape of defect this table exists for: an
+exactness assertion satisfied by an arithmetic coincidence at one number. The fix is
+a sweep of six Young's moduli with a guard that at least one of them loses the
+reciprocal round trip. Nothing else in either round survived, no mutant crashed and
+none timed out, against a harness that counts both.
+
+The second guard came from asking what in the diff was *not* exercised rather than
+whether the tests passed: `Softening::element` — which block corrects which element,
+and the only way a caller can tell what was softened — shipped with nothing reading
+it, and three mutants aimed at it (numbering the blocks instead of naming the
+elements, dropping the last element of the mesh, reversing a block's node order) all
+died once a test softened an odd-numbered *subset* rather than everything. Softening
+the whole mesh would have made a wrong answer indistinguishable from a right one.
+
+Four of the killed are worth naming, because each is a plausible edit rather than a
+typo: averaging the *modulus* over an element's Gauss points instead of the plastic
+*compliance* (the compliance is what is additive in the closed form, and the modulus
+average reports a patchily yielded element stiffer than a uniformly yielded one
+carrying the same flow); dropping the volume weighting in that average; leaving the
+correction unsymmetrised, which `Substructure` scatters into both triangles where
+the element assembly never sees the halves apart; and softening a torn element
+rather than skipping it.
 
 The one argued equivalent is the lower clamp in the boundary ramp's smoothstep:
 the only call site passes `result_.time + dt`, and `result_.time` starts at zero

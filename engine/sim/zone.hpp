@@ -177,15 +177,20 @@
 //
 // --- 5. What this does not do yet ---------------------------------------------
 //
-//  1. **Coupling to Tier 1 is static and elastic on the way back.**
+//  1. **Coupling to Tier 1 is static, and it is a linearisation on the way back.**
 //     `coupling.{hpp,cpp}` now drives the perimeter from a Craig-Bampton model of
-//     the structure round the patch, and hands a torn zone back to that model as a
-//     mesh with the dead elements removed, so the surroundings feel the damage.
-//     What it does *not* carry back is plastic softening short of a tear: a
-//     reduction is linear (`reduction.hpp` §6) and this solver forms no tangent
-//     operator, so between first yield and first tear the surroundings are told
-//     the zone is stiffer than it is. Coupling to Tier 0 is unchanged and remains
-//     the path `promotion.{hpp,cpp}` owns.
+//     the structure round the patch, hands a torn zone back to that model as a
+//     mesh with the dead elements removed, and hands a *yielded* one back as a
+//     secant knockdown built from the equivalent plastic strain this solver
+//     already carries per integration point (`coupling.hpp` §5). This item used to
+//     say the second of those could not be done without a tangent operator; at 45%
+//     of the way to a tear it measured at 66% of the surroundings' own
+//     displacement, a secant closes it to 9%, and a tangent would have made it
+//     *worse* than doing nothing at small plastic strain. What is left is that the knockdown is isotropic where a J2
+//     secant is not, and that the zone's state and the interface displacement set
+//     each other -- so the loop is staggered and a caller decides how many passes
+//     it can afford. Coupling to Tier 0 is unchanged and remains the path
+//     `promotion.{hpp,cpp}` owns.
 //  2. **The indenter is kinematic and rigid.** Nodes inside a rectangular footprint
 //     are driven at a prescribed velocity; there is no contact search, no friction,
 //     no release, and the striking body does not crush. A prescribed motion cannot

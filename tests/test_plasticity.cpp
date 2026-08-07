@@ -1841,6 +1841,139 @@ void testCost() {
                plasticPath < 1.0e6 && elasticPath < 1.0e6);
 }
 
+// --- What a yielded point has left ------------------------------------------------
+//
+// Two closed forms and a discontinuity. The secant is what `coupling.hpp` §5 hands
+// a reduced model, so the property that matters most is not its value at any one
+// strain but that it leaves G **exactly** at zero plastic strain: a coupling that
+// is exact on an unyielded zone stops being exact the moment this returns
+// `G * (1 - 1e-17)`.
+void testWhatAYieldedPointHasLeft() {
+    std::printf("\n--- the modulus a yielded point has left ---\n");
+    const Material steel = shipSteel();
+    const double shear = steel.shearModulus(), bulk = steel.bulkModulus();
+
+    // 1. Zero plastic strain returns the elastic modulus to the last bit, and it has
+    //    to be swept rather than asserted once.
+    //
+    //    **`1/(1/x)` is not the identity in floating point, but it is the identity
+    //    for most doubles**, and AH36's shear modulus is one of them. So the version
+    //    of this that checked ship steel alone passed against an implementation with
+    //    the exact-zero shortcut removed -- mutation testing found exactly that, and
+    //    it is the shortcut the whole negative control in `test_coupling.cpp` rests
+    //    on: one unit in the last place makes the knockdown ratio 0.999...89 instead
+    //    of 1, which emits a block of near-zeros where there should be no block.
+    //    206 GPa survives the round trip; **127 GPa does not**, in either modulus,
+    //    which is why it is in the sweep.
+    int swept = 0, luckyRoundTrips = 0;
+    for (double youngs : {69.0e9, 110.0e9, 127.0e9, 200.0e9, 206.0e9, 310.0e9}) {
+        Material other = steel;
+        other.youngsModulus = youngs;
+        const double otherShear = other.shearModulus();
+        expectTrue("an unyielded point's secant shear modulus is G, bit for bit",
+                   secantShearModulus(other, 0.0) == otherShear);
+        expectTrue("and so is its secant Young's modulus",
+                   secantYoungsModulus(other, 0.0) == youngs);
+        expectTrue("a negative plastic strain is clamped to zero rather than extrapolated",
+                   secantShearModulus(other, -0.1) == otherShear);
+        if (1.0 / (1.0 / otherShear) == otherShear && 1.0 / (1.0 / youngs) == youngs)
+            ++luckyRoundTrips;
+        ++swept;
+    }
+    // The guard that stops the sweep being vacuous: at least one of those moduli has
+    // to be one the reciprocal round trip does *not* survive, or every case above is
+    // satisfied by arithmetic that happens to be exact and the shortcut is untested.
+    std::printf("  %d moduli swept, %d of which survive 1/(1/x) by luck\n", swept,
+                luckyRoundTrips);
+    expectTrue("the sweep contains a modulus the reciprocal round trip loses",
+               luckyRoundTrips < swept);
+
+    // 2. The isotropic pair built from (K, G_s) *is* the uniaxial secant. That is the
+    //    identity 1/E = 1/(9K) + 1/(3G) carried through the plastic term, and it is
+    //    what makes "keep the bulk modulus, soften the shear one" the right split
+    //    rather than a plausible one.
+    double worstPair = 0, worstDirect = 0;
+    for (double plastic : {1.0e-5, 1.0e-4, 1.0e-3, 1.0e-2, 5.0e-2, 0.15}) {
+        double youngs = 0, poisson = 0;
+        isotropicFromBulkShear(bulk, secantShearModulus(steel, plastic), &youngs, &poisson);
+        const double closed = secantYoungsModulus(steel, plastic);
+        // ...and the closed form itself, from the stress-strain point: sigma_y over
+        // the total strain that produced it. Nothing here reuses the expression
+        // under test.
+        const double strength = flowStress(steel.flow, plastic);
+        const double total = strength / steel.youngsModulus + plastic;
+        worstPair = std::max(worstPair, std::fabs(youngs - closed) / closed);
+        worstDirect = std::max(worstDirect, std::fabs(closed - strength / total) / closed);
+        expectTrue("the secant Poisson ratio moves towards a half and never past it",
+                   poisson > steel.poissonRatio && poisson < 0.5);
+    }
+    std::printf("  (K, G_s) reproduces the uniaxial secant to %.2e relative;\n"
+                "  the uniaxial secant is sigma_y/eps to %.2e\n",
+                worstPair, worstDirect);
+    expectTrue("the isotropic pair is the uniaxial secant, to rounding", worstPair < 1e-15);
+    expectTrue("and the uniaxial secant is the stress over the total strain",
+               worstDirect < 1e-15);
+
+    // 3. Monotone, and bounded below by nothing physical -- it falls forever, which
+    //    is why a caller with a real element has to notice when it reaches zero.
+    double previous = shear;
+    for (double plastic : {1.0e-4, 1.0e-3, 1.0e-2, 0.1, 1.0}) {
+        const double got = secantShearModulus(steel, plastic);
+        expectTrue("the secant modulus falls with plastic strain", got < previous && got > 0.0);
+        previous = got;
+    }
+
+    // 4. **The tangent is discontinuous at first yield and the secant is not.** This
+    //    is the whole reason `coupling.hpp` §5's control loses: an elastic point has
+    //    modulus G, and the tangent's limit as the plastic strain goes to zero is
+    //    not G but a finite fraction of it.
+    const double tangentAtOnset = tangentShearModulus(steel, 0.0);
+    const double secantJustPast = secantShearModulus(steel, 1.0e-9);
+    std::printf("  at the first increment of flow: G_t/G = %.4f, G_s/G = %.9f\n",
+                tangentAtOnset / shear, secantJustPast / shear);
+    expectTrue("the tangent drops by a finite step at first yield",
+               tangentAtOnset < 0.1 * shear && tangentAtOnset > 0.0);
+    expectTrue("the secant leaves G continuously", secantJustPast > 0.999999 * shear);
+    expectTrue("so the two disagree by more than an order of magnitude where the softening "
+               "is smallest",
+               secantJustPast > 10.0 * tangentAtOnset);
+
+    // 5. Perfect plasticity has no tangent stiffness at all, taken as the limit
+    //    rather than divided by. The secant on the same curve is still finite.
+    Material flat = steel;
+    flat.flow = linearHardening(355.0e6, 0.0);
+    expectTrue("a perfectly plastic curve has no tangent shear stiffness",
+               tangentShearModulus(flat, 0.01) == 0.0);
+    expectTrue("but it still has a secant one", secantShearModulus(flat, 0.01) > 0.0);
+
+    // 6. On a linear curve both are closed forms of their own, which is the check
+    //    that the Swift arithmetic above is not being marked against itself.
+    Material linear = steel;
+    const double hardening = 2.0e9;
+    linear.flow = linearHardening(355.0e6, hardening);
+    const double e = linear.youngsModulus;
+    const double wantTangent = 1.0 / (1.0 / linear.shearModulus() + 3.0 / hardening);
+    expectNear("the linear-curve tangent shear modulus is 1/(1/G + 3/H)",
+               tangentShearModulus(linear, 0.03), wantTangent, 1e-9 * wantTangent);
+    const double plastic = 0.03, sigma = 355.0e6 + hardening * plastic;
+    expectNear("and the linear-curve secant Young's modulus is sigma/(sigma/E + eps_p)",
+               secantYoungsModulus(linear, plastic), sigma / (sigma / e + plastic),
+               1e-9 * sigma / (sigma / e + plastic));
+
+    // 7. `isotropicFromBulkShear` on the *elastic* pair is the identity, to rounding
+    //    -- the round trip, which is why `coupling.hpp` §5 emits no block at all for
+    //    an unyielded element rather than a block of zeros.
+    double youngs = 0, poisson = 0;
+    isotropicFromBulkShear(bulk, shear, &youngs, &poisson);
+    std::printf("  the elastic round trip is off by %.2e in E and %.2e in nu, which is why an "
+                "unyielded element gets no block\n",
+                std::fabs(youngs - steel.youngsModulus) / steel.youngsModulus,
+                std::fabs(poisson - steel.poissonRatio));
+    expectTrue("the round trip through (K, G) recovers E and nu to rounding",
+               std::fabs(youngs - steel.youngsModulus) < 1e-12 * steel.youngsModulus &&
+                   std::fabs(poisson - steel.poissonRatio) < 1e-14);
+}
+
 }  // namespace
 
 void runPlasticityTests() {
@@ -1867,5 +2000,6 @@ void runPlasticityTests() {
     testElementFrameIndifference();
     testElementTears();
     testPartialFailureIsNotATear();
+    testWhatAYieldedPointHasLeft();
     testCost();
 }

@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: MIT
 #include "coupling.hpp"
 
+#include "plasticity.hpp"
+
 #include <algorithm>
 #include <cmath>
+#include <string>
 
 namespace sim::coupling {
 
+using solidshell::kDof;
+using solidshell::kGauss;
 using solidshell::kNodes;
 
 // --- 1. A boundary condition on a reduced model ---------------------------------
@@ -213,6 +218,160 @@ std::vector<std::uint32_t> carriedInterface(const DamagedMesh& damaged,
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
+}
+
+// --- 5. What a yielded zone hands back ---------------------------------------------
+namespace {
+
+// The shear modulus one element has left, as a fraction of the elastic one.
+//
+// **The average is taken over the plastic *compliance*, not over the modulus.**
+// The closed form in `plasticity.hpp` is additive in compliance -- 1/G_s = 1/G +
+// 3 eps_p / sigma_y -- so averaging the added term is averaging the thing that is
+// linear in the damage, and it is also the softer of the two averages, which is
+// the direction §5 exists to move in. Averaging the modulus instead would report a
+// patchily yielded element stiffer than a uniformly yielded one carrying the same
+// total flow.
+//
+// **An element none of whose points has flowed returns exactly 1.0, by the
+// short-circuit rather than by the arithmetic.** An elastic point adds no
+// compliance under either modulus, so it is skipped before either closed form is
+// called; the alternative -- letting it add `1/G - 1/G` -- is not the same thing,
+// because the tangent of a point that is not flowing is `G` and is not the limit of
+// `tangentShearModulus` at zero. Exactness here is what makes the unyielded case
+// bit-identical downstream rather than merely close, and mutation testing kills
+// both the removal of this line and the removal of its partner in
+// `plasticity::secantShearModulus`.
+double shearRatio(const plasticity::Material& material,
+                  const solidshell::ElementPlasticState& state, const double volume[kGauss],
+                  Modulus modulus, double* peakPlasticStrain) {
+    const double shear = material.shearModulus();
+    double totalVolume = 0.0, plasticCompliance = 0.0;
+    bool dead = false;
+    for (int g = 0; g < kGauss; ++g) {
+        const double plastic = state.point[g].equivalentPlasticStrain;
+        if (peakPlasticStrain) *peakPlasticStrain = std::max(*peakPlasticStrain, plastic);
+        totalVolume += volume[g];
+        if (plastic <= 0.0) continue;  // elastic: no added compliance, either modulus
+        const double left = modulus == Modulus::Secant
+                                ? plasticity::secantShearModulus(material, plastic)
+                                : plasticity::tangentShearModulus(material, plastic);
+        if (!(left > 0.0)) {
+            dead = true;  // a perfectly plastic tangent: infinite added compliance
+            continue;
+        }
+        plasticCompliance += volume[g] * (1.0 / left - 1.0 / shear);
+    }
+    if (dead) return 0.0;
+    if (!(totalVolume > 0.0) || plasticCompliance <= 0.0) return 1.0;
+    return 1.0 / (1.0 + shear * plasticCompliance / totalVolume);
+}
+
+}  // namespace
+
+Softening softening(const solidshell::HexMesh& mesh, const StructuralMaterial& elastic,
+                    const plasticity::Material& material,
+                    const std::vector<solidshell::ElementPlasticState>& state, Modulus modulus,
+                    solidshell::Formulation form) {
+    Softening out;
+    const std::size_t elements = mesh.elementCount();
+    if (state.size() != elements) {
+        // Refused rather than read short. A state array of the wrong length is a
+        // zone whose history belongs to a different mesh, and the blocks it would
+        // produce would soften whichever elements happened to line up -- a
+        // plausible field and the wrong one, which is the failure mode §5 is here
+        // to remove rather than to introduce.
+        out.problems.push_back("the plastic state is " + std::to_string(state.size()) +
+                               " long for a mesh of " + std::to_string(elements) +
+                               " elements, so it is not this mesh's history");
+        return out;
+    }
+    if (elements == 0) return out;
+
+    const double bulk = elastic.youngsModulus / (3.0 * (1.0 - 2.0 * elastic.poissonRatio));
+    const double shear = elastic.youngsModulus / (2.0 * (1.0 + elastic.poissonRatio));
+
+    double softVolume = 0.0, totalVolume = 0.0;
+    for (std::size_t e = 0; e < elements; ++e) {
+        double nodes[kDof], volume[kGauss];
+        mesh.gather(e, mesh.position, nodes);
+        solidshell::gaussVolumes(nodes, volume);
+        double elementVolume = 0.0;
+        for (int g = 0; g < kGauss; ++g) elementVolume += volume[g];
+        totalVolume += elementVolume;
+
+        if (state[e].torn) {
+            ++out.torn;
+            for (int g = 0; g < kGauss; ++g)
+                out.peakPlasticStrain =
+                    std::max(out.peakPlasticStrain, state[e].point[g].equivalentPlasticStrain);
+            continue;  // §5: a tear is `withoutTornElements`, not a knockdown
+        }
+
+        const double ratio = shearRatio(material, state[e], volume, modulus, &out.peakPlasticStrain);
+        softVolume += elementVolume * ratio;
+        if (ratio >= 1.0) continue;  // never flowed: no block at all, so no rounding
+        out.worstRatio = std::min(out.worstRatio, ratio);
+        if (!(ratio > 0.0))
+            out.problems.push_back(
+                "element " + std::to_string(e) +
+                " has no shear stiffness left, so the reduced zone has a hole in it that the "
+                "interior factorisation will not reliably catch");
+
+        double softened[kDof * kDof], intact[kDof * kDof];
+        StructuralMaterial weakened = elastic;
+        plasticity::isotropicFromBulkShear(bulk, ratio * shear, &weakened.youngsModulus,
+                                           &weakened.poissonRatio);
+        solidshell::elementStiffness(nodes, weakened, form, softened);
+        solidshell::elementStiffness(nodes, elastic, form, intact);
+
+        solidshell::DofBlock block;
+        block.dof.resize(kDof);
+        for (int a = 0; a < kNodes; ++a) {
+            const std::uint32_t n = mesh.index[e * kNodes + static_cast<std::size_t>(a)];
+            for (int k = 0; k < 3; ++k)
+                block.dof[static_cast<std::size_t>(a * 3 + k)] = n * 3 + static_cast<std::uint32_t>(k);
+        }
+        // Symmetrised on the way out. `elementStiffness` is symmetric to rounding
+        // rather than to the last bit, and `Substructure` scatters both triangles of
+        // a block, so an asymmetry here would survive into a matrix the reduction
+        // assumes is symmetric -- unlike the element assembly beside it, which never
+        // sees the two halves apart.
+        block.stiffness.resize(static_cast<std::size_t>(kDof) * kDof);
+        for (int i = 0; i < kDof; ++i)
+            for (int j = 0; j <= i; ++j) {
+                const double d = 0.5 * ((softened[i * kDof + j] - intact[i * kDof + j]) +
+                                        (softened[j * kDof + i] - intact[j * kDof + i]));
+                block.stiffness[static_cast<std::size_t>(i) * kDof + static_cast<std::size_t>(j)] = d;
+                block.stiffness[static_cast<std::size_t>(j) * kDof + static_cast<std::size_t>(i)] = d;
+            }
+        out.attachment.stiffness.push_back(std::move(block));
+        out.attachment.stress.emplace_back(static_cast<std::size_t>(kDof), 0.0);
+        out.element.push_back(static_cast<std::uint32_t>(e));
+        ++out.softened;
+    }
+
+    if (totalVolume > 0.0) out.meanRatio = softVolume / totalVolume;
+    if (!out.attachment.stiffness.empty()) out.attachment.mass.assign(mesh.nodeCount(), 0.0);
+    if (out.torn > 0)
+        out.problems.push_back(
+            std::to_string(out.torn) +
+            " torn element(s) were not softened: a tear is element deletion, not a knockdown -- "
+            "see `withoutTornElements`");
+    return out;
+}
+
+Softening softening(const zone::Patch& patch, const zone::Solver& solver,
+                    const plasticity::Material& material, Modulus modulus) {
+    if (solver.elementState().empty()) {
+        // The same distinction `withoutTornElements` draws: "no damage" and "no
+        // damage model" are different answers and a caller cannot tell them apart
+        // from an empty result.
+        Softening out;
+        out.problems.push_back("the zone was solved elastically, so no element can have yielded");
+        return out;
+    }
+    return softening(patch.mesh, patch.material, material, solver.elementState(), modulus);
 }
 
 }  // namespace sim::coupling
