@@ -267,11 +267,18 @@
 // warning stands: **neither of those two could have told you the junction was
 // open.**
 //
-// The 60 m that stays open is the nodes on a cut plane. An interface degree of
-// freedom is what a reduction keeps *exactly* and what `applyBeamLoad` prescribes;
-// a degree of freedom cannot be both prescribed and derived, so those are counted in
-// `junctionsOnInterface` and left. On an eleven-bay section that is two stations of
-// twelve.
+// The 60 m that stays open is the nodes on a cut plane, and it is open because a
+// master *face* spans x: half its nodes are interior to the section, and a boundary
+// degree of freedom written as a function of an interior one is not one a reduction
+// keeps exactly -- `reduction::Substructure` refuses it. On an eleven-bay section that
+// is two stations of twelve.
+//
+// **§9 closes it, for a chain, with a tie to the master's line rather than its face.**
+// A lone section's cut planes stay open and should: they are what a load is prescribed
+// on, and a prescribed degree of freedom cannot also be derived. The 60 m above is
+// therefore still what this section delivers, and it is exactly
+// `planeTiedEdgesAft + planeTiedEdgesForward` -- 28.8 + 31.2 -- which is what a
+// neighbour on either side would join.
 //
 // --- What it costs, which is the band ---------------------------------------------
 //
@@ -454,6 +461,18 @@ struct SectionParams {
     // and it is what this file did before the tie existed.
     bool junctions = true;
 
+    // Build the **in-plane line ties** of §9 as well: the junction nodes that lie on a
+    // cut plane, tied to the line the other surface draws on that same plane rather
+    // than to a face that leaves it. A section does not apply them -- its interface is
+    // prescribed -- it carries them in `Section::planeTies` and `buildChain` puts them
+    // on the assembled model, where an interior plane is shared instead.
+    //
+    // Off is the negative control every figure in §9 is measured against, and it is
+    // what this file did before: `Section::junctionsOnInterface` then counts every
+    // junction node on a cut plane instead of only the ones no line reaches. It has no
+    // effect at all on a section solved on its own.
+    bool interfaceTies = true;
+
     // How far outside a master face, in the face's own natural coordinates, a tied
     // point may land. Zero would refuse every L-junction: two plates butting at a
     // corner have each other's mid-surface *ending* at the corner line, so a node
@@ -493,6 +512,27 @@ struct SectionParams {
     // is inside it but six, at x = 45.6..50.4 m, where a deck lands 2.15
     // thicknesses off a bilge strake's mid-surface and asks for `w = 2.65`.
     double junctionWeightLimit = 1.0;
+};
+
+// One in-plane line tie: a junction node on a cut plane written as a linear function
+// of the four mesh nodes of the segment the other surface draws on that same plane.
+// See §9.
+//
+// **Every degree of freedom in it lies on `plane`**, which is the whole point and the
+// only thing that distinguishes it from a `§5` tie. That makes it a relation among the
+// section's *boundary* unknowns, so it is meaningless inside a `reduction::Substructure`
+// -- which keeps its interface exactly and refuses a boundary degree of freedom that is
+// a function of others -- and exact on the assembled model of a chain, where the plane
+// is shared by the two sections that meet on it and prescribed by neither.
+struct PlaneTie {
+    // Which cut plane: 1 the aft, 2 the forward. From the mesher's own membership test
+    // on the **mid-surface**, not from a position test on the node -- a node whose
+    // plating leans out of the transverse plane is up to `t/2` off it, which is the
+    // distinction §6 note 1 records costing a day.
+    std::uint8_t plane = 0;
+    // In the section's own mesh degrees of freedom. `buildChain` maps them through
+    // `reduction::Substructure::boundaryDof` and `Assembly::from`.
+    solidshell::Mpc mpc;
 };
 
 // A meshed section: the elements, what they came from, how well they joined up,
@@ -608,6 +648,40 @@ struct Section {
     // one way this formulation can produce something an integrator cannot use.
     double worstJunctionOvershoot = 0;
     double worstJunctionWeight = 0;
+
+    // --- The in-plane line tie, see §9 ---------------------------------------------
+    //
+    // What a cut plane's ring of junctions comes to when it is not left open: the
+    // constraints, in this section's mesh degrees of freedom, and what applying them
+    // would join. A section on its own applies none of them -- `buildChain` does, and
+    // only at the interior planes, because an outermost plane is still prescribed.
+    std::vector<PlaneTie> planeTies;
+    int planeTieNodes = 0;  // mid-surface nodes tied this way, so `6 x` constraints
+    // How much more of `junctionEdges` is joined once the ties on the aft plane, on
+    // the forward plane, or on both at once are applied. `Both` is an edge reaching
+    // from one cut to the other -- a section one element long -- which needs both
+    // planes to be interior before it is joined at all, so it is counted apart rather
+    // than credited to either.
+    double planeTiedEdgesAft = 0, planeTiedEdgesForward = 0, planeTiedEdgesBoth = 0;
+    // Junction nodes on a cut plane a line tie could not take, and why. `Unreached` is
+    // **no one segment on this plane reaching both of the slave's extruded nodes**:
+    // either no other surface draws one within `junctionTolerance`, which is the honest
+    // answer where the other plate stops short of the cut, or the slave straddles the
+    // node between two of them and each half of its pair falls the other way. Tying the
+    // two halves to two different segments would split the slave against two plates.
+    int planeTiesUnreached = 0, planeTiesOutsideLine = 0;
+    int planeTiesThroughThickness = 0, planeTiesChained = 0;
+    // The same two bounds §5 reports, over the line ties, and one a face tie has no
+    // analogue of.
+    //
+    // **`worstPlaneTieSlip` is the whole of what a line approximates and a face does
+    // not.** Projecting onto a face leaves a residual along the master's own normal
+    // and nothing else, and the through-thickness weight is exactly what that residual
+    // becomes -- so a face tie drops nothing. Projecting onto a line leaves that, plus
+    // whatever ran along the master's surface *across* the line; on a cut plane that
+    // direction is x, so it is the slave's own normal leaning fore or aft, bounded by
+    // `t/2`. Zero on prismatic plating, m elsewhere.
+    double worstPlaneTieOvershoot = 0, worstPlaneTieWeight = 0, worstPlaneTieSlip = 0;
 
     int straddlingPanels = 0;   // panels a cut plane passed through, and dropped
     // Panels outside the section that reached one of its nodes, were averaged into
@@ -1105,22 +1179,22 @@ TorsionResponse applyTwist(const Section& section, const StructuralMaterial& mat
 // short in `EA` on a shoulder while reporting nothing wrong at all. It is the same
 // mistake in reverse that hid the 336 above behind a count of 24.
 //
-// **2. Every interior cut plane opens a ring of junctions the monolith closes.** A
-// junction node on a cut plane is an interface degree of freedom, and one of those is
-// prescribed rather than derived -- `Section::junctionsOnInterface`, §5. Cutting a
-// length into N pieces turns N-1 interior stations into interfaces, so the chain ties
-// N-1 stations fewer than the monolith does. Measured on x = -7.2 to 2.4 m of the
-// ferry, four bays: in one piece 36 ties and 72.0 m of junction edge joined; as two
-// two-bay sections, 12 + 12 ties and 4.8 + 4.8 m. That is not a rounding and it does
-// **not** get better with more sections -- it is the one thing about a chain that
-// argues for cutting it into as few pieces as the interface cost allows, and it is
-// the opposite of what an interior plane looks like it should do.
+// **2. Every interior cut plane used to open a ring of junctions the monolith closes,
+// and §9 is what closed it.** A junction node on a cut plane gets no *face* tie --
+// §5's master face spans x, so half its nodes are interior to the section, and a
+// boundary degree of freedom written as a function of an interior one is not one a
+// reduction keeps exactly. Cutting a length into N pieces turns N-1 interior stations
+// into interfaces, so a chain used to tie N-1 stations fewer than the monolith does.
+// Measured on x = -7.2 to 2.4 m of the ferry, four bays: in one piece 36 ties and
+// 72.0 m of junction edge joined; as two two-bay sections, 12 + 12 ties and
+// 4.8 + 4.8 m. On the box in the tests it cost **19.2% of `GJ` at N = 8** while `EA`
+// stayed exact at 1e-12 at every N, which is why the measurement had to be torsion.
 //
-// It cannot be fixed by tying anyway: a degree of freedom cannot be both prescribed
-// and derived. What would fix it is a tie whose masters all lie *in* the cut plane,
-// which both sections would then derive identically from shared boundary DOF -- and
-// that is a line tie through the plating thickness rather than the bilinear face tie
-// §5 builds, so it is new machinery rather than a parameter.
+// The fix is a tie whose masters all lie *in* the cut plane, which both sections
+// derive identically from shared boundary DOF -- a line tie through the plating
+// thickness rather than the bilinear face tie §5 builds. It is §9, it is new
+// machinery rather than a parameter, and the table above is now the negative control
+// `SectionParams::interfaceTies = false` reproduces.
 //
 // --- What it costs ----------------------------------------------------------------
 //
@@ -1131,6 +1205,229 @@ TorsionResponse applyTwist(const Section& section, const StructuralMaterial& mat
 // Cutting a ship into more pieces makes every piece cheaper to reduce and the
 // assembly quadratically dearer to solve, which is the trade a caller is making
 // whether or not it is stated. `tools/section_probe --chain=N` measures both halves.
+//
+// --- 9. The in-plane line tie: what an interior cut plane no longer costs ----------
+//
+// **The first question was whether this is possible at all, because a prescribed
+// degree of freedom cannot also be derived and that is why the ties were dropped.
+// The answer is that the premise was half right: an interior cut plane is not
+// prescribed, it is *shared*.** The two are different things and §6 note 2 ran them
+// together. What a reduction keeps exactly is the interface; what a *load* prescribes
+// is the chain's two outermost planes. An interior plane is neither -- it is a set of
+// unknowns that two reduced models both write into -- and a relation among those
+// unknowns is something the assembled model can carry.
+//
+// So the impossibility is real but narrower than it looked, and it lands in exactly
+// one place: **a `Substructure` cannot carry this constraint and an `Assembly` can.**
+//
+//   * §5's master is a *face*, and a sub-quad face spans x. Half its nodes are one
+//     station inside the section, so a slave on the cut plane would be a function of
+//     an interior unknown -- which is not something a reduction keeps exactly, and
+//     `reduction::Substructure` refuses it in as many words rather than dropping it.
+//   * The master that works is the **line** that surface draws on the same cut plane:
+//     the sub-quad edge both of whose ends are on the plane. Two mid-surface nodes,
+//     four mesh nodes with the through-thickness split, and every one of them on the
+//     plane. `Section::planeTies` is that, and `SectionParams::interfaceTies` is the
+//     negative control.
+//   * A section therefore **carries** the constraint and does not apply it. Its own
+//     two planes are what a load is prescribed on, so applying one there really would
+//     be a second claim on one unknown. `buildChain` applies them at the **interior**
+//     planes only, on `Assembly::stiffness` and `Assembly::mass`, as `T^T K T`.
+//
+// **Doing it after the condensation rather than before is exact, not an
+// approximation, and that is the load-bearing step.** Guyan condensation is exact for
+// any prescribed boundary displacement (`reduction.hpp` property 1), so the reduced
+// energy is `0.5 u_b^T K_r u_b` for *every* `u_b`. Restricting `u_b` to the subspace
+// the tie defines and relaxing the interior is therefore the same number as applying
+// the tie first and condensing after -- the constraint touches boundary rows only, so
+// it commutes with eliminating the interior. Nothing is truncated and no penalty is
+// introduced, exactly as in §5.
+//
+// --- What it does, on the box, where every quantity has a closed form ---------------
+//
+//     sections                        1          2          4          8
+//     -------------------------------------------------------------------------
+//     junction edge joined, of 64.0 m
+//       cut planes open              58.0       52.0       40.0       16.0
+//       line ties                    58.0       58.0       58.0       58.0
+//     GJ against the same length in one piece
+//       cut planes open           -2.6e-12    -3.289%    -9.236%   -19.204%
+//       line ties                 -2.6e-12   +9.3e-12   +2.9e-11   -1.6e-11
+//     EA against the closed form
+//       cut planes open            1.2e-12    8.0e-14    1.5e-12    1.1e-12
+//       line ties                  1.2e-12    1.2e-13    1.5e-12    1.4e-12
+//
+// **58.0 m at every N is the whole claim, and it is the monolith's own figure.** The
+// 6.0 m that never joins is the two outermost planes, which one piece leaves open as
+// well. `GJ` comes back to the conditioning of two independent solves -- 1e-11, four
+// orders below the 3.3% the first cut used to cost -- and it does so at N = 8, where
+// every station but two is an interface.
+//
+// **`EA` is the row that says why none of this could have been validated on `EA`.**
+// It is exact to 1e-12 in *both* columns at every N, so an implementation that did
+// nothing at all would have scored best on it. §2 says this about a section and it is
+// no less true of a chain: prescribing plane sections at the ends makes every
+// longitudinal strip carry `sigma = E eps` whatever it is joined to.
+//
+// --- And on the ferry, where it is a factor of fifty rather than an identity --------
+//
+//     ferry, tied                             junction edge joined   GJ vs one piece
+//     ------------------------------------------------------------------------------
+//     x = -7.2..2.4, 2 sections, planes open   9.6 m of 134.4           -3.334%
+//     x = -7.2..2.4, 2 sections, line ties     72.0 m (= one piece)     -0.095%
+//     x = -7.2..16.8, 5 sections, planes open  28.8 m of 336.0          -8.939%
+//     x = -7.2..16.8, 5 sections, line ties    273.6 m (= one piece)    -0.174%
+//
+// **It joins exactly what the monolith joins and it does not carry exactly what the
+// monolith carries, and the reason is worth stating rather than calling it
+// conditioning.** On the box the two are the *same constraint*: a slave whose own
+// normal is square to the cut lands on the master face's edge, where the bilinear shape
+// functions collapse onto the two nodes the line tie uses, so the line tie is the face
+// tie restricted rather than an approximation to it. On a real hull the slave lands a
+// little off that edge, so the monolith's face tie and the chain's line tie are two
+// slightly different constraints on the same junction -- and the residual is what the
+// line drops. 0.1% and 0.17% against 3.3% and 8.9%.
+//
+// The lowest fixed-interface frequency is the third instrument and it separates the
+// two by their **sign**. A tied chain is the monolith with each piece reduced, so its
+// Rayleigh quotient is an upper bound and it comes down onto the monolith's own
+// frequency from above -- 12.44833 Hz against 12.44824 at four sections and six modes.
+// A chain whose cut planes are open is a *different, softer* structure and falls
+// *through* it, to 12.37090; no number of modes brings it back, because there is
+// nothing there to converge to.
+//
+// --- What the line approximates, which is one number ------------------------------
+//
+// Projecting onto a face leaves a residual along the master's own normal and nothing
+// else, and the through-thickness weight is exactly what that residual becomes -- so
+// a face tie drops nothing. Projecting onto a line leaves that, **plus** whatever ran
+// along the master's surface across the line. On a cut plane that direction is x, so
+// what is dropped is the slave's own nodal normal leaning fore or aft, bounded above
+// by `t/2` and measured on the reference ferry at **1.9e-5 m** -- four hundred times
+// below the bound, because a transverse cut of a ship is very nearly square to the
+// plating it passes through. `Section::worstPlaneTieSlip` is that number and it is
+// reported rather than assumed; a mesher run on plating raked hard against its own
+// cut planes would see it grow, and would say so.
+//
+// Everything else is §5's, because it is the same construction: the weights are a
+// partition of unity so a rigid translation is exact, the masters interpolate the
+// slave's own point so a rigid rotation is too, the overshoot outside the segment is
+// bounded by `SectionParams::junctionOvershoot`, the through-thickness weight by
+// `junctionWeightLimit`, and a master that is itself a slave is refused rather than
+// composed. On the ferry the line ties run at the same `w = 1.69` the face ties do,
+// which is the same 9 mm gap seen from the same side.
+//
+// --- The two sides of a cut derive the same tie, and that is checked ---------------
+//
+// A constraint on an interior plane is one relation among shared unknowns, so the two
+// sections either side of it must agree about it or the ship is tied to itself twice.
+// They do, **to the last bit**, and it is §8 that makes them: the plane's mid-surface
+// nodes, nodal normals and nodal thicknesses are properties of the ship rather than of
+// the window, so both sections start from the same doubles. The one thing that is not
+// geometry -- which of several equidistant segments wins -- is broken by the segment's
+// own endpoint positions rather than by a node index, because node indices are a
+// property of the window and positions are not.
+//
+// `buildChain` derives every interior plane twice and compares before adopting one.
+// `Chain::planeTiesDisagreeing` is zero on the box at N = 2, 4 and 8 and on the ferry,
+// and `worstPlaneTieDisagreement` is **0.0 rather than small**. A chain built on a
+// plane the two sides disagreed about applies nothing there and says which plane.
+//
+// **Exact equality and not a tolerance, and the negative control is what says so.**
+// Turn the halo off and cut the ferry's stern shoulder at x = -21.6: the two sides pick
+// the *same* masters -- those come from panel corners and never depended on the cut --
+// and differ only in the weights, by **9.63e-8**. A structural comparison finds nothing
+// and a 1e-6 tolerance finds nothing; comparing against zero finds it. It is the same
+// argument §8 makes for testing `worstGap == 0`, and the same place the next defect
+// would have hidden.
+//
+// --- What it costs ----------------------------------------------------------------
+//
+// Nothing measurable. A tie is `6` constraints per node over `4` masters and the fold
+// is `O(n)` per constraint against a dense assembly that is `O(n^2)` to build and
+// `O(n^3)` to factor: the box at N = 8 has 28 tied nodes and the fold is under a
+// millisecond of a solve that is seconds. There is no band to widen -- the assembled
+// model is dense already -- which is the one way this is *cheaper* than §5, whose ties
+// cost the ferry hold a half-bandwidth of 146 against 1 520.
+//
+// The one thing a caller has to know is that **`Chain::planeTieDof` must be held**. An
+// eliminated row is left isolated with a unit diagonal, so a solve that leaves it free
+// returns zero there, and `assembledFrequencies` would return one spurious eigenvalue
+// of 1 rad/s per tie -- 0.159 Hz, underneath every elastic mode a ship has. All three
+// of `applyBeamLoad`, `applyTwist` and `chainFrequencies` hold them and fill them back
+// in from their masters afterwards.
+//
+// --- What mutation testing said, which is mostly what it demanded be built ---------
+//
+// Thirty-seven single edits across this file's implementation; twenty-nine are killed.
+// **The first pass killed eighteen, and the sixteen it left standing were worth more
+// than the score, because eleven of them said the same thing: the box's corners are a
+// butt joint, and a butt joint exercises almost none of a tie.** Two mid-surfaces
+// meeting on a corner line have no offset along either's normal, so the
+// through-thickness weight is 1/2 whatever the plating is, both halves of the pair
+// weigh the same, and swapping them is a no-op. Every junction figure in §5 and §9 was
+// measured on exactly that. Four fixtures now exist because of it:
+//
+//   * **A box with a deck laid inboard of its side plating**, stopping 12 mm short of
+//     its mid-surface at a height that lands in the *middle* of a side element, over
+//     plating that steps from 10 to 20 mm at mid-height. The junction is then at
+//     `w = 1.4639` -- a closed form in the gap and the two thicknesses -- so the split
+//     is not a half, the two halves of the pair are worth different things, and the
+//     master's thickness has to be interpolated along the segment rather than taken
+//     from either end. It kills four mutants that no box corner can.
+//   * **The same deck at exactly mid-height**, where it straddles the node between two
+//     side elements and each half of its pair falls the other way. That is the input
+//     the one-segment rule exists for and nothing else here produces it.
+//   * **The box wound the other way at every other bay**, which is what
+//     `makeStructuralMesh` does when it mirrors the starboard side. The sub-quads
+//     either side of a cut then name the segment they share in opposite directions,
+//     which is what ordering it by position is for.
+//   * **The shoulder chain with the halo off**, where the two sides of the cut pick the
+//     same masters and differ only in the weights, by 9.63e-8.
+//
+// **The eight that are left are equivalent on every input this repository has, and
+// saying which is more useful than the score:**
+//
+//   * **Accepting a master segment on *either* cut plane** changes nothing, because a
+//     candidate must already be within `junctionTolerance` -- 25 mm -- of the slave,
+//     and the two planes of a section that reduces are metres apart.
+//   * **Dropping the geometric tie-break between equidistant segments** changes
+//     nothing, because nothing here produces two candidates equal in both overshoot
+//     and distance; a slave that straddles a node produces two that differ and is
+//     refused by the rule above instead.
+//   * **Deleting the line-tie chain refusal** changes nothing, for the same reason §5
+//     records for its own: the "already a master" skip absorbs the second side of every
+//     junction here. `solidshell::DofExpansion` is the backstop and `buildChain` runs
+//     it over the assembled set.
+//   * **Leaving the eliminated rows free in `applyTwist`** changes nothing, because the
+//     fold already isolates them: holding a row and isolating it are two statements of
+//     the same thing and either alone is enough. Deleting the isolation is killed --
+//     the matrix is published as `T^T K T` and a caller reads it -- and deleting the
+//     hold from `chainFrequencies`, where the isolation is *not* enough, is killed too.
+//   * **Three separate edits to the restraint guard** -- letting the anchor, or its
+//     partner, or the lever land on an eliminated row -- each change nothing, while
+//     **disabling the guard as a whole is killed**. A slave's three axes are eliminated
+//     together, so any one of the three tests catches the same node and the other two
+//     are redundant *given it*. The guard is what stopped an eight-section box chain
+//     going singular in `applyBeamLoad`, which is how it came to be written.
+//   * **Not filling the eliminated rows back in** changes nothing, because the only
+//     thing that reads them is `BeamResponse::peakDisplacement` and every load here has
+//     its peak on a prescribed end-plane row. It is kept because a zero left at an
+//     eliminated degree of freedom is precisely the hole `reduction::recover` shipped
+//     with -- a displacement field that read 850 788 MPa against a true 427 -- and the
+//     next reader of that field would find it.
+//   * **Leaving the line ties out of `Chain::components`** changes nothing, and the
+//     reason is close to a theorem: a junction line runs along x, so a surface tied at
+//     a cut plane is tied again at a station inside the section unless the section is
+//     one element long, which `reduction::Substructure` refuses. Separating them needs
+//     a junction lying wholly *in* a cut plane -- a bulkhead on a frame station -- which
+//     this ship does not have, because none of its bulkheads is on one.
+//
+// One mutant was killed **only by a segmentation fault with no failure line**: tying
+// the outermost planes as well, which puts a constraint on a prescribed row and takes
+// `reduction::assembledStaticSolve` through a partition it cannot make. A harness that
+// counted `FAIL` lines would have scored it a survivor, which is the mistake §5's run
+// records making and §7's records making again.
 
 struct ChainParams {
     // The cut planes, ascending: N+1 of them make N sections. **Frame stations**, for
@@ -1200,8 +1497,34 @@ struct Chain {
     std::vector<int> pieceOf;
     std::vector<std::size_t> componentBase;
     // Junction ties the cut planes cost, against what the same length in one piece
-    // would have tied: see note 2. `tiedEdges` is summed over the sections.
+    // would have tied: see note 2. `tiedEdges` is summed over the sections **and over
+    // the interior planes the in-plane line ties of §9 close**, which is what makes it
+    // reach the monolith's own figure instead of falling by one station per cut.
     double tiedEdges = 0, junctionEdges = 0;
+
+    // --- The in-plane line ties, §9 --------------------------------------------------
+    //
+    // The ring of junctions on each interior cut plane, applied to the assembled model:
+    // `assembly.stiffness` and `assembly.mass` are `T^T K T` and `T^T M T` by the time
+    // a caller sees them, and the eliminated rows are left isolated.
+    //
+    // **`planeTieDof` has to be held.** An eliminated row carries a unit diagonal and
+    // nothing else, so a solve that leaves it free returns a zero displacement there
+    // and -- for `assembledFrequencies` -- one spurious eigenvalue of 1 rad/s per row,
+    // which would land underneath every elastic mode of a ship. All three of
+    // `applyBeamLoad`, `applyTwist` and `chainFrequencies` below hold them and then
+    // fill them back in from their masters.
+    std::vector<solidshell::Mpc> planeTies;    // in assembled degrees of freedom
+    std::vector<std::uint32_t> planeTieDof;    // the rows they eliminate, ascending
+    int planeTieNodes = 0;
+    // Interior planes whose two sections did **not** produce the same constraint. Zero
+    // is the claim §9 rests on -- with the halo a station's nodes, normals and
+    // thicknesses are the ship's rather than the window's, so the two sections derive
+    // the same tie from the same doubles -- and it is checked rather than assumed,
+    // because a chain built on a plane the two sides disagree about is a ship tied to
+    // itself twice in two different ways.
+    int planeTiesDisagreeing = 0;
+    double worstPlaneTieDisagreement = 0;
 
     double meshSeconds = 0, reduceSeconds = 0, assembleSeconds = 0;
     std::size_t boundaryDof() const { return static_cast<std::size_t>(assembly.boundary); }

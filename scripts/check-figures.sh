@@ -182,6 +182,35 @@ if [ -x "$SECTION" ]; then
   check "windows in the scan"         49 0 "$windows" "49 of 49 two-bay windows" "$SECTION_DOC"
   check "windows in one piece"        46 0 "$onepiece" "46 of 49" "$SECTION_DOC"
   check "reach along the hull (m)"    120.0 0.05 "$reach" "120.0 m of 120.0 m" "$SECTION_DOC"
+
+  # --- and what an interior cut plane costs the junctions, which is torsion or nothing
+  #
+  # Four figures over two runs, and the pair is the point exactly as the capsize
+  # threshold above is: the tied row on its own would pass on a chain that had never
+  # lost anything, so the negative control -- `--no-interface-ties`, the same tool with
+  # the line ties off -- is checked alongside it and has to still lose 3.3% of `GJ`.
+  #
+  # `GJ` and not `EA`: `EA` is exact to 1e-9 with the cut planes open *and* closed, so
+  # a figure taken off it would score a do-nothing implementation best. That is the
+  # trap the section it points at is written around.
+  for h in "72.0 m** (= one piece) | **−0.095%" "9.6 m of 134.4 | −3.334%"; do
+    hint "$h" "$SECTION_DOC"
+  done
+  summary() { printf '%s\n' "$1" | grep '^chain summary: ' | grep "junctions=1 lines=$2"; }
+  field() { printf '%s\n' "$1" | sed -n "s/.* $2=\\(-\\{0,1\\}[0-9.e+-]*\\).*/\\1/p"; }
+  tied=$(summary "$("$SECTION" --chain=2 --from=-7.2 --to=2.4 --sweep=0 --no-reduce 2>&1)" 1)
+  open=$(summary "$("$SECTION" --chain=2 --from=-7.2 --to=2.4 --sweep=0 --no-reduce \
+                    --no-interface-ties 2>&1)" 0)
+  check "ferry chain of 2, junction edge joined (m)" 72.0 0.05 "$(field "$tied" tiedEdges)" \
+        "72.0 m** (= one piece)" "$SECTION_DOC"
+  check "ferry chain of 2, GJ against one piece" -0.00095 0.0004 "$(field "$tied" GJrel)" \
+        "72.0 m** (= one piece) | **−0.095%" "$SECTION_DOC"
+  check "ferry chain of 2, planes the two sides disagreed about" 0 0 \
+        "$(field "$tied" disagree)" "worstPlaneTieDisagreement\` is **0.0" "$SECTION_DOC"
+  check "ferry chain of 2 with the line ties off, edge joined (m)" 9.6 0.05 \
+        "$(field "$open" tiedEdges)" "9.6 m of 134.4" "$SECTION_DOC"
+  check "ferry chain of 2 with the line ties off, GJ" -0.03334 0.0005 \
+        "$(field "$open" GJrel)" "9.6 m of 134.4 | −3.334%" "$SECTION_DOC"
 else
   echo "  - section_probe not built, skipping the reach figures"
 fi
