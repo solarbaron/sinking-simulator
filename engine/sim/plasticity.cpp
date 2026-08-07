@@ -193,6 +193,52 @@ Material shipSteel() {
     return material;
 }
 
+// --- What a yielded point has left ---------------------------------------------
+
+double secantShearModulus(const Material& material, double equivalentPlasticStrain) {
+    const double shear = material.shearModulus();
+    const double plastic = std::max(0.0, equivalentPlasticStrain);
+    // **The early return is what makes this exact, and the arithmetic below is
+    // not.** `1/(1/G) == G` for most doubles -- including AH36's shear modulus,
+    // which is why deleting this line survived the first round of mutation testing
+    // -- but not for all of them, and one unit in the last place turns a caller's
+    // knockdown ratio from 1 into 0.999...89 and puts a block of near-zeros where
+    // there should be no block at all. See the header, and the modulus sweep in
+    // `tests/test_plasticity.cpp` that now carries a case it fails.
+    if (plastic == 0.0) return shear;
+    const double strength = flowStress(material.flow, plastic);
+    if (!(strength > 0.0)) return 0.0;
+    const double compliance = 1.0 / shear + 3.0 * plastic / strength;
+    return compliance > 0.0 ? 1.0 / compliance : 0.0;
+}
+
+double tangentShearModulus(const Material& material, double equivalentPlasticStrain) {
+    const double shear = material.shearModulus();
+    const double slope = flowSlope(material.flow, std::max(0.0, equivalentPlasticStrain));
+    // Perfect plasticity: no incremental stiffness at all. The limit of the
+    // expression below, taken rather than divided by.
+    if (!(slope > 0.0)) return 0.0;
+    return 1.0 / (1.0 / shear + 3.0 / slope);
+}
+
+double secantYoungsModulus(const Material& material, double equivalentPlasticStrain) {
+    const double plastic = std::max(0.0, equivalentPlasticStrain);
+    if (plastic == 0.0) return material.youngsModulus;
+    const double strength = flowStress(material.flow, plastic);
+    if (!(strength > 0.0)) return 0.0;
+    return 1.0 / (1.0 / material.youngsModulus + plastic / strength);
+}
+
+void isotropicFromBulkShear(double bulk, double shearModulus, double* youngsModulus,
+                            double* poissonRatio) {
+    const double denominator = 3.0 * bulk + shearModulus;
+    if (youngsModulus)
+        *youngsModulus = denominator != 0.0 ? 9.0 * bulk * shearModulus / denominator : 0.0;
+    if (poissonRatio)
+        *poissonRatio =
+            denominator != 0.0 ? (3.0 * bulk - 2.0 * shearModulus) / (2.0 * denominator) : 0.5;
+}
+
 // --- Stress algebra ------------------------------------------------------------
 
 void elasticModuli(const Material& material, double c[kVoigt * kVoigt]) {

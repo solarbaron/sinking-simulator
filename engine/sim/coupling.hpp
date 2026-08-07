@@ -96,13 +96,15 @@
 // surrounding reduced model then feels a genuinely softer zone, because it is
 // assembled against a genuinely softer component.
 //
-// **What it cannot carry, and this is a real limit rather than a rounding.** A
-// zone that has *yielded* without tearing is softer than its elastic self and
-// nothing here says so: the reduction is linear by construction
-// (`reduction.hpp` §6) and there is no tangent stiffness to hand it. Between
-// first yield and first tear, direction 2 under-reports the softening -- always
-// in the stiff direction, which is the unsafe one. Closing that means a reduction
-// built from a tangent operator the Tier-2 explicit solver does not form.
+// **A zone that has *yielded* without tearing is softer than its elastic self, and
+// that used to be missing too.** It is §5 now. The note that stood here said
+// closing it needed "a reduction built from a tangent operator the Tier-2 explicit
+// solver does not form", and both halves of that were wrong: a static coupling
+// wants a **secant**, not a tangent, and the secant of a J2 point is a closed form
+// in the equivalent plastic strain the solver has carried all along. The
+// measurement is in §5 and in `tests/test_coupling.cpp`; what the note got right is
+// the direction, which is measured at **1.95x** the true perimeter travel a fifth
+// of the way to a tear and 2.27x at a half.
 //
 // --- 4. The stiffeners, and what a coupling has to hand over --------------------
 //
@@ -300,5 +302,139 @@ DamagedMesh withoutTornElements(const zone::Patch& patch, const zone::Solver& so
 // than refusing.
 std::vector<std::uint32_t> carriedInterface(const DamagedMesh& damaged,
                                             const std::vector<std::uint32_t>& interfaceNodes);
+
+// --- 5. What a *yielded* zone hands back --------------------------------------------
+//
+// §3 said this could not be done without "a reduction built from a tangent operator
+// the Tier-2 explicit solver does not form". **That framing was wrong, and the
+// measurement that says so is in `tests/test_coupling.cpp`.** Two things were wrong
+// with it and they point in opposite directions.
+//
+// **A tangent is not what a static coupling wants.** The assembled solve is
+// `K x = f` on a *total* load, so the operator that makes it right is the one for
+// which `K u = f_int(u)` at the state the zone is actually in -- a **secant**. A
+// tangent answers `K du = df`, which is a different question; used for a total
+// solve it over-softens, and it over-softens worst exactly where the softening is
+// smallest, because `dsigma_y/deps_p` drops by a finite step at the first
+// increment of flow while the secant leaves the elastic modulus continuously
+// (`plasticity.hpp`, "what a yielded point has left"). Both are built here, the
+// tangent as the control. Measured: just past first yield the secant leaves 0.37%
+// of the surroundings' own displacement, the tangent 31.3%, and reporting nothing
+// at all 1.14% -- so the tangent is 85x the secant there and **27x worse than
+// changing nothing**. Deep in the band it is 3.4x the secant. It over-softens
+// throughout, where the model it was meant to replace over-stiffens.
+//
+// **And nothing had to be *formed* that the solver does not already have.** The
+// secant modulus of a J2 point is a closed form in its equivalent plastic strain
+// alone, which `zone::Solver` has carried per integration point since it existed.
+// What was missing was not an operator but the arithmetic that turns that number
+// into element stiffness.
+//
+// --- How it reaches the reduced model, with nothing added to `reduction` ---------
+//
+// A `reduction::Attachment` is scatter-added into the same CSR the elements go
+// into, and nothing anywhere requires a block to be positive. So a **negative**
+// block is a stiffness *correction*: for each softened element,
+//
+//     dK_e = K_e(E_s, nu_s) - K_e(E, nu)
+//
+// on the element's own 24 DOF, so that the assembly the substructure forms is
+// exactly `K_e(E_s, nu_s)`. It names the degrees of freedom the element already
+// couples, so the sparsity, the bandwidth and the interior renumbering are
+// untouched, and `reduction.{hpp,cpp}` needed no change at all. `solid_shell.hpp`
+// says a `DofBlock` "can only add stiffness"; that is a statement about what a
+// *constraint* can be expressed as, not a sign convention, and §5 of this file is
+// the case that reads it the other way.
+//
+// The plate's bulk modulus is kept and the whole knockdown is in the shear
+// modulus, because J2 flow is deviatoric and never touches the trace.
+//
+// --- Where it stops, and how it composes with a tear ---------------------------
+//
+// **Torn elements are skipped, and that is not an omission.** A torn element's
+// secant stiffness is not small, it is *absent*, and handing back a block equal to
+// `-K_e` leaves the assembly with rows no element supports -- which is the
+// singular interior §4 removes an orphan node to avoid, and which
+// `reduction.hpp` §3 records the banded factorisation does not reliably catch.
+// Tearing goes back through `withoutTornElements` and softening goes back through
+// this; they are different mechanisms and they compose in that order. `torn` counts
+// what was skipped so a caller that has not deleted them can see it.
+//
+// **A secant is a statement about the state it was measured at.** It is exact where
+// the point is at yield, which is every point of a monotonically loaded zone. A
+// point that has yielded and then unloaded is reported with the stiffness it had at
+// its peak rather than the elastic stiffness it has now, because the secant is
+// built from `sigma_y(eps_p)` and not from the stress the point currently carries
+// -- which is the bounded, monotone choice, where the ratio of the two would run to
+// zero as an unloaded point's stress does.
+//
+// **And it is a linearisation, so it does not iterate itself.** The zone's state
+// sets the softening, the softening sets the interface displacement, and the
+// interface displacement sets the zone's state. `tests/test_coupling.cpp` measures
+// that loop from a single run, by keeping what each pass recovered: on the plate
+// there, three passes leave 9.22% and six leave 8.55%, and the sixth pass moves the
+// field by 0.018% of the peak against the third-to-sixth 1.27% -- a factor of 72, so
+// the loop has closed and the 8.55% is the isotropic knockdown rather than the
+// iteration. Nothing here runs the loop, because how many passes a caller can afford
+// is a caller's decision --
+// and a `Softening` is cheap beside it, one element stiffness pair per yielded
+// element against a whole zone re-solve.
+
+// Which modulus a softened element is given. `Secant` is the answer; `Tangent` is
+// the control the docs used to prescribe, kept because a claim that one of them is
+// wrong is worth being able to re-measure rather than re-read.
+enum class Modulus { Secant, Tangent };
+
+struct Softening {
+    // Ready to hand to `reduction::Substructure`. The mass is a zero per node --
+    // stated rather than left empty, because plastic flow moves no steel and the
+    // substructure would otherwise report an attachment that is "stiffer but no
+    // heavier", which is the opposite of what this is. The stress forms are zeros
+    // parallel to the blocks: a softening correction is not a member and carries no
+    // member stress, and `reduction::checkValidity` takes a maximum over them, so a
+    // zero is inert there. It does count in `Substructure::attachedMembers`.
+    reduction::Attachment attachment;
+
+    std::vector<std::uint32_t> element;  // per block, which element it corrects
+    std::size_t softened = 0;            // elements that had flowed
+    std::size_t torn = 0;                // elements skipped because they are gone
+
+    // The knockdown, as G_s/G. `worstRatio` is the softest single element and
+    // `meanRatio` is the volume-weighted average over the whole patch, torn
+    // elements counted at zero -- so an intact elastic zone reports 1.0 for both and
+    // a caller can read "how stale is my reduced model" off `meanRatio` without
+    // reducing or assembling anything. That is the cheap honest answer for a caller
+    // that would rather be told its model is stale than have it silently corrected:
+    // the ratios come out of the plastic state and the Gauss volumes alone.
+    double worstRatio = 1.0;
+    double meanRatio = 1.0;
+    double peakPlasticStrain = 0.0;
+
+    std::vector<std::string> problems;
+
+    bool empty() const { return softened == 0; }
+};
+
+// The correction for a mesh whose elements carry `state`. `elastic` is the material
+// the substructure is being built with -- the correction is referenced to it, so
+// the two must be the same material or the block corrects a stiffness nobody
+// assembled. `material` is where the flow curve comes from.
+//
+// **An element with no plastic strain gets no block at all**, rather than a block
+// of zeros, so a zone that has not yielded builds *bit for bit* the substructure it
+// built before this existed. That is the negative control the whole of §5 rests on
+// and it is a property of the code rather than of a tolerance.
+Softening softening(const solidshell::HexMesh& mesh, const StructuralMaterial& elastic,
+                    const plasticity::Material& material,
+                    const std::vector<solidshell::ElementPlasticState>& state,
+                    Modulus modulus = Modulus::Secant,
+                    solidshell::Formulation form = solidshell::Formulation::SolidShell);
+
+// The same, reading the state out of a solved zone. The mesh is the patch's, so a
+// caller that has already deleted torn elements should use the call above against
+// the damaged mesh and the states it kept -- this one is for a zone that has
+// yielded and not torn, which is the case §5 exists for.
+Softening softening(const zone::Patch& patch, const zone::Solver& solver,
+                    const plasticity::Material& material, Modulus modulus = Modulus::Secant);
 
 }  // namespace sim::coupling

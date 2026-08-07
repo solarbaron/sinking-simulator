@@ -45,6 +45,7 @@
 #include "harness.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1611,6 +1612,743 @@ void testTierOneCannotSeeTheStiffeners() {
                 recoveredGap, field, toBare);
 }
 
+// --- 9. Plastic softening short of a tear -------------------------------------------
+//
+// The claim under test is `coupling.hpp` §5's, and it replaces the one the docs
+// carried: that closing this needs "a reduction built from a tangent the solver does
+// not form". The reference is the **monolithic plate solved nonlinearly**, and the
+// experiment is controlled in exactly one place.
+//
+// **The surroundings cannot be allowed to yield, and that is not a convenience.** A
+// reduced model is linear by construction (`reduction.hpp` §6), so a reference whose
+// surroundings had flowed would be measuring two errors at once, only one of which
+// anything in this file can close. The plate is therefore given two materials: ship
+// steel inside the zone, and outside it the same elastic constants at ten times the
+// yield strength. Everything else -- mesh, element, load, solver -- is shared, so
+// the only difference between the reference and the coupled model is how the zone's
+// softening reaches the structure round it.
+//
+// **Ten times, and not an infinite yield strength.** `elementPlasticUpdate` measures its
+// enhanced-strain Newton against `yieldStrength * volume`, so an absurd yield
+// strength loosens that tolerance until the enhanced modes stop being solved for at
+// all: measured here at 1.45% of the peak displacement, *flat in the load*, which is
+// the signature of a tolerance rather than of physics. It is worth writing down
+// because "give it a material that cannot yield" is the obvious way to build this
+// control and it silently produces a 1.45% floor under everything.
+//
+// The load is an **in-plane** drag of the punch block, not the out-of-plane push the
+// tests above use. Out of plane, a 1.2 m plate reaching the deflections that yield it
+// is membrane-stiffening -- measured on this plate with **nothing yielded**, the punch
+// reaction per unit travel rises 21% between 0.2 mm and 8 mm of push -- and the
+// geometric nonlinearity would swamp the material one. In plane the reaction per unit
+// travel is constant to four figures until the steel yields, so the only
+// nonlinearity in the measurement is the one being measured. What survives is
+// the co-rotational element's own second-order geometry, reported as the floor
+// beside every figure it bounds: **absolute error quadratic in the travel, so the
+// percentage in that column is linear in it**. That is asserted rather than
+// described -- the floor comes out at 0.056% of the peak per mm of travel over a
+// 4.3x range of load, and a floor that did not scale that way would be something
+// other than geometry.
+
+// The surroundings' material. See above for why ten and not infinity.
+plasticity::Material outsideTheZone() {
+    plasticity::Material m = plasticity::shipSteel();
+    m.flow = plasticity::linearHardening(10.0 * steel().yieldStrength, 0.0);
+    m.failure.uniformStrain = 10.0;
+    m.failure.fractureStrain = 10.0;
+    return m;
+}
+
+// The punch, dragged along +x in the plane of the plate.
+void dragPunch(HexMesh& mesh, const std::vector<std::size_t>& nodes, double travel) {
+    for (std::size_t n : nodes)
+        for (int k = 0; k < 3; ++k) {
+            mesh.fixed[3 * n + static_cast<std::size_t>(k)] = 1u;
+            mesh.prescribed[3 * n + static_cast<std::size_t>(k)] = k == 0 ? travel : 0.0;
+        }
+}
+
+// The elastoplastic internal force over a mesh whose elements may have different
+// materials, and the history advanced to `u`. Nothing here touches the reduction or
+// the coupling.
+std::vector<double> plasticInternalForce(const HexMesh& mesh,
+                                         const std::vector<const plasticity::Material*>& material,
+                                         const std::vector<double>& u,
+                                         std::vector<solidshell::ElementPlasticState> state,
+                                         std::vector<solidshell::ElementPlasticState>* out) {
+    std::vector<double> f(mesh.nodeCount() * 3, 0.0);
+    for (std::size_t e = 0; e < mesh.elementCount(); ++e) {
+        double rest[kDof], displacement[kDof], current[kDof], force[kDof];
+        mesh.gather(e, mesh.position, rest);
+        mesh.gather(e, u, displacement);
+        for (int i = 0; i < kDof; ++i) current[i] = rest[i] + displacement[i];
+        solidshell::elementPlasticUpdate(rest, current, *material[e],
+                                         solidshell::Formulation::SolidShell, state[e], force);
+        for (int i = 0; i < kDof; ++i) {
+            const std::size_t n = mesh.index[e * kNodes + static_cast<std::size_t>(i / 3)];
+            f[n * 3 + static_cast<std::size_t>(i % 3)] += force[i];
+        }
+    }
+    if (out) *out = std::move(state);
+    return f;
+}
+
+struct Plastic {
+    std::vector<double> u;
+    std::vector<solidshell::ElementPlasticState> state;
+    double residual = 0, peakPlasticStrain = 0, peakDamage = 0;
+    int yielded = 0, torn = 0;
+    bool converged = false;
+};
+
+// Incremental modified Newton on the elastic stiffness. The root is `f_int(u) = 0`
+// at the free DOF, which is a statement about `elementPlasticUpdate` and about
+// nothing else -- the iteration matrix decides how many passes it takes and not
+// what it converges to.
+Plastic solvePlastic(const HexMesh& base,
+                     const std::vector<const plasticity::Material*>& material, int increments,
+                     int newtonMax, double tolerance = 1e-4) {
+    Plastic out;
+    out.state.resize(base.elementCount());
+    for (std::size_t e = 0; e < base.elementCount(); ++e) {
+        double rest[kDof];
+        base.gather(e, base.position, rest);
+        solidshell::initialisePlasticState(rest, *material[e], out.state[e]);
+    }
+    out.u.assign(base.nodeCount() * 3, 0.0);
+    const std::vector<double> target = base.prescribed;
+
+    HexMesh step = base;
+    for (int increment = 0; increment < increments; ++increment) {
+        for (std::size_t d = 0; d < step.prescribed.size(); ++d)
+            step.prescribed[d] = base.fixed[d] ? target[d] / increments : 0.0;
+        std::vector<solidshell::ElementPlasticState> trial = out.state;
+        for (int it = 0; it < newtonMax; ++it) {
+            const std::vector<double> residual =
+                plasticInternalForce(base, material, out.u, out.state, &trial);
+            double worst = 0;
+            for (std::size_t d = 0; d < residual.size(); ++d)
+                if (!base.fixed[d]) worst = std::max(worst, std::fabs(residual[d]));
+            out.residual = worst;
+            if (it > 0 && worst < tolerance) break;
+            std::vector<double> correction;
+            std::string problem;
+            if (!solidshell::solveStatic(step, steel(), solidshell::Formulation::SolidShell,
+                                         residual, correction, &problem))
+                return out;
+            for (std::size_t d = 0; d < out.u.size(); ++d) out.u[d] += correction[d];
+            for (double& p : step.prescribed) p = 0.0;
+        }
+        out.state = trial;
+    }
+    std::vector<solidshell::ElementPlasticState> committed;
+    plasticInternalForce(base, material, out.u, out.state, &committed);
+    out.state = committed;
+    for (const solidshell::ElementPlasticState& s : out.state) {
+        bool flowed = false;
+        for (int g = 0; g < solidshell::kGauss; ++g) {
+            out.peakPlasticStrain =
+                std::max(out.peakPlasticStrain, s.point[g].equivalentPlasticStrain);
+            out.peakDamage = std::max(out.peakDamage, s.point[g].damage);
+            if (s.point[g].equivalentPlasticStrain > 0.0) flowed = true;
+        }
+        if (flowed) ++out.yielded;
+        if (s.torn) ++out.torn;
+    }
+    out.converged = out.residual < 100.0 * tolerance;
+    return out;
+}
+
+enum class Route { Elastic, Secant, Tangent };
+
+struct SoftCoupled {
+    std::vector<double> surroundField;
+    // The recovered surroundings after each pass. The staggered loop computes these
+    // anyway, so asking whether it has converged costs nothing beyond the passes --
+    // where a second run at a higher count would cost the whole loop again.
+    std::vector<std::vector<double>> perPass;
+    std::vector<double> drive;  // in the zone mesh's DOF numbering
+    double meanRatio = 1.0, worstRatio = 1.0;
+    std::size_t softened = 0;
+    bool ok = false;
+    std::vector<std::string> problems;
+};
+
+// The staggered loop `coupling.hpp` §5 describes: the zone's state sets the
+// softening, the softening sets the interface displacement, the interface
+// displacement sets the zone's state. `Route::Elastic` at one pass is the model this
+// replaces.
+SoftCoupled coupleSoftened(const Fixture& f, const plasticity::Material& zoneMaterial,
+                           double travel, Route route, int passes) {
+    SoftCoupled out;
+    reduction::Substructure surroundings(f.surround, steel(), f.surroundInterface);
+    if (!surroundings.ready()) {
+        out.problems.push_back("the surroundings would not factor");
+        return out;
+    }
+    reduction::ReduceParams params;
+    params.modes = 0;
+    params.cutoffFrequency = 0;
+    const reduction::Reduction rs = reduction::craigBampton(surroundings, params);
+
+    std::vector<solidshell::ElementPlasticState> zoneState;
+    for (int pass = 0; pass < passes; ++pass) {
+        coupling::Softening soft;
+        if (!zoneState.empty() && route != Route::Elastic)
+            soft = coupling::softening(f.patch.mesh, f.patch.material, zoneMaterial, zoneState,
+                                       route == Route::Secant ? coupling::Modulus::Secant
+                                                              : coupling::Modulus::Tangent);
+        out.meanRatio = soft.meanRatio;
+        out.worstRatio = soft.worstRatio;
+        out.softened = soft.softened;
+
+        reduction::Substructure zoneSub(f.patch.mesh, f.patch.material, f.zoneInterface,
+                                        soft.attachment);
+        if (!zoneSub.ready()) {
+            out.problems.push_back("the softened zone would not factor");
+            return out;
+        }
+        const reduction::Reduction rz = reduction::craigBampton(zoneSub, params);
+        const coupling::Coupling link = coupling::couple(surroundings, rs, zoneSub, rz);
+        if (!link.ready()) {
+            out.problems.push_back("the coupling is not ready");
+            return out;
+        }
+
+        std::vector<std::uint32_t> held;
+        for (std::size_t b = 0; b < surroundings.boundaryDof().size(); ++b) {
+            const std::size_t node = surroundings.boundaryDof()[b] / 3;
+            if (!onRim(f.surround.position[3 * node], f.surround.position[3 * node + 1])) continue;
+            if (link.surroundDof[b] >= 0)
+                held.push_back(static_cast<std::uint32_t>(link.surroundDof[b]));
+        }
+        std::vector<coupling::Prescribed> punch;
+        for (std::size_t b = 0; b < zoneSub.boundaryDof().size(); ++b) {
+            const std::uint32_t global = zoneSub.boundaryDof()[b];
+            const std::size_t node = global / 3, axis = global % 3;
+            if (std::find(f.punchPatch.begin(), f.punchPatch.end(), node) == f.punchPatch.end())
+                continue;
+            if (link.zoneDof[b] < 0) continue;
+            punch.push_back(
+                {static_cast<std::uint32_t>(link.zoneDof[b]), axis == 0 ? travel : 0.0});
+        }
+        std::vector<double> state;
+        std::string problem;
+        const std::vector<double> load(static_cast<std::size_t>(link.assembly.size()), 0.0);
+        if (!coupling::prescribedStaticSolve(link.assembly, load, held, punch, state, &problem)) {
+            out.problems.push_back("the assembled solve failed: " + problem);
+            return out;
+        }
+
+        const coupling::EdgeDrive drive = coupling::edgeDrive(link, zoneSub, state);
+        out.drive = drive.displacement;
+        out.surroundField = reduction::recover(
+            surroundings, rs,
+            reduction::componentState(link.assembly, link.assembly.fromA(), state));
+        out.perPass.push_back(out.surroundField);
+
+        HexMesh driven = f.patch.mesh;
+        driven.fixed.assign(driven.nodeCount() * 3, 0u);
+        driven.prescribed.assign(driven.nodeCount() * 3, 0.0);
+        coupling::applyEdgeDrive(drive, driven);
+        dragPunch(driven, f.punchPatch, travel);
+        const std::vector<const plasticity::Material*> mat(driven.elementCount(), &zoneMaterial);
+        const Plastic zoneAnswer = solvePlastic(driven, mat, 8, 400);
+        if (!zoneAnswer.converged) {
+            out.problems.push_back("the driven zone would not converge");
+            return out;
+        }
+        zoneState = zoneAnswer.state;
+    }
+    out.ok = true;
+    return out;
+}
+
+// Worst displacement error of a recovered surroundings field against the monolithic
+// plate's own, and the peak it is measured against.
+double surroundingsError(const Fixture& f, const std::vector<double>& got,
+                         const std::vector<double>& whole, double* peak) {
+    double worst = 0, top = 0;
+    for (std::size_t n = 0; n < f.surround.nodeCount(); ++n) {
+        const std::size_t w =
+            nodeAt(f.whole, f.surround.position[3 * n], f.surround.position[3 * n + 1],
+                   f.surround.position[3 * n + 2]);
+        if (w >= f.whole.nodeCount()) continue;
+        for (int k = 0; k < 3; ++k) {
+            const std::size_t d = static_cast<std::size_t>(k);
+            worst = std::max(worst, std::fabs(got[3 * n + d] - whole[3 * w + d]));
+            top = std::max(top, std::fabs(whole[3 * w + d]));
+        }
+    }
+    if (peak) *peak = top;
+    return worst;
+}
+
+// How far the perimeter is pulled along the drive, summed over its nodes. A zone the
+// surroundings believe is stiffer than it is drags them further, so the ratio of
+// this to the monolithic plate's own is above one in the unsafe direction and below
+// one in the conservative one -- which is the sign a worst-error norm throws away.
+double perimeterPull(const Fixture& f, const std::vector<double>& zoneField) {
+    double sum = 0;
+    for (std::uint32_t n : f.zonePerimeter) sum += zoneField[3 * n];
+    return sum;
+}
+
+double perimeterPullOfWhole(const Fixture& f, const std::vector<double>& whole) {
+    double sum = 0;
+    for (std::uint32_t n : f.zonePerimeter) {
+        const std::size_t w =
+            nodeAt(f.whole, f.patch.mesh.position[3 * n], f.patch.mesh.position[3 * n + 1],
+                   f.patch.mesh.position[3 * n + 2]);
+        if (w < f.whole.nodeCount()) sum += whole[3 * w];
+    }
+    return sum;
+}
+
+void testPlasticSofteningGoesBack() {
+    std::printf("\n--- coupling: a yielded zone hands its softness back ---\n");
+    const auto started = std::chrono::steady_clock::now();
+    const Fixture f = buildFixture();
+    expectTrue("the fixture built", f.problems.empty());
+    const plasticity::Material zoneMaterial = plasticity::shipSteel();
+    const plasticity::Material outer = outsideTheZone();
+    std::vector<const plasticity::Material*> mixed(f.whole.elementCount(), &outer);
+    std::size_t zoneElements = 0;
+    for (std::size_t e = 0; e < f.whole.elementCount(); ++e)
+        if (f.inZone[e]) {
+            mixed[e] = &zoneMaterial;
+            ++zoneElements;
+        }
+    expectEqualCount("the zone the reference makes yieldable is the coupled zone", zoneElements,
+                     f.patch.elementCount());
+
+    // --- The negative control, and it is an identity rather than a tolerance ------
+    //
+    // An unyielded element gets no block, so the softened substructure *is* the
+    // unsoftened one -- every entry of the reduced stiffness bit for bit, not close.
+    {
+        std::vector<solidshell::ElementPlasticState> rest(f.patch.elementCount());
+        for (std::size_t e = 0; e < f.patch.elementCount(); ++e) {
+            double nodes[kDof];
+            f.patch.mesh.gather(e, f.patch.mesh.position, nodes);
+            solidshell::initialisePlasticState(nodes, zoneMaterial, rest[e]);
+        }
+        const coupling::Softening none = coupling::softening(f.patch.mesh, f.patch.material,
+                                                             zoneMaterial, rest);
+        expectTrue("an unyielded zone produces no block at all", none.attachment.empty());
+        expectTrue("and reports itself at full stiffness",
+                   none.meanRatio == 1.0 && none.worstRatio == 1.0);
+        expectEqualCount("with nothing softened", none.softened, 0u);
+
+        reduction::ReduceParams params;
+        params.modes = 0;
+        params.cutoffFrequency = 0;
+        reduction::Substructure bare(f.patch.mesh, f.patch.material, f.zoneInterface);
+        reduction::Substructure carried(f.patch.mesh, f.patch.material, f.zoneInterface,
+                                        none.attachment);
+        const reduction::Reduction a = reduction::craigBampton(bare, params);
+        const reduction::Reduction b = reduction::craigBampton(carried, params);
+        expectEqualCount("the softened reduction is the same size", b.stiffness.size(),
+                         a.stiffness.size());
+        std::size_t differing = 0;
+        for (std::size_t i = 0; i < a.stiffness.size() && i < b.stiffness.size(); ++i)
+            if (a.stiffness[i] != b.stiffness[i]) ++differing;
+        expectEqualCount("and every entry of it is bit-identical", differing, 0u);
+
+        // The same guard the tangent needs: an unyielded point is elastic under
+        // *either* modulus, so the control cannot soften an intact zone either.
+        const coupling::Softening noneTangent = coupling::softening(
+            f.patch.mesh, f.patch.material, zoneMaterial, rest, coupling::Modulus::Tangent);
+        expectTrue("and so does the tangent control, which is elastic where nothing has flowed",
+                   noneTangent.attachment.empty());
+
+        // ...and the coupled answer it leaves unchanged is the *linear* monolithic
+        // plate's own, which is what says the floor in the table below is the
+        // co-rotational element's geometry rather than anything in the coupling.
+        HexMesh whole = f.whole;
+        clampRim(whole);
+        dragPunch(whole, f.punchWhole, 0.4e-3);
+        std::vector<double> linear;
+        std::string problem;
+        expectTrue("the linear monolithic plate solved",
+                   solidshell::solveStatic(whole, steel(), solidshell::Formulation::SolidShell, {},
+                                           linear, &problem));
+        const SoftCoupled undamaged = coupleSoftened(f, zoneMaterial, 0.4e-3, Route::Secant, 1);
+        expectTrue("the undamaged coupled solve ran", undamaged.ok);
+        if (undamaged.ok) {
+            double peak = 0;
+            const double gap =
+                surroundingsError(f, undamaged.surroundField, linear, &peak);
+            std::printf("     with nothing yielded the coupled surroundings are the linear "
+                        "monolithic plate's own to %.2e m of %.3e m\n", gap, peak);
+            // Measured at 6.8e-12 relative, which is two dense solves of the same
+            // system and nothing else; asserted at 1e-10 because the file already
+            // uses 1e-9 for this class of agreement and this one is better than
+            // that by two orders.
+            expectTrue("with nothing yielded the coupling is exact, not close",
+                       gap < 1e-10 * peak);
+        }
+    }
+
+    // --- The measurement -----------------------------------------------------------
+    struct Case {
+        double travel;
+        int increments;
+    };
+    std::printf("     travel  peak eps_p  damage  zone  mean  |  worst surroundings error, %% of "
+                "peak     |  perimeter pull / monolithic\n");
+    std::printf("      (mm)                       yld   G_s/G |   elastic     secant     tangent  "
+                "floor  |  elastic  secant  tangent\n");
+
+    double elasticAtFirstYield = 0, secantAtFirstYield = 0, tangentAtFirstYield = 0;
+    double elasticFar = 0, secantFar = 0, tangentFar = 0;
+    double pullElasticFar = 0, pullSecantFar = 0, pullTangentFar = 0;
+    double meanRatioFar = 1.0, peakStrainFar = 0, damageFar = 0;
+    double floorSmall = 0, floorLarge = 0;
+    double floorSlopeLow = 1e30, floorSlopeHigh = 0;
+    int rows = 0;
+    for (const Case& c : {Case{0.6e-3, 12}, Case{0.8e-3, 12}, Case{2.0e-3, 12},
+                          Case{2.6e-3, 12}}) {
+        HexMesh whole = f.whole;
+        clampRim(whole);
+        dragPunch(whole, f.punchWhole, c.travel);
+        const Plastic reference = solvePlastic(whole, mixed, c.increments, 800);
+        expectTrue("the monolithic reference converged", reference.converged);
+        if (!reference.converged) continue;
+
+        // **The reference has to be independent of how it was reached**, or every
+        // figure below is a property of an increment count. Plasticity is path
+        // dependent, so this is a measurement and not an argument: a third of the
+        // increments has to give the same plate. Measured over 4 to 96 increments the
+        // whole spread is 0.45% of the peak, against a 56% error being reported.
+        const Plastic coarse = solvePlastic(whole, mixed, c.increments / 3, 800);
+        double drift = 0, span = 0;
+        for (std::size_t d = 0; d < reference.u.size(); ++d) {
+            drift = std::max(drift, std::fabs(reference.u[d] - coarse.u[d]));
+            span = std::max(span, std::fabs(reference.u[d]));
+        }
+        expectTrue("the reference does not depend on its increment count",
+                   coarse.converged && drift < 0.01 * span);
+
+        // The geometric floor: the same plate at the same travel with nothing able to
+        // yield, coupled elastically. Whatever is left there is co-rotational
+        // geometry and not plasticity, and it is what every figure in the row is
+        // measured above.
+        const std::vector<const plasticity::Material*> allStrong(f.whole.elementCount(), &outer);
+        const Plastic rigid = solvePlastic(whole, allStrong, 4, 60);
+        const SoftCoupled floorRun = coupleSoftened(f, outer, c.travel, Route::Elastic, 1);
+        double floorPeak = 0;
+        const double floor =
+            floorRun.ok ? surroundingsError(f, floorRun.surroundField, rigid.u, &floorPeak) : 0.0;
+
+        const SoftCoupled elastic = coupleSoftened(f, zoneMaterial, c.travel, Route::Elastic, 1);
+        // Three passes is what a caller would plausibly buy, and it is what the
+        // table reports at every load. The deepest case runs six, so that the same
+        // run says how much of its residual is the loop still moving and how much is
+        // the isotropic knockdown -- a question three passes cannot answer about
+        // itself.
+        const SoftCoupled secant =
+            coupleSoftened(f, zoneMaterial, c.travel, Route::Secant, rows + 1 == 4 ? 6 : 3);
+        const SoftCoupled tangent = coupleSoftened(f, zoneMaterial, c.travel, Route::Tangent, 3);
+        expectTrue("every route solved", elastic.ok && secant.ok && tangent.ok && floorRun.ok);
+        if (!(elastic.ok && secant.ok && tangent.ok && floorRun.ok)) continue;
+
+        double peak = 0;
+        const double eE = surroundingsError(f, elastic.surroundField, reference.u, &peak);
+        // Always the third pass, whatever was run, so the column means one thing.
+        const double eS = surroundingsError(f, secant.perPass[2], reference.u, nullptr);
+        const double eT = surroundingsError(f, tangent.surroundField, reference.u, nullptr);
+        const double pull = perimeterPullOfWhole(f, reference.u);
+        std::printf("     %5.2f  %9.5f %7.4f %5d %6.4f | %8.3f%% %8.3f%% %9.2f%% %6.3f%% | %7.4f "
+                    "%7.4f %7.4f\n",
+                    c.travel * 1e3, reference.peakPlasticStrain, reference.peakDamage,
+                    reference.yielded, secant.meanRatio, 100 * eE / peak, 100 * eS / peak, 100 * eT / peak,
+                    100 * floor / floorPeak, perimeterPull(f, elastic.drive) / pull,
+                    perimeterPull(f, secant.drive) / pull, perimeterPull(f, tangent.drive) / pull);
+        if (secant.perPass.size() >= 6) {
+            // **How much of the 9% is the loop and how much is the model?** The sixth
+            // pass moves the field by a hundredth of what the fifth-to-third does, so
+            // the loop has closed and what is left is the isotropic knockdown.
+            double lastStep = 0, thirdToSixth = 0;
+            for (std::size_t d = 0; d < secant.perPass[5].size(); ++d) {
+                lastStep = std::max(lastStep,
+                                    std::fabs(secant.perPass[5][d] - secant.perPass[4][d]));
+                thirdToSixth = std::max(thirdToSixth,
+                                        std::fabs(secant.perPass[5][d] - secant.perPass[2][d]));
+            }
+            const double converged =
+                surroundingsError(f, secant.perPass[5], reference.u, nullptr);
+            std::printf("     the staggered loop: three passes leave %.2f%%, six leave %.2f%%, "
+                        "and the sixth pass moves the field by %.4f%% of the peak against the "
+                        "third-to-sixth %.4f%%\n",
+                        100 * eS / peak, 100 * converged / peak, 100 * lastStep / peak,
+                        100 * thirdToSixth / peak);
+            expectTrue("the staggered loop has closed by the sixth pass",
+                       lastStep < 0.02 * thirdToSixth);
+            expectTrue("and what it converges to is still the same answer, so the residual is "
+                       "the isotropic knockdown and not the iteration",
+                       converged > 0.5 * eS && converged < eS);
+        }
+
+        // The reference has to be a reference: nothing outside the zone may have
+        // flowed, or the comparison is measuring an error no coupling could close.
+        int outside = 0;
+        for (std::size_t e = 0; e < f.whole.elementCount(); ++e) {
+            if (f.inZone[e]) continue;
+            for (int g = 0; g < solidshell::kGauss; ++g)
+                if (reference.state[e].point[g].equivalentPlasticStrain > 0.0) ++outside;
+        }
+        expectEqualCount("nothing outside the zone yielded in the reference",
+                         static_cast<std::size_t>(outside), 0u);
+        expectEqual("and nothing tore, so this is the band between first yield and first tear",
+                    reference.torn, 0);
+        expectTrue("the zone really did yield", reference.peakPlasticStrain > 1e-4);
+        // **How far into that band, measured rather than assumed.** The regularised
+        // failure strain is 0.20 and the zone here reaches 0.007, which sounds like
+        // the first per cent of the way -- but the state under an in-plane drag is
+        // nearly biaxial, and `plasticity.hpp`'s Rice-Tracey factor cuts the failure
+        // strain by about fourteen at that triaxiality. Damage is the honest
+        // coordinate: the near case sits at the very bottom of the band, which is
+        // its job, and the far case 45% of the way to a tear. Measured with the same
+        // harness beyond this test: the first element tears between 3.2 and 3.6 mm of
+        // travel, at an equivalent plastic strain of 0.0145 -- so 0.20 is the strain a
+        // *uniaxial* element would need and no zone under this load ever reaches it.
+        // The gate stops short of the tear because a reference past it is a reference
+        // that is localising.
+        expectTrue("the zone has taken damage and has not spent it",
+                   reference.peakDamage > 0.0 && reference.peakDamage < 0.9);
+
+        // The floor as a fraction of the peak, per metre of travel. Geometry makes
+        // this a constant; anything else would not.
+        const double floorSlope = floor / (floorPeak * c.travel);
+        floorSlopeLow = std::min(floorSlopeLow, floorSlope);
+        floorSlopeHigh = std::max(floorSlopeHigh, floorSlope);
+
+        if (rows == 0) {
+            elasticAtFirstYield = eE / peak;
+            secantAtFirstYield = eS / peak;
+            tangentAtFirstYield = eT / peak;
+            floorSmall = floor / floorPeak;
+        } else if (rows + 1 == 4) {
+            elasticFar = eE / peak;
+            secantFar = eS / peak;
+            tangentFar = eT / peak;
+            pullElasticFar = perimeterPull(f, elastic.drive) / pull;
+            pullSecantFar = perimeterPull(f, secant.drive) / pull;
+            pullTangentFar = perimeterPull(f, tangent.drive) / pull;
+            meanRatioFar = secant.meanRatio;
+            peakStrainFar = reference.peakPlasticStrain;
+            damageFar = reference.peakDamage;
+            floorLarge = floor / floorPeak;
+        }
+        ++rows;
+    }
+    expectEqual("every load case ran", rows, 4);
+    if (rows != 4) return;
+
+    // Vacuity guards. A zone that barely yielded, or a softening too small to see,
+    // would make any of this look right.
+    expectTrue("the zone softened by a factor worth measuring", meanRatioFar < 0.6);
+    expectTrue("at a plastic strain well past first yield", peakStrainFar > 5e-3);
+    expectTrue("and a measurable way into the band, rather than at its bottom edge",
+               damageFar > 0.1 && damageFar < 0.5);
+    expectTrue("and the geometric floor is far below every figure being compared",
+               floorLarge < 0.005 && floorSmall < floorLarge);
+    // The floor is the co-rotational element against linear theory: the absolute
+    // error is quadratic in the travel and the peak grows linearly, so this ratio is
+    // flat. Measured at 1.3% of spread over a 4.3x range of load, which is what says
+    // the floor is geometry and not a residue of the coupling or of the reference.
+    // Asserted at 3% because the gate builds this at three optimisation levels and
+    // the floor is a difference of small numbers.
+    std::printf("     the geometric floor is %.4f to %.4f %% of the peak per mm of travel, over "
+                "a 4.3x range of load -- flat, as second-order geometry against a linear peak "
+                "must be\n",
+                0.1 * floorSlopeLow, 0.1 * floorSlopeHigh);
+    expectTrue("and it is the same floor at every load, which is what makes it geometry",
+               floorSlopeHigh < 1.03 * floorSlopeLow);
+
+    // 1. **What is lost today.** The number this test exists to produce.
+    std::printf("     between first yield and first tear the linear coupling is wrong by "
+                "%.1f%% to %.1f%% of the surroundings' own displacement\n",
+                100 * elasticAtFirstYield, 100 * elasticFar);
+    expectTrue("the linear coupling is badly wrong once the zone has yielded", elasticFar > 0.4);
+    // And it is wrong from the first increment of flow, not only deep in the band:
+    // measured against the floor rather than against a constant, so the claim is
+    // "this is plasticity" and not "this is a number I chose".
+    expectTrue("and already wrong by an order of magnitude over the geometric floor where the "
+               "zone has only just yielded",
+               elasticAtFirstYield > 10.0 * floorSmall);
+    // And it is wrong in the stiff direction, which is the unsafe one -- the claim
+    // the docs made and never measured.
+    expectTrue("and wrong by dragging the surroundings too far, which is the stiff direction",
+               pullElasticFar > 1.5);
+
+    // 2. **A secant closes most of it.** Not all of it: an isotropic knockdown is a
+    //    model of a J2 secant and not the operator itself.
+    std::printf("     a secant reduction leaves %.1f%% and %.1f%%, and pulls the perimeter to "
+                "%.4f of the true travel where the linear one pulls it to %.4f\n",
+                100 * secantAtFirstYield, 100 * secantFar, pullSecantFar, pullElasticFar);
+    expectTrue("the secant is several times closer than the model it replaces",
+               secantFar < 0.25 * elasticFar && secantAtFirstYield < 0.5 * elasticAtFirstYield);
+    expectTrue("and it removes most of the over-stiffness rather than reversing it",
+               pullSecantFar > 1.0 && pullSecantFar < 1.0 + 0.1 * (pullElasticFar - 1.0));
+
+    // 3. **A tangent does not, and that is the finding.** It over-softens by a
+    //    factor, and it is at its worst exactly where the softening is smallest --
+    //    at first yield it is worse than doing nothing at all, by an order of
+    //    magnitude, because `dsigma_y/deps_p` drops by a finite step there while the
+    //    secant leaves the elastic modulus continuously.
+    std::printf("     the tangent the docs prescribed leaves %.0f%% and %.0f%%, pulling the "
+                "perimeter to %.4f -- it over-softens, and at first yield it is %.0fx worse than "
+                "changing nothing\n",
+                100 * tangentAtFirstYield, 100 * tangentFar, pullTangentFar,
+                tangentAtFirstYield / elasticAtFirstYield);
+    expectTrue("the tangent is worse than the secant at both loads",
+               tangentAtFirstYield > 4.0 * secantAtFirstYield && tangentFar > 3.0 * secantFar);
+    expectTrue("and worse than doing nothing where the zone has only just yielded",
+               tangentAtFirstYield > 2.0 * elasticAtFirstYield);
+    expectTrue("because it over-softens rather than under-softening", pullTangentFar < 0.8);
+
+    // Printed, never asserted on: `test_plasticity.cpp` records what a tight timing
+    // assertion costs on a shared machine. It is here because two monolithic
+    // nonlinear references and eight coupled solves are the most expensive thing in
+    // this file, and a measurement whose cost is invisible is one nobody can decide
+    // to keep.
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                         started)
+                               .count();
+    std::printf("     the whole measurement -- four monolithic references, four increment "
+                "controls, four rigid controls and thirty-six coupled solves -- took %.1f s\n",
+                seconds);
+}
+
+// --- 10. A torn zone and a yielded one are different mechanisms -----------------------
+//
+// They compose, in one order: delete first, soften what is left. The reason is the
+// one §4 gives for dropping an orphan node -- a torn element handed back as a
+// stiffness of zero leaves rows nothing supports, and `reduction.hpp` §3 records
+// that the banded factorisation does not reliably catch that.
+void testTearingAndSofteningCompose() {
+    std::printf("\n--- coupling: tearing and softening are different mechanisms ---\n");
+    const Fixture f = buildFixture();
+    const plasticity::Material material = plasticity::shipSteel();
+
+    // A zone with one torn element and every survivor elastic. This is the case the
+    // element-deletion route already handles, and the softening must not touch it.
+    std::vector<solidshell::ElementPlasticState> state(f.patch.elementCount());
+    for (std::size_t e = 0; e < f.patch.elementCount(); ++e) {
+        double nodes[kDof];
+        f.patch.mesh.gather(e, f.patch.mesh.position, nodes);
+        solidshell::initialisePlasticState(nodes, material, state[e]);
+    }
+    state[0].torn = true;
+    for (int g = 0; g < solidshell::kGauss; ++g) {
+        state[0].point[g].failed = true;
+        state[0].point[g].damage = 1.0;
+        state[0].point[g].equivalentPlasticStrain = 0.25;
+    }
+
+    const coupling::Softening soft =
+        coupling::softening(f.patch.mesh, f.patch.material, material, state);
+    expectEqualCount("a torn element is skipped rather than softened", soft.torn, 1u);
+    expectEqualCount("and nothing else was softened, because nothing else flowed", soft.softened,
+                     0u);
+    expectTrue("so the correction is empty and the deletion route answers unchanged",
+               soft.attachment.empty());
+    expectTrue("the skip is reported rather than silent", !soft.problems.empty());
+    // The tear still shows in the report even though it produced no block: a caller
+    // that has not deleted it can see the zone is not merely soft.
+    expectTrue("and the torn element's own plastic strain is still reported",
+               soft.peakPlasticStrain > 0.2);
+    // A torn element counts as gone in the volume average, not as intact.
+    expectTrue("a torn element counts as gone in the average, not as full stiffness",
+               soft.meanRatio < 1.0 && soft.meanRatio > 0.9);
+
+    // Deleted first, then softened: the survivors are elastic, so the composition is
+    // the deletion route bit for bit.
+    std::vector<std::uint8_t> torn(f.patch.elementCount(), 0u);
+    torn[0] = 1u;
+    const coupling::DamagedMesh damaged = coupling::withoutElements(f.patch.mesh, torn);
+    std::vector<solidshell::ElementPlasticState> kept;
+    for (std::uint32_t e : damaged.element) kept.push_back(state[e]);
+    const coupling::Softening afterDeletion =
+        coupling::softening(damaged.mesh, f.patch.material, material, kept);
+    expectEqualCount("after deletion there is nothing torn left to skip", afterDeletion.torn, 0u);
+    expectTrue("and nothing to soften, so the composition is element deletion alone",
+               afterDeletion.attachment.empty());
+    expectTrue("with the zone reported at full stiffness", afterDeletion.meanRatio == 1.0);
+
+    // Now the same damaged zone with its survivors flowed: the composition softens
+    // exactly the survivors, and every block names a degree of freedom of the
+    // *damaged* mesh, which is what an `Attachment` built against the original
+    // numbering would have got wrong (§4).
+    for (solidshell::ElementPlasticState& s : kept)
+        for (int g = 0; g < solidshell::kGauss; ++g) s.point[g].equivalentPlasticStrain = 0.02;
+    const coupling::Softening both =
+        coupling::softening(damaged.mesh, f.patch.material, material, kept);
+    expectEqualCount("every surviving element is softened", both.softened,
+                     damaged.mesh.elementCount());
+    const std::size_t dofs = damaged.mesh.nodeCount() * 3;
+    std::uint32_t highest = 0;
+    for (const solidshell::DofBlock& block : both.attachment.stiffness)
+        for (std::uint32_t d : block.dof) highest = std::max(highest, d);
+    expectTrue("and names only degrees of freedom the damaged mesh has",
+               static_cast<std::size_t>(highest) < dofs);
+    reduction::Substructure composed(damaged.mesh, f.patch.material,
+                                     coupling::carriedInterface(damaged, f.zoneInterface),
+                                     both.attachment);
+    expectTrue("a zone that has both torn and yielded still factors", composed.ready());
+
+    // **Which element each block corrects, asked about a subset.** `element` is
+    // parallel to the blocks and is the only way a caller can tell what was
+    // softened; softening everything would make a wrong answer here indistinguishable
+    // from a right one, so only the odd-numbered elements are made to flow.
+    std::vector<solidshell::ElementPlasticState> odd = state;
+    std::vector<std::uint32_t> wanted;
+    for (std::size_t e = 0; e < odd.size(); ++e) {
+        odd[e].torn = false;
+        for (int g = 0; g < solidshell::kGauss; ++g) {
+            odd[e].point[g].failed = false;
+            odd[e].point[g].equivalentPlasticStrain = (e % 2 == 1) ? 0.02 : 0.0;
+        }
+        if (e % 2 == 1) wanted.push_back(static_cast<std::uint32_t>(e));
+    }
+    const coupling::Softening subset =
+        coupling::softening(f.patch.mesh, f.patch.material, material, odd);
+    expectEqualCount("only the elements that flowed are softened", subset.softened,
+                     wanted.size());
+    expectTrue("and the subset is neither everything nor nothing",
+               !wanted.empty() && wanted.size() < f.patch.elementCount());
+    expectTrue("`element` names exactly those, in ascending order", subset.element == wanted);
+    expectEqualCount("with one block per named element", subset.attachment.stiffness.size(),
+                     subset.element.size());
+    // ...and block `i` really is element `element[i]`: its degrees of freedom are
+    // that element's own nodes, which is what a wrong-but-plausible index would get
+    // wrong while every count above still agreed.
+    std::size_t mismatched = 0;
+    for (std::size_t b = 0; b < subset.element.size(); ++b) {
+        const std::size_t e = subset.element[b];
+        for (int a = 0; a < solidshell::kNodes; ++a) {
+            const std::uint32_t node =
+                f.patch.mesh.index[e * solidshell::kNodes + static_cast<std::size_t>(a)];
+            for (int k = 0; k < 3; ++k)
+                if (subset.attachment.stiffness[b].dof[static_cast<std::size_t>(a * 3 + k)] !=
+                    node * 3 + static_cast<std::uint32_t>(k))
+                    ++mismatched;
+        }
+    }
+    expectEqualCount("and every degree of freedom a block names belongs to that element",
+                     mismatched, 0u);
+
+    // A state array of the wrong length is refused, not read short. The blocks it
+    // would otherwise produce would soften whichever elements happened to line up.
+    const coupling::Softening wrong =
+        coupling::softening(f.patch.mesh, f.patch.material, material, kept);
+    expectTrue("a history that is not this mesh's is refused", wrong.attachment.empty() &&
+                                                                   !wrong.problems.empty());
+    expectEqualCount("and nothing is softened on the strength of it", wrong.softened, 0u);
+}
+
 }  // namespace
 
 void runCouplingTests() {
@@ -1623,4 +2361,6 @@ void runCouplingTests() {
     testTheWholeChainAgainstTheWholePlate();
     testPrescribedSolveAndMeshSurgery();
     testTierOneCannotSeeTheStiffeners();
+    testPlasticSofteningGoesBack();
+    testTearingAndSofteningCompose();
 }
