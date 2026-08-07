@@ -49,6 +49,7 @@ void runPlasticityTests();
 void runPromotionTests();
 void runReductionTests();
 void runSolidShellTests();
+void runThermalTests();
 void runSerialiseTests();
 void runShipFileTests();
 void runWorldIoTests();

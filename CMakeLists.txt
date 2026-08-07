@@ -59,6 +59,7 @@ add_library(shipsim_engine
   engine/sim/reduction.cpp
   engine/sim/section.cpp
   engine/sim/solid_shell.cpp
+  engine/sim/thermal.cpp
   engine/sim/zone.cpp
   engine/sim/radiation.cpp
   engine/sim/roll_damping.cpp
@@ -126,6 +127,7 @@ add_executable(shipsim_tests
   tests/test_scheduler.cpp
   tests/test_serialise.cpp
   tests/test_solid_shell.cpp
+  tests/test_thermal.cpp
   tests/test_shipfile.cpp
   tests/test_worldio.cpp
   tests/test_zone.cpp

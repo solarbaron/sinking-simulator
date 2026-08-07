@@ -672,8 +672,31 @@ should be honest about that.
 ## Phase 4 — Fire and heat — *~10 em*
 
 - Multi-zone compartment fire, species transport through the opening network
-- Implicit thermal FEM on the structural mesh
-- Temperature-dependent material strength (fire → FEM coupling)
+- ✅ Implicit thermal FEM on the structural mesh — `engine/sim/thermal.{hpp,cpp}`.
+  Backward Euler on the same solid-shell mesh and the same `BandedSpd`
+  factorisation the statics use, one scalar unknown per node; Dirichlet, flux and
+  convective boundaries; EN 1993-1-2 carbon steel with `k(T)` and `c(T)` live,
+  closed by Picard on a **secant** heat capacity. Validated against the
+  semi-infinite `erf`, the steady plate, the Kirchhoff transform for the
+  nonlinear steady operator, and an energy account that closes to 5e-15 of the
+  enthalpy moved.
+
+  **A correction, because this item's own justification was wrong.** "Implicit"
+  is usually argued for from an explicit stability limit of `rho c h^2 / 2k`
+  said to be *milliseconds* on ship plating. It is **seconds** — 4.66 s for the
+  ferry's 12 mm AH36, because steel's diffusivity is 1.5e-5 m²/s and 12 mm is
+  not a small length. Milliseconds would need 0.3 mm elements. Explicit
+  conduction is therefore *viable* on the unrefined structural mesh, and the
+  real case for implicit is the `h²`: four elements through the same plate —
+  which is what a through-thickness gradient needs, and a through-thickness
+  gradient is what bows a plate — takes the limit to 0.29 s, and a 1.5 mm
+  surface layer to 0.073 s. `thermal.hpp` carries the measurement and
+  `explicitLimit()` reproduces it as a closed form.
+- Temperature-dependent material strength (fire → FEM coupling). The thermal
+  half is in place and `StructuralMaterial` now carries `conductivity` and
+  `specificHeat`; what is missing is the reduction factors for `E` and
+  `f_y` (EN 1993-1-2 §3.2), and a decision about whether the strength model
+  reads a nodal temperature field or an element-averaged one.
 - Suppression systems, and their effect on stability
 - LES promotion for the local compartment
 - Volumetric fire and smoke rendering

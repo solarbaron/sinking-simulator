@@ -5414,6 +5414,13 @@ Separate from the fast solver, on a very long timescale:
 
 ### Material database
 
+`StructuralMaterial` now carries `conductivity` and `specificHeat`, at 20 °C,
+from EN 1993-1-2 §3.4.1.3 and §3.4.1.2 evaluated there — 53.334 W/(m·K) and
+439.802 J/(kg·K). They are the *room-temperature* values and a fire does not stay
+there: `thermal::carbonSteelConductivity` and `carbonSteelSpecificHeat` carry the
+published curves, and `thermal::Problem::temperatureDependent` uses them.
+Conductivity falls 36% by 600 °C; specific heat spikes elevenfold at 735 °C.
+
 Per material: density, E, ν, yield and ultimate strength, hardening curve,
 fracture strain vs triaxiality, Johnson–Cook rate and thermal coefficients,
 thermal conductivity, specific heat, expansion, melting point, and — critically —
@@ -5459,7 +5466,26 @@ out the top, cool air in the bottom, with a neutral plane in between).
 
 - Conduction through bulkheads and decks by an implicit FEM thermal solve on the
   structural mesh — the same mesh, so the temperature field maps directly onto the
-  strength reduction in §3.
+  strength reduction in §3. **Built**: `engine/sim/thermal.{hpp,cpp}`, backward
+  Euler on the solid-shell mesh through `solidshell::BandedSpd`, one scalar
+  unknown per node so the band is a third of the statics' and the factorisation a
+  ninth. Dirichlet, flux and convective boundaries; EN 1993-1-2 carbon steel with
+  `k(T)` and `c(T)` live, closed by Picard on a **secant** heat capacity so the
+  735 °C ferrite–austenite spike is integrated rather than sampled and the energy
+  account still closes.
+
+  **The stability figure that justified "implicit" was wrong by three orders of
+  magnitude, and the conclusion survives for a different reason.** The explicit
+  limit `ρ c h²/2k` on 12 mm AH36 is **4.66 s**, not milliseconds — steel's
+  diffusivity is 1.5×10⁻⁵ m²/s and 12 mm is not a small length, so explicit
+  conduction is perfectly viable on the unrefined structural mesh. What is not
+  viable is refinement: four elements through the same plate, which is what a
+  through-thickness gradient needs and what will bow a plate, takes it to 0.29 s,
+  and a 1.5 mm surface layer to 0.073 s. The `h²` is the argument, not the value.
+  Measured at 2 304 elements and 4 802 nodes: half-bandwidth 101, 2.8 ms to
+  prepare, 11 ms for the first step, and **under a millisecond** for each of the
+  next 200 — because a fixed step is factored once and every later step is two
+  triangular solves.
 - Radiation between hot surfaces and to flame volumes (view factors precomputed
   per compartment).
 - Convection to gas layers.

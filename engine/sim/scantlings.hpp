@@ -122,6 +122,20 @@ struct StructuralMaterial {
     double youngsModulus = 206.0e9;  // Pa
     double poissonRatio = 0.30;
     double yieldStrength = 355.0e6;  // Pa
+
+    // Thermal, at 20 C, from EN 1993-1-2:2005 §3.4.1.3 and §3.4.1.2 evaluated
+    // there: `54 - 3.33e-2 * 20` and the cubic at 20 C. They arrive here with
+    // `thermal.hpp`, which is the constitutive model this header was waiting for.
+    //
+    // **These are the room-temperature values and a fire does not stay there.**
+    // Conductivity falls 36% by 600 C and specific heat has an eleven-fold spike
+    // at 735 C, so `thermal::Problem::temperatureDependent` takes both from the
+    // published curves instead of from here. What these two are for is a solve
+    // over a range narrow enough that constant properties are the right model --
+    // and for the closed forms that validate the operator, every one of which
+    // assumes a constant diffusivity.
+    double conductivity = 53.334;   // W/(m K)
+    double specificHeat = 439.80176;  // J/(kg K)
 };
 
 StructuralMaterial mildSteel();   // grade A, 235 MPa
