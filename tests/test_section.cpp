@@ -1682,9 +1682,21 @@ void testFerrySection() {
     const double predictedArea = girder.area - hold.missedMemberArea;
     expectNear("EA against the girder's own area, less the members it could not attach",
                effectiveArea / predictedArea, 1.0, 0.01);
-    // 0.44% measured, and it is not noise: the frames and deck beams restrain the
-    // section's Poisson contraction, which a beam model has no way to represent. It
-    // is worth 0.52% of the area, measured by omitting them.
+    // **0.356% measured on this window, not the 0.44% this comment carried**, and it is
+    // not noise: the frames and deck beams restrain the section's Poisson contraction,
+    // which a beam model has no way to represent. They are worth 0.439% of the area
+    // here, measured by omitting them in `testFramesRestrainThePoissonContraction`
+    // below -- where both figures come out of a run rather than out of a comment.
+    //
+    // **The old pair, 0.44% and 0.52%, were the *hold*'s figures written into a
+    // two-bay test, and they were the hold's figures before §8's halo.** The hold now
+    // gives +0.411% and +0.508% (`section_probe --from=-7.2 --to=19.2`, with and
+    // without `--no-frames`), against +0.420% before the halo moved
+    // `missedMemberArea` -- so one of the two numbers was near enough to be believed
+    // and neither belonged to the section this test builds. The effect is a function
+    // of section length: 0.31% at one bay, 0.44% at two, 0.48% at four, tending to the
+    // hold's 0.51%, because a cut plane is free in y and z and a longer section has
+    // proportionally less of itself next to one. Nothing tests a comment.
     expectTrue("the agreement is not vacuous: the girders alone are four per cent",
                hold.missedMemberArea / girder.area > 0.03);
 
@@ -3728,6 +3740,488 @@ void testNodePositionsDoNotDependOnWhereTheSectionWasCut() {
     expectTrue("though it did average a halo there too", withHalo.haloPanels > 0);
 }
 
+// --- 10. The stress the section carries, against the only field it can be -----------
+//
+// `section.hpp` §2 is that `EA` and `EI` are the wrong instrument for the junctions
+// because a prescribed plane-sections field makes them come out right on a mesh that
+// joined nothing. **The stress path has the mirror-image hazard**: on a *prismatic*
+// section the exact three-dimensional answer to that same prescribed field **is**
+// plane sections, so a stress reader that returned `E eps` from a lookup table would
+// pass everything below. What stops that being vacuous is that the same reader is
+// asked for a field it must get wrong -- the ferry, where the residual is not zero --
+// and that the box is asked at Gauss points whose `z` the fit has to discover.
+
+void testAxialStressIsThePatchTest() {
+    const StructuralMesh structure = makeBox(kT, kT);
+    const section::Section box = section::buildSection(structure, openBoxParams());
+    const StructuralMaterial material = ah36Steel();
+    expectTrue("the box meshed", !box.empty());
+
+    section::BeamLoad axial;
+    axial.strain = 1e-4;
+    std::vector<double> field;
+    const section::BeamResponse stretched =
+        section::applyBeamLoad(box, material, axial, &field);
+    expectTrue("the box takes an axial load: " + stretched.problem, stretched.ok);
+    expectEqualCount("and hands back a field over its own mesh", field.size(),
+                     box.nodeCount() * 3);
+
+    const std::vector<section::StressSample> samples =
+        section::axialStress(box, material, field, 0.5 * kL);
+    // Twelve sub-quads cross a bay of this box -- four in each flange, two in each
+    // side -- so ninety-six Gauss points, and the bound is set off that rather than off
+    // a round number.
+    expectTrue("a transverse plane crosses elements", samples.size() >= 96);
+
+    // The patch test. A prismatic section stretched by `eps` carries `sigma = E eps`
+    // at every point, because every longitudinal strip is free to contract and the
+    // ends alone say what its strain is. Nothing here is a discretisation: it is what
+    // the element is supposed to reproduce exactly.
+    const double exact = material.youngsModulus * axial.strain;
+    const section::BeamFit fit = section::fitBeam(samples, 0.5 * kH);
+    const double fitVolume = fit.volume;
+    double worst = 0, volume = 0;
+    for (const section::StressSample& s : samples) {
+        worst = std::max(worst, std::abs(s.sigmaXX / exact - 1.0));
+        volume += s.volume;
+        expectTrue("every Gauss point carries a volume", s.volume > 0);
+    }
+    std::printf("     box under pure strain: worst |sigma/E eps - 1| over %zu Gauss points"
+                " = %.3e\n", samples.size(), worst);
+    expectTrue("sigma_xx is E eps at every Gauss point on the cut, to 5e-11 (measured"
+               " 1.16e-11)", worst < 5e-11);
+    // And it is not vacuous: `exact` is 20.6 MPa, so a reader returning zero would
+    // fail.
+    expectTrue("against a stress worth reading", exact > 1e7);
+    // **The volume is a closed form and it is asserted as one**, because it is the
+    // weight in every average `fitBeam` and `fibreStress` take and a mutation run said
+    // nothing here could tell it from a constant. One bay of this box is its perimeter
+    // times the plate thickness times the bay length -- the Gauss weights of the
+    // elements the plane crosses sum to exactly the steel in that slab, which is what
+    // makes a volume-weighted mean a mean over steel rather than over mesh.
+    expectNear("the Gauss weights sum to the slab's own steel", volume,
+               2 * (kB + kH) * kT * (kL / kNx), 1e-12 * (2 * (kB + kH) * kT * (kL / kNx)));
+    expectNear("which the fit agrees about", fitVolume, volume, 1e-15 * volume);
+
+    expectTrue("the fit ran", fit.ok);
+    expectNear("a uniform field fits a constant", fit.axial, exact, 1e-11 * exact);
+    expectTrue("with no gradient in z", std::abs(fit.gradient) < 1e-6 * exact / kH);
+    expectTrue("and nothing left over", fit.residualRms < 1e-11 * exact);
+    // The guard that says the fit had a `z` range to find a gradient in. Without it a
+    // field sampled at one height would report "no gradient" and mean nothing.
+    expectNear("the samples reach the keel", fit.zLo, 0.0, 0.1 * kH);
+    expectNear("and the deck", fit.zHi, kH, 0.1 * kH);
+
+    // **And the same field fitted about an axis that is not the section's own.** Every
+    // fit above turns about the neutral axis, where the axial term is zero and the
+    // cross term `s1 t0` in the normal equations vanishes with it -- so a sign error
+    // there is invisible, which a mutation run said in as many words. About the keel
+    // both are non-zero and the gradient still has to come out at nothing: a uniform
+    // field has no gradient whatever it is measured from.
+    const section::BeamFit low = section::fitBeam(samples, 0.0);
+    expectTrue("the fit about the keel ran", low.ok);
+    expectNear("a uniform field is uniform from any axis", low.axial, exact, 1e-11 * exact);
+    expectTrue("and still has no gradient in z, to 1e-9 of the extreme fibre (measured 2e-11)",
+               std::abs(low.gradient) * kH < 1e-9 * exact);
+    // Vacuity: the cross term has to be non-zero, or "the sign of it does not matter"
+    // is what is being asserted rather than tested. `sum w z` over a box about its keel
+    // is half its depth times its steel.
+    expectTrue("about the keel the first moment of the samples is not zero",
+               std::abs(fit.volume * 0.5 * kH) > 1e-4);
+
+    // **And the same field in compression, because a ship sags as well as hogs.**
+    // `fitBeam` is arithmetic over a sample list, so the sign case is free: negate every
+    // stress and every reported quantity has to follow. A `peak` taken as the largest
+    // *signed* value instead of the largest magnitude reports zero here, and nothing
+    // that only ever looks at a hogging deck would notice.
+    std::vector<section::StressSample> compressed = samples;
+    for (section::StressSample& c : compressed) c.sigmaXX = -c.sigmaXX;
+    const section::BeamFit sagging = section::fitBeam(compressed, 0.5 * kH);
+    expectTrue("the mirrored fit ran", sagging.ok);
+    expectNear("a uniform compression fits its own constant", sagging.axial, -exact,
+               1e-11 * exact);
+    expectNear("and the peak carries the sign", sagging.peak, -exact, 1e-11 * exact);
+    expectNear("as does the unmirrored one", fit.peak, exact, 1e-11 * exact);
+}
+
+void testAxialStressUnderCurvatureIsTheBeamsOwnLine() {
+    const StructuralMesh structure = makeBox(kT, kT);
+    const section::Section box = section::buildSection(structure, openBoxParams());
+    const StructuralMaterial material = ah36Steel();
+
+    // About the box's own neutral axis, which is mid-height by symmetry. Turning about
+    // anything else would superpose an axial strain and the two would have to be
+    // separated before anything could be asserted.
+    section::BeamLoad bending;
+    bending.curvature = 1e-4;
+    bending.reference = 0.5 * kH;
+    std::vector<double> field;
+    const section::BeamResponse bent = section::applyBeamLoad(box, material, bending, &field);
+    expectTrue("the box takes a curvature: " + bent.problem, bent.ok);
+
+    const std::vector<section::StressSample> samples =
+        section::axialStress(box, material, field, 0.5 * kL);
+    const double gradient = material.youngsModulus * bending.curvature;
+    double worst = 0;
+    for (const section::StressSample& s : samples)
+        worst = std::max(worst, std::abs(s.sigmaXX - gradient * (s.at.z - 0.5 * kH)));
+    std::printf("     box under pure curvature: worst |sigma - E kappa (z - z_na)| = %.3e Pa"
+                " against a %.3e Pa extreme fibre\n", worst, gradient * 0.5 * kH);
+    expectTrue("sigma_xx is E kappa (z - z_na) at every Gauss point, to 100 Pa of a 10.3 MPa"
+               " extreme fibre (measured 28 Pa)", worst < 100.0);
+
+    const section::BeamFit fit = section::fitBeam(samples, 0.5 * kH);
+    expectTrue("the fit ran", fit.ok);
+    std::printf("     fitted gradient %.6e against E kappa %.6e (%.3e relative), fitted"
+                " neutral axis %.9f\n", fit.gradient, gradient, fit.gradient / gradient - 1.0,
+                fit.neutralAxis);
+    expectNear("and recovers the curvature it was given, to 2e-6 (measured 4.9e-7)",
+               fit.gradient, gradient, 2e-6 * gradient);
+    expectNear("and the neutral axis, which it was not told", fit.neutralAxis, 0.5 * kH, 1e-6);
+    // The rms is an average and can hide one bad point; the worst residual cannot, and
+    // on a prismatic box under pure bending there is no bad point to hide.
+    expectTrue("with no single Gauss point off the line either", fit.residualWorst < 100.0);
+    expectTrue("and the worst is at least the rms, which is what a worst means",
+               fit.residualWorst >= fit.residualRms);
+    // **From an axis that is not the neutral one**, which is the case that has any
+    // content: fitted about its own axis the axial term is zero and `about - axial /
+    // gradient` is `about` whichever sign it carries. About the keel the axial term is
+    // `-E kappa H / 2` and the answer has to come back at mid-height anyway.
+    const section::BeamFit low = section::fitBeam(samples, 0.0);
+    expectTrue("the fit about the keel ran", low.ok);
+    expectNear("the neutral axis is found from the keel too", low.neutralAxis, 0.5 * kH, 1e-6);
+    expectNear("with the same gradient", low.gradient, gradient, 2e-6 * gradient);
+    expectTrue("and a non-zero axial term, so the sign of the shift is being tested",
+               std::abs(low.axial) > 0.1 * gradient * kH);
+    expectTrue("with nothing left over", fit.residualRms < 1e-6 * gradient * kH);
+    // Vacuity: the field this is agreeing with has to be a real gradient, or "linear
+    // in z" is a statement about a constant. The extreme fibre is 10.3 MPa.
+    expectTrue("over a gradient worth fitting", gradient * 0.5 * kH > 1e7);
+
+    // The two extreme fibres, which is what a section modulus is taken at. On a box
+    // the deck and the keel are flat plates at one height apiece, so the worst and the
+    // mean are the *same number* -- which is the negative control for shear lag: a
+    // prismatic box has none, and a ferry does.
+    const section::FibreStress deck = section::fibreStress(samples, true);
+    const section::FibreStress keel = section::fibreStress(samples, false);
+    expectTrue("there is a deck band and a keel band", deck.ok && keel.ok);
+    expectNear("the deck carries E kappa H/2", deck.mean, gradient * 0.5 * kH,
+               1e-3 * gradient * kH);
+    expectNear("and the keel the same in compression", keel.mean, -gradient * 0.5 * kH,
+               1e-3 * gradient * kH);
+    // **Not exactly one, and the reason is the band and not the ship.** A fibre is a
+    // line and a band has a depth, so under a gradient the worst point in it is higher
+    // than the mean point in it by the band's own 2% of the section. That is 0.6% here
+    // and it is the floor this instrument can resolve -- against 1.4 on the ferry, which
+    // is what makes the ferry's number shear lag rather than arithmetic.
+    std::printf("     box deck band: worst/mean %.6f over %zu samples\n",
+                deck.worst / deck.mean, deck.samples);
+    expectNear("a flat deck has no shear lag beyond its own band depth: measured 1.0058,"
+               " asserted at 1.01", deck.worst / deck.mean, 1.0, 0.01);
+    expectNear("nor a flat keel", keel.worst / keel.mean, 1.0, 0.01);
+    expectTrue("and the two bands are on opposite sides of the axis", deck.z > keel.z);
+    // **The sign, which a magnitude cannot carry.** Hogging tensions the deck and
+    // compresses the keel; deck plating in compression buckles well below yield, so
+    // reporting the worst fibre as a magnitude would lose the one thing that tells the
+    // two failures apart. `girder.hpp` makes the same point about `M / Z`.
+    expectTrue("the worst deck fibre is in tension", deck.worst > 0);
+    expectTrue("and the worst keel fibre is in compression", keel.worst < 0);
+
+    // **A cut with no depth has no fibres and is refused rather than answered.** Every
+    // sample at one height makes the band the whole field, so a "deck stress" would come
+    // back as the section's mean and read as a perfectly ordinary number. Nothing this
+    // mesher builds produces one -- which is exactly why it has to be constructed here,
+    // and why a mutation run found the guard untested.
+    std::vector<section::StressSample> flat;
+    for (int i = 0; i < 8; ++i)
+        flat.push_back({Vec3{0.0, 0.1 * i, 1.0}, 1e-3, 1e6 * (i + 1)});
+    expectTrue("a cut with no depth has no deck", !section::fibreStress(flat, true).ok);
+    expectTrue("and no keel", !section::fibreStress(flat, false).ok);
+    // Nor a beam: there is no gradient to find and the normal equations are singular.
+    expectTrue("and no beam to fit through it", !section::fitBeam(flat, 0.0).ok);
+    // The guard that says the list was otherwise usable, so "refused" is about the depth
+    // and not about the samples.
+    std::vector<section::StressSample> spread = flat;
+    for (std::size_t i = 0; i < spread.size(); ++i) spread[i].at.z = 0.1 * i;
+    expectTrue("the same samples spread over a depth do have a deck",
+               section::fibreStress(spread, true).ok);
+    expectTrue("and a beam", section::fitBeam(spread, 0.0).ok);
+}
+
+// **A wide deck does, and this is the fixture that has one.** The box's flanges are
+// 2 m across on a 1 m depth and are fed by side plating at both edges, so a plane
+// section is very nearly right; the reference ferry's strength deck is 20 m across on
+// a 15 m depth and it is not. The claim is not a number -- it is that `fibreStress`
+// separates a mean from a worst on a real hull and reports the same number on a
+// prismatic one, which is the only way the ratio means anything.
+void testFerryDeckStressIsNotOneNumber() {
+    const StructuralMesh structure = ferryStructure();
+    const section::Section hold = section::buildSection(structure, ferryParams());
+    const StructuralMaterial material = ah36Steel();
+    const HullGirderSection girder = hullGirderSection(structure, 0.0);
+    expectTrue("the ferry section meshed", !hold.empty());
+
+    section::BeamLoad bending;
+    bending.curvature = 1e-6;
+    bending.reference = girder.neutralAxis;
+    std::vector<double> field;
+    const section::BeamResponse bent = section::applyBeamLoad(hold, material, bending, &field);
+    expectTrue("the ferry section takes a curvature: " + bent.problem, bent.ok);
+
+    const std::vector<section::StressSample> samples =
+        section::axialStress(hold, material, field, 0.0);
+    expectTrue("a midship cut crosses hundreds of elements", samples.size() > 500);
+    const section::BeamFit fit = section::fitBeam(samples, girder.neutralAxis);
+    expectTrue("the fit ran", fit.ok);
+
+    // The beam's own answer, from `hullGirderSection`, which shares no code with any
+    // of this: `sigma = M (z - z_na) / I`, and `M / I` is `E kappa` if the two tiers
+    // agree about `EI`. They agree to a fraction of a per cent amidships.
+    const double beam = material.youngsModulus * bending.curvature;
+    expectNear("the fitted gradient is E kappa", fit.gradient, beam, 0.02 * beam);
+    expectNear("and the fitted neutral axis is the girder's", fit.neutralAxis,
+               girder.neutralAxis, 0.15);
+    // **And the residual is not zero, which is the whole point.** A beam has exactly
+    // none of it. Asserted as a band rather than a value: below 1e-3 of the peak the
+    // ferry would be behaving like a prismatic box and this test would be measuring
+    // the box twice; above a tenth the fit would not be a beam at all and the
+    // comparison against Tier 0 would be meaningless.
+    expectTrue("a real hull does not carry a beam's stress field", fit.residualRms >
+                                                                      1e-3 * std::abs(fit.peak));
+    expectTrue("but it is still recognisably one", fit.residualRms < 0.2 * std::abs(fit.peak));
+    // And the worst single point is worse than the rms by a real factor, which is what
+    // says the departure is *local* -- shear lag crowding stress into the deck edge --
+    // rather than a uniform offset the fit could have absorbed.
+    expectTrue("the worst point is well above the rms", fit.residualWorst > 1.5 * fit.residualRms);
+
+    const section::FibreStress deck = section::fibreStress(samples, true);
+    expectTrue("the deck band has samples", deck.ok && deck.samples > 4);
+    expectTrue("the worst deck stress is above its own mean", std::abs(deck.worst) >
+                                                                  std::abs(deck.mean));
+    expectTrue("and it is the *same sign*, so this is a spread and not two structures",
+               deck.worst * deck.mean > 0);
+}
+
+// The half-open rule, which is the one `sectionElements` records a defect for.
+//
+// A plane on a frame station is served by the bay forward of it and not by both.
+// Counting both would double the steel on the cut, and every average taken over it --
+// the fit's gradient, the deck's mean -- is a *ratio*, so it would look perfectly
+// correct while the volume behind it was twice what it should be.
+void testAxialStressCountsASeamOnce() {
+    const StructuralMesh structure = makeBox(kT, kT);
+    const section::Section box = section::buildSection(structure, openBoxParams());
+    const StructuralMaterial material = ah36Steel();
+    section::BeamLoad axial;
+    axial.strain = 1e-4;
+    std::vector<double> field;
+    const section::BeamResponse stretched = section::applyBeamLoad(box, material, axial, &field);
+    expectTrue("the box solved", stretched.ok);
+
+    const double bay = kL / kNx;
+    const std::vector<section::StressSample> inside =
+        section::axialStress(box, material, field, 4.0 * bay + 0.5 * bay);
+    const std::vector<section::StressSample> onSeam =
+        section::axialStress(box, material, field, 4.0 * bay);
+    expectEqualCount("a seam is served by one bay, not two", onSeam.size(), inside.size());
+    double insideVolume = 0, seamVolume = 0;
+    for (const section::StressSample& s : inside) insideVolume += s.volume;
+    for (const section::StressSample& s : onSeam) seamVolume += s.volume;
+    expectNear("and carries the same steel", seamVolume, insideVolume, 1e-12 * insideVolume);
+    // Vacuity: the plane really is on a seam, and a bay really is a distinct set of
+    // elements -- otherwise "the same count" is the same elements twice.
+    expectTrue("the box has bays to land between", kNx > 4);
+    const std::vector<section::StressSample> next =
+        section::axialStress(box, material, field, 5.0 * bay + 0.5 * bay);
+    expectEqualCount("each bay contributes the same population", next.size(), inside.size());
+}
+
+// --- 11. A whole-ship model can answer a stress question ---------------------------
+//
+// `sectionDisplacement` is the one route from an assembled chain back to a mesh, and
+// without it a Tier-1 ship reports resultants -- which is what Tier 0 already had.
+// **What makes it exact is `reduction.hpp` property 1**, and it is worth checking
+// rather than quoting: with zero modes the boundary response of a chain is the same
+// solve as eliminating every interior, so a section's interface displacement is not an
+// approximation of the monolith's, it is the monolith's.
+void testChainRecoversTheStressItsSectionsCarry() {
+    const StructuralMesh structure = makeBox(kT, kT);
+    const StructuralMaterial material = ah36Steel();
+    section::ChainParams params;
+    // Tied, not open: a chain has to be one piece before `applyBeamLoad` will solve it,
+    // and an open box is four plates. The corner ties cost `EA` nothing -- `section.hpp`
+    // §5's table is 1.000000 either way -- so the patch test below is unaffected by the
+    // choice and the component count is not.
+    params.section = boxParams();
+    params.reduce.modes = 0;
+    params.reduce.cutoffFrequency = 0;
+    for (int i = 0; i <= 4; ++i) params.station.push_back(kL * i / 4);
+    const section::Chain chain = section::buildChain(structure, params);
+    expectTrue("the chain of four is ready", chain.ready());
+    expectEqual("in one piece", chain.components, 1);
+
+    section::BeamLoad axial;
+    axial.strain = 1e-4;
+    std::vector<double> state;
+    const section::BeamResponse stretched = section::applyBeamLoad(chain, axial, &state);
+    expectTrue("the chain takes an axial load: " + stretched.problem, stretched.ok);
+    expectEqualCount("and hands back its assembled state", state.size(),
+                     static_cast<std::size_t>(chain.assembly.size()));
+
+    // Every section of the chain, expanded onto its own mesh and asked for its stress.
+    // The answer is the patch test again -- `E eps` everywhere -- and the point is that
+    // it now comes through `componentState`, `recover` and the constraint expansion
+    // rather than out of a single solve.
+    const double exact = material.youngsModulus * axial.strain;
+    double worst = 0;
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < chain.section.size(); ++i) {
+        const std::vector<double> field = section::sectionDisplacement(chain, i, state);
+        expectEqualCount("section " + std::to_string(i) + " expands onto its own mesh",
+                         field.size(), chain.section[i].nodeCount() * 3);
+        const double middle = 0.5 * (chain.section[i].xFrom + chain.section[i].xTo);
+        const std::vector<section::StressSample> samples =
+            section::axialStress(chain.section[i], material, field, middle);
+        total += samples.size();
+        for (const section::StressSample& s : samples)
+            worst = std::max(worst, std::abs(s.sigmaXX / exact - 1.0));
+    }
+    std::printf("     chain of four: worst |sigma/E eps - 1| over %zu Gauss points = %.3e\n",
+                total, worst);
+    expectTrue("every section of the assembled ship carries E eps, to 5e-9 (measured 5.8e-10 --"
+               " three orders above the single section's 1.2e-11, which is the assembled"
+               " Cholesky and not the recovery)", worst < 5e-9);
+    expectTrue("over the whole length, not one section of it", total >= 4 * 96);
+
+    // **The negative control for the recovery.** A state that is not this assembly's
+    // comes back empty rather than as a plausible field: every index would otherwise be
+    // in range and the modal content would quietly be missing.
+    expectTrue("a foreign state is refused",
+               section::sectionDisplacement(chain, 0, std::vector<double>(3, 0.0)).empty());
+    expectTrue("and so is a section index the chain does not have",
+               section::sectionDisplacement(chain, chain.section.size(), state).empty());
+}
+
+// --- 12. The member accounting reaches the second moment too -------------------------
+//
+// `missedMemberArea` was the whole of the accounting and it is not enough to correct
+// an `I` comparison with. The ferry's girders are 4.4% of her area and 5.3% of her
+// second moment -- they sit low in a double bottom, and a second moment is a lever arm
+// squared -- so subtracting the area alone leaves the two tiers looking 5% apart
+// amidships where they agree to 0.4%. That is the difference between "a mesher that
+// cannot reach three girders" and "a mesher that is wrong".
+void testMissedMembersAccountForTheirMomentsToo() {
+    const StructuralMesh structure = ferryStructure();
+    const section::Section hold = section::buildSection(structure, ferryParams());
+    expectTrue("the ferry section meshed", !hold.empty());
+
+    // `sectionElements` at the section's own mid-station, which is where a member's
+    // share is evaluated. It shares no code with the mesher.
+    double area = 0, first = 0, second = 0;
+    for (const SectionElement& element : sectionElements(structure, 0.0)) {
+        if (!element.stiffener) continue;
+        area += element.area;
+        first += element.area * element.height;
+        second += element.ownSecondMoment + element.area * element.height * element.height;
+    }
+    expectNear("attached plus missed is the stiffener area of the cut",
+               hold.attachedMemberArea + hold.missedMemberArea, area, 1e-9);
+    expectNear("and its first moment about the baseline",
+               hold.attachedMemberFirstMoment + hold.missedMemberFirstMoment, first, 1e-9 * first);
+    expectNear("and its second moment about the baseline",
+               hold.attachedMemberSecondMoment + hold.missedMemberSecondMoment, second,
+               1e-9 * second);
+
+    // What is missed is worth more of the second moment than of the area, and that is
+    // the reason this exists rather than a curiosity: correcting one and not the other
+    // is correcting the wrong one.
+    const HullGirderSection girder = hullGirderSection(structure, 0.0);
+    const double missedAboutAxis =
+        hold.missedMemberSecondMoment - 2.0 * girder.neutralAxis * hold.missedMemberFirstMoment +
+        girder.neutralAxis * girder.neutralAxis * hold.missedMemberArea;
+    expectTrue("the girders are a few per cent of the ferry's area",
+               hold.missedMemberArea / girder.area > 0.03);
+    expectTrue("and more of her second moment",
+               missedAboutAxis / girder.secondMoment > hold.missedMemberArea / girder.area);
+    expectNear("2.46 m^4 of her 46.2, which is the figure `section.hpp` quotes",
+               missedAboutAxis, 2.459, 0.05);
+
+    // And with both corrections the two tiers agree, where with one of them they do
+    // not. Asserting the *pair* is the point: the area agreement alone would pass on a
+    // section that had lost the girders' whole Steiner term.
+    const StructuralMaterial material = ah36Steel();
+    section::BeamLoad bending;
+    bending.curvature = 1e-6;
+    bending.reference = girder.neutralAxis;
+    const section::BeamResponse bent = section::applyBeamLoad(hold, material, bending);
+    expectTrue("the section takes a curvature", bent.ok);
+    const double effective = bent.bendingStiffness / material.youngsModulus;
+    expectNear("EI against the girder's second moment less the girders' own",
+               effective / (girder.secondMoment - missedAboutAxis), 1.0, 0.01);
+    expectTrue("where subtracting only the area would be five per cent out",
+               std::abs(effective / girder.secondMoment - 1.0) > 0.04);
+}
+
+// --- 13. The frames a beam cannot see ------------------------------------------------
+//
+// `hullGirderSection` drops every member with no extent along x, and it is right to:
+// an athwartships member carries no longitudinal stress, so a frame, a deck beam or a
+// bulkhead stiffener is worth nothing to a beam idealisation. **Tier 0 therefore scores
+// a structure with no frames in it identically, and Tier 1 does not.**
+//
+// What is left is the transverse restraint a ring of frames puts on the section's own
+// Poisson contraction: a strip that cannot contract in y and z carries more than
+// `E eps` for the same strain. It is real, it is worth a few tenths of a per cent, and
+// **the FEM is right about it and the beam is wrong** -- which is the one place in this
+// comparison where a difference is not the finer model's error.
+void testFramesRestrainThePoissonContraction() {
+    const StructuralMesh structure = ferryStructure();
+    StructuralMesh bare = structure;
+    bare.members.clear();
+    for (const StructuralMember& m : structure.members)
+        if (std::abs(m.b.x - m.a.x) > 1e-9) bare.members.push_back(m);
+    expectTrue("the ferry has athwartships members to remove",
+               bare.members.size() < structure.members.size());
+    expectTrue("and longitudinal ones to keep", !bare.members.empty());
+
+    // Tier 0 scores the two identically, and that is checked rather than assumed --
+    // it is the whole reason the difference below belongs to Tier 1.
+    const HullGirderSection full = hullGirderSection(structure, 0.0);
+    const HullGirderSection stripped = hullGirderSection(bare, 0.0);
+    expectNear("Tier 0 cannot tell the two structures apart", stripped.area, full.area, 1e-12);
+    expectNear("in area or in second moment", stripped.secondMoment, full.secondMoment, 1e-12);
+
+    const StructuralMaterial material = ah36Steel();
+    const auto effective = [&](const StructuralMesh& mesh) {
+        const section::Section piece = section::buildSection(mesh, ferryParams());
+        section::BeamLoad axial;
+        axial.strain = 1e-6;
+        axial.reference = full.neutralAxis;
+        const section::BeamResponse stretchedOne = section::applyBeamLoad(piece, material, axial);
+        expectTrue("the section takes an axial load: " + stretchedOne.problem, stretchedOne.ok);
+        return stretchedOne.axialStiffness / material.youngsModulus /
+               (full.area - piece.missedMemberArea);
+    };
+    const double with = effective(structure), without = effective(bare);
+    std::printf("     EA against Tier 0 less the members it could not attach: %+.4f%% with the"
+                " frames, %+.4f%% without, so they are worth %+.4f%%\n", 100.0 * (with - 1.0),
+                100.0 * (without - 1.0), 100.0 * (with - without));
+
+    // The direction is the claim: restraint can only stiffen. The size is reported.
+    expectTrue("the frames stiffen the section rather than soften it", with > without);
+    // Measured 0.44% on this two-bay window, and it rises with length towards 0.5% as
+    // the free cut planes become a smaller share of the section. Asserted as a band,
+    // because a value would be asserting the ferry's frame spacing.
+    expectTrue("by a few tenths of a per cent, not by a factor",
+               with - without > 1e-3 && with - without < 1e-2);
+    // **Without them the two tiers agree to a tenth of a per cent, and that is what
+    // says the rest of the accounting is right.** With them Tier 1 reads high, and
+    // reading high is the direction a restraint has to move it.
+    expectTrue("and without them the beam and the mesh agree to a tenth of a per cent",
+               std::abs(without - 1.0) < 1e-3);
+    expectTrue("while with them the mesh reads above the beam", with > 1.0);
+}
+
 }  // namespace
 
 void runSectionTests() {
@@ -3769,4 +4263,11 @@ void runSectionTests() {
     testHaloReachesAsFarAsTheWeld();
     testNodePositionsDoNotDependOnWhereTheSectionWasCut();
     testHaloMakesTheCutPlanesCoincide();
+    testAxialStressIsThePatchTest();
+    testAxialStressUnderCurvatureIsTheBeamsOwnLine();
+    testAxialStressCountsASeamOnce();
+    testFerryDeckStressIsNotOneNumber();
+    testChainRecoversTheStressItsSectionsCarry();
+    testMissedMembersAccountForTheirMomentsToo();
+    testFramesRestrainThePoissonContraction();
 }

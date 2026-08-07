@@ -3532,6 +3532,15 @@ makes, arriving as a frequency.
    model of the whole length: measured against the same length in one piece at
    1e-10 in `EA`, `EI` and `GJ` on the box girder and 4e-10 on the ferry.
 
+   **And it has now been built for the whole 120 m and compared against the beam it
+   refines** — §*The whole ship, against the beam it refines* below. The ship-scale
+   agreement between a chain and the monolith is **3 × 10⁻⁴**, not the box's 10⁻¹⁰,
+   and the reason is the line-tie/face-tie trade rather than the solver. What the
+   comparison against Tier 0 found is that two thirds of the apparent disagreement
+   was accounting — a missing girder *second moment*, and a beam asked at a station
+   compared against a mesh asked over a length — and what is left amidships is the
+   frames' Poisson restraint, where the FEM is right and the beam has no way to be.
+
    ~~What is left is the mesher's reach.~~ **Also done, and the diagnosis was worth
    more than the fix.** Two-bay sections used to work over 62.4 m of a 120 m ship in
    five disconnected islands, the longest unbroken run being 26.4 m, and
@@ -4700,6 +4709,176 @@ a score:
   each. It is kept as the deliberate difference between the two calls.
 - One is the **no-op control**, because a harness that reports everything killed is
   reporting nothing.
+
+### The whole ship, against the beam it refines — **implemented**
+
+`tools/section_probe --whole`, `--profile` and `--wave`, plus `section::axialStress`,
+`fitBeam`, `fibreStress` and `sectionDisplacement` in `engine/sim/section.{hpp,cpp}`.
+The mesher reached the ends, the halo made a station's nodes a property of the ship,
+and the line tie closed what an interior cut opens — and **nobody had assembled the
+whole thing and asked whether it agrees with the beam it is supposed to refine.**
+
+#### What the whole ship costs, both ways
+
+| the reference ferry, subdivision 1, −60…60 m | |
+|---|---|
+| one piece, mesh | **0.44 s**, 8 900 elements, 18 780 nodes, **one** component |
+| its steel | 1 084 106 kg plate + 501 263 kg member — §*The halo*'s two figures to the kilogram |
+| its junctions | 1 408.6 m of edge, 1 337.6 m tied |
+| its band | **5 384**; three banded solves **1 044 s** |
+| chain of 5, build | 221 s (mesh 0.2, reduce 221, assemble 0.1) |
+| | 5 058 assembled DOF, 390 MB dense, 0 unmatched, worst gap **0.0 m** |
+| | three dense solves **9.0 s** |
+| chain of 10, build | 93 s; 9 828 DOF, 1 474 MB dense, dense solve **69 s** |
+
+**The band is why one piece is not a model.** `solveStatic` factors at `n·b²`: the
+eleven-bay hold is 1 520 tied and the whole ship is 5 384 over 56 340 unknowns — 1.6 ×
+10¹² flops against 5.5 × 10¹⁰ — and it measures 1 044 s against 5.3. A tie joins nodes
+no element edge joins, so the ordering carries the whole cross-section *and* every
+junction across fifty bays. The monolithic solve is behind `--whole-solve` and is in no
+gate. **And more pieces is not simply better**: cutting finer makes each reduction
+cheaper (221 s → 93 s) and the assembly cubically dearer to factor (9 s → 69 s).
+
+#### The chain against the monolith at ship scale is 3 × 10⁻⁴, not 10⁻¹⁰
+
+| | one piece | chain of 5 | chain of 10 | 5 vs 10 |
+|---|---|---|---|---|
+| EA (N) | 1.47220e11 | 1.47255e11 | 1.47342e11 | +5.9e−4 |
+| z_na (m) | 4.97345 | 4.97283 | 4.97306 | +4.6e−5 |
+| EI (N m²) | 2.38603e12 | 2.38679e12 | 2.38676e12 | −1.5e−5 |
+| GJ (N m²) | 1.25970e12 | 1.26030e12 | 1.26000e12 | −2.4e−4 |
+
+Nothing is truncated — `unmatched` is zero, `worstGap` is exactly 0.0 m,
+`planeTiesDisagreeing` is zero, both chains tie 1 340.8 m against the monolith's
+1 337.6. The residual is §*The in-plane line tie*'s own: on the box a cut plane's line
+tie and the monolith's face tie are the **same constraint**, and on a real hull the
+slave lands a little off the face's edge, so every extra cut trades one for the other.
+That section measures 0.095% of `GJ` for a two-section chain of the hold; five more
+planes in a 120 m ship come to 0.024%, in the same direction — the finer chain is the
+softer one. **Quoting the box's 10⁻¹⁰ as a ship-scale figure would be this project's
+own recorded failure mode.**
+
+#### Along the length: two of the three differences are accounting
+
+`--profile=2` tiles the hull and asks both tiers for `A`, `z_na` and `I`. Amidships they
+agree to **+0.356% in area and +0.347% in second moment**; at the ends Tier 1 reads 80%
+low.
+
+1. **An area alone cannot correct an `I` comparison.** The three girders the mesh
+   cannot reach are 4.4% of the ferry's area and **5.3% of her second moment** — they
+   sit low in a double bottom and a second moment is a lever arm squared. Subtracting
+   the area and not the moment left the tiers looking 5.0% apart amidships where they
+   agree to 0.35%. `Section::missedMemberFirstMoment` and `missedMemberSecondMoment`
+   are the fix.
+2. **Where plane sections is asserted matters as much as what is compared.** Tier 0
+   asserts it at every station; a Tier-1 window asserts it at two. Holding the steel
+   fixed and moving only the planes — one eight-bay window cut into k pieces combined in
+   series, as a fraction of Tier 0's answer for that length:
+
+   | planes apart | 2.4 m | 4.8 m | 9.6 m | 19.2 m |
+   |---|---|---|---|---|
+   | stern | 0.9847 | 0.5161 | 0.5421 | 0.6275 |
+   | amidships | 1.0059 | 1.0055 | 1.0075 | 1.0078 |
+   | bow | 0.9303 | 0.3153 | 0.3324 | 0.3951 |
+
+   The first hypothesis — that a window is the harmonic mean of its own stations — is
+   **measured and rejected**: that mean is within one per cent of the arithmetic mean
+   everywhere, because the section total barely changes over two bays even at the stem.
+   What changes is which steel is continuous from one plane to the other. At the ends
+   **the FEM is the better answer and the beam is answering a different question**: no
+   station-by-station section property can say that the material at one station is not
+   the material at the next.
+3. **What is left amidships is the frames, and there the FEM is right.**
+   `hullGirderSection` drops every member with no extent along x, so Tier 0 scores a
+   frameless structure *identically* — checked, not assumed — and Tier 1 does not: a
+   strip that cannot contract in y and z carries more than `E ε`. Worth **+0.4389%** on
+   a two-bay window and **+0.508%** on the hold, and without the frames the two tiers
+   agree to a tenth of a per cent, which is what says the rest of the accounting is
+   right.
+
+The hold's three published figures above — +0.41%, +0.28% and +0.52% — re-measure at
+**+0.411%, +0.279% and +0.508%** and all three stand.
+
+#### The hull-girder response: the first time the two tiers were asked one question
+
+`--wave` poises the ferry on a crest of her own length and applies **the load**, not the
+answer: weight minus buoyancy per station, spread over that station's elements by
+volume, so the resultant per station is exact and the local distribution deliberately is
+not. Three things had to be right, and each is a place a load can vanish:
+
+- **A junction tie's slave has no row.** `reduction::reduceLoad` reads the boundary and
+  interior partitions, and an eliminated DOF is in neither — so a load left on one is
+  **silently dropped**, 0.84 MN of it on this ship. It belongs to the masters by the
+  transpose of the constraint. `reduceLoad` is unchanged; the caller folds first, and
+  the hole is worth knowing about before the next caller finds it.
+- **Six restraints, not three.** A ship floating free has six rigid motions where a
+  prescribed beam load leaves three. They are determinate, so on a balanced load they
+  carry nothing: 3.8 × 10³ N against a largest applied 1.2 × 10⁷.
+- **Guyan is exact at the interface for a load applied inside it**, so every cut plane's
+  displacement is the monolith's — but the *interior* recovery is not, so the stress
+  inside a section is got by prescribing the chain's own exact interface on that
+  section's mesh and solving it directly with its own share of the load.
+
+| at x = 6.0 m, M = 4.573 × 10⁸ N m | Tier 0 | Tier 1 |
+|---|---|---|
+| deck fibre | 82.06 MPa | **118.42 MPa** |
+| the deck's own mean | (one number) | 83.26 MPa |
+| keel fibre | −66.52 MPa | −88.49 MPa |
+| neutral axis | 6.7132 m | 6.7961 m |
+| what a beam cannot carry | 0 | **8.06 MPa rms** |
+
+**The mean over the deck is the beam's answer to 1.5% and the worst is 42% above it**,
+and both halves matter: the mean agreeing says the moment is arriving, the worst not
+agreeing says the field is not a beam. The peak sits at (5.31, 10.00, 14.81) — the deck
+edge at the ship's side, which is where the shell feeds stress in and exactly where
+shear lag puts it. `fibreStress` reports worst/mean at **1.42** here and 1.50 at x = 18
+— over the sections carrying at least half the peak moment, because towards the ends the
+deck's own mean passes through zero and the ratio says nothing — against 1.006 on the
+prismatic box, which is the sampling band's own depth. It needed the real load to see:
+shear lag is driven by dM/dx and a section handed a constant moment has none of it.
+
+**A cut plane's mean `u_z` is not the ship's deflection**, and using it cost this
+measurement a false answer before it was checked. The load is spread over steel, so
+buoyancy lands on the deck as well as the shell and the plating deflects locally under
+it: the second difference of the mean `u_z` is **3.8 times** the curvature the stress
+field carries at the same station, which is not something bending can do. The bending is
+in `u_x` — a least squares of `u_x` against `z` over a plane's own rows gives −dw/dx and
+a bulging panel contributes nothing to it. Against that, and with heave and trim removed
+from both, Tier 1 and `M/EI` differ by 9.5 mm over the middle two thirds of a 69.8 mm
+peak and by 33.1 mm at the forward perpendicular, where the section is finest;
+substituting each section's own measured `EI` takes the worst to 25.7 mm, so about a
+quarter of it is `EI(x)` and shear and the ends are not separated further.
+
+#### What mutation testing found
+
+28 single edits to the new code in `section.cpp`, compiled from a copy outside the
+repository with a per-mutant timeout and the verdict taken from the **exit code** as
+well as the `FAIL` lines — the harness that counted lines has scored false survivors
+here three times, on mutants that segfaulted downstream of the code they broke. (None
+of these 28 did; the count is kept because the next set will.) The first pass killed 20
+and the eight survivors were worth more than the score — six of them said the same thing twice over:
+
+- **Nothing tested that a Gauss point's weight is a volume.** A mutant giving every
+  point weight 1.0 survived every assertion in the file. One bay of the box carries
+  `2(B+H)·t·L/n` of steel and the weights now have to sum to it.
+- **Every fit was taken about the neutral axis**, where the axial term is zero and the
+  cross term `s₁t₀` in the normal equations vanishes with it — so a sign error there,
+  and a reflected neutral axis, were both invisible. Both are now fitted about the keel
+  as well.
+- **Every load was hogging**, so a peak taken as the largest *signed* stress rather than
+  the largest magnitude was never wrong, and a worst fibre reported as a magnitude never
+  lost a sign. A mirrored sample set and a keel-in-compression assertion close both.
+- **A cut with no depth** was never handed to `fibreStress`; nothing this mesher builds
+  produces one, so it is constructed.
+
+Two survivors are equivalent on every input this repository has and saying which is more
+useful than the number: **sign-flipping ξ in the shape function that places a Gauss
+point** moves the point along the ship, and every load `applyBeamLoad` can prescribe
+gives a stress that is uniform along the ship, so the mispairing is unobservable —
+separating it needs a longitudinal stress gradient *inside one element*. And an
+**off-by-one on the section index** in `sectionDisplacement` is caught by the next of the
+three bounds tests, exactly as §*What mutation testing said about the line tie* records
+for its restraint guard. The second pass kills six of the eight: **26 of 28**.
 
 ### Tier-1 to Tier-2 coupling — **implemented**
 

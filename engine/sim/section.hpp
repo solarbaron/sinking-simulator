@@ -726,6 +726,24 @@ struct Section {
     // built from panel seams.
     double attachedMemberArea = 0;
     double missedMemberArea = 0;
+    // The same two, as first and second moments about the **baseline** -- `A z` and
+    // `A z^2 + I_own`, weighted by the same length fraction, with the profile's own
+    // second moment rotated in by the web's direction cosines exactly as
+    // `sectionElements` does it.
+    //
+    // **An area alone cannot correct an `I` comparison, and reporting only the area
+    // made it look as though the two tiers disagreed by 5% amidships when they agree
+    // to 0.4%.** The girders this mesh cannot reach are 2.5 m^4 of the ferry's 46.2 --
+    // 5.3% of her second moment against 4.4% of her area, because they sit low in a
+    // double bottom and a second moment is a lever arm squared. Subtracting the area
+    // and not the moment is subtracting the wrong one of the two.
+    //
+    // About the baseline rather than about a neutral axis, because the axis a caller
+    // wants to compare on is `hullGirderSection`'s and not this section's: a moment
+    // about z = 0 shifts to any axis by the parallel axis theorem and a moment about
+    // some other axis does not shift back without the area it was taken with.
+    double attachedMemberFirstMoment = 0, missedMemberFirstMoment = 0;    // m^3
+    double attachedMemberSecondMoment = 0, missedMemberSecondMoment = 0;  // m^4
 
     std::vector<std::string> problems;
 
@@ -798,8 +816,13 @@ struct BeamResponse {
 // reports **is** `0.5 u_b^T K_r u_b` for the Guyan reduction of this section, and
 // `tests/test_section.cpp` asserts that identity against a real `craigBampton`
 // rather than taking it on the header's word.
+// `displacementOut`, when given, receives the solved field over the section's own
+// mesh degrees of freedom -- with the junction ties' eliminated rows already filled
+// in from their masters, because a zero left at one of those is the hole
+// `reduction::recover` shipped with and it reads as an enormous artificial gradient
+// in every element that touches the node. It is what `axialStress` below consumes.
 BeamResponse applyBeamLoad(const Section& section, const StructuralMaterial& material,
-                           const BeamLoad& load);
+                           const BeamLoad& load, std::vector<double>* displacementOut = nullptr);
 
 // The same, with the section twisted: the forward plane is rotated by `twist`
 // radians about the x axis through (`y`, `z`) = (0, `reference`) and the aft plane
@@ -822,6 +845,91 @@ struct TorsionResponse {
 
 TorsionResponse applyTwist(const Section& section, const StructuralMaterial& material,
                            double twist, double reference = 0.0);
+
+// --- 10. The stress the section carries, which is where the two tiers can differ ---
+//
+// `BeamResponse` reports **resultants** -- a force and a moment on the forward plane
+// -- and those are exactly the quantities `hullGirderSection` reaches by summing over
+// a transverse cut. That is what makes them a real comparison, and it is also what
+// makes them a limited one: two models can agree on `EA`, on the neutral axis and on
+// `EI` to ten figures and still disagree everywhere about the stress, because a
+// resultant is an integral and an integral does not see how its integrand is spread.
+//
+// A beam idealisation can produce exactly one distribution:
+//
+//     sigma_xx = N / A + M (z - z_na) / I
+//
+// -- linear in `z`, constant at a given `z` across the whole breadth, and with no
+// memory of how the load reached the section. A reduced 3D model produces whatever
+// the plating does, and the three ways it differs -- shear lag across a wide deck,
+// the warping of a section that is not closed, and the transverse restraint a ring
+// of frames adds -- are the whole of what this tier is for. **None of the three is
+// visible in `EA` or `EI`**, which is the same warning §2 makes about the junctions,
+// arriving at the other end of the model.
+//
+// So the stress is exposed where the element carries it: the eight Gauss points of
+// every element a transverse plane passes through, each with the volume it
+// integrates. **The volume is the weight and not a decoration** -- a deck element
+// spans metres of this ferry and a bilge strake spans centimetres, so an unweighted
+// mean over Gauss points is an average over the mesher's resolution rather than over
+// the steel.
+struct StressSample {
+    Vec3 at{};           // m, body frame: where the element integrates
+    double volume = 0;   // m^3 this point carries
+    double sigmaXX = 0;  // Pa, longitudinal, tension positive
+};
+
+// Every Gauss point of every element the transverse plane `x` passes through, by the
+// same half-open rule `sectionElements` uses -- an element counts when its own nodes
+// straddle `x` as `[xLo, xHi)`, so a plane on a frame station is served by the bay
+// forward of it and not by both. Counting both would double the steel at every seam
+// while leaving the *fit* below looking perfectly correct, which is the failure mode
+// `scantlings.hpp` records for the same convention.
+//
+// `displacement` is what `applyBeamLoad` solved for; hand it back the same section
+// and the same material, or this is a stress from one model read off another.
+std::vector<StressSample> axialStress(const Section& section, const StructuralMaterial& material,
+                                      const std::vector<double>& displacement, double x);
+
+// The beam a stress field would have to be, and how much of it is not one.
+//
+// A volume-weighted least squares of `sigma = axial + gradient * (z - about)`, which
+// is the only shape Tier 0 can produce. **`residualRms` is the number with no Tier-0
+// counterpart**: it is identically zero for a beam, and on a section it is everything
+// the plane-sections assumption threw away. It is reported next to `peak` because a
+// residual means nothing except against the field it is a residual of.
+struct BeamFit {
+    bool ok = false;
+    std::size_t samples = 0;
+    double volume = 0;         // m^3 the fit was taken over
+    double axial = 0;          // Pa at z = `about`
+    double gradient = 0;       // Pa/m
+    double neutralAxis = 0;    // m where the fitted line crosses zero; `about` if flat
+    double residualRms = 0;    // Pa, volume weighted
+    double residualWorst = 0;  // Pa
+    double peak = 0;           // Pa, largest |sigma| in the field, signed
+    Vec3   peakAt{};
+    double zLo = 0, zHi = 0;   // m, the extreme fibres the samples reached
+};
+BeamFit fitBeam(const std::vector<StressSample>& samples, double about);
+
+// The extreme fibre a section modulus is taken at, as the stress actually found
+// there. `band` is the fraction of the sampled depth counted as "the deck" or "the
+// keel", because a fibre is a line and a mesh has elements.
+//
+// **`worst / mean` is shear lag stated as a number.** A beam says the two are equal:
+// every point at one `z` carries one stress. A wide deck does not -- the stress
+// crowds towards the sides, which is where the shell can feed it in -- and that ratio
+// is a thing Tier 0 has no way to report at all.
+struct FibreStress {
+    bool ok = false;
+    std::size_t samples = 0;
+    double z = 0;       // m, volume-weighted mean height of the band
+    double mean = 0;    // Pa
+    double worst = 0;   // Pa, largest magnitude, signed
+    double volume = 0;  // m^3
+};
+FibreStress fibreStress(const std::vector<StressSample>& samples, bool deck, double band = 0.02);
 
 // --- 7. Reaching the whole ship: the collapsed element ----------------------------
 //
@@ -1552,8 +1660,30 @@ Chain buildChain(const StructuralMesh& structure, const ChainParams& params);
 // A chain in more than one piece is refused rather than solved: the second piece is a
 // mechanism and the factorisation would report a rigid body mode without saying which
 // of the two it belonged to.
-BeamResponse applyBeamLoad(const Chain& chain, const BeamLoad& load);
+//
+// `stateOut` receives the solved assembled state -- boundary rows and modal
+// coordinates together, with the interior planes' eliminated rows filled in from
+// their masters. It is what `sectionDisplacement` expands back onto a section's own
+// mesh, and it is the only route from a whole-ship model to a stress.
+BeamResponse applyBeamLoad(const Chain& chain, const BeamLoad& load,
+                           std::vector<double>* stateOut = nullptr);
 TorsionResponse applyTwist(const Chain& chain, double twist, double reference = 0.0);
+
+// One section's own mesh displacement field, out of a solved assembled state.
+//
+// `reduction::componentState` picks that section's reduced coordinates out of the
+// assembly and `reduction::recover` expands them through `u = T x`, so what comes
+// back is the *exact* Guyan interior for the boundary the chain settled on -- not an
+// interpolation of it, and not a second solve. Empty if the state is not this
+// chain's, for the same reason `componentState` refuses one: every index would
+// otherwise be in range and a short state would come back as a plausible field
+// quietly missing its modal content.
+//
+// **This is what makes a whole-ship Tier-1 model able to answer a stress question at
+// all.** Everything above it reports resultants, and a resultant is what Tier 0
+// already had.
+std::vector<double> sectionDisplacement(const Chain& chain, std::size_t index,
+                                        const std::vector<double>& state);
 
 // The chain's lowest natural frequencies with both end planes held, rad/s ascending.
 //
@@ -1569,5 +1699,264 @@ TorsionResponse applyTwist(const Chain& chain, double twist, double reference = 
 // the decks' own frequency instead, which is the failure §2 of this file is about.
 // Neither is visible in `EA` or `EI`.
 std::vector<double> chainFrequencies(const Chain& chain);
+
+// --- 11. The whole ship, and what she does not agree with Tier 0 about --------------
+//
+// Every piece above existed and nobody had put them together. The mesher reaches all
+// 120 m (§7), the halo makes a station's nodes a property of the ship rather than of
+// the cut (§8), and the in-plane line tie stops an interior plane costing torsion
+// (§9) -- and the model those three exist to make had never been built, nor asked
+// whether it agrees with the beam it is supposed to refine. `tools/section_probe
+// --whole`, `--profile` and `--wave` are that, and the disagreements are the part
+// worth reading.
+//
+// **All timings below were taken with the machine also running a mutation harness.**
+// They are the shape of the cost, not a benchmark.
+//
+// --- What the whole ship costs, both ways ---------------------------------------
+//
+//     the reference ferry, subdivision 1, -60 .. 60 m
+//     ------------------------------------------------------------------------------
+//     one piece    mesh 0.44 s: 8 900 elements, 18 780 nodes, **one** component
+//                  1 084 106 kg of plate + 501 263 kg of member -- the same two
+//                  figures §8's partition table publishes, to the kilogram
+//                  1 408.6 m of junction edge, 1 337.6 m of it tied
+//                  DOF half-bandwidth **5 384**; three banded solves **1 044 s**
+//     chain of 5   build 221 s (mesh 0.2, reduce 221, assemble 0.1)
+//                  5 058 assembled DOF, 390 MB dense, 0 unmatched, worst gap **0.0 m**
+//                  three dense solves **9.0 s**
+//     chain of 10  build 93 s (mesh 0.1, reduce 92, assemble 0.4)
+//                  9 828 assembled DOF, 1 474 MB dense, dense solve **69 s**
+//
+// **The band is why one piece is not a model.** `solveStatic` factors at `n b^2`: the
+// eleven-bay hold is 1 520 tied and the whole ship is 5 384 over 56 340 unknowns --
+// 1.6e12 flops against 5.5e10, thirty times -- and it measures 1 044 s against 5.3. A
+// tie joins nodes no element edge joins, so the ordering has to carry the whole
+// cross-section *and* every junction across fifty bays. It is not a property of this
+// ordering. The monolithic solve is therefore behind `--whole-solve` and is in no gate.
+//
+// **And more pieces is not simply better.** Cutting finer makes every reduction
+// cheaper -- 221 s at five, 93 s at ten, because a Guyan condensation is
+// `O(n_i b_i^2)` and both shrink -- and makes the assembled model quadratically larger
+// to hold and cubically dearer to factor: 9 s at five, 69 s at ten, 390 MB against
+// 1.5 GB. The minimum is somewhere in between and it is set by the cross-section, not
+// by the length.
+//
+// --- The chain against the monolith at ship scale, which is not 1e-10 ---------------
+//
+//     whole ship        one piece      chain of 5     chain of 10    5 against 10
+//     -------------------------------------------------------------------------------
+//     EA  N            1.47220e11      1.47255e11     1.47342e11      +5.9e-4
+//     z_na m              4.97345         4.97283        4.97306      +4.6e-5
+//     EI  N m^2        2.38603e12      2.38679e12     2.38676e12      -1.5e-5
+//     GJ  N m^2        1.25970e12      1.26030e12     1.26000e12      -2.4e-4
+//
+// **§6 says a chain and the same length in one piece agree "to the conditioning of the
+// solves and not to a truncation". That is still true and the number is 3e-4, not the
+// 1e-10 the box reaches, and the reason is §9's rather than the solver's.** Nothing is
+// truncated: `unmatched` is zero, `worstGap` is exactly 0.0 m, `planeTiesDisagreeing`
+// is zero, and both chains tie 1 340.8 m of the monolith's 1 337.6 m. What differs is
+// that on the box a cut plane's *line* tie and the monolith's *face* tie are the same
+// constraint -- the slave lands on the face's own edge, where the bilinear shape
+// functions collapse onto the two nodes the line uses -- and on a real hull it lands a
+// little off it. §9 measures that trade at 0.095% of `GJ` for a two-section chain of
+// the hold; five more cut planes in a 120 m ship come to 0.024%, in the same direction:
+// the finer chain is the softer one. **Quoting the box's 1e-10 as a ship-scale figure
+// would be this file's own recorded failure mode, so the ship-scale figure is measured
+// and sits next to it.**
+//
+// The gate can afford **two partitions against each other** and not the 1 044 s
+// monolith. It is the same claim: an interior cut plane is *shared* rather than
+// prescribed, so cutting one ship two ways has to give one model.
+//
+// --- Against Tier 0 along the length, where two of three differences are accounting --
+//
+// `--profile=2` tiles the hull with two-bay windows and asks both tiers for `A`, the
+// neutral axis and `I`. Amidships they agree to **+0.356% in area and +0.347% in second
+// moment**; at the ends Tier 1 reads **80% low**. Three separate things are in that and
+// only the third is physics.
+//
+// **1. An area alone cannot correct an `I` comparison.** `missedMemberArea` was the
+// whole of the accounting, and the girders this mesh cannot reach -- three of them, off
+// the longitudinal spacing, so no node of a mesh built from panel seams lands on one --
+// are 4.4% of the ferry's area and **5.3% of her second moment**, because they sit low
+// in a double bottom and a second moment is a lever arm squared. Subtracting the area
+// and not the moment left the two tiers looking 5.0% apart amidships where they agree
+// to 0.35%. `missedMemberFirstMoment` and `missedMemberSecondMoment` are the fix, and
+// `tests/test_section.cpp` asserts all three against `sectionElements`.
+//
+// **2. Where plane sections is asserted matters as much as what is compared.** Tier 0
+// gives a section at a *station* and asserts plane sections at every one of them; a
+// Tier-1 window asserts it at two and lets the plating do as it likes in between. The
+// experiment holds the steel fixed and moves only the planes -- one eight-bay window
+// cut into k pieces combined in series, as a fraction of Tier 0's own answer for the
+// same length:
+//
+//     planes apart      2.4 m    4.8 m    9.6 m   19.2 m
+//     ---------------------------------------------------
+//     stern            0.9847   0.5161   0.5421   0.6275
+//     amidships        1.0059   1.0055   1.0075   1.0078
+//     bow              0.9303   0.3153   0.3324   0.3951
+//
+// Amidships nothing moves. At the ends the answer halves as soon as the planes are more
+// than one bay apart, and **the first hypothesis -- section-level averaging -- is
+// measured and rejected**: the harmonic mean of a window's own station properties is
+// within one per cent of the arithmetic mean everywhere, because the section *total*
+// barely changes over two bays even at the stem. What changes is which steel is
+// continuous from one plane to the other: a girth band closing to nothing, a strake
+// turning to meet the stem and spending its length athwartships, where it carries no
+// longitudinal stress and Tier 0 still counts the full cut through it.
+//
+// It is not monotone in between, and that was predicted wrongly here before it was
+// measured: eight bays cut into four pieces and into two are cut at *different frames*,
+// so which station a plane lands on matters as well as how far apart they are. The
+// claim is carried by the two ends of the sweep.
+//
+// **At the ends the FEM is the better answer and the beam is not imprecise, it is
+// answering a different question.** No station-by-station section property can say that
+// the material at one station is not the material at the next.
+//
+// **3. What is left amidships is the frames, and there the FEM is right.**
+// `hullGirderSection` drops every member with no extent along x -- an athwartships
+// member carries no longitudinal stress -- so Tier 0 scores a structure with no frames
+// in it *identically*, which is checked rather than assumed. Tier 1 does not: a strip
+// that cannot contract in y and z carries more than `E eps` for the same strain.
+// Measured on the two-bay midship window, **+0.3561% with the frames and -0.0828%
+// without, so they are worth +0.4389%** -- and without them the two tiers agree to a
+// tenth of a per cent, which is what says the rest of the accounting is right. The
+// effect grows with section length (0.31% at one bay, 0.44% at two, 0.48% at four)
+// because a cut plane is free in y and z and a longer section has proportionally less
+// of itself next to one.
+//
+// **Two figures `tests/test_section.cpp` carried for that were the wrong section's.**
+// "0.44% measured" and "0.52% ... measured by omitting them" sit above a *two-bay*
+// test and are the **hold**'s numbers -- and the hold's numbers from before §8's halo.
+// Re-measured today: the hold gives +0.411% and +0.508% and the two-bay window gives
+// +0.356% and +0.439%. So one of the two was near enough to be believed and neither
+// belonged to the section the test builds. Both are corrected in place and both now
+// come out of a run rather than out of a comment.
+//
+// `docs/02-simulation.md` §*Against Tier 0* carries **+0.41%**, **+0.28%** and
+// **+0.52%** for the hold and all three reproduce: +0.411%, +0.279% and +0.508%.
+//
+// --- The hull-girder response: the first time the two tiers were asked one question --
+//
+// `--wave` poises the ferry on a crest of her own length and applies **the load** to
+// the Tier-1 model rather than the answer: `girder.hpp`'s weight minus buoyancy per
+// station, spread over the elements in that station's slab in proportion to their
+// volume, so the resultant per station -- which is the whole of what sets `V(x)` and
+// `M(x)` -- is exact and the local distribution deliberately is not. Handing the model
+// Tier 0's own bending moment would assume most of what is being compared.
+//
+// Three things had to be right and each is a place a load can vanish:
+//
+//   * **A junction tie's slave has no row.** `reduction::reduceLoad` reads the boundary
+//     and interior partitions, and an eliminated degree of freedom is in neither, so a
+//     load left on one is **silently dropped** -- 0.84 MN of it on this ship. It belongs
+//     to the masters by the transpose of the constraint, exactly as the reaction does in
+//     `stiffnessTimes`. The same fold is needed again for the assembly's own line ties.
+//     `reduceLoad` is not changed here; the caller folds first, and the hole is worth
+//     knowing about before the next caller finds it.
+//   * **Six restraints, not three.** `applyBeamLoad` prescribes both end planes and has
+//     three motions left; a ship floating free has six. They are statically determinate,
+//     so on a balanced load they carry nothing -- measured at 3.8e3 N against a largest
+//     applied 1.2e7 -- and that reading is the end-to-end check that the load balanced.
+//   * **Guyan is exact at the interface for a load applied inside it**
+//     (`reduction.hpp` property 1), so every cut plane's displacement is the monolith's.
+//     What zero modes does not buy is the *interior* recovery under an interior load, so
+//     the stress inside a section is not read off the reduced model: the chain's own
+//     exact interface displacement is prescribed on that section's mesh and it is solved
+//     directly with its own share of the load. That is exact and costs one banded
+//     factorisation per section.
+//
+// --- The stress, which is the half a beam cannot produce ----------------------------
+//
+// At the peak-moment station, driven by the wave load through the whole-ship model:
+//
+//     x = 6.0 m, M = 4.573e8 N m       Tier 0          Tier 1
+//     ---------------------------------------------------------------
+//     deck fibre                       82.06 MPa      118.42 MPa
+//       the deck's own mean            (one number)    83.26 MPa
+//     keel fibre                      -66.52 MPa      -88.49 MPa
+//     neutral axis                      6.7132 m        6.7961 m
+//     what a beam cannot carry          0               8.06 MPa rms
+//
+// **The mean over the deck is the beam's answer to 1.5%, and the worst is 42% above
+// it.** Both halves matter and neither alone would do: the mean agreeing is what says
+// the moment is arriving, and the worst not agreeing is what says the field is not a
+// beam. The peak sits at `(5.31, 10.00, 14.81)` -- the deck edge at the ship's side,
+// which is where the shell can feed stress in and is exactly where shear lag puts it.
+//
+// `Section::fibreStress` reports `worst / mean` and it is **1.42** here, rising to 1.50
+// at x = 18 -- taken only over the sections carrying at least half the peak moment,
+// because towards the ends the deck's own mean passes through zero and the ratio runs
+// off to seventy while saying nothing. On the prismatic box in the tests the same ratio
+// is 1.006, which is the sampling band's own depth and is the floor this instrument can
+// resolve.
+//
+// **It needed the real load to see.** Shear lag is driven by `dM/dx`, and a section
+// handed a constant moment -- which is all `applyBeamLoad` can prescribe -- has none of
+// it to show. That is why the wave *load* is applied and not the wave's moment.
+//
+// --- And what she does, where the obvious reading is the wrong one -------------------
+//
+// **A cut plane's mean `u_z` is not the ship's deflection and using it cost this
+// measurement a false answer before it was checked.** The load is applied to every node
+// of a slab in proportion to its steel, which puts the right resultant on each station
+// and buoyancy on the deck as well as on the shell, so the plating deflects locally
+// under it and the mean carries that too. Measured: the second difference of the mean
+// `u_z` is **3.8 times** the curvature the stress field carries at the same station,
+// which is not something bending can do.
+//
+// The bending is in `u_x`. A beam's axial displacement is `-z dw/dx`, so a least squares
+// of `u_x` against `z` over a cut plane's own rows gives the slope, and a panel bulging
+// between frames contributes nothing to it. `--wave` reports that curve and the mean
+// `u_z` beside it, because the gap between them *is* the local response and hiding it
+// would be worse than publishing it.
+//
+// Both curves are defined only up to a heave and a trim -- she is floating -- so the
+// best-fit line comes off each before they are compared, and the difference is run
+// against **two** beams: one with Tier 0's `I` and one with each chain section's own
+// measured `EI`, so that "the ends are softer" is separated from "a beam has no shear"
+// rather than argued about. Measured on a peak bending deflection of 69.8 mm: the two
+// differ by **9.5 mm over the middle two thirds and 33.1 mm at worst**, at the forward
+// perpendicular where the section is finest and least like a beam, and putting Tier 1's
+// own `EI` into the same integration takes the worst to 25.7 mm. So about a quarter of
+// the difference is `EI(x)`. **Shear and the ends are not separated further and this
+// brief did not close that.**
+//
+// --- What mutation testing said about all of it ------------------------------------
+//
+// Twenty-eight single edits to the code above, compiled from a copy outside the
+// repository, with a per-mutant timeout and the verdict taken from the **exit code** as
+// well as the `FAIL` lines. None of these twenty-eight needed the exit code -- no
+// segmentation fault and no timeout -- and it is kept because §5, §7 and §9 each record
+// a run where it was the only thing that scored a mutant correctly.
+//
+// The first pass killed twenty, and **six of the eight survivors said two things**:
+//
+//   * **Nothing tested that a Gauss point's weight is a volume.** A mutant giving every
+//     point a weight of 1.0 survived the whole file. One bay of the box carries
+//     `2(B+H) t L/n` of steel and the weights now have to sum to it, exactly.
+//   * **Every fit was taken about the neutral axis**, where the axial term is zero and
+//     the cross term `s1 t0` in the normal equations goes with it -- so a sign error
+//     there, and a reflected neutral axis, were both invisible. Both are now fitted
+//     about the keel as well, on the same samples.
+//   * And every load was **hogging**, so a peak taken as the largest *signed* stress
+//     rather than the largest magnitude was never wrong and a worst fibre reported as a
+//     magnitude never lost a sign. A mirrored sample set and a keel-in-compression
+//     assertion close both. A **cut with no depth** was never handed to `fibreStress`
+//     either, because nothing this mesher builds produces one; it is constructed.
+//
+// **The two that are left are equivalent on every input this repository has, and saying
+// which is more useful than the score.** Sign-flipping `xi` in the shape function that
+// *places* a Gauss point moves the point along the ship and pairs it with another
+// point's stress -- and every load `applyBeamLoad` can prescribe gives a stress that is
+// uniform along the ship, so nothing sees it. Separating it needs a longitudinal stress
+// gradient inside one element, which needs a distributed load. And an off-by-one on the
+// section index in `sectionDisplacement` is caught by the next of the three bounds
+// tests, which is the same redundancy §9 records for its restraint guard.
+//
+// Twenty-six of twenty-eight.
 
 }  // namespace sim::section
