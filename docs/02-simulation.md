@@ -2878,23 +2878,29 @@ reach, which is exactly what that change was for.
    `solidshell_forces_wg.comp` re-maps it to **one workgroup per element**, which
    spills 96 bytes and runs at **1.26–2.43×**, rising monotonically with size.
 
-   What stops it being used is precision, not speed. At 768 and 3 072 elements the
-   float kernel tears **41 and 248 elements against the double reference's 32 and
-   162**, and plastic dissipation runs 27–34% high — while the negative control, the
-   same double solver on a mesh jittered by 2 × 10⁻⁷ m, tears exactly 32 and 162 and
-   moves the dissipation by 0.06–0.8%. **An earlier claim here that it "tears 60
-   elements where the CPU tears none" does not reproduce and has been withdrawn.**
+   What stops it being used is precision, not speed. At 768 and 3 072 elements, over
+   5 505 steps, the float kernel tears **40 and 247 elements against the double
+   reference's 32 and 162**, and plastic dissipation runs 26–34% high — while the
+   negative control, the same double solver on a mesh jittered by 2 × 10⁻⁷ m, tears
+   exactly 32 and 162 and moves the dissipation by 0.06–0.8%. **An earlier claim here
+   that it "tears 60 elements where the CPU tears none" does not reproduce and has
+   been withdrawn**, and a later revision that put 41 and 248 here was quoting a run
+   whose step count was *derived* from the punch depth rather than fixed — 5 513 and
+   5 545 — which is why the step count is now written next to the figures.
+   `07-fem-spike-findings.md` §8 has the mechanism.
    The enhanced modes have since been normalised in `solid_shell.cpp`, and measured
    by A/B that changes nothing on this path, because the shader was already
    equilibrating Kaa.
 
    **Keeping `alpha` in double was the last thing left to try, and it does not work
    either.** The enhanced block is now compilable in fp64 at three depths from the one
-   shader source; the five resulting kernels tear between 40 and 49 elements at 768 and
-   between 205 and 268 at 3 072, against 32 and 162, and the spread among them is as
-   large as the gap. The block is not what was short of digits: `computeRestForms`'s
+   shader source; over 5 505 steps the five resulting kernels tear between 40 and 44
+   elements at 768 and between 204 and 247 at 3 072, against 32 and 162, and the spread
+   among them is about half the gap and reverses sign between the two sizes. What they
+   sort by is the *stopping rule* each carries, not its arithmetic. The block is not
+   what was short of digits: `computeRestForms`'s
    normalisation made κ(Kaa) a constant 3.50, and Kaa's inputs — the algorithmic tangent
-   and the stress — are float whatever consumes them. It costs 5–10× on the kernel.
+   and the stress — are float whatever consumes them. It costs **5–15×** on the kernel.
    `07-fem-spike-findings.md` §8 has the measurements.
 
 ### Adaptive zone promotion — **implemented**

@@ -83,6 +83,75 @@ hint() {
   return 1
 }
 
+# --- the GPU zone solver's published torn counts ---------------------------------
+#
+# `verify.sh` already runs `zone_gpu_probe`, and its comment there says why: every
+# figure in `07-fem-spike-findings.md` §8 comes out of this tool and nothing ran it.
+# But that gate only asserts the tool still prints `ok`. **It proves the tool runs;
+# it does not prove §8's numbers are still the tool's numbers**, and that is the half
+# that kept failing -- three times now in one section:
+#
+#   - "float tears 60 elements where double tears none", carried by three documents,
+#     each quoting the previous rather than the tool. Withdrawn; it never reproduced.
+#   - five cells marked as not reproducing, which did reproduce. The re-run that
+#     marked them had let the probe *derive* its step count from the punch depth
+#     while the table was taken at a fixed 5 505 -- 5 513 steps at 768 and 5 545 at
+#     3 072, because the critical timestep falls with element size. Eight extra
+#     steps move the torn count by one and the dissipation by 0.07%.
+#   - and the second of those propagated into `02-simulation.md` before anyone
+#     re-ran it.
+#
+# So `--steps` is passed explicitly here and not derived. That is the whole defect
+# in the second case: a parameter of the experiment that was not written next to the
+# number. These are deterministic -- identical across six repeats, and at 1, 4, 12
+# and 23 workers -- so the tolerance is zero and any movement at all wants a human.
+#
+# ~20 s of the `full` gate. The 3 072 invocation cell is the expensive one at ~15 s
+# and it is the one that drifted 13%, which is exactly why it is here.
+GPU=${GPU:-./build/zone_gpu_probe}
+FEM_DOC=docs/07-fem-spike-findings.md
+if [ -x "$GPU" ]; then
+  gpu768=$("$GPU" --radius=2.5 --sub=8 --steps=5505 --mapping=workgroup --jitter=2e-7 2>&1)
+  if printf '%s\n' "$gpu768" | grep -q '^skipped: '; then
+    echo "  - no Vulkan device, skipping the §8 torn counts"
+  else
+    for h in "GPU float, torn (workgroup) | **40**" "CPU dissipation | **1.5194**" \
+             "GPU float, torn (invocation) | **44**"; do
+      hint "$h" "$FEM_DOC"
+    done
+    # Anchored to its own line for the reason the damage figures above are: the
+    # word "torn" appears in the control block as well, and a checker that
+    # misparses is worse than no checker.
+    # `torn elements` prints two columns and nothing else; `plastic dissipation
+    # (MJ)` prints three, and its CPU value is the *fourth* field rather than
+    # `NF-1`. Counting back from the end picked the GPU column here once.
+    torn_cpu() { printf '%s\n' "$1" | grep '^torn elements' | awk '{ print $3 }'; }
+    torn_gpu() { printf '%s\n' "$1" | grep '^torn elements' | awk '{ print $4 }'; }
+    diss_cpu() { printf '%s\n' "$1" | grep '^plastic dissipation' | awk '{ print $4 }'; }
+    ctl() { printf '%s\n' "$1" | sed -n '/^control:/,$p' | grep "$2" | awk '{ print $NF }'; }
+    check "§8 768 el, CPU double torn"  32 0 \
+          "$(torn_cpu "$gpu768")" "CPU double, torn | **32**" "$FEM_DOC"
+    check "§8 768 el, GPU float torn"   40 0 \
+          "$(torn_gpu "$gpu768")" "GPU float, torn (workgroup) | **40**" "$FEM_DOC"
+    check "§8 768 el, CPU dissipation (MJ)" 1.5194 0.0001 \
+          "$(diss_cpu "$gpu768")" "CPU dissipation | **1.5194**" "$FEM_DOC"
+    # **The negative control, and it is the load-bearing cell of the argument.** A
+    # geometric jitter the size of float's own representation error, applied to the
+    # double solver, must not move the torn count at all -- otherwise "float tears
+    # 25% too many" says nothing about float and everything about the problem.
+    check "§8 768 el, jittered control torn" 32 0 \
+          "$(ctl "$gpu768" 'torn elements')" \
+          "control: double, mesh jittered 2 × 10⁻⁷ m, torn" "$FEM_DOC"
+
+    gpu3072=$("$GPU" --radius=2.5 --sub=16 --steps=5505 --mapping=invocation 2>&1)
+    check "§8 3 072 el, GPU float torn, invocation mapping" 213 0 \
+          "$(torn_gpu "$gpu3072")" "GPU float, torn (invocation) | **44**" \
+          "$FEM_DOC"
+  fi
+else
+  echo "  - zone_gpu_probe not built, skipping the §8 torn counts"
+fi
+
 if [ ! -x "$RAM" ]; then
   echo "  - ram_view not built, skipping published-figure check"
   exit 0

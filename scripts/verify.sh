@@ -66,9 +66,22 @@ build_into() {
 expect_ok() {
   local label="$1" expect="$2"; shift 2
   local log; log="$(mktemp)"
-  if ! timeout 1800 "$@" >"$log" 2>&1; then
+  timeout 1800 "$@" >"$log" 2>&1
+  local status=$?
+  if [ "$status" -ne 0 ]; then
     fail "$label exited non-zero"
-    tail -15 "$log"; rm -f "$log"; return 1
+    # **Name the assertion, do not just dump the tail.** `tail -15` shows whatever
+    # the program printed last, which for a suite that keeps running after a failed
+    # check is fifteen lines of *later* diagnostics with the `FAIL` scrolled off the
+    # top. That cost a diagnosis: an intermittent single-check failure here printed
+    # a table from the following section and nothing about what failed. The repeat
+    # block was fixed for exactly this earlier; this is the same fix at the step
+    # that runs first and therefore fails most often.
+    printf '      exited %d%s\n' "$status" \
+           "$([ "$status" -ge 128 ] && echo " (signal $((status - 128)))")"
+    grep -E '^  FAIL' "$log" | head -8 || printf '      (no FAIL lines: a crash, or a failure before any check)\n'
+    tail -6 "$log"
+    rm -f "$log"; return 1
   fi
   if [ -n "$expect" ] && ! grep -qE "$expect" "$log"; then
     fail "$label did not report '$expect'"

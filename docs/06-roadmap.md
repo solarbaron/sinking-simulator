@@ -478,13 +478,15 @@ The longest and highest-risk phase.
   **`alpha` in double was the next step, it has been taken, and it is a negative.**
   §8 item 3 named it as the only part shown to need the digits. Five kernels are now
   compiled from one source, differing only in how much of the enhanced block is fp64
-  (`--eas=float|tight|solve|condense|newton`). They land between **40 and 49** torn at
-  768 elements and between **205 and 268** at 3 072, against a reference of 32 and 162
-  that the negative control hits exactly — a spread the size of the gap, and not
-  monotone in precision. Holding the stopping rule fixed, the whole block in fp64 moves
-  alpha by 1/810 of the amount float is already wrong by, because Kaa's inputs are a
-  float tangent and a float stress. It costs 5–10× on the kernel, turning 1.26–2.43×
-  into 0.14–0.43×. **The list of cheap things to try is now empty**, and the error is
+  (`--eas=float|tight|solve|condense|newton`). Over 5 505 steps they land between
+  **40 and 44** torn at 768 elements and between **204 and 247** at 3 072, against a
+  reference of 32 and 162 that the negative control hits exactly — a spread about half
+  the gap, whose sign reverses between the two sizes, and which sorts by the *stopping
+  rule* each kernel carries rather than by its arithmetic. Holding the stopping rule
+  fixed, the whole block in fp64 moves alpha by 1/810 of the amount float is already
+  wrong by, because Kaa's inputs are a float tangent and a float stress. It costs
+  **5–15×** on the kernel, turning 1.26–2.43× into **0.09–0.47×**. **The list of cheap
+  things to try is now empty**, and the error is
   where §8 said it was: per-step float in `u`, the return map and the integrator
 - ~~FEM → flooding coupling (a tear becomes an orifice)~~ — done:
   `engine/sim/breach.hpp`, measured in `02-simulation.md` §3. Failed panels become
