@@ -504,7 +504,8 @@ Patch buildPatch(const StructuralMesh& structure, const Vec3& impact, const Mesh
     if (params.stiffeners != Stiffeners::Ignored) {
         patch.stiffening.material = patch.material;
         const double reach = params.radius + 2.0;
-        for (const StructuralMember& member : structure.members) {
+        for (std::size_t memberIndex = 0; memberIndex < structure.members.size(); ++memberIndex) {
+            const StructuralMember& member = structure.members[memberIndex];
             const Vec3 edge = member.b - member.a;
             const double lengthSquared = length2(edge);
             if (!(lengthSquared > 0)) continue;
@@ -549,6 +550,10 @@ Patch buildPatch(const StructuralMesh& structure, const Vec3& impact, const Mesh
             // the gap.
             constraint::SeamRun run;
             run.sign = alignment > 0 ? 1.0 : -1.0;
+            // Which longitudinal these fibres are, so that a torn one can be named
+            // back to `StructuralMesh::members` rather than reported as an anonymous
+            // loss of steel. `promotion::reactionOf` is the reader.
+            run.member = static_cast<int>(memberIndex);
             std::uint32_t previous = 0;
             bool have = false;
             // Counted once per *member*, not once per run: a member the patch
@@ -918,7 +923,8 @@ void Solver::computeForces() {
     if (!patch_->stiffening.empty()) {
         const constraint::FiberForces fibres =
             constraint::fiberForces(patch_->stiffening, fiberForms_, position_, material_,
-                                    params_.plastic ? &fiber_ : nullptr, force_);
+                                    params_.plastic ? &fiber_ : nullptr, force_,
+                                    params_.fiberFailure);
         fiberEnergy_ = fibres.strainEnergy;
         result_.dissipation += fibres.dissipation;
     }
@@ -1145,6 +1151,20 @@ void Solver::collectTorn() {
                 ++result_.yieldedElements;
                 break;
             }
+    }
+    // The stiffeners' half, taken from the *committed* fibre state for the same
+    // reason the plating's is taken from `plastic_` here rather than kept from
+    // `computeForces`: `adopt` runs a force evaluation on a throwaway copy to
+    // recover the stress, and a fibre sitting just under its damage limit would be
+    // tipped over it by the act of being read. Counting here counts what was
+    // adopted.
+    result_.tornFibers = 0;
+    result_.tornFiberVolume = 0;
+    for (std::size_t i = 0; i < fiber_.size(); ++i) {
+        if (!fiber_[i].failed) continue;
+        ++result_.tornFibers;
+        if (i < fiberForms_.length.size() && i < patch_->stiffening.fiber.size())
+            result_.tornFiberVolume += patch_->stiffening.fiber[i].area * fiberForms_.length[i];
     }
     result_.tornPanels = tornPanelsAt(params_.tearFraction);
     // The area `breach.hpp` will open is the whole panel, not the deleted part.

@@ -122,9 +122,83 @@
 //     bending of the panel about the plate normal. For a flat bar that is a 10 mm
 //     web against a 200 mm one and the omission is small; for a tee with a wide
 //     flange it is not.
-//   * **The stiffener does not tear.** A fibre yields and hardens; it has no
-//     damage variable and is never deleted. A zone whose plating has torn away
-//     from under a stiffener still has the stiffener.
+//
+// --- 2b. The stiffener tears, and on what length -------------------------------
+//
+// This used to read "the stiffener does not tear", and it was the last named gap in
+// Phase 3: a ram could take the plating out from under a longitudinal and the
+// longitudinal kept its full axial stiffness, which is the un-conservative
+// direction and which every downstream consumer inherited.
+//
+// **It is the same mechanism the plating already has**, and that is a finding
+// rather than a convenience. `plasticity::update` accumulates
+// `damage += d eps_p / (eps_f * triaxialityFactor(eta))`, and at `damage >= 1` the
+// point carries no stress and no further history for the rest of the run.
+// `FiberState` now carries the same two variables and `fiberForces` runs the same
+// accumulation. Nothing about the criterion is new; **the two arguments it takes
+// are**.
+//
+// **The length is the fibre's own rest length, not the seam's.** The
+// regularisation asks over what length the neck's elongation is averaged, and a
+// fibre reports strain as `(l - L) / L` with `L` its own tied-point-to-tied-point
+// rest length. On a curved patch that is *not* the seam segment: the tie
+// extrapolates, so the outer fibre of a 200 mm bar on plating turning through an
+// angle is longer than the seam it is welded to by the eccentricity times that
+// angle. Regularising on the seam would divide the damage by a length the strain
+// was never measured over. `RestFibers::length` is already exactly the right
+// number and no new geometry is taken.
+//
+// **The width the neck forms across is the profile rectangle's own thickness, not
+// the plate's.** The plating's rule is "the neck is as wide as the member is thick
+// and the element averages over its in-plane size"; the *rule* carries over
+// unchanged and only the two numbers move. A fibre is a two-point Gauss station of
+// one rectangle of the profile, so the thickness that localises it is that
+// rectangle's -- the web thickness for a web station, the flange thickness for a
+// flange one. For a 200x10 flat bar on 12 mm plating at the zone's 0.15 m element
+// the plating fails at `eps_f = 0.2004` and the fibre at `0.1918`: 4.5% apart, so
+// **the failure strains are not what separates them.** What separates them is the
+// stress state, below.
+//
+// **A bar's triaxiality is +/-1/3 and nothing else, and both ends are exactly on a
+// boundary of `plasticity::Failure`.** A uniaxial stress has `sigma_m = sigma/3`
+// and `sigma_eq = |sigma|`, so `eta = sign(sigma)/3`. In tension that is exactly
+// `referenceTriaxiality`, so the Rice-Tracey multiplier is **exactly 1** and a
+// fibre fails at its regularised strain unmodified. In compression it is exactly
+// `cutoffTriaxiality`, so the multiplier is infinite and a **compressed fibre
+// accumulates no damage at all** -- voids close rather than grow, which is the
+// physics the cutoff is there for, and a stiffener on the far side of a dent
+// therefore does not tear however hard it is squashed.
+//
+// **That closed form is taken rather than `plasticity::triaxiality` of an assembled
+// Voigt stress, and one ULP is why.** `vonMises([sigma,0,0,0,0,0])` is *not*
+// identically `|sigma|` -- it is for 3.55e8 and 1.234568e8 and it is not for 1.0 or
+// -9.876543e8, where it comes back one unit in the last place low. The tension end
+// survives that (a relative 5e-17 on the multiplier), but the compression end is a
+// `<=` against the cutoff: an `eta` that rounded to *inside* the cutoff by one ULP
+// would take the multiplier from infinite to `exp(1)`, and a compressed fibre would
+// go from never failing to failing at 37% of its tensile failure strain. A branch
+// that flips on the last bit of a square root is not a criterion.
+// `tests/test_constraint.cpp` asserts the closed form against
+// `plasticity::triaxiality` -- the two independent routes -- and records the ULP.
+//
+// **Tearing and softening do not compose, exactly as `coupling.hpp` records for
+// elements, but a fibre needs no separate softening path to say so.** A yielded
+// element hands back a *negative correction* to a stiffness somebody else
+// assembled, so a torn one has to be skipped or the correction leaves rows no
+// element supports. A fibre's `attachedForms` block is not a correction; it is the
+// whole of the member's stiffness, added to a plating assembly that supports those
+// rows on its own. So a torn fibre is **dropped**, and dropping it is exact rather
+// than singular. The distinction survives in the other direction: `-K_fibre` would
+// be wrong for the same reason it is wrong for an element, and nothing here forms
+// one.
+//
+// **What this still does not do.** A fibre fails on axial damage alone. A
+// longitudinal welded to plating that has been deleted from under it is not held up
+// by anything, and this does not notice that: the tie still names plating nodes,
+// and if the elements round them are gone those nodes are unsupported. That is
+// `coupling::withoutTornElements`' business and it is stated here so it is not
+// discovered. The fibres do not shear off the plate either -- the tie is rigid by
+// construction (§1), so weld failure is outside the model, not approximated by it.
 //
 // SI units, body frame per CLAUDE.md.
 #pragma once
@@ -180,13 +254,29 @@ struct Fiber {
     Tie end[2];
     double area = 0;    // m^2 of the profile this fibre stands for
     double offset = 0;  // m from the plate mid-surface, along the pair direction
+    // The thickness of the profile rectangle this fibre is a Gauss station of --
+    // the web thickness for a web station, the flange thickness for a flange one.
+    // It is the width the neck forms across, and it is the *only* new geometry the
+    // failure criterion needs: see the header §2b. Zero means "no regularisation",
+    // which falls to the unregularised end rather than to zero, exactly as
+    // `plasticity::regularisedFailureStrain` does for a degenerate element.
+    double neckWidth = 0;  // m
+    // Which `StructuralMesh::members` entry this fibre belongs to, or -1 when the
+    // caller did not say. It is what lets `promotion::reduce` name a longitudinal
+    // rather than an anonymous bundle of bars, and it is carried here rather than
+    // recovered by geometry because a member the patch holds in two disconnected
+    // runs is still one member.
+    int member = -1;
 };
 
-// What one fibre remembers. Uniaxial isotropic hardening; no kinematic hardening
-// and no damage -- see the header note on what this cannot do.
+// What one fibre remembers. Uniaxial isotropic hardening; no kinematic hardening.
+// `damage` and `failed` are the same two variables `plasticity::State` carries and
+// mean the same things -- see the header §2b.
 struct FiberState {
     double plasticStrain = 0;            // signed, so a reversal unloads elastically
     double equivalentPlasticStrain = 0;  // monotone, drives the flow curve
+    double damage = 0;                   // 0..1, monotone. 1 means torn.
+    bool failed = false;
 };
 
 // The fibre stations of one profile: offsets from the plate mid-surface and the
@@ -199,6 +289,7 @@ struct ProfileFibers {
     int count = 0;
     double offset[4] = {};  // m from the plate mid-surface, signed
     double area[4] = {};    // m^2
+    double width[4] = {};   // m, the rectangle's own thickness -- see `Fiber::neckWidth`
 };
 ProfileFibers profileFibers(const StiffenerProfile& profile, double plateThickness, double sign);
 
@@ -235,11 +326,33 @@ struct RestFibers {
 };
 RestFibers restFibers(const Stiffening& stiffening, const std::vector<double>& rest);
 
+// --- 2b. The failure criterion, as two closed forms ----------------------------
+
+// The triaxiality of a bar: `+1/3` in tension, `-1/3` in compression, and nothing
+// in between. Taken in closed form rather than from `plasticity::triaxiality` of an
+// assembled uniaxial stress, because the compression end is a `<=` against
+// `Failure::cutoffTriaxiality` and `vonMises` of a uniaxial Voigt vector is not
+// identically `|sigma|` -- see the header §2b for the ULP that decides it. Zero
+// stress has no direction and returns zero, which is what `plasticity::triaxiality`
+// returns there too.
+double fiberTriaxiality(double axialStress);
+
+// The failure strain one fibre sees: `plasticity::regularisedFailureStrain` with the
+// fibre's own rest length as the averaging length and the profile rectangle's
+// thickness as the neck width. A thin wrapper, and it exists as a named function
+// because those two arguments are the whole of what this task had to establish and
+// a test that asserts the mesh-invariant needs to call exactly what the solver calls.
+double fiberFailureStrain(const plasticity::Failure& failure, double restLength,
+                          double neckWidth);
+
 // What one force evaluation produced.
 struct FiberForces {
     double strainEnergy = 0;  // J, recoverable
     double dissipation = 0;   // J, plastic, this increment
     int yielded = 0;          // fibres that yielded this increment
+    int tornNow = 0;          // fibres that failed this increment
+    int torn = 0;             // fibres carrying nothing, cumulative over the run
+    double tornVolume = 0;    // m^3 of stiffener steel that has gone, cumulative
 };
 
 // Co-rotational axial force of every fibre, **added into** `force` through the
@@ -251,10 +364,55 @@ struct FiberForces {
 // rotating zone would grow force out of nothing.
 //
 // `state` may be null, which solves the elastic bar and is the path the geometric
-// tests use.
+// tests use. **An elastic fibre never fails**, for the same reason a `nullptr`
+// plastic state means "no plasticity": damage is history and there is nowhere to
+// keep it.
+//
+// `allowFailure` false hands every fibre `plasticity::kNeverFails` and is the
+// control `zone::SolveParams::fiberFailure` exposes: the un-conservative model that
+// shipped before §2b, kept re-runnable so the size of its error stays a measurement.
 FiberForces fiberForces(const Stiffening& stiffening, const RestFibers& forms,
                         const std::vector<double>& current, const plasticity::Material& material,
-                        std::vector<FiberState>* state, std::vector<double>& force);
+                        std::vector<FiberState>* state, std::vector<double>& force,
+                        bool allowFailure = true);
+
+// What a solved fibre set says about the members it was built from: per member, how
+// much of the steel the zone meshed for it is still carrying.
+//
+// **The measure is volume, `sum A_i L_i`, and that is a choice with a reason.** The
+// hull girder reads a member as an area at a height, and the Steiner term `A d^2`
+// about a neutral axis metres away dwarfs the profile's own second moment -- so what
+// a torn stiffener costs the section is overwhelmingly its *area*, and an
+// area-weighted effectiveness is the number that carries. It is also the exact
+// analogue of what `promotion::PanelDamage` does for plating: area still carrying
+// over area meshed.
+//
+// It is not the whole truth and the direction of the lie is stated: the outer fibre
+// is the one that tears first and the one that carries the most of `I_own`, so a
+// uniform knockdown built from this over-states what a partly torn member has left
+// *about its own axis*. About the hull's axis, which is the one Tier 0 asks about,
+// the error is the ratio of `I_own` to `A d^2` and is small.
+struct MemberFibers {
+    int member = -1;
+    double volume = 0;    // m^3 of stiffener steel this zone meshed for the member
+    double carrying = 0;  // m^3 of it still carrying
+    // m^3 of it that has torn. **Summed, not `volume - carrying`.** The difference
+    // of two sums is not the sum of the differences in floating point, and
+    // `zone::SolveResult::tornFiberVolume` is the same quantity accumulated the
+    // other way -- two readers of one state that a test compares bit for bit, which
+    // they cannot be if one of them subtracts.
+    double lost = 0;
+    int fibers = 0;
+    int torn = 0;
+    double effectiveness = 1;  // carrying / volume, in [0, 1]
+};
+
+// Ascending by member index; fibres whose `member` is -1 are grouped together under
+// -1, because a caller that did not name its members still deserves an answer.
+// A short or empty `state` is read as "no fibre has failed", which is what an
+// elastic solve leaves behind and is the same convention `fiberForces` uses.
+std::vector<MemberFibers> memberDamage(const Stiffening& stiffening, const RestFibers& forms,
+                                       const std::vector<FiberState>& state);
 
 // Add the fibres' mass to a per-node lumped mass array, **split equally over each
 // pair**. Not `T^T M T`: see the header. The total is exact; the first moment
@@ -299,7 +457,8 @@ double fiberFrequencySquared(const FiberStiffness& stiffness,
 // than two formulations. One block per fibre: 12 DOF, rank one.
 std::vector<solidshell::DofBlock> stiffnessBlocks(const Stiffening& stiffening,
                                                   const std::vector<double>& rest,
-                                                  const RestFibers& forms, double youngsModulus);
+                                                  const RestFibers& forms, double youngsModulus,
+                                                  const std::vector<FiberState>* state = nullptr);
 
 // What a fibre set gives a *linear* model: its stiffness, and how to read back
 // what each fibre is carrying.
@@ -319,7 +478,12 @@ std::vector<solidshell::DofBlock> stiffnessBlocks(const Stiffening& stiffening,
 // freedom in the same order**, because both come out of one `fiberStiffness` in
 // one pass. Two loops would be two places to decide which fibres to skip, and a
 // stress form paired with the wrong block reports a plausible number for the wrong
-// member. A fibre with no rest length or no area is dropped from both.
+// member. A fibre with no rest length or no area is dropped from both, **and so is
+// a fibre that has failed** -- one more clause on the same single skip test, for
+// exactly the same reason. A torn fibre left in would hand the reduced model a
+// member's full axial stiffness after it had gone, and would then report a stress in
+// it to `reduction::checkValidity`, which reads the attached members' stress: a
+// utilisation from a bar that does not exist.
 struct AttachedForms {
     std::vector<solidshell::DofBlock> stiffness;
     // Per block, one entry per degree of freedom that block names. The fibre's
@@ -331,8 +495,14 @@ struct AttachedForms {
     // `sigma * A` would then not be the force the model actually carried.
     std::vector<std::vector<double>> stress;  // Pa per metre of displacement
 };
+//
+// `state` may be null, and null means "nothing has failed" -- so a caller that has
+// not solved plastically, or that solved before this existed, builds *bit for bit*
+// the forms it built before. That is the negative control, and it is a property of
+// the code rather than of a tolerance.
 AttachedForms attachedForms(const Stiffening& stiffening, const std::vector<double>& rest,
-                            const RestFibers& forms, double youngsModulus);
+                            const RestFibers& forms, double youngsModulus,
+                            const std::vector<FiberState>* state = nullptr);
 
 // Smallest stable explicit step the fibres allow, given the assembled nodal mass:
 // `safety * 2 / omega_max` over every fibre. Infinite -- returned as zero -- when
@@ -350,6 +520,11 @@ double criticalTimestep(const Stiffening& stiffening, const RestFibers& forms,
 struct SeamRun {
     std::vector<std::uint32_t> bottom, top;
     double sign = -1.0;  // +1 if the web rises bottom -> top, -1 the other way
+    // Which `StructuralMesh::members` entry this run belongs to. -1 -- the default,
+    // so a caller that has no member index compiles and behaves unchanged -- means
+    // the fibres are anonymous and `promotion::reduce` will not weaken anything on
+    // their account.
+    int member = -1;
 };
 
 // Fibres for one profile along one run of pairs. Appends to `out`; returns how

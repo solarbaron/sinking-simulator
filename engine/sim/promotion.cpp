@@ -655,7 +655,87 @@ SectionReduction reactionOf(const StructuralMesh& structure, const zone::Patch& 
             out.xHi = std::max(out.xHi, corner.x);
         }
     }
-    if (out.panels.empty()) {
+    // --- The stiffeners ----------------------------------------------------------
+    //
+    // The same reckoning on the members: the steel the zone's fibres stand for, the
+    // part of it still carrying, and the rest of the member counted intact because
+    // nobody looked at it. `constraint::memberDamage` does the per-fibre half; what
+    // is here is the "how much of the member did the zone see" half, which needs the
+    // structure and so cannot live in `constraint.hpp`.
+    if (!patch.stiffening.empty()) {
+        const std::vector<constraint::MemberFibers> byMember = constraint::memberDamage(
+            patch.stiffening, solver.restFibers(), solver.fiberState());
+        for (const constraint::MemberFibers& fibres : byMember) {
+            if (fibres.member < 0) {
+                // Anonymous fibres cannot be reduced -- there is no member to name.
+                // Reported rather than dropped, because a zone that built fibres
+                // without member indices would otherwise look like a zone with
+                // undamaged stiffeners.
+                if (fibres.torn > 0)
+                    out.problems.push_back(
+                        std::to_string(fibres.torn) +
+                        " fibres tore in a run that carries no member index, so the section"
+                        " reduction cannot say which longitudinal they were");
+                continue;
+            }
+            if (static_cast<std::size_t>(fibres.member) >= structure.members.size()) {
+                out.problems.push_back("the patch names a member the structure does not have");
+                continue;
+            }
+            const StructuralMember& member =
+                structure.members[static_cast<std::size_t>(fibres.member)];
+            const double whole = profileSection(member.profile).area * member.length();
+            if (!(whole > 0)) continue;
+
+            MemberDamage damage;
+            damage.member = fibres.member;
+            damage.meshedFraction = std::min(1.0, fibres.volume / whole);
+            damage.fibers = fibres.fibers;
+            damage.tornFibers = fibres.torn;
+            damage.lostVolume = fibres.lost;
+            // The part of the member outside the patch counts as intact, exactly as
+            // the unmeshed part of a panel does -- otherwise the zone *radius*
+            // decides how much of a 60 m longitudinal is gone, which is the defect
+            // `indentation.hpp` records on the plating side.
+            const double intact = std::max(0.0, whole - std::min(fibres.volume, whole));
+            damage.effectiveness =
+                std::min(1.0, std::max(0.0, (fibres.carrying + intact) / whole));
+            // The snap to zero is the plating's, for the plating's reason: an epsilon
+            // of section left is a member `sectionElements` *keeps*, and a member
+            // that thin has a critical stress of nothing. It cost the ferry's whole
+            // reported ultimate moment once on the panel side.
+            if (damage.effectiveness < 1e-6) damage.effectiveness = 0.0;
+            // **The noise floor is not the plating's, and that is deliberate.** A
+            // panel's effectiveness is a continuous thinning measure and needs a
+            // floor at mill tolerance. A member's is *quantised* -- it moves in units
+            // of one fibre's share of the member -- so the honest question is simply
+            // whether a fibre tore, and asking it directly needs no threshold at all.
+            // A threshold would also be doing the wrong job here: `(carrying +
+            // intact) / whole` is not exactly 1 for a member nothing happened to,
+            // because `whole` and `volume` are computed by different routes, and a
+            // near-one test that let the residue through would scale an undamaged
+            // longitudinal by 0.9999999999999999. Mutation testing found the
+            // inherited `1e-4` surviving every assertion, which is what it looks
+            // like when a threshold cannot fire: at one fibre per 0.1 m of member you
+            // would need a longitudinal a kilometre long to land inside it.
+            if (fibres.torn == 0) continue;
+
+            out.members.push_back(damage);
+            out.worstMemberEffectiveness =
+                std::min(out.worstMemberEffectiveness, damage.effectiveness);
+            const double density =
+                static_cast<std::size_t>(member.material) < structure.materials.size()
+                    ? structure.materials[static_cast<std::size_t>(member.material)].density
+                    : ah36Steel().density;
+            out.lostSteelMass += (1.0 - damage.effectiveness) * whole * density;
+            out.xLo = std::min({out.xLo, member.a.x, member.b.x});
+            out.xHi = std::max({out.xHi, member.a.x, member.b.x});
+        }
+        std::sort(out.members.begin(), out.members.end(),
+                  [](const MemberDamage& a, const MemberDamage& b) { return a.member < b.member; });
+    }
+
+    if (out.panels.empty() && out.members.empty()) {
         out.xLo = out.xHi = 0;
         out.worstEffectiveness = 1.0;
     }
@@ -671,6 +751,19 @@ StructuralMesh reduce(const StructuralMesh& structure, const SectionReduction& r
             continue;
         const double factor = std::min(1.0, std::max(0.0, damage.effectiveness));
         out.panels[static_cast<std::size_t>(damage.panel)].thickness *= factor;
+    }
+    for (const MemberDamage& damage : reduction.members) {
+        if (damage.member < 0 || static_cast<std::size_t>(damage.member) >= out.members.size())
+            continue;
+        const double factor = std::min(1.0, std::max(0.0, damage.effectiveness));
+        // Web *and* flange, together. See the header: one factor on both thicknesses
+        // scales area, `I_own` and the Steiner term alike and leaves the profile's
+        // centroid where it was, which is the exact analogue of a plate's thickness.
+        // Scaling the web alone would leave a tee's flange floating on nothing, with
+        // `profileSection` still counting its full area.
+        StiffenerProfile& profile = out.members[static_cast<std::size_t>(damage.member)].profile;
+        profile.webThickness *= factor;
+        profile.flangeThickness *= factor;
     }
     return out;
 }
