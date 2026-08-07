@@ -517,12 +517,23 @@ back-end as instructed.
 > **And the last item on this section's own list has since been closed, as a negative.**
 > "Keep alpha in double" was item 3 of *What to do about it* and the only thing left to
 > try. It is built — five kernels from one source, `--eas=float|tight|solve|condense|
-> newton` — and it does not close the gap: the five land between 40 and 49 torn elements
-> at 768 where the reference is 32, the spread across the precisions is the size of the
-> gap they were meant to close, and it is not monotone in precision. It costs 5–10× on
-> the kernel, which undoes the remap. *Alpha in double — measured, and it is not what
-> was missing*, below, has the tables, the mechanism, and the two claims in item 3 that
-> turned out to be wrong.
+> newton` — and it does not close the gap: the five land between 40 and 44 torn elements
+> at 768 where the reference is 32 and between 204 and 247 at 3 072 where it is 162, the
+> spread across the precisions is about half the gap they were meant to close, and its
+> sign reverses between the two sizes. What the five *do* sort by is the stopping rule
+> they carry, not their arithmetic. It costs 5–15× on the kernel, which undoes the
+> remap. *Alpha in double — measured, and it is not what was missing*, below, has the
+> tables, the mechanism, and the two claims in item 3 that turned out to be wrong.
+
+> **The throughput numbers here have since been re-measured on a box checked idle,
+> and they hold.** 1.26–2.43× re-measures as **1.27–2.44×** over six interleaved
+> repeats, and 0.23–0.68× as 0.22–0.64×; every cell is within 6% of what it
+> replaces. The range is quoted below as 1.26–2.43× where other documents quote it,
+> because a re-measurement agreeing to 1% is a confirmation and not a new figure.
+> What that pass *did* overturn is a correction: five cells this section had marked
+> as "not reproducing" reproduce exactly, and the arrows are withdrawn — see *The
+> correction to the correction*. And the fp64 cost table, which was taken against an
+> unrelated GPU consumer and said so, has been re-taken idle; it moved.
 
 The kernel exists, it is correct on the closed forms available to it, and after the
 remap it is **1.26× to 2.43× the 23-worker CPU** end to end on the real patch. The
@@ -659,9 +670,21 @@ offset and the raw number means nothing on its own:
 | shader | registers/thread | spill over calibration |
 |---|---|---|
 | `node_integrate.comp` (calibration) | 32 | 0 B |
-| `tet_forces.comp` | 40 | **0 B** |
+| `tet_forces.comp` † | 40 | **0 B** |
 | `solidshell_forces.comp` — one invocation | 128 | **1 936 B = 484 floats** |
 | `solidshell_forces_wg.comp` — one workgroup | 64 | **96 B = 24 floats** |
+
+Re-run and identical, every row: these come from the driver's compiler and not from
+a clock, so they are the one part of this section that a busy box cannot move.
+
+> † **except the tet row, which `--stats` does not print.** It queries the two
+> solid-shell mappings, the calibration and the four fp64 variants;
+> `tet_forces.comp` is not among them, so that cell cannot be re-derived from the
+> tool that produced the rest of the table and is carried on the authority of the
+> run that first took it. Flagged rather than fixed, because the tet is not what
+> this section is about — but it is exactly one cell of one table with a different
+> provenance from its neighbours, which is the thing this section has now been
+> caught by twice.
 
 **484 floats.** The first version guessed "about five hundred floats of
 thread-private state" from counting the arrays by hand and was right to three
@@ -674,37 +697,77 @@ occupancy goes from 16 of 64 warps per SM to 32.
 
 Not element-updates per second. Wall time for a whole run of the same patch, the
 same steps, the same punch — CPU on 23 threads in double, GPU on a 1070 Ti in
-float. Both mappings, same binary, same session:
+float. Both mappings, same binary, one sweep, **six interleaved repeats of every
+cell**, `tools/zone_gpu_probe/sweep.sh`:
 
-| elements | steps | CPU wall | invocation | vs CPU | workgroup | vs CPU | kernel time |
+| elements | steps | CPU wall | invocation | vs CPU | workgroup | vs CPU | workgroup ÷ invocation |
 |---|---|---|---|---|---|---|---|
-| 192 | 5 505 | 0.71 s | 2.87 s | **0.25×** | 0.45 s | **1.55×** | 6.5× faster |
-| 768 | 5 505 | 1.77 s | 4.24 s | **0.42×** | 1.37 s | **1.26×** | 3.1× |
-| 3 072 | 5 505 | 6.06 s | 9.32 s | **0.65×** | 4.40 s | **1.38×** | 2.1× |
-| 8 192 | 1 500 | 6.75 s | 27.62 s | **0.24×** | 2.93 s | **2.28×** | 9.5× |
-| 16 384 | 1 000 | 9.44 s | 41.21 s | **0.23×** | 3.88 s | **2.43×** | 10.7× |
+| 192 | 5 505 | 0.67 s (0.67–0.70) | 2.71 s (2.71–2.83) | **0.25×** | 0.43 s (0.43–0.47) | **1.56×** | 6.3× |
+| 768 | 5 505 | 1.62 s (1.62–2.76) | 4.10 s (4.10–4.42) | **0.40×** | 1.28 s (1.28–1.30) | **1.27×** | 3.2× |
+| 3 072 | 5 505 | 5.63 s (5.63–10.28) | 8.83 s (8.83–9.09) | **0.64×** | 4.19 s (4.19–4.39) | **1.34×** | 2.1× |
+| 8 192 | 1 500 | 6.17 s (6.17–7.12) | 26.02 s (26.02–28.19) | **0.24×** | 2.77 s (2.77–2.88) | **2.23×** | 9.4× |
+| 16 384 | 1 000 | 8.84 s (8.84–9.55) | 40.98 s (40.98–42.28) | **0.22×** | 3.62 s (3.62–6.45) | **2.44×** | 11.3× |
 
-The invocation column reproduces the original table to within 4% at every size,
-which is what makes the workgroup column a comparison rather than a fresh
-measurement. (The CPU columns likewise: 0.70/1.80/6.19/6.63/9.29 originally.)
+Each cell is the **minimum over its repeats**, with the full range beside it.
+Minimum rather than mean, because contention can only *add* time: an inflated run
+is a run with someone else's work in it, and averaging it in publishes a number
+that is partly the neighbour's. The ratios are formed from the two minima. The
+last column is how much faster the remap is than the mapping it replaced, which
+is the quantity the prose calls "off the kernel time".
 
-> **Measured with the GPU otherwise idle, and that qualification earns its place.**
-> A confirmation pass with another job sharing the machine reproduced the workgroup
-> figures at both ends of the range to 4% and the CPU columns to 2%, but put the
-> **192-element invocation** kernel 43% slower — 2.85 s to 4.07 s. That size is the
-> one to distrust under contention: six workgroups of 32 threads is a handful of
-> warps, so it is latency-bound and anything else on the device shows up in it
-> directly. The workgroup mapping runs 192 groups for the same patch and moved 5%.
-> Nothing else in the table is sensitive at that level.
+**The published range survives the re-measurement: 1.26–2.43× against 1.27–2.44×
+here**, and the invocation mapping's 0.23–0.68× against 0.22–0.64×. Every number
+in the previous version of this table is within 6% of its re-measurement and most
+are within 2%.
+
+> ### The box was idle, and that was established rather than assumed
+>
+> The previous version of this table asserted idleness in a callout. The fp64 work
+> below then published a table that was *not* taken on an idle box and said so, and
+> the two claims are indistinguishable from the outside — which is the reason this
+> is now instrumented instead of stated.
+>
+> **Three instruments, because they fail differently.**
+>
+> - **Before every run**, in the gap where nothing of ours is executing, the CPU's
+>   busy fraction from a `/proc/stat` delta and the GPU's utilisation and clock from
+>   the driver. Across all sixty rows the worst reading was **9.7% of the CPU and
+>   13% of the GPU**, against a desktop floor of about 2%. Deliberately not the load
+>   average: a 1-minute average still carries the sweep's own previous run, so it
+>   would flag every row after the first.
+> - **During every run**, everything the machine burned minus everything this probe
+>   burned, over the run's own wall clock, so our own 23 workers cancel. The before
+>   check cannot see a neighbour that starts two seconds later, and one did; this
+>   column was added *because* of what the third instrument found in the sweep
+>   above, and it catches the same events live in the fp64 sweep below.
+> - **The repeats themselves**, which are the sharpest of the three because they
+>   measure the thing that matters rather than a proxy for it. **The GPU column
+>   repeats to within 2–9% at every size bar one run**, where the fp64 session below
+>   — with an unrelated consumer on the device — saw the same configuration move
+>   **35%**. A kernel time that repeats to 2% cannot have been taken against a
+>   competing load. The exception is named in the next paragraph rather than dropped.
+>
+> **The GPU was idle. The CPU was not, and the difference matters.** Two sibling
+> agents were gating this repository throughout, and their `shipsim_tests` runs land
+> on the CPU reference: four of the sixty rows carry a CPU wall 15–83% above the
+> minimum for their configuration, and one carries a GPU wall 78% above it, because
+> that suite has device tests in it too. Every one of those rows read **under 3%
+> busy** on its before-check. That is why the table quotes minima and ranges rather
+> than a mean of six, and why the CPU column's range is wide at 768 and 3 072 while
+> the GPU column's is not.
+>
+> The one figure to distrust is unchanged and for the reason previously given: at
+> 192 elements six workgroups is a handful of warps, so it is latency-bound and
+> anything else on the device shows in it directly.
 
 **The degradation past 3 000 elements is gone**, and that is the load-bearing part.
-The old curve improved to 3 072 and then fell off a cliff — 0.68× to 0.24× to 0.23×
+The old curve improved to 3 072 and then fell off a cliff — 0.64× to 0.24× to 0.22×
 — which is a spill working set leaving the 2 MB L2. The new one does not: from 768
-up it rises with size, 1.26× → 1.38× → 2.28× → 2.43×, which is what a kernel does
+up it rises with size, 1.27× → 1.34× → 2.23× → 2.44×, which is what a kernel does
 when it is bound by occupancy. The diagnosis was right.
 
 **It is not monotone across the whole range, and the 192-element point is the
-exception rather than the trend.** 1.55× there sits above the 1.26× at 768, because
+exception rather than the trend.** 1.56× there sits above the 1.27× at 768, because
 192 elements is six workgroups short of filling one SM's worth of the device while
 also being the size at which the CPU's own 23-way split has the least to work
 with — both sides are inefficient and the ratio says little. The four larger sizes
@@ -827,23 +890,57 @@ so at sizes where tearing is live.** 192 elements never tears on either path, wh
 is why the original run could say nothing about it. At 768 and 3 072 elements the
 *double* reference does tear, and that is where the comparison bites:
 
+**All of it at a fixed 5 505 steps**, which is the whole of what was ever wrong with
+this table — see the correction below.
+
 | | 768 elements | 3 072 elements |
 |---|---|---|
 | CPU double, torn | **32** | **162** |
-| GPU float, torn (workgroup) | 40 → **41** | 247 → **248** |
-| GPU float, torn (invocation) | **44** | 213 → **241** |
+| GPU float, torn (workgroup) | **40** | **247** |
+| GPU float, torn (invocation) | **44** | **213** |
 | **control: double, mesh jittered 2 × 10⁻⁷ m, torn** | **32** | **162** |
-| CPU dissipation | 1.5194 → **1.5205** MJ | 1.2910 → **1.2963** MJ |
-| GPU dissipation, relative | 2.6 → **2.7** × 10⁻¹ | 3.4 × 10⁻¹ |
-| control dissipation, relative | 7.7 → **7.9** × 10⁻³ | 5.6 × 10⁻⁴ |
+| CPU dissipation | **1.5194** MJ | **1.2910** MJ |
+| GPU dissipation, relative | **2.57** × 10⁻¹ | **3.38** × 10⁻¹ |
+| control dissipation, relative | **7.69** × 10⁻³ | **5.64** × 10⁻⁴ |
 
-> **The arrows are a correction, made when the table was re-run for the fp64 work below.**
-> Five of these cells do not reproduce — on today's tree, on a repeat, at any worker
-> count, or on `776d15e` itself. The bold figures are what the tool produces. Four of
-> the five are off by one element or 0.4%; the invocation mapping's 3 072-element count
-> is off by 28. See *First, the float baseline* below for how that was established.
-> Nothing in the argument moves, and the two cells it rests on — the reference and the
-> jittered control, 32 and 162 both — reproduce exactly.
+> ### The correction to the correction: this table was right, and the arrows were the error
+>
+> An earlier revision annotated five of these cells with arrows — 40 → 41, 247 → 248,
+> 213 → 241, 1.5194 → 1.5205 MJ, 1.2910 → 1.2963 MJ — on the grounds that the tool no
+> longer produced the figures printed, and concluded that "five more cells of this
+> table did not come from the run the rest of it did". **Every cell above is what the
+> tool produces today**, on six repeats of a single sweep, identical on every one.
+> The arrows are withdrawn.
+>
+> **What produced the other set of numbers was eight extra steps at 768, and forty at
+> 3 072.** The probe derives
+> its step count from the punch *depth* unless `--steps` is given, and the critical
+> timestep falls with element size — 1.8163 µs at 192 elements, 1.8138 at 768, 1.8033
+> at 3 072 — so the derived count is 5 505, 5 513 and 5 545. This table was taken at a
+> **fixed** 5 505; the re-run that produced the arrows let the count be derived. Run
+> today's tree at the derived count and the "corrections" come back exactly, all five:
+>
+> | 768, derived 5 513 steps | 3 072, derived 5 545 steps |
+> |---|---|
+> | CPU dissipation **1.5205** MJ, torn 32 / **41** | CPU dissipation **1.2963** MJ, torn 162 / **248** workgroup, **241** invocation |
+>
+> **So neither table had cells from two different runs.** Each was internally
+> consistent; they were two different experiments, and the second was read as a
+> re-measurement of the first.
+>
+> **The reusable part is how convincing the wrong diagnosis was.** That re-run
+> established that its figures were not noise (identical on a repeat), not the
+> reduction order (identical at 1, 4, 12 and 23 workers), and not the tree — it built
+> `776d15e` from a `git archive` and got its own numbers back rather than the
+> published ones. All three are true and none of them could see the fault, because
+> **every one of those controls varied something other than the command line, and the
+> command line was what differed.** `6b928ba`'s own binary, rebuilt here from a `git
+> archive` and given `--steps=5505`, produces 1.5194 MJ and 40 torn — the figures its
+> commit message says it could not reproduce.
+>
+> A step count is a parameter of the experiment and it was not recorded next to the
+> numbers. It is now, in this table's own heading and in every row of the CSV
+> `sweep.sh` writes.
 
 **The control tears exactly the reference's count at both sizes and the float
 kernel is 25% and 52% over it.** That is the argument, and it is much stronger than
@@ -892,75 +989,87 @@ moved anything — and it turns out to be entirely the tolerance.
 it is summed, so a level that widened the arithmetic without widening the operator would
 have measured nothing and reported it as a result.
 
-#### First, the float baseline — and two more cells of the table above do not reproduce
+#### First, the float baseline
 
-Same probe, same five sizes, today's tree:
+Same probe, same five sizes, workgroup mapping, one sweep of six repeats, and the
+step count **fixed** at each size rather than derived — 5 505, 5 505, 5 505, 1 500,
+1 000, which is what *Throughput* above runs and what *Precision* above records:
 
 | | 192 | 768 | 3 072 | 8 192 | 16 384 |
 |---|---|---|---|---|---|
 | CPU double, torn | 0 | **32** | **162** | 0 | 0 |
-| GPU float, torn | 0 | **41** | **248** | 0 | 0 |
+| GPU float, torn | 0 | **40** | **247** | 0 | 0 |
 | control: double, jittered 2e-7 m | — | **32** | **162** | — | — |
-| GPU dissipation, relative | 2.79e-1 | 2.74e-1 | 3.40e-1 | 9.3e-2 | 2.3e-2 |
-| control dissipation, relative | — | 7.9e-3 | 5.6e-4 | — | — |
+| GPU dissipation, relative | 2.79e-1 | 2.57e-1 | 3.38e-1 | 9.32e-2 | 2.28e-2 |
+| control dissipation, relative | — | 7.69e-3 | 5.64e-4 | — | — |
 
-At 192 elements every figure reproduces to four significant figures: dissipation 1.1114
-against 1.4214 MJ, peak damage 0.6527 against 0.4094, zero torn on both sides. The
-reference's 32 and 162 reproduce, and so does the negative control's exact 32 and 162 —
-which is the load-bearing part of the argument and it is intact.
+Every cell here is identical on all six repeats — both paths are deterministic, and
+the sweep asserts that by recording each repeat rather than the first. At 192
+elements every figure reproduces §8's original to four significant figures:
+dissipation 1.1114 against 1.4214 MJ, peak damage 0.6527 against 0.4094, zero torn
+on both sides. The reference's 32 and 162 reproduce, and so does the negative
+control's exact 32 and 162 — which is the load-bearing part of the argument and it
+is intact.
 
-> **What does not reproduce is the float kernel's own torn count and the CPU's
-> dissipation at 768 and 3 072.** *Precision* above records 40 and 247 torn on the
-> workgroup mapping, 213 on the invocation mapping at 3 072, and the CPU dissipating
-> 1.5194 and 1.2910 MJ. The tool produces **41 and 248**, **241**, and 1.5205 and
-> 1.2963 MJ, and it does so:
->
-> - on a repeat run, exactly — both paths are deterministic here, so it is not noise;
-> - at 1, 4, 12 and 23 CPU workers, identically — so it is not the reduction order;
-> - **and on `776d15e` itself, the commit that table was taken at**, built from a `git
->   archive` of it. `scantlings.cpp` and `solid_shell.cpp` have both moved since, which
->   was the obvious explanation and is the wrong one: the old tree gives 1.5205 MJ and
->   41 torn as well.
->
-> So a second set of cells in §8's precision table did not come from the run the rest of
-> it came from. Four of them are off by one element or 0.4%; the invocation mapping's
-> 3 072-element count is off by 28, which is 13%. **The conclusion is untouched** —
-> float is 28% and 53% over a reference that a float-sized geometric jitter reproduces
-> exactly — but it is the same failure twice in one table, and the reusable part is how
-> it was found: by re-running the tool at the old commit, not by comparing two
-> documents. The obvious explanation, that `scantlings.cpp` and `solid_shell.cpp` have
-> both moved since, is the wrong one and would have been recorded as fact if the
-> archive had not been built.
+> **An earlier revision of this subsection was titled "and two more cells of the table
+> above do not reproduce", and it was wrong.** It compared a derived step count
+> against a fixed one; the arrows it added to *Precision* are withdrawn there, with
+> the mechanism. Nothing in the conclusion moved then and nothing moves now — float
+> is 25% and 52% over a reference that a float-sized geometric jitter reproduces
+> exactly — but two revisions of this document have now published a "figure that does
+> not reproduce" which did reproduce, under the parameters it was taken at. **The
+> first cost a real figure** (the 60 torn elements, correctly withdrawn); the second
+> cost five figures that were correct. A withdrawal is a claim like any other and
+> wants the same standard of evidence as the thing it withdraws.
 
 #### Then the ladder, and nothing on it converges to the reference
 
-| torn elements | 768 | 3 072 | dissipation, relative |
+**Re-taken at a fixed 5 505 steps**, like everything else in this section — the first
+version of this table let the count be derived and so is not comparable with the
+reference rows above it:
+
+| torn elements | stopping rule | 768 | 3 072 |
 |---|---|---|---|
-| CPU double, the reference | **32** | **162** | — |
-| control: double, mesh jittered 2e-7 m | **32** | **162** | 7.9e-3 / 5.6e-4 |
-| `float`, as shipped | 41 | 248 | 2.74e-1 / 3.40e-1 |
-| `tight` — float, the CPU's stopping rule | 40 | 205 | 2.65e-1 / 2.87e-1 |
-| `solve` — + the 7×7 solve in fp64 | 44 | 248 | 2.67e-1 / 3.58e-1 |
-| `condense` — + the condensation in fp64 | 49 | 268 | 2.80e-1 / 3.80e-1 |
-| `newton` — the **whole block** in fp64 | 45 | 241 | 2.80e-1 / 3.40e-1 |
+| CPU double, the reference | 1e-16 | **32** | **162** |
+| control: double, mesh jittered 2e-7 m | 1e-16 | **32** | **162** |
+| `float`, as shipped | 1e-9 | 40 | 247 |
+| `solve` — + the 7×7 solve in fp64 | 1e-9 | 44 | 243 |
+| `condense` — + the condensation in fp64 | 1e-9 | 44 | 243 |
+| `tight` — float, the CPU's stopping rule | 1e-16 | 40 | **205** |
+| `newton` — the **whole block** in fp64 | 1e-16 | 44 | **204** |
+
+**Sorted by stopping rule rather than by precision, because that is what the numbers
+sort by.** At 3 072 the three kernels on the shipped 1e-9 gate land on 243–247 and the
+two on the CPU's 1e-16 land on 204–205, whatever their arithmetic: the gate is worth
+**42 elements** and everything fp64 does inside a gate is worth **four**. At 768 the
+gate is worth nothing at all and fp64 is worth four, in the wrong direction.
+
+**And `tight` and `newton` now agree to one element at both sizes** — 40/44 and
+205/204. That is the section's own central claim about this ladder, *"the whole of the
+fp64 block's effect on this kernel is the tolerance it was bundled with"*, and the
+derived-step table it was drawn from actually contradicted it at 3 072 (205 against
+241). Fixing the step count did not weaken the finding; it is the first version of this
+table that supports it.
 
 **Read the spread, not any one row.** Five kernels that differ only in the precision of
-the enhanced block land between 40 and 49 at 768 and between 205 and 268 at 3 072, while
+the enhanced block land between 40 and 44 at 768 and between 204 and 247 at 3 072, while
 the reference is 32 and 162 and the negative control hits both exactly. The variation
-*among the precisions* is the same size as the gap they were supposed to close, and it is
-not monotone in precision: of the three that share the shipped stopping rule, the one
-with the most of its enhanced block in fp64 (`condense`) is the furthest from the
-reference at both sizes. That is the signature of a quantity that is not responding to
-the variable being changed at all.
+*among the precisions* is about **half** the gap they were supposed to close at both
+sizes, and its sign reverses with size: fp64 makes it worse at 768 and better at 3 072.
+A quantity that responds to a variable does not change which way it responds when the
+mesh is refined.
 
-Over the full five sizes the fp64 block changes the dissipation in the fourth digit and
-the torn count nowhere it was zero:
+Over the full five sizes the fp64 block changes the torn count nowhere it was zero.
+**Re-taken at the fixed step counts this column claims** — the previous version of
+this table gave 5 505 / 5 505 in its own `steps` column while carrying figures from
+runs of 5 513 and 5 545, which is the same defect as the arrows above and in the one
+place it was self-evidently wrong:
 
 | elements | steps | CPU torn | float torn | fp64 torn | float diss. rel. | fp64 diss. rel. |
 |---|---|---|---|---|---|---|
 | 192 | 5 505 | 0 | 0 | 0 | 2.79e-1 | 2.79e-1 |
-| 768 | 5 505 | **32** | 41 | 45 | 2.74e-1 | 2.80e-1 |
-| 3 072 | 5 505 | **162** | 248 | 241 | 3.40e-1 | 3.40e-1 |
+| 768 | 5 505 | **32** | 40 | 44 | 2.57e-1 | 2.69e-1 |
+| 3 072 | 5 505 | **162** | 247 | 204 | 3.38e-1 | 3.01e-1 |
 | 8 192 | 1 500 | 0 | 0 | 0 | 9.32e-2 | 9.32e-2 |
 | 16 384 | 1 000 | 0 | 0 | 0 | 2.28e-2 | 2.28e-2 |
 
@@ -1037,37 +1146,59 @@ Derived from the register count and Pascal's 65 536-register file, warp occupanc
 from 32 warps per SM to 25. That is the cheap part. The expensive part is the arithmetic
 and the extra Newton iterations the tighter rule buys:
 
-Kernel time at 768 elements, two interleaved passes of all five, relative to `float`:
+Kernel time at 768 elements, two interleaved passes of all five, relative to `float`,
+minima:
 
-| kernel | × `float` |
-|---|---|
-| `tight` — float, the CPU's stopping rule | ×3.5 |
-| `solve` | ×1.8 |
-| `condense` | ×2.9 |
-| `newton` | ×6.5 |
+| kernel | × `float` | *as first published, under contention* |
+|---|---|---|
+| `solve` | **×2.4** | ×1.8 |
+| `condense` | **×4.4** | ×2.9 |
+| `tight` — float, the CPU's stopping rule | **×4.5** | ×3.5 |
+| `newton` | **×14.7** | ×6.5 |
 
-And `newton` against `float` across the whole size range, from the two sweeps:
+> **All four were understated, and `newton` by a factor of 2.3.** This pass was itself
+> taken while a sibling agent was building — 25–70% of the box in other hands, recorded
+> per row — so it is quoted for *ratios* and not for absolute times: all five kernels
+> ran in one interleaved pass and were equally exposed. The check that this is
+> permissible is `newton`, which was also measured on the idle sweep above: **×14.7
+> here against ×14.4 there**, 2% apart. A ratio taken across five kernels in one pass
+> survives contention; the ratio that does not is the one taken across two *sessions*,
+> which is what produced the ×6.5.
+
+And `newton` against `float` across the whole size range. **Re-measured on a box
+checked idle** — the first version of this row was taken against an unrelated GPU
+consumer at 100% utilisation and said so; this is the re-run it asked for, four
+interleaved repeats per cell, minima quoted:
 
 | elements | 192 | 768 | 3 072 | 8 192 | 16 384 |
 |---|---|---|---|---|---|
-| `newton` ÷ `float`, kernel time | ×10.4 | ×8.5 | ×9.9 | ×5.3 | ×6.0 |
-| float mapping, against the CPU (§8) | 1.55× | 1.26× | 1.38× | 2.28× | 2.43× |
-| **implied for the fp64 kernel** | **0.15×** | **0.15×** | **0.14×** | **0.43×** | **0.41×** |
+| `newton` ÷ `float`, kernel time | **×14.5** | **×14.4** | **×10.3** | **×5.3** | **×5.2** |
+| *the same row, taken under contention* | ×10.4 | ×8.5 | ×9.9 | ×5.3 | ×6.0 |
+| float mapping, against the CPU | 1.56× | 1.27× | 1.34× | 2.23× | 2.44× |
+| **measured for the fp64 kernel** | **0.11×** | **0.09×** | **0.13×** | **0.42×** | **0.47×** |
 
-> **Measured against an unrelated GPU consumer at 100% utilisation, and that is not a
-> footnote.** Repeat passes of the *same* configuration differ by up to 35% on the float
-> kernel, and the CPU reference column moved 47% across the sweep, so these are
-> within-session ratios good to one significant figure and nothing finer should be read
-> off them. The absolute end-to-end speedups from that session are meaningless and are
-> not quoted; §8's 1.26–2.43× is carried through instead, which is why the last row above
-> is labelled *implied*. `newton` itself is the steadiest of the five — two passes 0.8%
-> apart — because at six times the work it is the least sensitive to anything else on the
-> device.
+> **The contended session understated the cost, and the mechanism is worth keeping.**
+> The three larger sizes agree to within 13%; **768 elements is out by 70%** and 192
+> by 39%. That is not noise in one direction by luck. A competing consumer inflates a
+> *short* kernel proportionally more than a long one — latency it can hide behind its
+> own work is latency the short kernel is made of — so it inflates the `float`
+> denominator far more than the `newton` numerator and the ratio comes out too small.
+> The previous revision noticed the second half of this ("`newton` is the steadiest of
+> the five, because at six times the work it is the least sensitive") and drew the
+> reassuring conclusion from it. The correct conclusion is the opposite: **if only one
+> side of a ratio is insensitive to contention, the ratio is biased, not robust.**
+>
+> The last row is now **measured** rather than *implied*: `newton`'s own wall time
+> against the CPU minimum for the same size and step count, out of the same sweeps,
+> rather than the float figure scaled by the kernel ratio. It is worse than the
+> implied 0.14–0.43× at the small end and slightly better at the large one.
 
-**Five to ten times, and it is enough to undo the remap.** The fp64 block puts the kernel
-at **0.14–0.43× the 23-worker CPU**, lower at both ends than the one-invocation mapping's
-0.23–0.68×. §8 item 3's estimate — "even at Pascal's 1/32 fp64 rate it is a small share
-of the kernel" — is wrong twice over: the enhanced block is ~70% of a Newton iteration by
+**Five to fifteen times, and it is enough to undo the remap.** The fp64 block puts the
+kernel at **0.09–0.47× the 23-worker CPU** — lower at the small end than the
+one-invocation mapping's 0.22–0.64×, and never better than half the CPU anywhere.
+
+§8 item 3's estimate — "even at Pascal's 1/32 fp64 rate it is a small share of the
+kernel" — is wrong twice over: the enhanced block is ~70% of a Newton iteration by
 §8's own phase table in *The remap, and what it did*, not a small share; and the
 stopping rule that has to come with it multiplies the iteration count on top.
 
@@ -1090,6 +1221,16 @@ between this kernel and its answer. The enhanced block was simply not the part t
 needed the digits.
 
 ### What mutation testing found on the fp64 block
+
+> **The re-measurement pass that produced the tables above ran no mutants, and that is
+> deliberate rather than an omission.** It changed no C++ and no GLSL: what it added is
+> `tools/zone_gpu_probe/sweep.sh`, a driver that runs the whole sweep in one invocation
+> and writes a CSV with a run id, a commit and the step count on every row, plus five
+> deterministic cells of this section in `scripts/check-figures.sh`. There is nothing
+> for a mutant of the solver to be detected by that was not already there. The level-0
+> SPIR-V is unchanged and that was checked rather than assumed — `776d15e`'s shader
+> source and today's compile to byte-identical output under the same `glslc -O`, 36 480
+> bytes, `cmp`-clean, and identical to the build artifact the probe loads.
 
 Forty-one mutants — the twenty-six from the remap, brought up to date, plus twelve of
 the fp64 block and its host wiring, and three deliberate controls.
@@ -1348,14 +1489,20 @@ which says the fix earns its place.
    is the only part that has been shown to need the digits.~~ **Done, and it is a
    negative.** *Alpha in double — measured, and it is not what was missing*, above, has
    the tables. The short version: five kernels from one source, differing only in how
-   much of the enhanced block is fp64, land between 40 and 49 torn at 768 elements and
-   between 205 and 268 at 3 072, against a reference of 32 and 162 that the negative
-   control reproduces exactly — a spread the size of the gap and not monotone in
-   precision. Holding the stopping rule fixed, the whole block in fp64 moves alpha by
+   much of the enhanced block is fp64, land between 40 and 44 torn at 768 elements and
+   between 204 and 247 at 3 072, against a reference of 32 and 162 that the negative
+   control reproduces exactly — a spread about half the gap, whose sign reverses
+   between the two sizes, and which sorts by the stopping rule each kernel carries
+   rather than by its arithmetic. Holding the stopping rule fixed, the whole block in
+   fp64 moves alpha by
    1/810 of the amount the float kernel is already wrong by, because Kaa's inputs are a
    float tangent and a float stress and widening what consumes them recovers nothing.
-   It costs **5–10× on the kernel**, which turns 1.26–2.43× against the CPU into
-   0.14–0.43×. Two claims in this item were wrong: the block is ~70% of a Newton
+   It costs **5–15× on the kernel**, which turns 1.26–2.43× against the CPU into
+   **0.09–0.47×** — re-measured on an idle box, where the first pass was taken
+   against a GPU consumer at 100% and reported 5–10× and 0.14–0.43×. Contention
+   inflates a short kernel more than a long one, so it inflated the `float`
+   denominator and understated the cost, by 70% at 768 elements. Two claims in this
+   item were wrong: the block is ~70% of a Newton
    iteration rather than "a small share", and it was not "the only part shown to need
    the digits" — that was true when κ(Kaa) was (h/t)⁴ and stopped being true when
    item 2 made it 3.50.
@@ -1363,7 +1510,10 @@ which says the fix earns its place.
    again. The current numbers measure register spilling, not the element.~~
    **Done**, and the diagnosis held: `solidshell_forces_wg.comp`, 1.26–2.43× against
    the CPU where the invocation mapping was 0.23–0.68×, and 484 floats of spill per
-   thread down to 24. Every precision figure is unchanged by it.
+   thread down to 24. Every precision figure is unchanged by it. **Re-measured on a
+   box checked idle, six interleaved repeats: 1.27–2.44× and 0.22–0.64×**, so the
+   pair holds to 1% and the spill figures — which come from the driver's compiler
+   rather than a clock — are identical.
 
 **The status of this item has changed twice, and the second change is that the list is
 now empty.** Throughput was the visible problem and it is solved. Precision was the one
@@ -1371,7 +1521,7 @@ that decided whether the element belongs on a GPU at all, and it is **unchanged*
 float kernel tears a quarter to a half too many elements, which is exactly the output a
 zone exists to produce. Item 3 was the remaining hypothesis about *why*, and it is now
 disproved rather than untried — the enhanced block is well conditioned, float already
-resolves it, and putting it in fp64 costs 5–10× to move the answer by less than the
+resolves it, and putting it in fp64 costs 5–15× to move the answer by less than the
 noise between five kernels that all claim to compute it.
 
 So the CPU remains the *trustworthy* path for Tier 2, it is no longer the faster one,
