@@ -47,6 +47,7 @@ int main() {
     runBreachTests();
     runSchedulerTests();
     runSolidShellTests();
+    runThermalTests();
     runPlasticityTests();
     runSerialiseTests();
     runShipFileTests();
