@@ -162,6 +162,50 @@ FaceCoordinate projectOntoQuad(const Vec3& p, const Vec3& a, const Vec3& b, cons
     return out;
 }
 
+// Where a point sits along a sub-quad's *edge*, in the same natural coordinate the
+// face uses: `s = -1` at the first corner, `+1` at the second. See §9 -- an in-plane
+// line tie is the face tie of §5 with the one direction that leaves the cut plane
+// taken away, so its coordinate, its overshoot and its bound all have to mean the
+// same thing as `FaceCoordinate`'s or the two would be bounded by one number against
+// two conventions.
+//
+// **Not clamped**, for the reason `projectOntoQuad` is not: a plate butting onto
+// another ends half a thickness past its mid-surface, and the honest answer is a
+// small extrapolation. `distance` is to the extrapolated point and is the junction's
+// own gap, most of which the through-thickness weight then accounts for exactly; what
+// the *line* drops is only the part of it running along the master surface across the
+// line, which `tieOnLine` measures separately as the slip.
+struct LineCoordinate {
+    double s = 0;
+    double distance = 0;   // m from the point to the (possibly extrapolated) line point
+    double overshoot = 0;  // how far outside [-1, 1] `s` is
+};
+
+LineCoordinate projectOntoSegment(const Vec3& p, const Vec3& a, const Vec3& b) {
+    LineCoordinate out;
+    const Vec3 ab = b - a;
+    const double span = length2(ab);
+    if (!(span > 0)) {
+        out.distance = length(p - a);
+        out.overshoot = 0;
+        return out;
+    }
+    const double t = dot(p - a, ab) / span;
+    out.s = 2 * t - 1;
+    out.distance = length(a + ab * t - p);
+    out.overshoot = std::max(0.0, std::abs(out.s) - 1.0);
+    return out;
+}
+
+// The two linear shape functions of a segment, summing to one everywhere inside it
+// and outside it -- which is what makes a line tie reproduce a rigid translation
+// exactly, and a rigid rotation exactly as well because the masters interpolate the
+// slave's own point.
+void linear(double s, double out[2]) {
+    out[0] = 0.5 * (1 - s);
+    out[1] = 0.5 * (1 + s);
+}
+
 // A union-find over sub-quads, for the connected component count. It is not a
 // diagnostic in the ordinary sense: a component touching neither cut plane is a
 // mechanism in `K_ii`, and `reduction::Substructure` will *not* catch it -- its
@@ -703,6 +747,173 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
     };
     std::vector<PairedTie> paired;
     std::vector<std::uint8_t> tieRole(mid.size(), 0u);  // 1 slave, 2 master
+
+    // --- The in-plane line tie, section 9, paired ------------------------------------
+    //
+    // The same construction with the one direction that leaves the cut plane taken
+    // away. A junction node *on* a cut plane cannot be tied to a master face -- a face
+    // spans x, so half its nodes are interior to the section, and a boundary degree of
+    // freedom written as a function of an interior one is not kept exactly by a
+    // reduction and `reduction::Substructure` refuses it. Tie it instead to the
+    // **line** where the other surface meets the same plane: two mid-surface nodes,
+    // four mesh nodes, every one of them on the plane and therefore a boundary degree
+    // of freedom that both sections either side of the cut have.
+    //
+    // The relation is then between assembled unknowns alone, which is why it is
+    // carried out of the section rather than applied inside it -- `Chain` puts it on
+    // the assembly. See §9.
+    struct PairedPlaneTie {
+        std::uint32_t slave;
+        std::uint32_t master[2];  // the segment's two mid-surface nodes, both on `plane`
+        double s[2];              // where along it each extruded node landed
+        double weight[2];         // the through-thickness split there
+        std::uint8_t plane;       // 1 aft, 2 forward, as `onPlane`
+    };
+    std::vector<PairedPlaneTie> planePaired;
+    std::vector<std::uint8_t> planeRole(mid.size(), 0u);  // 1 slave, 2 master
+    // The same split `tieOnFace` computes, over a segment instead of a face -- and the
+    // one number a line has that a face does not.
+    //
+    // A face's projection leaves a residual along the master's own normal and nothing
+    // else, and the through-thickness weight is exactly what that residual becomes. A
+    // line's leaves the normal part *and* whatever ran along the master surface across
+    // the line -- which on a cut plane is the x direction, so it is the slave's own
+    // normal leaning fore or aft, up to `t/2`. That part is what the line drops, and
+    // `slip` is it.
+    const auto tieOnLine = [&](std::uint32_t slave, int face, std::uint32_t a, std::uint32_t b,
+                               double s, double* slip) {
+        double shape[2];
+        linear(s, shape);
+        const Vec3 surface = mid[a] * shape[0] + mid[b] * shape[1];
+        const Vec3 normal = normalize(nodeNormal[a] * shape[0] + nodeNormal[b] * shape[1]);
+        const double thickness = nodeThickness[a] * shape[0] + nodeThickness[b] * shape[1];
+        const Vec3 at =
+            mid[slave] + nodeNormal[slave] * ((face == 0 ? -0.5 : 0.5) * nodeThickness[slave]);
+        const Vec3 offset = at - surface;
+        const double along = dot(offset, normal);
+        const Vec3 line = normalize(mid[b] - mid[a]);
+        const Vec3 residual = offset - normal * along - line * dot(offset, line);
+        if (slip) *slip = length(residual);
+        return constraint::tieWeight(along, thickness);
+    };
+
+    // A junction node on a cut plane, tied to the line the other surface draws on that
+    // same plane. Returns false when there is no admissible line, on the same four
+    // grounds `params` bounds the face tie by, so that a junction left open on a cut
+    // plane is still counted as one and not silently promoted.
+    const auto tiePlaneNode = [&](std::uint32_t i, const Vec3 through[2]) {
+        const std::uint8_t plane = onPlane[i];
+        PairedPlaneTie tie{i, {0, 0}, {0, 0}, {0.5, 0.5}, plane};
+        LineCoordinate landed[2];
+        bool found[2] = {false, false};
+        // The segment's endpoints as a position pair, lexicographically ordered. Two
+        // things ride on this being a **position** and not a node index.
+        //
+        // The first is the tie-break: two sections cut on the same station see the same
+        // segments and must choose the same one, or the constraint would be a property
+        // of which side of the cut was asked, and node indices are exactly that.
+        //
+        // The second is subtler and would have been a real defect. The segment is
+        // ordered by position too, so `s` means the same thing for both of the slave's
+        // extruded nodes -- a sub-quad names its edge in whichever direction its own
+        // winding runs, and the two faces reaching the same segment through different
+        // windings would otherwise measure `s` from opposite ends and interpolate the
+        // masters backwards for one of them.
+        const auto ordered = [&](std::uint32_t& a, std::uint32_t& b) {
+            const std::array<double, 3> lo{mid[a].x, mid[a].y, mid[a].z};
+            const std::array<double, 3> hi{mid[b].x, mid[b].y, mid[b].z};
+            if (hi < lo) std::swap(a, b);
+        };
+        const auto identity = [&](std::uint32_t a, std::uint32_t b) {
+            return std::array<double, 6>{mid[a].x, mid[a].y, mid[a].z,
+                                         mid[b].x, mid[b].y, mid[b].z};
+        };
+        std::array<double, 6> chosen[2] = {};
+        for (int face = 0; face < 2; ++face) {
+            auto cell = bucket.find(
+                {cellOf(through[face].x), cellOf(through[face].y), cellOf(through[face].z)});
+            if (cell == bucket.end()) continue;
+            for (std::size_t k : cell->second) {
+                const SubQuad& q = quads[k];
+                if (q.surface == nodeSurface[i]) continue;  // its own plating
+                for (int e = 0; e < 4; ++e) {
+                    std::uint32_t a = q.node[static_cast<std::size_t>(e)];
+                    std::uint32_t b = q.node[static_cast<std::size_t>((e + 1) % 4)];
+                    // The edge has to lie **in** the slave's own cut plane. That is
+                    // the whole of the construction: every master is then a boundary
+                    // degree of freedom of both sections that meet there.
+                    if (a == b || onPlane[a] != plane || onPlane[b] != plane) continue;
+                    ordered(a, b);
+                    const LineCoordinate at = projectOntoSegment(through[face], mid[a], mid[b]);
+                    if (at.distance > params.junctionTolerance) continue;
+                    const std::array<double, 6> key = identity(a, b);
+                    if (!found[face] || at.overshoot < landed[face].overshoot - 1e-12 ||
+                        (at.overshoot < landed[face].overshoot + 1e-12 &&
+                         (at.distance < landed[face].distance - 1e-15 ||
+                          (at.distance < landed[face].distance + 1e-15 && key < chosen[face])))) {
+                        found[face] = true;
+                        landed[face] = at;
+                        chosen[face] = key;
+                        tie.master[0] = a;
+                        tie.master[1] = b;
+                        tie.s[face] = at.s;
+                    }
+                }
+            }
+            // Both extruded nodes have to land on the *same* segment, because the
+            // through-thickness split and the coordinate along the line are the
+            // master's, and two segments would split the slave's pair against two
+            // different plates. It happens where a slave lands on the *node* between
+            // two of them: the pair straddles it and each half falls the other way.
+            if (face == 1 && found[0] && found[1] && chosen[0] != chosen[1]) {
+                ++section.planeTiesUnreached;
+                return false;
+            }
+        }
+        if (!found[0] || !found[1]) {
+            ++section.planeTiesUnreached;
+            return false;
+        }
+        if (landed[0].overshoot > params.junctionOvershoot ||
+            landed[1].overshoot > params.junctionOvershoot) {
+            ++section.planeTiesOutsideLine;
+            return false;
+        }
+        double slip[2] = {0, 0};
+        for (int face = 0; face < 2; ++face) {
+            tie.weight[face] =
+                tieOnLine(i, face, tie.master[0], tie.master[1], tie.s[face], &slip[face]);
+            if (std::min(tie.weight[face], 1.0 - tie.weight[face]) < -params.junctionWeightLimit) {
+                ++section.planeTiesThroughThickness;
+                return false;
+            }
+        }
+        // Already the master side of a tie on this plane: the joint is closed and a
+        // second tie the other way round would be the same statement twice.
+        if (planeRole[i] == 2u) return true;
+        // A master of mine is already somebody's slave. Refused rather than composed,
+        // exactly as §5 refuses it -- and here the composition would be refused by
+        // `solidshell::DofExpansion` on the assembly instead of on the mesh.
+        if (planeRole[tie.master[0]] == 1u || planeRole[tie.master[1]] == 1u) {
+            ++section.planeTiesChained;
+            return false;
+        }
+        for (int face = 0; face < 2; ++face) {
+            section.worstPlaneTieOvershoot =
+                std::max(section.worstPlaneTieOvershoot, landed[face].overshoot);
+            section.worstPlaneTieSlip = std::max(section.worstPlaneTieSlip, slip[face]);
+            section.worstPlaneTieWeight =
+                std::max(section.worstPlaneTieWeight,
+                         std::max(std::abs(tie.weight[face]), std::abs(1.0 - tie.weight[face])));
+        }
+        planeRole[i] = 1u;
+        planeRole[tie.master[0]] = 2u;
+        planeRole[tie.master[1]] = 2u;
+        planePaired.push_back(tie);
+        ++section.planeTieNodes;
+        return true;
+    };
+
     if (params.junctions) {
         std::vector<std::uint8_t> onFreeEdge(mid.size(), 0u);
         for (const auto& [edge, count] : edgeUse) {
@@ -749,7 +960,12 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
             }
             if (tie.quad[0] == quads.size() || tie.quad[1] == quads.size()) continue;
             if (onPlane[i] != 0u) {
-                ++section.junctionsOnInterface;
+                // On a cut plane the face tie is unavailable -- half a face's nodes
+                // are interior -- and the line tie of §9 is what replaces it. A node
+                // it cannot reach either is what `junctionsOnInterface` has always
+                // counted: a junction the interface leaves open.
+                if (!params.interfaceTies || !tiePlaneNode(i, through))
+                    ++section.junctionsOnInterface;
                 continue;
             }
             if (landed[0].overshoot > params.junctionOvershoot ||
@@ -810,9 +1026,15 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
                    " junctions are still open");
         if (section.junctionsOnInterface > 0)
             report(std::to_string(section.junctionsOnInterface) +
-                   " junction nodes lie on a cut plane and were left untied: the interface is"
-                   " prescribed, and a prescribed degree of freedom cannot also be a function of"
-                   " others");
+                   " junction nodes lie on a cut plane and were left untied (" +
+                   std::to_string(section.planeTiesUnreached) +
+                   " with no other surface drawing a line on that plane within reach, " +
+                   std::to_string(section.planeTiesOutsideLine) + " off the end of one, " +
+                   std::to_string(section.planeTiesThroughThickness) + " over weight, " +
+                   std::to_string(section.planeTiesChained) +
+                   " refused as a chain): a chain closes such a junction only where both"
+                   " sections either side of the cut derive the same constraint from degrees of"
+                   " freedom they share, and there is nothing there to derive it from");
         if (section.junctionsOutsideFace > 0)
             report(std::to_string(section.junctionsOutsideFace) +
                    " junction nodes land further outside a master face than"
@@ -1127,6 +1349,44 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
                 connected.join(static_cast<int>(tie.slave), static_cast<int>(node));
     }
 
+    // --- The in-plane line tie, written out -----------------------------------------
+    //
+    // The same three constraints per extruded node over four masters instead of eight.
+    // They are **not** put in `attachment.constrained`: every degree of freedom here is
+    // on a cut plane, `reduction::Substructure` keeps its interface exactly and refuses
+    // a boundary degree of freedom that is a function of others, and it is right to --
+    // a section on its own has its interface prescribed. They are carried out whole and
+    // `buildChain` puts them on the assembled model, where the plane is shared and no
+    // longer prescribed. See §9.
+    //
+    // The component walk does **not** join them either, for the same reason: within one
+    // section this junction is open, and `Section::components` is what the section is.
+    // `Chain::components` joins them, because there it is applied.
+    for (const PairedPlaneTie& tie : planePaired) {
+        const std::size_t low = static_cast<std::size_t>(rank[tie.slave]) * 2;
+        for (int face = 0; face < 2; ++face) {
+            double shape[2];
+            linear(tie.s[face], shape);
+            const double weight = tie.weight[face];
+            for (int k = 0; k < 3; ++k) {
+                PlaneTie out;
+                out.plane = tie.plane;
+                out.mpc.slave = static_cast<std::uint32_t>(
+                    (low + static_cast<std::size_t>(face)) * 3 + static_cast<std::size_t>(k));
+                out.mpc.master.reserve(4);
+                out.mpc.weight.reserve(4);
+                for (int a = 0; a < 2; ++a) {
+                    const auto pair = static_cast<std::uint32_t>(rank[tie.master[a]]) * 2;
+                    out.mpc.master.push_back(pair * 3 + static_cast<std::uint32_t>(k));
+                    out.mpc.weight.push_back(shape[a] * (1.0 - weight));
+                    out.mpc.master.push_back((pair + 1) * 3 + static_cast<std::uint32_t>(k));
+                    out.mpc.weight.push_back(shape[a] * weight);
+                }
+                section.planeTies.push_back(std::move(out));
+            }
+        }
+    }
+
     // --- Topology: components, free edges, and junctions that are still open --------
 
     // Which surface each free edge belongs to, so the census does not report an edge
@@ -1224,8 +1484,26 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
             // constraint joins *two* edges: at a butt corner the flange's edge nodes
             // are the slaves and the side plate's are the masters, and reporting only
             // the slaves would call four closed corners half-open.
-            if (tieRole[edge.first] != 0u && tieRole[edge.second] != 0u)
+            if (tieRole[edge.first] != 0u && tieRole[edge.second] != 0u) {
                 section.tiedEdges += span;
+                continue;
+            }
+            // And what an in-plane line tie would add, per cut plane, because whether
+            // it is applied is the chain's question and not the section's: a plane with
+            // a neighbour is shared and a plane without one is prescribed. An edge
+            // reaching both planes -- a section one element long -- needs both, so it is
+            // counted apart rather than credited to either.
+            std::uint8_t needs = 0;
+            bool joined = true;
+            for (std::uint32_t node : {edge.first, edge.second}) {
+                if (tieRole[node] != 0u) continue;
+                if (planeRole[node] == 0u) joined = false;
+                else needs = static_cast<std::uint8_t>(needs | onPlane[node]);
+            }
+            if (!joined || needs == 0) continue;
+            if (needs == 1u) section.planeTiedEdgesAft += span;
+            else if (needs == 2u) section.planeTiedEdgesForward += span;
+            else section.planeTiedEdgesBoth += span;
         }
     }
     if (section.junctionEdges - section.tiedEdges > 1e-9)
@@ -1661,6 +1939,113 @@ std::vector<std::size_t> boundaryOnPlane(const reduction::Substructure& substruc
     return out;
 }
 
+// One section's in-plane line ties on one of its two cut planes, rewritten in the
+// assembled model's degrees of freedom. `complete` says every one of them arrived:
+// a tie whose slave or any master did not reach the assembly is dropped, because
+// half a constraint is a statement nobody made.
+std::vector<solidshell::Mpc> planeTiesInAssembly(const Chain& chain, std::size_t i,
+                                                 std::uint8_t plane, bool& complete) {
+    std::vector<solidshell::Mpc> out;
+    complete = true;
+    const std::vector<std::uint32_t>& bdof = chain.substructure[i].boundaryDof();
+    const std::vector<int>& from = chain.assembly.from[i];
+    // Boundary DOF are ascending, so a mesh DOF's place among them is a search and its
+    // assembled row is `from` at that place.
+    const auto row = [&](std::uint32_t meshDof) {
+        const auto it = std::lower_bound(bdof.begin(), bdof.end(), meshDof);
+        if (it == bdof.end() || *it != meshDof) return -1;
+        const auto b = static_cast<std::size_t>(it - bdof.begin());
+        return b < from.size() ? from[b] : -1;
+    };
+    for (const PlaneTie& tie : chain.section[i].planeTies) {
+        if (tie.plane != plane) continue;
+        solidshell::Mpc mapped;
+        const int slave = row(tie.mpc.slave);
+        if (slave < 0) {
+            complete = false;
+            continue;
+        }
+        mapped.slave = static_cast<std::uint32_t>(slave);
+        mapped.master.reserve(tie.mpc.master.size());
+        mapped.weight.reserve(tie.mpc.weight.size());
+        bool whole = true;
+        for (std::size_t a = 0; a < tie.mpc.master.size(); ++a) {
+            const int m = row(tie.mpc.master[a]);
+            if (m < 0) {
+                whole = false;
+                break;
+            }
+            mapped.master.push_back(static_cast<std::uint32_t>(m));
+            mapped.weight.push_back(tie.mpc.weight[a]);
+        }
+        if (!whole) {
+            complete = false;
+            continue;
+        }
+        out.push_back(std::move(mapped));
+    }
+    return out;
+}
+
+// A constraint as something two sections can be asked to agree about: the slave's row
+// and its masters' rows in ascending order, each with its weight.
+std::vector<std::pair<std::uint32_t, std::vector<std::pair<std::uint32_t, double>>>> tieKeys(
+    const std::vector<solidshell::Mpc>& ties) {
+    std::vector<std::pair<std::uint32_t, std::vector<std::pair<std::uint32_t, double>>>> out;
+    out.reserve(ties.size());
+    for (const solidshell::Mpc& t : ties) {
+        std::vector<std::pair<std::uint32_t, double>> terms;
+        terms.reserve(t.master.size());
+        for (std::size_t a = 0; a < t.master.size(); ++a) terms.emplace_back(t.master[a], t.weight[a]);
+        std::sort(terms.begin(), terms.end());
+        out.emplace_back(t.slave, std::move(terms));
+    }
+    std::sort(out.begin(), out.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    return out;
+}
+
+// `A <- T^T A T` for one constraint, in place, leaving the eliminated row and column
+// isolated with a unit diagonal. Two passes and not one: the row fold puts
+// `w_a A[s][s]` on `A[m_a][s]`, and the column fold then picks it up as
+// `w_a w_b A[s][s]` on `A[m_a][m_b]`, which is the term a single pass drops.
+void foldConstraint(std::vector<double>& matrix, std::size_t n, const solidshell::Mpc& tie) {
+    if (matrix.size() != n * n) return;
+    const auto s = static_cast<std::size_t>(tie.slave);
+    if (s >= n) return;
+    double* a = matrix.data();
+    for (std::size_t t = 0; t < tie.master.size(); ++t) {
+        const auto m = static_cast<std::size_t>(tie.master[t]);
+        const double w = tie.weight[t];
+        if (m >= n) continue;
+        for (std::size_t j = 0; j < n; ++j) a[m * n + j] += w * a[s * n + j];
+    }
+    for (std::size_t t = 0; t < tie.master.size(); ++t) {
+        const auto m = static_cast<std::size_t>(tie.master[t]);
+        const double w = tie.weight[t];
+        if (m >= n) continue;
+        for (std::size_t i = 0; i < n; ++i) a[i * n + m] += w * a[i * n + s];
+    }
+    for (std::size_t j = 0; j < n; ++j) {
+        a[s * n + j] = 0.0;
+        a[j * n + s] = 0.0;
+    }
+    a[s * n + s] = 1.0;
+}
+
+// Fill the eliminated rows of an assembled state from their masters. No constraint
+// here has a master that is itself a slave -- both the mesher and
+// `solidshell::DofExpansion` refuse that -- so one pass in any order is exact.
+void recoverPlaneTies(const Chain& chain, std::vector<double>& state) {
+    for (const solidshell::Mpc& tie : chain.planeTies) {
+        if (tie.slave >= state.size()) continue;
+        double sum = 0;
+        for (std::size_t a = 0; a < tie.master.size(); ++a)
+            if (tie.master[a] < state.size()) sum += tie.weight[a] * state[tie.master[a]];
+        state[tie.slave] = sum;
+    }
+}
+
 }  // namespace
 
 bool Chain::ready() const {
@@ -1803,6 +2188,94 @@ Chain buildChain(const StructuralMesh& structure, const ChainParams& params) {
         report("the assembled reduced model is in " + std::to_string(chain.reducedComponents) +
                " pieces: consecutive sections do not share the cut plane between them");
 
+    // --- The in-plane line ties of the interior planes, §9 ---------------------------
+    //
+    // Each interior plane is derived twice, once by the section aft of it and once by
+    // the one forward, and the two are **compared before one is adopted**. With the
+    // halo (§8) they are the same constraint to the last bit: the plane's mid-surface
+    // nodes, nodal normals and nodal thicknesses are properties of the ship rather than
+    // of the window, the segment is chosen by position and not by node index, and both
+    // sections therefore land on the same masters with the same weights. That is a
+    // claim worth checking rather than assuming, which is what `planeTiesDisagreeing`
+    // is: a plane the two sides disagree about would tie the ship to itself twice.
+    //
+    // The outermost two planes are left open, exactly as a monolith leaves its own two
+    // open: they are prescribed by whatever loads the chain, and a prescribed degree of
+    // freedom cannot also be derived. So a chain ties what the same length in one piece
+    // ties, and no more.
+    for (std::size_t j = 1; j < pieces; ++j) {
+        bool aftComplete = true, forwardComplete = true;
+        std::vector<solidshell::Mpc> fromAft =
+            planeTiesInAssembly(chain, j - 1, 2u, aftComplete);
+        const std::vector<solidshell::Mpc> fromForward =
+            planeTiesInAssembly(chain, j, 1u, forwardComplete);
+        const auto aftKeys = tieKeys(fromAft);
+        const auto forwardKeys = tieKeys(fromForward);
+        if (!aftComplete || !forwardComplete || aftKeys.size() != forwardKeys.size()) {
+            ++chain.planeTiesDisagreeing;
+            chain.worstPlaneTieDisagreement = 1.0;
+            continue;
+        }
+        bool same = true;
+        double worst = 0;
+        for (std::size_t t = 0; t < aftKeys.size() && same; ++t) {
+            if (aftKeys[t].first != forwardKeys[t].first ||
+                aftKeys[t].second.size() != forwardKeys[t].second.size()) {
+                same = false;
+                break;
+            }
+            for (std::size_t a = 0; a < aftKeys[t].second.size(); ++a) {
+                if (aftKeys[t].second[a].first != forwardKeys[t].second[a].first) {
+                    same = false;
+                    break;
+                }
+                worst = std::max(worst, std::fabs(aftKeys[t].second[a].second -
+                                                  forwardKeys[t].second[a].second));
+            }
+        }
+        chain.worstPlaneTieDisagreement =
+            std::max(chain.worstPlaneTieDisagreement, same ? worst : 1.0);
+        // **Exactly equal, not equal to a tolerance**, for the reason §8's interface
+        // test is `worstGap == 0`: with the halo the two sections read the same
+        // mid-surface, the same nodal normal and the same nodal thickness out of the
+        // same doubles and run the same arithmetic over them, so a difference of one
+        // ulp is not a rounding to be absorbed -- it is the halo not having done its
+        // job, and a tolerance there is where the next defect would hide.
+        if (!same || worst != 0.0) {
+            ++chain.planeTiesDisagreeing;
+            continue;
+        }
+        for (solidshell::Mpc& tie : fromAft) chain.planeTies.push_back(std::move(tie));
+        chain.tiedEdges += chain.section[j - 1].planeTiedEdgesForward +
+                           chain.section[j].planeTiedEdgesAft;
+    }
+    // An edge running from one cut of a section to the other -- a section one element
+    // long -- is joined only when both its planes are interior.
+    for (std::size_t i = 1; i + 1 < pieces; ++i)
+        chain.tiedEdges += chain.section[i].planeTiedEdgesBoth;
+    if (chain.planeTiesDisagreeing > 0)
+        report(std::to_string(chain.planeTiesDisagreeing) +
+               " interior cut planes are tied differently by the sections either side of them, so"
+               " no tie was applied there: the two sides of a cut have to derive the same"
+               " constraint from the same shared boundary DOF, which is what SectionParams::halo"
+               " is for -- see section.hpp section 9");
+    // Chains and double eliminations are refused here rather than composed, by the same
+    // object that refuses them on a mesh. Nothing this file builds produces one -- a
+    // master is always on the *other* surface and is never itself a slave -- so this is
+    // the check that says so rather than the code that copes.
+    if (!chain.planeTies.empty()) {
+        const solidshell::DofExpansion expansion(static_cast<std::size_t>(chain.assembly.size()),
+                                                 chain.planeTies);
+        if (!expansion.ok()) {
+            report("the interior cut planes' line ties do not form a valid constraint set: " +
+                   expansion.problem());
+            chain.planeTies.clear();
+        }
+    }
+    chain.planeTieNodes = static_cast<int>(chain.planeTies.size() / 6);
+    for (const solidshell::Mpc& tie : chain.planeTies) chain.planeTieDof.push_back(tie.slave);
+    std::sort(chain.planeTieDof.begin(), chain.planeTieDof.end());
+
     // Pieces of the *structure*, which is a different count and the one a ship is
     // judged by. `reduction::assembledComponents` cannot see inside a section -- a
     // component's reduced pair is dense over its own DOF whether the mesh behind it
@@ -1838,6 +2311,18 @@ Chain buildChain(const StructuralMesh& structure, const ChainParams& params) {
                     continue;
                 }
                 const int x = find(claim[row]), y = find(key);
+                if (x != y) parent[static_cast<std::size_t>(x)] = y;
+            }
+        }
+        // And the interior planes' line ties, which join a piece of one section to a
+        // piece of the next exactly as a shared row does -- that is what a tie is. A
+        // section on its own leaves these junctions open and `Section::components`
+        // says so; the chain applies them and has to count what it applied.
+        for (const solidshell::Mpc& tie : chain.planeTies) {
+            if (tie.slave >= claim.size() || claim[tie.slave] < 0) continue;
+            for (std::uint32_t m : tie.master) {
+                if (m >= claim.size() || claim[m] < 0) continue;
+                const int x = find(claim[tie.slave]), y = find(claim[m]);
                 if (x != y) parent[static_cast<std::size_t>(x)] = y;
             }
         }
@@ -1882,6 +2367,36 @@ Chain buildChain(const StructuralMesh& structure, const ChainParams& params) {
     }
     if (chain.aftDof.empty() || chain.forwardDof.empty())
         report("one of the chain's end planes carries no assembled boundary DOF");
+
+    // --- And apply them: `K <- T^T K T`, `M <- T^T M T` -------------------------------
+    //
+    // Last, because everything above reads the assembly the parts made: the reduced
+    // component count is a property of what was scattered, and folding a constraint
+    // into a row would make a plane's two sections look joined by the assembly rather
+    // than by the tie. From here on `assembly` is the chain's model rather than the sum
+    // of its pieces, and the three solvers below are the only readers of it.
+    //
+    // A tie eliminates only boundary rows, so `assembly.modes` is untouched and a
+    // component's modal block is exactly what `craigBampton` produced.
+    {
+        const auto n = static_cast<std::size_t>(chain.assembly.size());
+        for (const solidshell::Mpc& tie : chain.planeTies) {
+            foldConstraint(chain.assembly.stiffness, n, tie);
+            foldConstraint(chain.assembly.mass, n, tie);
+        }
+        // A negative weight is a negative share of the slave's steel handed to a
+        // master, exactly as in §5, and past one full share the master's own mass goes
+        // through zero. `reduction::Substructure` is the backstop inside a section;
+        // there is none out here, so the diagonal is read directly.
+        if (!chain.planeTies.empty())
+            for (std::size_t d = 0; d < n; ++d)
+                if (!(chain.assembly.mass[d * n + d] > 0.0)) {
+                    report("assembled degree of freedom " + std::to_string(d) +
+                           " carries no mass once the interior cut planes' line ties are applied:"
+                           " a master has been given more of a slave's steel than the slave has");
+                    break;
+                }
+    }
     return chain;
 }
 
@@ -1951,14 +2466,23 @@ bool chainRestraints(const Chain& chain, std::vector<std::uint32_t>& held) {
     if (point.size() != static_cast<std::size_t>(chain.assembly.boundary)) return false;
     const std::vector<std::vector<std::uint32_t>> rows = rowsPerPiece(chain);
     if (rows.empty()) return false;
+    // **A row an interior plane's line tie eliminated cannot restrain anything.** It is
+    // isolated in the assembly, so holding it removes no motion at all and the piece
+    // keeps the rigid body mode the restraint was there to take out -- which the
+    // factorisation then reports as a singular stiffness with no hint of where it came
+    // from. `planeTieDof` is ascending, so this is a search rather than a set.
+    const auto eliminated = [&](std::uint32_t b) {
+        return std::binary_search(chain.planeTieDof.begin(), chain.planeTieDof.end(), b);
+    };
 
     for (const std::vector<std::uint32_t>& piece : rows) {
         int anchorY = -1, anchorZ = -1;
         Vec3 anchor{};
         for (std::uint32_t b : piece) {
-            if (point[b].axis != 1) continue;
+            if (point[b].axis != 1 || eliminated(b)) continue;
             for (std::uint32_t c : piece)
-                if (point[c].axis == 2 && length(point[c].position - point[b].position) < 1e-12) {
+                if (point[c].axis == 2 && !eliminated(c) &&
+                    length(point[c].position - point[b].position) < 1e-12) {
                     anchorY = static_cast<int>(b);
                     anchorZ = static_cast<int>(c);
                     anchor = point[b].position;
@@ -1975,7 +2499,7 @@ bool chainRestraints(const Chain& chain, std::vector<std::uint32_t>& held) {
             const double dy = d.position.y - anchor.y, dz = d.position.z - anchor.z;
             const double arm = std::sqrt(dy * dy + dz * dz);
             const std::uint32_t axis = std::fabs(dy) >= std::fabs(dz) ? 2u : 1u;
-            if (d.axis != axis || !(arm > best)) continue;
+            if (d.axis != axis || !(arm > best) || eliminated(b)) continue;
             best = arm;
             lever = static_cast<int>(b);
         }
@@ -2016,16 +2540,25 @@ BeamResponse applyBeamLoad(const Chain& chain, const BeamLoad& load) {
                       " rotation about x cannot be held";
         return out;
     }
+    // The rows the interior planes' line ties eliminated: isolated in the assembly and
+    // therefore held at zero here, then filled in from their masters below. Kept apart
+    // from `held` proper because `restraintReaction` is about the three restraints and
+    // an eliminated row is not one of them.
+    std::vector<std::uint32_t> solved = held;
+    solved.insert(solved.end(), chain.planeTieDof.begin(), chain.planeTieDof.end());
 
     std::vector<double> state;
     const std::vector<double> zeroLoad(static_cast<std::size_t>(chain.assembly.size()), 0.0);
     std::string problem;
-    if (!reduction::assembledStaticSolve(chain.assembly, zeroLoad, held, prescribed, state,
+    if (!reduction::assembledStaticSolve(chain.assembly, zeroLoad, solved, prescribed, state,
                                          &problem)) {
         out.problem = problem;
         return out;
     }
 
+    // Before the constrained rows are filled in, because `0.5 x^T (T^T K T) x` with the
+    // eliminated entries at zero **is** the constrained model's energy, and filling
+    // them in first would count the slave's share twice.
     const std::vector<double> reaction = assembledReaction(chain.assembly, state);
     for (std::uint32_t b : chain.forwardDof) {
         const reduction::BoundaryDof& d = point[b];
@@ -2037,11 +2570,12 @@ BeamResponse applyBeamLoad(const Chain& chain, const BeamLoad& load) {
 
     std::vector<std::uint8_t> fixed(state.size(), 0u);
     for (const reduction::Prescribed& p : prescribed) fixed[p.dof] = 1u;
-    for (std::uint32_t d : held) fixed[d] = 1u;
+    for (std::uint32_t d : solved) fixed[d] = 1u;
     for (std::size_t i = 0; i < state.size(); ++i)
         if (!fixed[i]) out.residual = std::max(out.residual, std::fabs(reaction[i]));
     for (std::uint32_t d : held)
         out.restraintReaction = std::max(out.restraintReaction, std::fabs(reaction[d]));
+    recoverPlaneTies(chain, state);
     // Over the boundary rows only. A modal coordinate is not a displacement -- it is
     // an amplitude against a mass-normalised mode shape -- so taking the largest of
     // the whole reduced state would report metres that are not metres.
@@ -2077,8 +2611,8 @@ TorsionResponse applyTwist(const Chain& chain, double twist, double reference) {
     std::vector<double> state;
     const std::vector<double> zeroLoad(static_cast<std::size_t>(chain.assembly.size()), 0.0);
     std::string problem;
-    if (!reduction::assembledStaticSolve(chain.assembly, zeroLoad, {}, prescribed, state,
-                                         &problem)) {
+    if (!reduction::assembledStaticSolve(chain.assembly, zeroLoad, chain.planeTieDof, prescribed,
+                                         state, &problem)) {
         out.problem = problem;
         return out;
     }
@@ -2101,6 +2635,11 @@ std::vector<double> chainFrequencies(const Chain& chain) {
     if (chain.assembly.empty()) return {};
     std::vector<std::uint32_t> held = chain.aftDof;
     held.insert(held.end(), chain.forwardDof.begin(), chain.forwardDof.end());
+    // And the rows the interior planes' line ties eliminated. They carry a unit
+    // stiffness against a unit mass, so leaving one free would put a mode at exactly
+    // 1 rad/s -- 0.159 Hz -- underneath every elastic mode a ship has, and the spectrum
+    // would open with as many of them as the chain has ties.
+    held.insert(held.end(), chain.planeTieDof.begin(), chain.planeTieDof.end());
     return reduction::assembledFrequencies(chain.assembly, held);
 }
 

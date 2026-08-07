@@ -19,6 +19,7 @@
 //
 //   ./section_probe [--from=X] [--to=X] [--sub=N] [--sweep=N] [--reduce] [--modes=N]
 //                   [--chain=N] [--match=M] [--scan=BAYS] [--invariance=BAYS]
+//                   [--no-interface-ties]
 #include "engine/sim/girder.hpp"
 #include "engine/sim/reduction.hpp"
 #include "engine/sim/scantlings.hpp"
@@ -55,6 +56,10 @@ struct Options {
     // assembled model is dense at (N+1) x 1 170 boundary DOF on this ship and the
     // Cholesky at the end of it is the most expensive thing this program does.
     int chain = 0;
+    // Build the chain's interior cut planes with the in-plane line ties of
+    // `section.hpp` §9 off. The negative control every figure §9 publishes is measured
+    // against, and what this tool reported before they existed.
+    bool interfaceTies = true;
     // How far apart two boundary DOF on a shared cut plane may be and still be the
     // same unknown. `matchBoundaries`' 1e-9 default used to be right amidships and to
     // leave a third of the interface unmatched at the ends -- see `section.hpp` §6
@@ -100,6 +105,7 @@ bool parse(int argc, char** argv, Options& o) {
         else if (const char* v = value("match")) o.match = std::atof(v);
         else if (const char* v = value("scan")) o.scan = std::atoi(v);
         else if (const char* v = value("invariance")) o.invariance = std::atoi(v);
+        else if (a == "--no-interface-ties") o.interfaceTies = false;
         else if (a == "--no-reduce") o.reduce = false;
         else if (a == "--reduce") o.reduce = true;
         else {
@@ -440,6 +446,14 @@ int main(int argc, char** argv) {
                 hold.junctionsChained, hold.junctionsOutsideFace);
     std::printf("  worst tie: overshoot %.4f of a face, through-thickness weight %.4f\n",
                 hold.worstJunctionOvershoot, hold.worstJunctionWeight);
+    std::printf("  in-plane line ties: %d nodes on the cut planes, joining %.1f m aft + %.1f m"
+                " forward + %.1f m needing both when a chain applies them; %d unreached,"
+                " %d off the end of a line, %d over weight, %d chained\n",
+                hold.planeTieNodes, hold.planeTiedEdgesAft, hold.planeTiedEdgesForward,
+                hold.planeTiedEdgesBoth, hold.planeTiesUnreached, hold.planeTiesOutsideLine,
+                hold.planeTiesThroughThickness, hold.planeTiesChained);
+    std::printf("  worst line tie: overshoot %.4f of a segment, weight %.4f, slip %.3e m\n",
+                hold.worstPlaneTieOvershoot, hold.worstPlaneTieWeight, hold.worstPlaneTieSlip);
     std::printf("  panels straddling a cut plane: %d; halo panels averaged into the nodal"
                 " normals and thicknesses and then dropped: %d\n",
                 hold.straddlingPanels, hold.haloPanels);
@@ -600,6 +614,7 @@ int main(int argc, char** argv) {
             sim::section::ChainParams chainParams;
             chainParams.section = params;
             chainParams.section.junctions = tie != 0;
+            chainParams.section.interfaceTies = options.interfaceTies;
             chainParams.reduce.modes = 0;
             chainParams.reduce.cutoffFrequency = 0;
             chainParams.matchTolerance = options.match;
@@ -620,6 +635,10 @@ int main(int argc, char** argv) {
                         " %.3e m; ties %.1f m of %.1f m of junction edge\n",
                         "", chain.shared.empty() ? 0 : chain.shared.front(), unmatched,
                         chain.worstGap, chain.tiedEdges, chain.junctionEdges);
+            std::printf("  %-5s in-plane line ties: %d nodes over %d interior planes, %d planes the"
+                        " two sides disagreed about (worst %.3e)\n",
+                        "", chain.planeTieNodes, options.chain - 1, chain.planeTiesDisagreeing,
+                        chain.worstPlaneTieDisagreement);
             for (const std::string& problem : chain.problems)
                 std::printf("      ! %s\n", problem.c_str());
             std::fflush(stdout);
@@ -672,6 +691,22 @@ int main(int argc, char** argv) {
                         " chain restraint reaction %.2e N, residual %.2e N\n",
                         "", chainSolve, monoSolve, chainAxial.restraintReaction,
                         chainAxial.residual);
+            // One anchored line per variant, because `scripts/check-figures.sh` reads
+            // these and a checker that misparses is worse than no checker: every figure
+            // above is spread over a block whose rows carry no label of their own, and
+            // the first version of that script picked the intact ship's GM out of a
+            // banner because it matched on a word rather than on a line.
+            std::printf("chain summary: N=%d junctions=%d lines=%d tiedEdges=%.1f"
+                        " onePieceTiedEdges=%.1f planeTieNodes=%d disagree=%d GJrel=%+.4e"
+                        " EArel=%+.4e\n",
+                        options.chain, tie, options.interfaceTies ? 1 : 0, chain.tiedEdges,
+                        mono.tiedEdges, chain.planeTieNodes, chain.planeTiesDisagreeing,
+                        monoTwist.torsionalStiffness != 0
+                            ? chainTwist.torsionalStiffness / monoTwist.torsionalStiffness - 1.0
+                            : 0.0,
+                        monoAxial.axialStiffness != 0
+                            ? chainAxial.axialStiffness / monoAxial.axialStiffness - 1.0
+                            : 0.0);
             std::fflush(stdout);
         }
     }

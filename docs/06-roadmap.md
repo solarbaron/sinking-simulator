@@ -625,10 +625,19 @@ The longest and highest-risk phase.
   reach is now the whole 120 m, and `./scripts/verify.sh full` runs
   `section_probe --scan=2` so it stays that way.
 
-  What is left is that a cut plane unties the junctions on it, which costs a
-  five-section chain 8.9% of its torsional stiffness — invisible in `EA` and `EI`,
-  which is exactly the trap `docs/02-simulation.md` §*A ship: a chain of sections*
-  is written around.
+  ~~What is left is that a cut plane unties the junctions on it, which costs a
+  five-section chain 8.9% of its torsional stiffness~~ — **done**, and the premise
+  was half wrong: a prescribed degree of freedom cannot also be derived, but an
+  *interior* cut plane is **shared** rather than prescribed. The junctions on it are
+  now tied to the line the other surface draws in the same plane — every master a
+  boundary DOF both sections have — and the constraint is applied to the assembled
+  model rather than inside a section, where condensation being exact makes before and
+  after the same number. The five-section chain's 8.9% becomes 0.17% and the box
+  girder's 19.2% at eight sections becomes 1.6e-11; `docs/02-simulation.md`
+  §*The in-plane line tie* has the measurements, and the old table is the negative
+  control `SectionParams::interfaceTies = false` still reproduces. It was invisible
+  in `EA` and `EI` at every stage, which is exactly the trap that section is written
+  around.
 
 This is the phase the whole concept is named for. If it works, everything after
 it is addition; if it does not, the project is a very good flooding simulator and

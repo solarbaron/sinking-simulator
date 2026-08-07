@@ -287,14 +287,40 @@ void testBoxMesh() {
     expectNear("where welding turns the thickness direction and tying does not",
                tied.worstNormalSpread, 0.0, 1e-12);
 
-    // Four corner lines, 17 stations each, of which the two on the cut planes cannot
-    // be tied: an interface degree of freedom is prescribed, and prescribing it and
-    // deriving it are two different claims on one unknown.
+    // Four corner lines, 17 stations each, of which the two on the cut planes get no
+    // *face* tie: half a face's nodes are interior to the section, and a boundary
+    // degree of freedom written as a function of an interior one is not one a
+    // reduction keeps exactly.
     expectEqual("every corner station off the cut planes is tied", tied.junctionTies,
                 4 * (kNx - 1));
-    expectEqual("and the ones on them are counted, not silently dropped",
-                tied.junctionsOnInterface, 4 * 2 * 2);
+    // They get a line tie instead -- §9 -- and one per corner per plane, because the
+    // two coincident nodes at a corner are one junction and the second is the first's
+    // master. Nothing is left over: `junctionsOnInterface` counts what no line reached.
+    expectEqual("the stations on the cut planes are tied to the line in the plane",
+                tied.planeTieNodes, 4 * 2);
+    expectEqual("and nothing on a cut plane is left open", tied.junctionsOnInterface, 0);
+    // The negative control, and the figure this file used to publish: with the line
+    // tie off, every junction node on a cut plane is one the interface leaves open.
+    {
+        section::SectionParams open = boxParams();
+        open.interfaceTies = false;
+        const section::Section noLine = section::buildSection(structure, open);
+        expectEqual("with the line tie off they are counted, not silently dropped",
+                    noLine.junctionsOnInterface, 4 * 2 * 2);
+        expectEqual("and none of them is tied", noLine.planeTieNodes, 0);
+        expectEqualCount("so the section carries no constraint for them",
+                         noLine.planeTies.size(), 0u);
+        // And the switch changes nothing else: a line tie is data a section carries,
+        // not something it applies, so the mesh and its own ties are bit-identical.
+        expectEqual("the face ties are untouched", noLine.junctionTies, tied.junctionTies);
+        expectNear("and so is what they join", noLine.tiedEdges, tied.tiedEdges, 0.0);
+    }
+    expectEqualCount("six constraints per tied node, one per axis per extruded node",
+                     tied.planeTies.size(), static_cast<std::size_t>(6 * 4 * 2));
     expectEqual("nothing was refused as a chain", tied.junctionsChained, 0);
+    expectEqual("nor as a line-tie chain", tied.planeTiesChained, 0);
+    expectEqual("nor for landing off the end of a line", tied.planeTiesOutsideLine, 0);
+    expectEqual("nor for having no line to land on", tied.planeTiesUnreached, 0);
     expectEqual("nor for landing outside a face", tied.junctionsOutsideFace, 0);
     // A butt corner puts the flange's node half a plate thickness past the end of
     // the side plate's mid-surface: `t / 2` over a half-metre element is 0.02 of the
@@ -312,6 +338,98 @@ void testBoxMesh() {
     expectNear("of which all but the segments against a cut plane is tied", tied.tiedEdges,
                8 * kL - 12 * (kL / kNx), 1e-9);
     expectNear("where the untied mesh joins none of it", cut.tiedEdges, 0.0, 0.0);
+    // And the twelve segments the section itself leaves open are exactly the ones a
+    // line tie on its two planes would close. A chain applies them at its *interior*
+    // planes only, which is why they are reported per plane rather than summed.
+    //
+    // **Four against the aft plane and eight against the forward one, and the
+    // asymmetry is real rather than an accounting slip.** Of the two segments meeting
+    // at a corner on a plane, whether the side plate's is already joined depends on
+    // which of its two sub-quads §5 chose as the master face for the slave one station
+    // in -- and that is always the lower-x one, so at the aft plane the side plate's
+    // segment is already a master's and at the forward plane it is not.
+    expectNear("what a line tie on the aft plane would add", tied.planeTiedEdgesAft,
+               4 * (kL / kNx), 1e-9);
+    expectNear("and on the forward plane", tied.planeTiedEdgesForward, 8 * (kL / kNx), 1e-9);
+    expectNear("with nothing needing both", tied.planeTiedEdgesBoth, 0.0, 0.0);
+    expectNear("which together is the whole junction census", tied.junctionEdges,
+               tied.tiedEdges + tied.planeTiedEdgesAft + tied.planeTiedEdgesForward, 1e-9);
+}
+
+// **What an in-plane line tie is, checked on the constraint itself.**
+//
+// The two identities a tie has to have, on the four masters of a line rather than the
+// eight of a face: the weights are a partition of unity, so a rigid translation is
+// reproduced exactly, and they interpolate the slave's own point, so a rigid rotation
+// is too. Checked here rather than through a solve because a tie wrong in either is
+// wrong in a way an energy comparison reports as a small stiffness change.
+//
+// **And the property that makes it a line tie at all**: every degree of freedom in it,
+// slave and master alike, lies on the cut plane it belongs to. That is the whole of
+// why it survives the plane being an interface, and it is one loop.
+void testPlaneTieLiesInThePlane() {
+    std::printf("\n--- section: the in-plane line tie is in the plane ---\n");
+    const StructuralMesh structure = makeBox(kT, kT);
+    const section::Section tied = section::buildSection(structure, boxParams());
+    expectTrue("the box built some line ties", !tied.planeTies.empty());
+
+    // Which mesh nodes are on which cut plane, from the mesher's own answer rather
+    // than from a position test -- `aftNodes` and `forwardNodes` are chosen on the
+    // mid-surface, which is the distinction §6 note 1 cost a day.
+    std::vector<int> plane(tied.nodeCount(), 0);
+    for (std::uint32_t n : tied.aftNodes) plane[n] = 1;
+    for (std::uint32_t n : tied.forwardNodes) plane[n] = 2;
+
+    double worstUnity = 0, worstPoint = 0;
+    int offPlane = 0;
+    for (const section::PlaneTie& tie : tied.planeTies) {
+        double sum = 0;
+        Vec3 interpolated{0, 0, 0};
+        const std::size_t slave = tie.mpc.slave / 3;
+        if (plane[slave] != tie.plane) ++offPlane;
+        for (std::size_t a = 0; a < tie.mpc.master.size(); ++a) {
+            const std::size_t node = tie.mpc.master[a] / 3;
+            if (plane[node] != tie.plane) ++offPlane;
+            // The masters have to carry the same axis as the slave: a tie that
+            // coupled x to y would solve and would be a different structure.
+            if (tie.mpc.master[a] % 3 != tie.mpc.slave % 3) ++offPlane;
+            sum += tie.mpc.weight[a];
+            interpolated += Vec3{tied.mesh.position[node * 3], tied.mesh.position[node * 3 + 1],
+                                 tied.mesh.position[node * 3 + 2]} *
+                            tie.mpc.weight[a];
+        }
+        worstUnity = std::max(worstUnity, std::abs(sum - 1.0));
+        const Vec3 at{tied.mesh.position[slave * 3], tied.mesh.position[slave * 3 + 1],
+                      tied.mesh.position[slave * 3 + 2]};
+        worstPoint = std::max(worstPoint, length(interpolated - at));
+    }
+    std::printf("     line tie: |sum w - 1| %.2e, |sum w X - X_slave| %.2e m, %d DOF off plane\n",
+                worstUnity, worstPoint, offPlane);
+    // Every degree of freedom on the plane is not a tolerance, it is the construction.
+    expectEqual("every degree of freedom of a line tie is on its own cut plane", offPlane, 0);
+    // A partition of unity to rounding: the shape functions are `0.5 (1 -/+ s)` times
+    // `(1 - w)` and `w`, and both pairs sum to one exactly in exact arithmetic.
+    expectNear("the weights are a partition of unity", worstUnity, 0.0, 1e-15);
+    // On this box the masters *interpolate* the slave rather than extrapolating to it:
+    // the corner nodes coincide, so the tie is exact to rounding. On a real hull the
+    // line drops whatever the slave's normal leans along the ship, which is
+    // `worstPlaneTieGap` and is measured on the ferry rather than here.
+    expectNear("and they interpolate the slave's own point", worstPoint, 0.0, 1e-15);
+    expectNear("which the mesher agrees it did", tied.worstPlaneTieSlip, 0.0, 1e-15);
+    // The vacuity guard: a tie of one master to itself would pass both identities
+    // above. There are four distinct masters, and they are four distinct nodes.
+    std::size_t distinct = 0;
+    for (const section::PlaneTie& tie : tied.planeTies) {
+        std::vector<std::uint32_t> nodes;
+        for (std::uint32_t d : tie.mpc.master) nodes.push_back(d / 3);
+        std::sort(nodes.begin(), nodes.end());
+        nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+        distinct = std::max(distinct, nodes.size());
+        expectTrue("no line tie names its own slave as a master",
+                   std::find(nodes.begin(), nodes.end(), tie.mpc.slave / 3) == nodes.end());
+    }
+    expectEqualCount("a line tie has four masters: two mid-surface nodes, both extruded",
+                     distinct, 4u);
 }
 
 // --- 1c. What the tie is, before what it does ------------------------------------
@@ -1485,8 +1603,27 @@ void testFerrySection() {
     // why the frequency measurement below runs on eight bays instead. It is asserted
     // here so that the small `tiedEdges` is a stated property rather than a
     // surprise.
+    // Two bays is three stations, of which two are cut planes, so most of this
+    // section's junction nodes are on the interface -- twice as many as are not. They
+    // are tied to the line in their own plane rather than left open (§9), which is
+    // what the chain applies and a lone section does not; `tiedEdges` is small here
+    // for that reason and it is asserted so that it is a stated property.
     expectTrue("most of a two-bay section's junction nodes are on a cut plane",
-               hold.junctionsOnInterface > hold.junctionTies);
+               hold.planeTieNodes > hold.junctionTies);
+    expectEqual("and none of them is left open", hold.junctionsOnInterface, 0);
+    expectNear("what the section itself joins plus what its two planes would is all of it",
+               hold.tiedEdges + hold.planeTiedEdgesAft + hold.planeTiedEdgesForward +
+                   hold.planeTiedEdgesBoth,
+               hold.junctionEdges, 1e-9);
+    // A line drops whatever the slave's own normal leans along the ship -- the one
+    // thing a face tie has no analogue of -- bounded above by half a plate thickness,
+    // 7.8 mm on this hull's bilge strake. Measured at **1.9e-5 m**, four hundred times
+    // below that bound, because a transverse cut of a ship is very nearly square to
+    // the plating it passes through. Asserted at 1e-4, which is what was measured with
+    // a factor of five; the half-thickness bound would be nearly a vacuous assertion.
+    expectTrue("and the line drops a fiftieth of a millimetre, not half a thickness",
+               hold.worstPlaneTieSlip < 1e-4);
+    expectTrue("which is not zero, so there was something to drop", hold.worstPlaneTieSlip > 0);
     // A real ship's junction has a real gap -- 9 mm at worst on this hull -- so the
     // through-thickness weight extrapolates rather than interpolating, and the tie
     // has to survive a weight outside [0, 1] without producing a negative nodal
@@ -1975,12 +2112,23 @@ void testChainOfSectionsIsTheWholeSection() {
                chain.assembly.size() > static_cast<int>(3 * chain.section[0].forwardNodes.size()));
 }
 
-// **What a cut plane costs, which `EA` cannot see and torsion can.**
+// **What a cut plane costs, which `EA` cannot see and torsion can -- and what the
+// in-plane line tie of §9 gives back.**
 //
-// A junction node on a cut plane is an interface degree of freedom, and one of those
-// is prescribed rather than derived -- so it cannot also be tied. Cutting a length
-// into N pieces turns N-1 interior stations into interfaces and unties them. `EA` is
-// exact at every N regardless; `GJ` falls monotonically, and by 19% at N = 8.
+// A junction node on a cut plane cannot be tied to a master *face*: half a face's
+// nodes are interior to the section, and a boundary degree of freedom written as a
+// function of an interior one is not one a reduction keeps exactly. So cutting a
+// length into N pieces used to turn N-1 interior stations into open rings of
+// junctions, and `GJ` fell by 19% at N = 8 while `EA` stayed exact at every N.
+//
+// A tie to the *line* the other surface draws on that same plane has every master on
+// the plane, so it is a relation between assembled unknowns that both sections either
+// side of the cut have. It is applied to the assembled model rather than inside a
+// section, and it puts every figure below back on the monolith's.
+//
+// **The negative control is the whole of the evidence.** `interfaceTies = false` is
+// what this file did before and it still reproduces the table it published, so the
+// comparison is between two measurements and not between a measurement and a memory.
 void testChainCutPlanesUntieTheJunctions() {
     std::printf("\n--- section: what an interior cut plane costs the junctions ---\n");
     const StructuralMesh structure = makeBox(kT, kT);
@@ -1991,45 +2139,543 @@ void testChainCutPlanesUntieTheJunctions() {
     expectTrue("the monolithic box is closed in torsion",
                wholeTwist.torsionalStiffness > 0.9 * bredt);
 
-    double previousTorsion = 2.0 * wholeTwist.torsionalStiffness;
-    double previousTied = 2.0 * whole.tiedEdges;
+    double previousOpenTorsion = 2.0 * wholeTwist.torsionalStiffness;
+    double previousOpenTied = 2.0 * whole.tiedEdges;
     for (int sections : {1, 2, 4, 8}) {
         const section::Chain chain = section::buildChain(structure, boxChain(sections, true));
-        expectTrue("the tied chain built", chain.ready());
-        expectEqual("and is one piece of ship", chain.components, 1);
+        section::ChainParams openParams = boxChain(sections, true);
+        openParams.section.interfaceTies = false;
+        const section::Chain open = section::buildChain(structure, openParams);
+        expectTrue("both chains built", chain.ready() && open.ready());
+        expectEqual("and each is one piece of ship", chain.components, 1);
+        expectEqual("with or without the line tie", open.components, 1);
         section::BeamLoad axial;
         axial.strain = 1e-4;
         const section::BeamResponse stretched = section::applyBeamLoad(chain, axial);
         const section::TorsionResponse twisted = section::applyTwist(chain, 1e-4, kH / 2);
-        expectTrue("both solves ran", stretched.ok && twisted.ok);
-        std::printf("     %d sections: tied %5.1f m of %.1f, EA %+.2e of the whole, GJ %+.3f%%,"
-                    " %.4f of Bredt\n",
+        const section::BeamResponse openStretched = section::applyBeamLoad(open, axial);
+        const section::TorsionResponse openTwisted = section::applyTwist(open, 1e-4, kH / 2);
+        expectTrue("every solve ran",
+                   stretched.ok && twisted.ok && openStretched.ok && openTwisted.ok);
+        std::printf("     %d sections: tied %5.1f m of %.1f, EA %+.2e, GJ %+.2e"
+                    "   |  open: %5.1f m, EA %+.2e, GJ %+.3f%%\n",
                     sections, chain.tiedEdges, chain.junctionEdges,
                     stretched.axialStiffness / (steel.youngsModulus * kBoxArea) - 1,
-                    100.0 * (twisted.torsionalStiffness / wholeTwist.torsionalStiffness - 1),
-                    twisted.torsionalStiffness / bredt);
+                    twisted.torsionalStiffness / wholeTwist.torsionalStiffness - 1,
+                    open.tiedEdges,
+                    openStretched.axialStiffness / (steel.youngsModulus * kBoxArea) - 1,
+                    100.0 * (openTwisted.torsionalStiffness / wholeTwist.torsionalStiffness - 1));
 
-        // The whole point: axial says nothing.
+        // **`EA` says nothing, in either column, at any N.** It is here only as the
+        // thing that is exact while `GJ` is 19% out, which is the whole reason a
+        // validation of this that stopped at `EA` would have proved nothing.
         expectNear("EA is the closed form at every N", stretched.axialStiffness,
                    steel.youngsModulus * kBoxArea, kAxialTolerance * steel.youngsModulus * kBoxArea);
-        // And torsion says it every time.
-        expectTrue("every extra cut plane unties another station", chain.tiedEdges < previousTied);
-        expectTrue("and costs torsional stiffness", twisted.torsionalStiffness < previousTorsion);
-        previousTied = chain.tiedEdges;
-        previousTorsion = twisted.torsionalStiffness;
-        if (sections == 1)
-            // One section is the monolith reduced and reassembled, so it is the
-            // control for everything above: it must reproduce it exactly.
+        expectNear("and it is the closed form with the ties off too", openStretched.axialStiffness,
+                   steel.youngsModulus * kBoxArea, kAxialTolerance * steel.youngsModulus * kBoxArea);
+
+        // The line ties: four corners on each of the N-1 interior planes, and the two
+        // sections either side of every one of them derived the same constraint.
+        expectEqual("four corners tied on each interior plane", chain.planeTieNodes,
+                    4 * (sections - 1));
+        expectEqual("and the two sides of every cut agreed about all of it",
+                    chain.planeTiesDisagreeing, 0);
+        expectNear("to the last bit", chain.worstPlaneTieDisagreement, 0.0, 0.0);
+        expectEqual("with the line tie off there are none at all", open.planeTieNodes, 0);
+
+        // **The claim.** A chain ties what the same length in one piece ties -- 58 m
+        // of the box's 64, the missing 6 being the two outermost planes, which a
+        // monolith leaves open as well because they are what a load is prescribed on.
+        expectNear("a chain joins what the monolith joins, at every N", chain.tiedEdges,
+                   whole.tiedEdges, 1e-9);
+        // And torsion, which is the only quantity here that can tell. Measured at
+        // 4e-13, 2.2e-13 and 1.7e-13 relative for N = 2, 4, 8 -- the conditioning of
+        // two independent solves and not a truncation. Asserted at 1e-9, which is four
+        // orders above the measurement and ten below the 3.3% the first cut costs.
+        expectNear("and it carries the torsion the monolith carries", twisted.torsionalStiffness,
+                   wholeTwist.torsionalStiffness, 1e-9 * wholeTwist.torsionalStiffness);
+
+        // --- The negative control, which is what makes the line above mean anything --
+        expectTrue("with the line tie off, every extra cut plane unties another station",
+                   open.tiedEdges < previousOpenTied);
+        expectTrue("and costs torsional stiffness",
+                   openTwisted.torsionalStiffness < previousOpenTorsion);
+        previousOpenTied = open.tiedEdges;
+        previousOpenTorsion = openTwisted.torsionalStiffness;
+        if (sections == 1) {
+            // One section is the monolith reduced and reassembled: there is no interior
+            // plane, so the two columns are the same model and both must reproduce it.
             expectNear("a chain of one is the section it was cut from",
                        twisted.torsionalStiffness, wholeTwist.torsionalStiffness,
                        1e-9 * wholeTwist.torsionalStiffness);
-        if (sections == 8)
-            // Measured at -19.20%. Asserted as a band rather than a point because it
-            // is a property of this box's bay count, but a band tight enough that a
-            // chain which had stopped losing ties would fail it.
+            expectNear("with the line tie off as well", openTwisted.torsionalStiffness,
+                       wholeTwist.torsionalStiffness, 1e-9 * wholeTwist.torsionalStiffness);
+        }
+        if (sections == 8) {
+            // Measured at -19.20% with the ties off. Asserted as a band rather than a
+            // point because it is a property of this box's bay count, but tight enough
+            // that a control which had stopped losing ties would fail it -- which is
+            // the failure mode that would make the line above vacuous.
             expectTrue("eight sections lose about a fifth of the torsional stiffness",
-                       twisted.torsionalStiffness < 0.85 * wholeTwist.torsionalStiffness &&
-                           twisted.torsionalStiffness > 0.75 * wholeTwist.torsionalStiffness);
+                       openTwisted.torsionalStiffness < 0.85 * wholeTwist.torsionalStiffness &&
+                           openTwisted.torsionalStiffness > 0.75 * wholeTwist.torsionalStiffness);
+            expectNear("and the same eight sections tied lose 16 m of junction", open.tiedEdges,
+                       whole.tiedEdges - 7 * 6.0, 1e-9);
+        }
+    }
+}
+
+// **A junction that is *off* the master's mid-surface, which is where the
+// through-thickness half of a line tie lives -- and the box's own corners are not.**
+//
+// Every corner of a rectangular box is a butt joint: the two mid-surfaces meet on the
+// corner line, so the offset along the master's normal is zero and the weight is 0.5
+// whatever the plating is. Mutation testing is what said so — replacing the split with
+// a flat 0.5, and taking the master's thickness from one end of the segment instead of
+// interpolating it, both survived the whole suite. A real hull is not like that: a deck
+// edge sits on the shell's *outer* face plus whatever gap two plates of different
+// thickness leave, and the reference ferry's junctions run at `w = 1.69`.
+//
+// So: a box with a deck laid **inboard of the side plating**, stopping `kDeckGap` short
+// of its mid-surface, at a height where it lands in the *middle* of a side element
+// rather than on one of its nodes — and side plating that steps in thickness at
+// mid-height, so the two ends of the master segment carry different thicknesses and
+// interpolating them is not the same as taking either. Every number below is then a
+// closed form in the gap and the two thicknesses.
+constexpr double kDeckGap = 0.012;    // m inboard of the side plating's mid-surface
+constexpr double kSideLow = 0.010;    // m, the side plating below mid-height
+constexpr double kSideHigh = 0.020;   // m, and above it
+constexpr double kDeckZ = kH / 4;     // mid-way along the lower side element
+
+StructuralMesh makeBoxWithInboardDeck(double deckZ = kDeckZ) {
+    StructuralMesh mesh;
+    mesh.materials = {ah36Steel()};
+    mesh.frameSpacing = kL / kNx;
+    const auto quad = [&](const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& d, double t) {
+        PlatePanel p;
+        p.corner[0] = a;
+        p.corner[1] = b;
+        p.corner[2] = c;
+        p.corner[3] = d;
+        p.thickness = t;
+        p.material = 0;
+        p.role = PanelRole::Shell;
+        p.source = 0;
+        mesh.panels.push_back(p);
+    };
+    for (int i = 0; i < kNx; ++i) {
+        const double x0 = kL * i / kNx, x1 = kL * (i + 1) / kNx;
+        for (int j = 0; j < kNy; ++j) {
+            const double y0 = -kB / 2 + kB * j / kNy, y1 = -kB / 2 + kB * (j + 1) / kNy;
+            quad({x0, y0, 0}, {x1, y0, 0}, {x1, y1, 0}, {x0, y1, 0}, kSideLow);
+            quad({x0, y0, kH}, {x1, y0, kH}, {x1, y1, kH}, {x0, y1, kH}, kSideLow);
+        }
+        // The sides, thin below mid-height and thick above it. The node they share at
+        // z = kH/2 therefore carries the area-weighted mean of the two, which is what
+        // makes the master segment's thickness vary along its own length.
+        for (int k = 0; k < kNz; ++k) {
+            const double z0 = kH * k / kNz, z1 = kH * (k + 1) / kNz;
+            const double t = k == 0 ? kSideLow : kSideHigh;
+            quad({x0, -kB / 2, z0}, {x1, -kB / 2, z0}, {x1, -kB / 2, z1}, {x0, -kB / 2, z1}, t);
+            quad({x0, kB / 2, z0}, {x1, kB / 2, z0}, {x1, kB / 2, z1}, {x0, kB / 2, z1}, t);
+        }
+        // The deck, stopping short of the sides on both hands.
+        const double edge = kB / 2 - kDeckGap;
+        quad({x0, -edge, deckZ}, {x1, -edge, deckZ}, {x1, 0, deckZ}, {x0, 0, deckZ}, kSideLow);
+        quad({x0, 0, deckZ}, {x1, 0, deckZ}, {x1, edge, deckZ}, {x0, edge, deckZ}, kSideLow);
+    }
+    for (int i = 0; i <= kNx; ++i) mesh.frameStations.push_back(kL * i / kNx);
+    return mesh;
+}
+
+void testPlaneTieSplitsTheMastersThickness() {
+    std::printf("\n--- section: a line tie through a master of two thicknesses ---\n");
+    const section::Section tied =
+        section::buildSection(makeBoxWithInboardDeck(), boxParams());
+    expectTrue("the deck box meshed", !tied.empty());
+    expectTrue("and tied its cut planes", tied.planeTieNodes > 0);
+    expectEqual("with nothing left open on them", tied.junctionsOnInterface, 0);
+
+    // **The closed form, and getting it wrong first is the useful part.** The obvious
+    // answer -- the master's thickness at the deck's own height, half way along the
+    // side's lower element -- is 1.46 and the mesher says 1.463855. The difference is
+    // that a tie is made at the slave's two *extruded* nodes and not at its
+    // mid-surface: they sit half the deck's own thickness above and below it, so they
+    // land at `s = -0.02` and `+0.02` along the segment rather than at its middle, and
+    // the master's interpolated thickness is a shade different at each.
+    //
+    // So: the side's node at z = 0 is reached only by the thin band and carries
+    // `kSideLow`; the node at z = kH/2 is reached by both and carries their mean; the
+    // thickness anywhere between is the linear interpolation of those two; and
+    // `constraint::tieWeight` puts the deck `kDeckGap` off that mid-surface along the
+    // side's normal. `worstPlaneTieWeight` is `max(|w|, |1 - w|)` over both faces,
+    // which comes out the same number whichever way round the side's normal points and
+    // is set by the *thinner* of the two.
+    const double element = kH / kNz;
+    const double atZero = kSideLow, atMid = 0.5 * (kSideLow + kSideHigh);
+    const auto masterThickness = [&](double z) {
+        const double s = 2 * (z / element) - 1;
+        return 0.5 * (1 - s) * atZero + 0.5 * (1 + s) * atMid;
+    };
+    const double lower = masterThickness(kDeckZ - 0.5 * kSideLow);
+    const double upper = masterThickness(kDeckZ + 0.5 * kSideLow);
+    const double expected = kDeckGap / std::min(lower, upper) + 0.5;
+    std::printf("     master thickness %.6f / %.6f m at the two extruded nodes, over a"
+                " %.3f/%.3f m step: worst weight %.6f against a closed form of %.6f\n",
+                lower, upper, kSideLow, kSideHigh, tied.worstPlaneTieWeight, expected);
+    // Exact to rounding: every term is a mean of doubles that are exactly representable
+    // multiples of a millimetre, so there is nothing here to converge.
+    expectNear("the line tie splits the master's own interpolated thickness",
+               tied.worstPlaneTieWeight, expected, 1e-12);
+    // **Three vacuity guards, one per way this could have passed while proving
+    // nothing.** The measurement has to be away from the mid-surface at all; it has to
+    // differ from what either end of the master segment alone would give, because
+    // taking one end instead of interpolating is the plausible wrong implementation;
+    // and the box's own butt corners -- which are what every other junction test here
+    // measures -- have to be the 0.5 that says they could not have produced it.
+    expectTrue("which is not the mid-surface", std::abs(expected - 0.5) > 0.5);
+    expectTrue("and not what either end of the segment alone would give",
+               std::abs(expected - (kDeckGap / atZero + 0.5)) > 0.1 &&
+                   std::abs(expected - (kDeckGap / atMid + 0.5)) > 0.1);
+    // And the two faces really did land at different points along the segment, which is
+    // the whole reason the figure is 1.4639 and not 1.46.
+    expectTrue("the slave's two extruded nodes land at different thicknesses",
+               std::abs(upper - lower) > 1e-5);
+    const section::Section butt = section::buildSection(makeBox(kT, kT), boxParams());
+    expectNear("where a butt corner has no offset to split and gives exactly the mid-surface",
+               butt.worstPlaneTieWeight, 0.5, 1e-15);
+    // And the deck really is a junction the section could not weld, rather than plating
+    // that happens to touch: it is a separate surface, and the tie is what joins it.
+    expectTrue("the deck is a surface of its own", tied.surfaces > 4);
+    expectNear("and the line drops nothing on prismatic plating", tied.worstPlaneTieSlip, 0.0,
+               1e-15);
+}
+
+// **A chain whose line ties actually split a master's thickness, solved.**
+//
+// Every junction on the plain box is a butt joint at `w = 1/2`, where the two masters
+// of a through-thickness pair carry the same weight and swapping them is a no-op --
+// mutation testing said so, by surviving that swap on the whole suite. The inboard
+// deck is at `w = 1.464`, so `-0.464` on the master's other face, and now the two
+// halves are worth different things.
+//
+// The reference is the same length in one piece, where the same junction is closed by
+// a *face* tie instead. That the two agree exactly is a claim in its own right: a
+// slave whose own normal is square to the cut lands on the master face's edge, where
+// the bilinear shape functions collapse onto the two nodes the line tie uses, so the
+// line tie is the face tie restricted rather than an approximation to it.
+void testDeckChainSplitsTheSameThicknessTheMonolithDoes() {
+    std::printf("\n--- section: a chain of the deck box, where the split is not a half ---\n");
+    const StructuralMesh structure = makeBoxWithInboardDeck();
+    const StructuralMaterial steel = ah36Steel();
+    const section::Section whole = section::buildSection(structure, boxParams());
+    const section::TorsionResponse wholeTwist = section::applyTwist(whole, steel, 1e-4, kH / 2);
+    expectTrue("the monolith solved", wholeTwist.ok);
+    expectTrue("and its junctions really do extrapolate through the master",
+               whole.worstPlaneTieWeight > 1.4 && whole.worstJunctionWeight > 1.4);
+
+    section::ChainParams params = boxChain(4, true);
+    section::ChainParams open = params;
+    open.section.interfaceTies = false;
+    const section::Chain chain = section::buildChain(structure, params);
+    const section::Chain cut = section::buildChain(structure, open);
+    expectTrue("both chains built", chain.ready() && cut.ready());
+    const section::TorsionResponse twisted = section::applyTwist(chain, 1e-4, kH / 2);
+    const section::TorsionResponse cutTwist = section::applyTwist(cut, 1e-4, kH / 2);
+    expectTrue("both solved", twisted.ok && cutTwist.ok);
+    std::printf("     deck box, 4 sections: tied %.1f m of %.1f (one piece %.1f), GJ %+.2e"
+                "  |  cut planes open: %.1f m, GJ %+.3f%%\n",
+                chain.tiedEdges, chain.junctionEdges, whole.tiedEdges,
+                twisted.torsionalStiffness / wholeTwist.torsionalStiffness - 1, cut.tiedEdges,
+                100.0 * (cutTwist.torsionalStiffness / wholeTwist.torsionalStiffness - 1));
+    expectNear("the chain joins what the monolith joins", chain.tiedEdges, whole.tiedEdges, 1e-9);
+    // The face tie and the line tie are the same constraint here, so this is exact to
+    // the conditioning of two independent solves rather than converged.
+    expectNear("and carries the torsion the monolith carries", twisted.torsionalStiffness,
+               wholeTwist.torsionalStiffness, 1e-9 * wholeTwist.torsionalStiffness);
+    // The guard, without which the line above would pass on a chain that had never lost
+    // anything: with the cut planes left open the same model is visibly softer.
+    expectTrue("where leaving the cut planes open costs it torsional stiffness",
+               cutTwist.torsionalStiffness < 0.97 * wholeTwist.torsionalStiffness);
+    expectTrue("and leaves junction edge unjoined", cut.tiedEdges < whole.tiedEdges - 1.0);
+}
+
+// **The three ways a line tie is refused, each on an input whose verdict it changes.**
+//
+// Mutation testing is what said these needed writing: deleting the overshoot bound,
+// deleting the weight bound and deleting the one-segment rule all survived the whole
+// suite, because every junction on the box and on the ferry is comfortably inside all
+// three. A predicate is only tested by an input it says no to.
+void testPlaneTieRefusals() {
+    std::printf("\n--- section: what a line tie on a cut plane refuses ---\n");
+
+    // **1. A slave that straddles the node between two segments.** Put the deck at
+    // exactly mid-height, where the side plating's two thickness bands meet: the deck's
+    // pair straddles that node, so its lower half lands on the segment below and its
+    // upper half on the one above. Two segments would split the slave against two
+    // plates -- and against two thicknesses here -- so it is refused whole.
+    const section::Section straddled =
+        section::buildSection(makeBoxWithInboardDeck(kH / 2), boxParams());
+    const section::Section clear = section::buildSection(makeBoxWithInboardDeck(), boxParams());
+    std::printf("     deck on the node between two segments: %d tied, %d unreached;"
+                " mid-element: %d tied, %d unreached\n",
+                straddled.planeTieNodes, straddled.planeTiesUnreached, clear.planeTieNodes,
+                clear.planeTiesUnreached);
+    expectTrue("the deck on a segment node is refused", straddled.planeTiesUnreached > 0);
+    // The vacuity guard: the same deck a quarter of the way up lands inside one segment
+    // and is tied, so the refusal is about where it landed and not about the fixture.
+    expectEqual("where the same deck inside a segment is not", clear.planeTiesUnreached, 0);
+    expectTrue("and is tied instead", clear.planeTieNodes > straddled.planeTieNodes);
+    // A refused junction is still counted as open rather than forgotten.
+    expectTrue("and a refused one is counted open", straddled.junctionsOnInterface > 0);
+
+    // **2. A face overshoot past `junctionOvershoot`.** The box's butt corners put the
+    // flange's node half a plate thickness past the end of the side's mid-surface,
+    // which is `t / 2` over half an element -- 0.02 of the segment's own coordinate,
+    // a closed form and not a reading. Bound it below that and every line tie goes.
+    const double overshoot = (kT / 2) / (0.5 * (kH / kNz));
+    const section::Section tied = section::buildSection(makeBox(kT, kT), boxParams());
+    expectNear("the box's line ties overshoot by half a thickness over half an element",
+               tied.worstPlaneTieOvershoot, overshoot, 1e-12);
+    section::SectionParams tight = boxParams();
+    tight.junctionOvershoot = 0.5 * overshoot;
+    const section::Section bounded = section::buildSection(makeBox(kT, kT), tight);
+    expectEqual("bounding the overshoot below that refuses every one of them",
+                bounded.planeTieNodes, 0);
+    // Sixteen and not eight: with no tie made, the node that would have been the
+    // *master* half of each corner is no longer absorbed by one, so it comes round in
+    // its own turn and is refused on the same ground. Four corners, two planes, two
+    // plates at each.
+    expectEqual("and counts every one of them", bounded.planeTiesOutsideLine, 4 * 2 * 2);
+    expectEqual("which is what the section then reports as still open",
+                bounded.junctionsOnInterface, 4 * 2 * 2);
+    expectTrue("where the default admits them all", tied.planeTieNodes > 0);
+    expectEqual("and refuses none", tied.planeTiesOutsideLine, 0);
+
+    // **3. A through-thickness split past `junctionWeightLimit`.** The inboard deck
+    // asks for `w = 1.464`, so `-0.464` on the master's other face -- inside the
+    // default one full share and outside a fifth of one.
+    section::SectionParams mean = boxParams();
+    mean.junctionWeightLimit = 0.2;
+    const section::Section refused = section::buildSection(makeBoxWithInboardDeck(), mean);
+    std::printf("     deck weight %.4f: %d tied at a limit of 1.0, %d at 0.2 (%d over weight)\n",
+                clear.worstPlaneTieWeight, clear.planeTieNodes, refused.planeTieNodes,
+                refused.planeTiesThroughThickness);
+    expectTrue("the deck's split is past a fifth of a share",
+               clear.worstPlaneTieWeight - 1.0 > 0.2);
+    expectTrue("so a limit of a fifth refuses some of them",
+               refused.planeTiesThroughThickness > 0);
+    expectTrue("and ties fewer", refused.planeTieNodes < clear.planeTieNodes);
+    expectEqual("where the default refuses none", clear.planeTiesThroughThickness, 0);
+    // And the guard that the limit is about the *split* and not about everything: the
+    // box's own butt corners are at 0.5 and survive the same limit untouched.
+    const section::Section buttAtLimit = section::buildSection(makeBox(kT, kT), mean);
+    expectEqual("a butt corner is unaffected by the same limit", buttAtLimit.planeTieNodes,
+                tied.planeTieNodes);
+}
+
+// **The same station named by two sub-quads that wind opposite ways.**
+//
+// `makeStructuralMesh` reverses every other bay's corner order when it mirrors the
+// starboard side, so the sub-quad aft of a cut plane and the one forward of it can name
+// the segment they share in opposite directions. Both sections would then measure `s`
+// from opposite ends of the same line and interpolate its masters backwards for one of
+// them — which is why the segment is ordered by *position* before anything is measured
+// along it. Mutation testing is what said this needed a test: deleting that ordering
+// survived every fixture wound one way.
+void testPlaneTieSurvivesReversedWinding() {
+    std::printf("\n--- section: a cut plane whose two sides wind opposite ways ---\n");
+    const StructuralMesh reversed = makeBox(kT, kT, /*alternateWinding=*/true);
+    const StructuralMaterial steel = ah36Steel();
+    const section::Section whole = section::buildSection(reversed, boxParams());
+    const section::TorsionResponse wholeTwist = section::applyTwist(whole, steel, 1e-4, kH / 2);
+    expectTrue("the monolith solved", wholeTwist.ok);
+
+    // Four sections, so three interior planes, each of which has a bay of one winding
+    // on one side and a bay of the other on the other.
+    const section::Chain chain = section::buildChain(reversed, boxChain(4, true));
+    expectTrue("the chain built", chain.ready());
+    const section::TorsionResponse twisted = section::applyTwist(chain, 1e-4, kH / 2);
+    expectTrue("and solved", twisted.ok);
+    std::printf("     alternating winding, 4 sections: %d line ties, %d planes disagreed,"
+                " tied %.1f m, GJ %+.2e of the monolith's\n",
+                chain.planeTieNodes, chain.planeTiesDisagreeing, chain.tiedEdges,
+                twisted.torsionalStiffness / wholeTwist.torsionalStiffness - 1);
+    expectEqual("every interior plane is tied", chain.planeTieNodes, 4 * 3);
+    expectEqual("and the two sides of every one of them agree", chain.planeTiesDisagreeing, 0);
+    expectNear("to the last bit", chain.worstPlaneTieDisagreement, 0.0, 0.0);
+    expectNear("so the chain joins what the monolith joins", chain.tiedEdges, whole.tiedEdges,
+               1e-9);
+    expectNear("and carries its torsion", twisted.torsionalStiffness,
+               wholeTwist.torsionalStiffness, 1e-9 * wholeTwist.torsionalStiffness);
+    // The guard that the winding was actually alternating: the same box wound one way
+    // is a different input, and a fixture that had quietly stopped reversing would make
+    // this test a duplicate of the one above it.
+    expectTrue("and the fixture really does alternate", [] {
+        const StructuralMesh a = makeBox(kT, kT, true), b = makeBox(kT, kT, false);
+        for (std::size_t p = 0; p < a.panels.size() && p < b.panels.size(); ++p)
+            for (int c = 0; c < 4; ++c)
+                if (length(a.panels[p].corner[c] - b.panels[p].corner[c]) > 0) return true;
+        return false;
+    }());
+}
+
+// **The constraint on the assembled model, checked as arithmetic rather than through
+// a solve.**
+//
+// `GJ` coming back to the monolith's is the finding, and it is an aggregate: a fold
+// that dropped one of the four terms of `TᵀKT` would move it by a little and look like
+// conditioning. The recurring shape of a defect in this repository is exactly that --
+// an error that cancels when asked globally -- so the fold is asked about alone.
+//
+// A **rigid translation of the whole chain stores no energy**, and it has to survive
+// the constraint: the tie's weights are a partition of unity, so the slave moves with
+// its masters, and `TᵀKT` applied to the translation with the eliminated entries at
+// zero must give back zero force. That dies on a weight that does not sum to one, on a
+// master named wrongly, and on the single-pass fold that drops the `w_a w_b K[s][s]`
+// term -- none of which any energy comparison separates.
+void testChainPlaneTiesAreExactOnTheAssembly() {
+    std::printf("\n--- section: a rigid translation of a tied chain stores nothing ---\n");
+    const StructuralMesh structure = makeBox(kT, kT);
+    const section::Chain chain = section::buildChain(structure, boxChain(4, true));
+    expectTrue("the chain built", chain.ready());
+    expectTrue("and it applied some line ties", !chain.planeTies.empty());
+    expectEqualCount("six constraints per tied node", chain.planeTies.size(),
+                     static_cast<std::size_t>(6 * chain.planeTieNodes));
+    expectEqualCount("and one eliminated row each", chain.planeTieDof.size(),
+                     chain.planeTies.size());
+
+    const auto n = static_cast<std::size_t>(chain.assembly.size());
+    expectEqualCount("the assembly is square", chain.assembly.stiffness.size(), n * n);
+    // The fold's postcondition: an eliminated row and column carry nothing but a unit
+    // diagonal, so holding the row costs the model nothing. A fold that left the slave
+    // coupled would double-count it, and the energy would still look plausible.
+    double worstLeak = 0, worstDiagonal = 0;
+    for (std::uint32_t d : chain.planeTieDof)
+        for (std::size_t j = 0; j < n; ++j) {
+            if (j == d) {
+                worstDiagonal = std::max(worstDiagonal,
+                                         std::abs(chain.assembly.stiffness[d * n + j] - 1.0));
+                continue;
+            }
+            worstLeak = std::max(worstLeak, std::abs(chain.assembly.stiffness[d * n + j]));
+            worstLeak = std::max(worstLeak, std::abs(chain.assembly.stiffness[j * n + d]));
+        }
+    expectNear("an eliminated row and column are exactly empty", worstLeak, 0.0, 0.0);
+    expectNear("with a unit diagonal", worstDiagonal, 0.0, 0.0);
+
+    // A rigid translation along each axis, written on the boundary rows the constraint
+    // did *not* eliminate. The slaves stay at zero, which is what `TᵀKT` expects: the
+    // masters carry them, and the weights being a partition of unity is what makes the
+    // slave arrive at the same 1 m as everything else.
+    std::vector<std::uint8_t> eliminated(n, 0u);
+    for (std::uint32_t d : chain.planeTieDof) eliminated[d] = 1u;
+    const std::vector<reduction::BoundaryDof>& point = chain.assembly.boundaryPoint;
+    expectEqualCount("the assembly carries its boundary identity", point.size(),
+                     static_cast<std::size_t>(chain.assembly.boundary));
+    double scale = 0;
+    for (std::size_t i = 0; i < n; ++i)
+        scale = std::max(scale, std::abs(chain.assembly.stiffness[i * n + i]));
+    expectTrue("the assembled stiffness is not empty", scale > 0);
+
+    double worstForce = 0, worstEnergy = 0;
+    for (int axis = 0; axis < 3; ++axis) {
+        std::vector<double> u(n, 0.0);
+        for (int b = 0; b < chain.assembly.boundary; ++b) {
+            const auto d = static_cast<std::size_t>(b);
+            if (point[d].axis == static_cast<std::uint32_t>(axis) && !eliminated[d]) u[d] = 1.0;
+        }
+        double energy = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            double force = 0;
+            for (std::size_t j = 0; j < n; ++j) force += chain.assembly.stiffness[i * n + j] * u[j];
+            energy += 0.5 * u[i] * force;
+            if (!eliminated[i]) worstForce = std::max(worstForce, std::abs(force));
+        }
+        worstEnergy = std::max(worstEnergy, std::abs(energy));
+    }
+    std::printf("     rigid translation of the tied chain: worst force %.3e N of a %.3e N/m"
+                " diagonal, energy %.3e J\n",
+                worstForce, scale, worstEnergy);
+    // Measured at 1.2e-1 N against a 2.27e+12 N/m diagonal -- **5.3e-14 relative**,
+    // which is the assembly's own conditioning on a dense Guyan model this size.
+    // Asserted at 1e-12 of the diagonal: nineteen times the measurement, which is the
+    // margin a different optimisation level wants, and many orders below what dropping
+    // one of the four terms of the fold would cost.
+    expectTrue("a rigid translation of the tied chain carries no force",
+               worstForce < 1e-12 * scale);
+    expectTrue("and stores no energy", worstEnergy < 1e-12 * scale);
+
+    // **The vacuity guard.** A zero matrix would pass everything above, and so would a
+    // model whose boundary rows had all been eliminated. A field that is *not* rigid
+    // has to cost something, on the same matrix, through the same product.
+    std::vector<double> stretched(n, 0.0);
+    for (int b = 0; b < chain.assembly.boundary; ++b) {
+        const auto d = static_cast<std::size_t>(b);
+        if (point[d].axis == 0 && !eliminated[d]) stretched[d] = point[d].position.x;
+    }
+    double stretchEnergy = 0;
+    for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t j = 0; j < n; ++j)
+            stretchEnergy += 0.5 * stretched[i] * chain.assembly.stiffness[i * n + j] * stretched[j];
+    std::printf("     against %.3e J for stretching it, on the same matrix\n", stretchEnergy);
+    // 5.2e+10 J. The guard exists because a zero matrix, or one whose boundary rows had
+    // all been eliminated, would pass every assertion above.
+    expectTrue("where stretching the same chain costs a great deal", stretchEnergy > 1e6);
+}
+
+// **The other quantity that sees a junction: the lowest fixed-interface frequency.**
+//
+// `EA` and `EI` are exact on a mesh whose plates are not joined at all (§2), so the
+// two instruments that can tell a joined chain from an open one are torsion and this.
+// The reference is the same length in one piece with the same plating tied, through
+// none of the assembly -- so the chain owes it nothing.
+void testChainFrequencyReachesTheMonolith() {
+    std::printf("\n--- section: a tied chain's first frequency against the monolith's ---\n");
+    const StructuralMesh structure = makeBox(kT, kT);
+    const section::Section whole = section::buildSection(structure, boxParams());
+    reduction::Substructure sWhole(whole.mesh, whole.material, whole.interfaceNodes,
+                                   whole.attachment);
+    expectTrue("the monolithic substructure is ready", sWhole.ready());
+    const reduction::Eigenpairs exact = sWhole.fixedInterfaceModes(1);
+    expectTrue("and has a first mode", !exact.value.empty());
+    const double reference = std::sqrt(std::max(0.0, exact.value[0]));
+    expectTrue("which is not zero", reference > 0);
+
+    for (int sections : {2, 4}) {
+        section::ChainParams tiedParams = boxChain(sections, true);
+        tiedParams.reduce.modes = 6;
+        section::ChainParams openParams = tiedParams;
+        openParams.section.interfaceTies = false;
+        const section::Chain tied = section::buildChain(structure, tiedParams);
+        const section::Chain open = section::buildChain(structure, openParams);
+        expectTrue("both chains built", tied.ready() && open.ready());
+        const std::vector<double> tiedOmega = section::chainFrequencies(tied);
+        const std::vector<double> openOmega = section::chainFrequencies(open);
+        expectTrue("both have a spectrum", !tiedOmega.empty() && !openOmega.empty());
+        std::printf("     %d sections at 6 modes: %.6f Hz tied, %.6f Hz with the cut planes open,"
+                    " monolith %.6f Hz\n",
+                    sections, tiedOmega[0] / (2 * std::numbers::pi),
+                    openOmega[0] / (2 * std::numbers::pi), reference / (2 * std::numbers::pi));
+
+        // **The two sit on opposite sides of the monolith, and that is the whole
+        // discrimination -- no tolerance can fudge a sign.** A tied chain is the same
+        // structure as the monolith with each piece reduced, so its Rayleigh quotient
+        // is an upper bound and it approaches from above. A chain whose cut planes are
+        // open is a *different, softer* structure -- rings of junctions carrying no
+        // shear -- so it falls through the monolith rather than converging on it, and
+        // no number of modes brings it back.
+        expectTrue("an assembled frequency is an upper bound on the true one",
+                   tiedOmega[0] > reference * (1.0 - 1e-9));
+        expectTrue("where an open cut plane makes it a softer structure, and it falls below",
+                   openOmega[0] < reference * (1.0 - 1e-3));
+        // Measured 1.9e-3 above at N = 2 and 7e-6 at N = 4 -- the modal truncation,
+        // which four sections carry twice as many modes against. The open chain is
+        // 2.3e-3 and 6.2e-3 *below*, so the two are separated by their sign and not by
+        // the width of this tolerance.
+        expectNear("a tied chain reaches the monolith's own first frequency", tiedOmega[0],
+                   reference, 5e-3 * reference);
+        expectTrue("and it is stiffer than the open one at every N", tiedOmega[0] > openOmega[0]);
     }
 }
 
@@ -2615,6 +3261,44 @@ void testHaloMakesTheCutPlanesCoincide() {
     expectTrue("and the disagreement it is covering is microns, not the plate thickness",
                tolerated.worstGap > 1e-6 && tolerated.worstGap < 1e-5);
 
+    // --- And what the halo buys the in-plane line ties of §9 -------------------------
+    //
+    // The two sections either side of an interior cut plane derive that plane's line
+    // ties **independently**, and the two derivations have to come out identical or the
+    // ship is tied to itself twice in two different ways. What makes them identical is
+    // the halo: the plane's nodal normals and nodal thicknesses are then properties of
+    // the ship rather than of the window, so both sides start from the same doubles and
+    // run the same arithmetic over them.
+    //
+    // The masters are the same either way -- they are chosen on the mid-surface, which
+    // comes from panel corners and never depended on the cut. What moves is the
+    // **weights**, so this is a difference no structural comparison would find, and it
+    // is why `worstPlaneTieDisagreement` is compared against zero rather than against a
+    // tolerance.
+    section::ChainParams withTies = params;
+    withTies.section.junctions = true;
+    const section::Chain tiedJoined = section::buildChain(structure, withTies);
+    expectTrue("the tied chain built", tiedJoined.ready());
+    expectTrue("and tied the shoulder's interior plane", tiedJoined.planeTieNodes > 0);
+    expectEqual("with both sides agreeing about all of it", tiedJoined.planeTiesDisagreeing, 0);
+    expectNear("to the last bit", tiedJoined.worstPlaneTieDisagreement, 0.0, 0.0);
+
+    section::ChainParams tiedNoHalo = withTies;
+    tiedNoHalo.section.halo = false;
+    tiedNoHalo.matchTolerance = 1e-5;  // or the plane does not match at all, as above
+    const section::Chain tiedCut = section::buildChain(structure, tiedNoHalo);
+    std::printf("     line ties on the shoulder plane: %d with the halo (%d planes disagreed),"
+                " %d without (%d disagreed, worst %.3e)\n",
+                tiedJoined.planeTieNodes, tiedJoined.planeTiesDisagreeing, tiedCut.planeTieNodes,
+                tiedCut.planeTiesDisagreeing, tiedCut.worstPlaneTieDisagreement);
+    expectTrue("without the halo the two sides derive a different constraint",
+               tiedCut.planeTiesDisagreeing > 0);
+    expectTrue("and it is a difference in the weights, not a tie one side simply lacks",
+               tiedCut.worstPlaneTieDisagreement > 0 && tiedCut.worstPlaneTieDisagreement < 1.0);
+    expectEqual("so the chain applies nothing on that plane rather than picking a side",
+                tiedCut.planeTieNodes, 0);
+    expectTrue("and says which plane", !tiedCut.problems.empty());
+
     // The guard against the whole test being about nothing: amidships the same
     // measurement is exactly zero, so this is the hull's shape and not the mesher's
     // arithmetic.
@@ -3052,6 +3736,7 @@ void runSectionTests() {
     testCollapsedPanelsMeshAsWedges();
     testWedgeApexIsCountedOnce();
     testJunctionTieIsAPartitionOfUnity();
+    testPlaneTieLiesInThePlane();
     testWeldIsADistance();
     testReversedWindingIsOriented();
     testBoxSectionProperties();
@@ -3071,6 +3756,12 @@ void runSectionTests() {
     testInterfaceIsChosenOnTheMidSurface();
     testChainOfSectionsIsTheWholeSection();
     testChainCutPlanesUntieTheJunctions();
+    testPlaneTieSplitsTheMastersThickness();
+    testDeckChainSplitsTheSameThicknessTheMonolithDoes();
+    testPlaneTieRefusals();
+    testPlaneTieSurvivesReversedWinding();
+    testChainPlaneTiesAreExactOnTheAssembly();
+    testChainFrequencyReachesTheMonolith();
     testChainFrequencySeesTheJoins();
     testMesherReachesTheEndsOfTheShip();
     testJunctionWeightLimitRefusesTheNodeAndNotTheSection();
