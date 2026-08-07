@@ -1552,10 +1552,44 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
             // fraction of the section it spans, which is what an average transverse
             // cut of the section would see.
             const double spanX = std::min(hi, params.xTo) - std::max(lo, params.xFrom);
-            const double share = spanX > 0 ? profileSection(member.profile).area * spanX /
-                                                 (params.xTo - params.xFrom)
+            const ProfileSection profile = profileSection(member.profile);
+            // **Left as `a * b / c` and not rewritten as `a * (b / c)`**, which would be
+            // the same number in exact arithmetic and not the same double. §8's claim is
+            // that a station's steel is a property of the ship rather than of the window
+            // and is checked against *zero* rather than a tolerance, so re-associating
+            // this product would move the last bits of every published member figure for
+            // no reason at all.
+            const double share = spanX > 0 ? profile.area * spanX / (params.xTo - params.xFrom)
                                            : 0.0;
-            const auto lost = [&]() { section.missedMemberArea += share; };
+            const double fraction = spanX > 0 ? spanX / (params.xTo - params.xFrom) : 0.0;
+
+            // And the same share as a first and a second moment about the baseline,
+            // taken at the **middle of the overlap** -- a longitudinal follows the hull,
+            // so its centroid height varies along the section and one height has to
+            // stand for the length the share already averages over. The profile's own
+            // second moment rotates in by the web's direction cosines, which is
+            // `sectionElements`' own arithmetic: a tee on the bottom shell contributes
+            // its strong axis and the same tee on the side shell its weak one.
+            double shareFirst = 0, shareSecond = 0;
+            if (share > 0) {
+                const double middleX = 0.5 * (std::min(hi, params.xTo) + std::max(lo, params.xFrom));
+                const double t = hi - lo > eps
+                                     ? std::clamp((middleX - member.a.x) / (member.b.x - member.a.x),
+                                                  0.0, 1.0)
+                                     : 0.0;
+                const Vec3 root = member.a + (member.b - member.a) * t;
+                const double height =
+                    root.z + member.rise.z * (0.5 * member.attachedPlateThickness + profile.centroid);
+                const double own = member.rise.z * member.rise.z * profile.secondMoment +
+                                   member.rise.y * member.rise.y * profile.secondMomentWeak;
+                shareFirst = share * height;
+                shareSecond = fraction * own + share * height * height;
+            }
+            const auto lost = [&]() {
+                section.missedMemberArea += share;
+                section.missedMemberFirstMoment += shareFirst;
+                section.missedMemberSecondMoment += shareSecond;
+            };
 
             std::vector<std::pair<double, std::uint32_t>> onMember;
             for (std::size_t i = 0; i < mid.size(); ++i) {
@@ -1628,6 +1662,8 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
                 ++section.membersAttached;
                 ++section.stiffening.members;
                 section.attachedMemberArea += share;
+                section.attachedMemberFirstMoment += shareFirst;
+                section.attachedMemberSecondMoment += shareSecond;
             } else {
                 ++section.membersMissed;
                 lost();
@@ -1741,7 +1777,7 @@ Applied stiffnessTimes(const Section& section, const StructuralMaterial& materia
 }  // namespace
 
 BeamResponse applyBeamLoad(const Section& section, const StructuralMaterial& material,
-                           const BeamLoad& load) {
+                           const BeamLoad& load, std::vector<double>* displacementOut) {
     BeamResponse out;
     if (section.empty() || section.aftNodes.empty() || section.forwardNodes.empty()) {
         out.problem = "the section has no elements or no interface";
@@ -1867,6 +1903,11 @@ BeamResponse applyBeamLoad(const Section& section, const StructuralMaterial& mat
             length(Vec3{displacement[node * 3], displacement[node * 3 + 1], displacement[node * 3 + 2]}));
     if (load.strain != 0) out.axialStiffness = out.axialForce / load.strain;
     if (load.curvature != 0) out.bendingStiffness = out.bendingMoment / load.curvature;
+    // `solveStatic` has already filled every tied node in from its masters -- it makes
+    // the same `DofExpansion::recover` call `reduction::recover` does, and for the same
+    // reason -- so this is a field over the mesh's own degrees of freedom with no hole
+    // at a junction.
+    if (displacementOut != nullptr) *displacementOut = displacement;
     out.ok = true;
     return out;
 }
@@ -1909,6 +1950,124 @@ TorsionResponse applyTwist(const Section& section, const StructuralMaterial& mat
     }
     out.strainEnergy = applied.energy;
     if (twist != 0) out.torsionalStiffness = out.torque * section.length() / twist;
+    out.ok = true;
+    return out;
+}
+
+// --- 10. The stress the section carries -------------------------------------------
+
+std::vector<StressSample> axialStress(const Section& section, const StructuralMaterial& material,
+                                      const std::vector<double>& displacement, double x) {
+    std::vector<StressSample> out;
+    if (section.empty() || displacement.size() != section.mesh.nodeCount() * 3) return out;
+
+    // The natural coordinates of the nodes and of the 2x2x2 rule, in the bit order
+    // `solid_shell.cpp` uses: xi fastest, then eta, then zeta. **Reproducing the
+    // ordering matters more than reproducing the values** -- a stress paired with the
+    // wrong Gauss point would scatter a perfectly correct field over the section and
+    // every aggregate below would still look plausible.
+    static constexpr double kNodeXi[kNodes] = {-1, 1, 1, -1, -1, 1, 1, -1};
+    static constexpr double kNodeEta[kNodes] = {-1, -1, 1, 1, -1, -1, 1, 1};
+    static constexpr double kNodeZeta[kNodes] = {-1, -1, -1, -1, 1, 1, 1, 1};
+    const double q = 1.0 / std::sqrt(3.0);
+
+    double nodes[kDof], local[kDof];
+    double stress[kGauss * 6], volume[kGauss];
+    for (std::size_t e = 0; e < section.mesh.elementCount(); ++e) {
+        section.mesh.gather(e, section.mesh.position, nodes);
+        double lo = nodes[0], hi = nodes[0];
+        for (int n = 1; n < kNodes; ++n) {
+            lo = std::min(lo, nodes[n * 3]);
+            hi = std::max(hi, nodes[n * 3]);
+        }
+        if (!(lo <= x && x < hi)) continue;
+        section.mesh.gather(e, displacement, local);
+        solidshell::elementStress(nodes, local, material, solidshell::Formulation::SolidShell,
+                                  stress);
+        solidshell::gaussVolumes(nodes, volume);
+        for (int g = 0; g < kGauss; ++g) {
+            const double xi = (g & 1) ? q : -q;
+            const double eta = (g & 2) ? q : -q;
+            const double zeta = (g & 4) ? q : -q;
+            Vec3 at{};
+            for (int n = 0; n < kNodes; ++n) {
+                const double shape = 0.125 * (1.0 + xi * kNodeXi[n]) * (1.0 + eta * kNodeEta[n]) *
+                                     (1.0 + zeta * kNodeZeta[n]);
+                at.x += shape * nodes[n * 3];
+                at.y += shape * nodes[n * 3 + 1];
+                at.z += shape * nodes[n * 3 + 2];
+            }
+            out.push_back({at, volume[g], stress[g * 6]});
+        }
+    }
+    return out;
+}
+
+BeamFit fitBeam(const std::vector<StressSample>& samples, double about) {
+    BeamFit out;
+    if (samples.empty()) return out;
+    out.zLo = samples.front().at.z;
+    out.zHi = samples.front().at.z;
+    double s0 = 0, s1 = 0, s2 = 0, t0 = 0, t1 = 0;
+    for (const StressSample& s : samples) {
+        const double w = s.volume, d = s.at.z - about;
+        s0 += w;
+        s1 += w * d;
+        s2 += w * d * d;
+        t0 += w * s.sigmaXX;
+        t1 += w * s.sigmaXX * d;
+        out.zLo = std::min(out.zLo, s.at.z);
+        out.zHi = std::max(out.zHi, s.at.z);
+        if (std::abs(s.sigmaXX) > std::abs(out.peak)) {
+            out.peak = s.sigmaXX;
+            out.peakAt = s.at;
+        }
+    }
+    out.samples = samples.size();
+    out.volume = s0;
+    // A cut with no depth -- every sample at one height -- has no gradient to find
+    // and the normal equations are singular. It is refused rather than regularised:
+    // a fitted gradient there would be arbitrary and would still print.
+    const double det = s0 * s2 - s1 * s1;
+    if (!(s0 > 0) || !(det > 0)) return out;
+    out.axial = (s2 * t0 - s1 * t1) / det;
+    out.gradient = (s0 * t1 - s1 * t0) / det;
+    out.neutralAxis = out.gradient != 0 ? about - out.axial / out.gradient : about;
+    double squared = 0;
+    for (const StressSample& s : samples) {
+        const double r = s.sigmaXX - out.axial - out.gradient * (s.at.z - about);
+        squared += s.volume * r * r;
+        out.residualWorst = std::max(out.residualWorst, std::abs(r));
+    }
+    out.residualRms = std::sqrt(squared / s0);
+    out.ok = true;
+    return out;
+}
+
+FibreStress fibreStress(const std::vector<StressSample>& samples, bool deck, double band) {
+    FibreStress out;
+    if (samples.empty()) return out;
+    double zLo = samples.front().at.z, zHi = zLo;
+    for (const StressSample& s : samples) {
+        zLo = std::min(zLo, s.at.z);
+        zHi = std::max(zHi, s.at.z);
+    }
+    const double depth = zHi - zLo;
+    if (!(depth > 0)) return out;
+    const double cut = deck ? zHi - band * depth : zLo + band * depth;
+    double weight = 0, sum = 0, height = 0;
+    for (const StressSample& s : samples) {
+        if (deck ? !(s.at.z >= cut) : !(s.at.z <= cut)) continue;
+        weight += s.volume;
+        sum += s.volume * s.sigmaXX;
+        height += s.volume * s.at.z;
+        ++out.samples;
+        if (std::abs(s.sigmaXX) > std::abs(out.worst)) out.worst = s.sigmaXX;
+    }
+    if (!(weight > 0)) return out;
+    out.volume = weight;
+    out.mean = sum / weight;
+    out.z = height / weight;
     out.ok = true;
     return out;
 }
@@ -2513,7 +2672,8 @@ bool chainRestraints(const Chain& chain, std::vector<std::uint32_t>& held) {
 
 }  // namespace
 
-BeamResponse applyBeamLoad(const Chain& chain, const BeamLoad& load) {
+BeamResponse applyBeamLoad(const Chain& chain, const BeamLoad& load,
+                           std::vector<double>* stateOut) {
     BeamResponse out;
     if (!chain.ready()) {
         out.problem = "the chain is not ready: " +
@@ -2584,8 +2744,25 @@ BeamResponse applyBeamLoad(const Chain& chain, const BeamLoad& load) {
             std::max(out.peakDisplacement, std::fabs(state[static_cast<std::size_t>(b)]));
     if (load.strain != 0) out.axialStiffness = out.axialForce / load.strain;
     if (load.curvature != 0) out.bendingStiffness = out.bendingMoment / load.curvature;
+    // After `recoverPlaneTies`, so a caller expanding this back onto a section's mesh
+    // gets the interior plane's tied rows at what their masters say rather than at the
+    // zero the elimination left. The energy above is taken *before* it, and both are
+    // deliberate: the energy is `0.5 x^T (T^T K T) x` and counting a slave's share
+    // twice is exactly what filling it in first would do.
+    if (stateOut != nullptr) *stateOut = state;
     out.ok = true;
     return out;
+}
+
+std::vector<double> sectionDisplacement(const Chain& chain, std::size_t index,
+                                        const std::vector<double>& state) {
+    if (index >= chain.section.size() || index >= chain.reduced.size() ||
+        index >= chain.assembly.from.size())
+        return {};
+    const std::vector<double> mine =
+        reduction::componentState(chain.assembly, chain.assembly.from[index], state);
+    if (mine.empty()) return {};
+    return reduction::recover(chain.substructure[index], chain.reduced[index], mine);
 }
 
 TorsionResponse applyTwist(const Chain& chain, double twist, double reference) {
