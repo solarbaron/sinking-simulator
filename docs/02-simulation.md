@@ -2855,10 +2855,59 @@ reach, which is exactly what that change was for.
    secant is not, and that the zone's state and the interface displacement set each
    other, so the loop is staggered. Coupling to Tier 0 is unchanged and remains
    `promotion.{hpp,cpp}`'s.
-2. **The indenter is kinematic and rigid** — a prescribed rectangular punch, no
-   contact search, no friction, no release, and the striking body does not crush. A
-   prescribed motion cannot run away, which is what makes it testable; a delivered
-   *energy* needs the striking body's mass and is what `collision.hpp` would supply.
+2. ~~**The indenter is kinematic and rigid.**~~ **Half done: it takes joules now,
+   and the bow still does not crush** — `zone.hpp` §6, `Drive::Inertial`. There is
+   still no contact search, no friction and no release. What has gone is that the
+   zone consumed a *prescribed travel* where a collision delivers a *number of
+   joules*, so the depth of the hole was an assumption. The entry point is a mass
+   and a velocity rather than an energy, deliberately: this is explicit dynamics,
+   an energy is a first integral rather than a boundary condition, and inventing a
+   mass inside the solver to get a motion back out of it would be exactly the
+   coefficient no measurement sets. `collision.hpp` already computes both halves —
+   `ImpulseSolution::effectiveMass` and `energyLost` — and `zone::impactSpeed`
+   turns the pair into the arrival speed whose kinetic energy *is* that energy.
+
+   This item said a prescribed motion "cannot run away, which is what makes it
+   testable", and the useful half of that survives in a stronger form. **Nothing
+   does work on the punch**, so the total energy of (punch + patch) is
+   non-increasing and `½mv² ≤ ½mv₀²` for the whole run: the striker can never be
+   going faster than it arrived, through the tearing, through every element the
+   solver deletes and through the springback behind it. That is asserted on every
+   step of a run that tears.
+
+   **The bound is on the speed and not on the distance, and this file assumed
+   otherwise first.** A punch that has perforated the plating under it meets no
+   force and coasts — twice the energy needed to tear the reference strip put it
+   **24.9 m** past the plating and ended the run on `maxSteps`. So an inertial
+   drive is *refused* unless a travel or a duration bounds it, and the cap's
+   meaning changes: on a prescribed punch it is the answer, and here it is the edge
+   of what the patch can be asked about, with the striker's remaining kinetic
+   energy reported exactly as `ImpactDamage::energyUnspent` is on the membrane path.
+
+   **What it costs, measured on the ferry's own patch.** Driving by the 2.755 MJ a
+   0.22 m prescribed punch absorbed, as a 153 t striker at 6 m/s, reaches the same
+   0.22 m with **11% of its energy unspent**, having done 2.444 MJ of work and torn
+   **42 elements against 80** — no panel past `tearFraction` where the prescribed
+   run tore six. On a quasi-static bay the two drives agree on penetration to
+   **0.16%**; this run is not quasi-static, and the gap above is what that costs. A
+   third of the prescribed run's work is sitting in the plating's velocity, so a
+   punch held at 6 m/s to the last millimetre is doing damage a decelerating
+   striker does not, and that difference had nowhere to show before. It also costs
+   more —
+   45 970 steps against 21 290 — because a striker that has nearly stopped crawls,
+   and a run that perforates and then coasts at 0.5 m/s took 216 000. Bound an
+   inertial run by `duration` for cost and by `stopAt` for reach; they are not the
+   same bound.
+
+   **Where it errs.** The punch is rigid, so every joule goes into the struck
+   plating — the same bias `indentation.hpp` records against its own high-energy
+   holes, making this an upper bound on the struck side's damage, tight when the
+   striking bow is far stronger than what it hits and loose when the two are
+   comparable. A share of the energy assigned to the bow is *not* offered, because
+   that share is a coefficient nothing here measures. What has changed is that the
+   honest fix is representable at all: the punch is a body with a mass, so a
+   crushing characteristic is one force law between it and the plating, where a
+   prescribed motion has no force to share.
 3. **Element deletion, not splitting**, so the hole is the deleted area — reported
    as whole panels because that is what `breachesFromFailedPanels` consumes.
    `tearFraction` decides at what share of a panel it counts, and neither end of it

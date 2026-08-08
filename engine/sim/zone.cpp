@@ -648,6 +648,17 @@ double estimatedCost(const Patch& patch, bool plastic) {
     return static_cast<double>(patch.elementCount()) * steps * perElement * 1e-6;
 }
 
+// --- The striking body ------------------------------------------------------------
+
+double impactSpeed(double energy, double mass) {
+    // Not `sqrt(2E/m)` guarded afterwards: a non-positive mass divides by zero and
+    // a negative energy takes the root of a negative, and both come back as a NaN
+    // that would then be a velocity nothing in the solver could reject. Zero is a
+    // punch that does not move, which is a request a caller can see it made.
+    if (!(mass > 0) || !(energy > 0)) return 0.0;
+    return std::sqrt(2.0 * energy / mass);
+}
+
 // --- Solver ---------------------------------------------------------------------
 
 Solver::Solver(const Patch& patch, const plasticity::Material& material, const SolveParams& params)
@@ -757,6 +768,67 @@ Solver::Solver(const Patch& patch, const plasticity::Material& material, const S
     }
     if (punchPresent && driven_.empty())
         result_.problems.push_back("the indenter's footprint contains no free node");
+
+    // The striking body. See `zone.hpp` §6: the mass and the arrival speed are the
+    // entry point, and the energy is what they carry rather than a third input that
+    // could disagree with them.
+    if (params_.indenter.drive == Drive::Inertial) {
+        if (!(params_.indenter.mass > 0) || !(params_.indenter.speed > 0)) {
+            // Refused rather than fallen back on. A striker with no mass or no
+            // approach speed carries no energy, and running it as a prescribed punch
+            // instead would hand back a travel the caller asked for an energy to
+            // decide -- which is exactly the assumption the inertial drive exists to
+            // remove. `impactSpeed` returns zero for an energy or a mass it cannot
+            // use, so this is the shape a mis-piped collision arrives in and it has
+            // to be loud.
+            //
+            // **The speed is refused here rather than left to arrest on the first
+            // step, and that was a measurement.** A striker released at zero was
+            // meant to stop immediately, because `arrested` is `!(speed > 0)`. It
+            // does not: the internal force at the rest configuration is a rounding
+            // residue rather than an identical zero, so the grip hands back a speed
+            // around 1e-29 m/s and the run goes to `maxSteps` having travelled
+            // 1e-33 m. Deciding a run's whole termination on an exact floating-point
+            // zero is the trapdoor CLAUDE.md records `sectionElements` falling
+            // through, and the fix is to refuse the input rather than to widen the
+            // test into a tolerance nothing measures.
+            result_.problems.push_back(
+                "an inertial indenter needs a positive striking mass and approach speed;"
+                " nothing was solved");
+            done_ = true;
+        } else if (driven_.empty()) {
+            result_.problems.push_back(
+                "an inertial indenter that touches nothing would never stop; nothing was solved");
+            done_ = true;
+        } else if (!(params_.indenter.stopAt > 0) && !(params_.duration > 0)) {
+            // **Refused, and this is the one place the inertial drive really can run
+            // on.** Its *speed* is bounded -- nothing does work on the punch, so
+            // `1/2 m v^2 <= 1/2 m v_0^2` for the whole run -- but its *travel* is
+            // not: a punch that has perforated the plating under it meets no force
+            // at all and coasts at very nearly its arrival speed for ever. Measured:
+            // twice the energy needed to tear the reference strip put the punch
+            // 24.9 m past the plating and ended on `maxSteps`. So an inertial drive
+            // must be bounded by something that is not a step count, and it is made
+            // to say so at construction rather than after two million steps.
+            result_.problems.push_back(
+                "an inertial indenter needs a travel or a duration to bound it: a punch that"
+                " perforates coasts, and maxSteps is a budget rather than a bound. Nothing was"
+                " solved");
+            done_ = true;
+        } else {
+            punchMass_ = params_.indenter.mass;
+            punchSpeed_ = params_.indenter.speed;
+            for (std::uint32_t node : driven_) drivenMass_ += mass_[node];
+        }
+        if (params_.indenter.rampTime > 0)
+            result_.problems.push_back(
+                "rampTime is a prescribed punch's statement about compliance and an inertial"
+                " punch arrives travelling; it was ignored");
+        result_.indenterMass = punchMass_;
+        result_.indenterSpeed = punchSpeed_;
+        result_.indenterEnergy = 0.5 * punchMass_ * punchSpeed_ * punchSpeed_;
+        result_.indenterKinetic = result_.indenterEnergy;
+    }
 
     // The driven perimeter. A pinned DOF whose prescribed value is zero is a
     // clamp and takes the cheap path; one with a value follows the surrounding
@@ -1079,6 +1151,38 @@ bool Solver::step() {
     double speed = punch.speed;
     if (punch.rampTime > 0 && result_.time < punch.rampTime)
         speed = punch.speed * (result_.time / punch.rampTime);
+    // The striking body, when there is one. `punchMass_` is zero on the prescribed
+    // drive, so everything below this block is the arithmetic that path always ran,
+    // in the order it ran it -- which is what lets the tests assert bit-identity
+    // rather than agreement.
+    //
+    // **The grip is a perfectly inelastic collision, and taking it that way is what
+    // makes the infinite-mass limit exact.** The punch and the nodes it holds are
+    // rigidly attached, so momentum along the travel is what survives the step:
+    //
+    //     v' = (m_punch v + sum_i m_i u_i) / (m_punch + sum_i m_i)
+    //
+    // As `m_punch` grows this tends to `v` and the impulse tends to
+    // `sum_i m_i (v - u_i)`, which is the expression the prescribed punch has
+    // always used -- so the two drives are one formulation and not two, and a heavy
+    // enough inertial punch reproduces a prescribed run rather than resembling it.
+    // A separate `m dv/dt = -F` with F taken from the previous step would be neither
+    // momentum-conserving nor convergent to that limit.
+    if (punchMass_ > 0) {
+        double nodeMomentum = 0;
+        for (std::uint32_t node : driven_) {
+            double along = 0;
+            for (int k = 0; k < 3; ++k) along += velocity_[node * 3 + static_cast<std::size_t>(k)] *
+                                                 patch_->axis[k];
+            // `along` is the +axis component and the punch travels along -axis, so
+            // the node's speed *with* the punch is its negative.
+            nodeMomentum -= mass_[node] * along;
+        }
+        punchSpeed_ = (punchMass_ * punchSpeed_ + nodeMomentum) / (punchMass_ + drivenMass_);
+        speed = punchSpeed_;
+        result_.indenterSpeed = punchSpeed_;
+        result_.indenterKinetic = 0.5 * punchMass_ * punchSpeed_ * punchSpeed_;
+    }
     double impulse = 0;
     for (std::uint32_t node : driven_) {
         double along = 0;
@@ -1105,13 +1209,39 @@ bool Solver::step() {
     if (params_.historyStride > 0 && result_.steps % params_.historyStride == 0)
         result_.history.push_back({result_.time, result_.penetration, result_.force, result_.work,
                                    result_.strainEnergy, result_.dissipation, result_.kinetic,
-                                   result_.tornElements});
+                                   // `speed` and not a test on the drive: the grip
+                                   // above assigns `speed = punchSpeed_`, so the
+                                   // conditional this used to carry was dead. A
+                                   // mutant that removed it changed nothing, which
+                                   // is how it was found.
+                                   speed, result_.tornElements});
 
+    // The striking body has stopped: it spent what it arrived with and the
+    // penetration above is what that bought. Tested *before* the travel cap, so a
+    // run that satisfies both is reported as ended by the energy -- which is the
+    // truthful reading, since a striker with nothing left would not have gone
+    // further whatever the cap said. And tested after the step, so the depth
+    // reported is the deepest reached rather than the one before it.
+    const bool arrested = punchMass_ > 0 && !(punchSpeed_ > 0);
     const bool reachedDepth = punch.stopAt > 0 && result_.penetration >= punch.stopAt;
     const bool reachedTime = params_.duration > 0 && result_.time >= params_.duration;
-    if (reachedDepth || reachedTime) {
+    if (arrested) {
         done_ = true;
         result_.completed = true;
+        result_.indenterArrested = true;
+    } else if (reachedDepth || reachedTime) {
+        done_ = true;
+        result_.completed = true;
+        // A travel cap that ends an energy-driven run has decided the answer the
+        // energy was meant to decide, and silently. That is the failure
+        // `ImpactDamage::energyUnspent` guards on the membrane path, and it is
+        // guarded here rather than left to be inferred from `indenterArrested`.
+        if (punchMass_ > 0)
+            result_.problems.push_back(
+                std::string("the run ended on the ") + (reachedDepth ? "travel" : "duration") +
+                " cap with the striker still carrying " +
+                std::to_string(result_.indenterKinetic) +
+                " J; the cap decided the penetration, not the energy");
     } else if (result_.steps >= params_.maxSteps) {
         done_ = true;
         result_.problems.push_back("stopped at maxSteps with the indenter at " +
@@ -1194,6 +1324,14 @@ void Solver::adopt(const std::vector<double>& position, const std::vector<double
     if (position.size() == position_.size()) position_ = position;
     if (velocity.size() == velocity_.size()) velocity_ = velocity;
     if (params_.plastic && state.size() == plastic_.size()) plastic_ = state;
+    // The accelerator drives a prescribed punch and knows nothing about a striking
+    // mass, so a state adopted onto an inertial drive carries a punch speed that was
+    // never decelerated. Said rather than absorbed, for the same reason the missing
+    // stiffeners below are: the answer would look like a slightly deep zone.
+    if (punchMass_ > 0)
+        result_.problems.push_back(
+            "a state was adopted onto an inertial indenter; the striker's speed is the one this"
+            " solver last computed and not the one the other path ran");
     result_.steps = steps;
     result_.time = time;
     result_.penetration = penetration;

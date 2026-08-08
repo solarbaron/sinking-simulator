@@ -191,11 +191,13 @@
 //     each other -- so the loop is staggered and a caller decides how many passes
 //     it can afford. Coupling to Tier 0 is unchanged and remains the path
 //     `promotion.{hpp,cpp}` owns.
-//  2. **The indenter is kinematic and rigid.** Nodes inside a rectangular footprint
-//     are driven at a prescribed velocity; there is no contact search, no friction,
-//     no release, and the striking body does not crush. A prescribed motion cannot
-//     run away, which is what makes it testable; a delivered *energy* would need
-//     the striking body's mass and is what `collision.hpp` would eventually supply.
+//  2. **The indenter is rigid, and it no longer has to be kinematic.** Nodes inside
+//     a rectangular footprint are driven; there is still no contact search, no
+//     friction, no release, and the striking body still does not crush. What has
+//     changed is where the motion comes from: this item used to say a delivered
+//     *energy* "would need the striking body's mass and is what `collision.hpp`
+//     would eventually supply", and that is now `Drive::Inertial` -- see §6. It
+//     supplies neither more nor less than `collision.hpp` already computes.
 //  3. **Element deletion, not splitting.** A torn element carries no stress and
 //     keeps its mass. The hole is therefore the deleted area, which this reports as
 //     whole panels because that is what `breachesFromFailedPanels` consumes -- see
@@ -211,6 +213,126 @@
 //     fifty lines further down, and then said "slower" after it had stopped being.
 //  5. **No rate dependence in the material**, so the resistance is under-predicted
 //     by the 10-30% steel gains at collision strain rates.
+//
+// --- 6. A collision delivers joules; this used to consume a travel --------------
+//
+// `collision.hpp` ends an event holding two numbers -- `ImpulseSolution::
+// effectiveMass` and an energy `(1 - e^2)/2 m_eff u^2` its penalty force's work
+// integral is aimed at -- and the zone had nowhere to put either. It took a punch
+// speed and a `stopAt`, so the depth of the hole was an *assumption* rather than a
+// consequence, which is the same failure `indentation.hpp` records against its own
+// first version. `Drive::Inertial` closes it.
+//
+// **The entry point is a mass and a velocity, not an energy, and that is a
+// decision rather than a convenience.** Three shapes were available:
+//
+//   * *An energy.* Rejected. This is explicit dynamics: an energy is not a
+//     boundary condition, it is a first integral of one, and the zone would have
+//     to invent a mass to get a motion back out of it. Two collisions carrying
+//     identical joules at different masses do not do identical damage here and
+//     the solver can tell them apart -- the plating ahead of a punch sees `rho c v`,
+//     280 MPa at 6 m/s, so how fast the joules arrive is part of the answer. A mass
+//     invented inside this file to hide that would be exactly the coefficient no
+//     measurement sets that §4 rejects for the boundary.
+//   * *A force history*, played in from `collision.hpp`'s penalty contact. Rejected,
+//     and it is the shape that would really have cost the testability: **a
+//     prescribed force is the drive that runs away.** If the structure fails it
+//     keeps pushing at the same newtons into nothing and accelerates without
+//     bound. It is also a force computed against a *rigid* hull, which §5 of
+//     `collision.hpp` says over-states the peak and under-states the penetration,
+//     so it is the wrong history for a structure that deforms.
+//   * *A mass and a velocity.* Taken. It is what `collision.hpp` has, it reduces to
+//     the energy exactly -- `impactSpeed(energyLost, effectiveMass)` gives the
+//     `u sqrt(1 - e^2)` whose kinetic energy *is* that energy -- and it carries the
+//     deceleration law as well, which an energy alone cannot.
+//
+// **Its speed cannot run away; its travel can, and the difference is the whole
+// design.** Nothing here does work on the punch: the plating grips it, and a
+// stretched plate pulls back along the travel rather than pushing forward. So the
+// total energy of (punch + patch) is non-increasing -- internal forces are
+// conservative, the grip and the return map and `damping` are dissipative, and a
+// clamped edge does no work -- and therefore `1/2 m v^2 <= 1/2 m v_0^2` for the
+// whole run. The punch can never be going faster than it arrived, whatever the
+// structure does, and `tests/test_zone.cpp` asserts that on a run that tears
+// because tearing is the case the bound exists for.
+//
+// **That bound is on the speed and not on the distance, and assuming otherwise is
+// a mistake this file made first.** A punch that has perforated the plating under
+// it meets no force at all and coasts: twice the energy needed to tear the
+// reference strip put it 24.9 m past the plating and ended the run on `maxSteps`.
+// Nothing is wrong there -- the zone simply has nothing further to say, because
+// the rest of the energy goes into structure this patch does not contain, and the
+// punch cannot re-engage what it is not already touching (there is no contact
+// search; §5 item 2) -- but a solver that discovers it after two million steps is
+// no use. So **an inertial drive is refused unless `Indenter::stopAt` or
+// `SolveParams::duration` bounds it**, and the cap's meaning changes: on a
+// prescribed punch it *is* the answer, and here it is the edge of what this patch
+// can be asked about. A run that ends on it leaves `indenterKinetic` unspent,
+// which is `ImpactDamage::energyUnspent` on the membrane path and means exactly
+// the same thing -- the hole would have been bigger and the caller is looking at a
+// bound rather than a result.
+//
+// **Four requests are refused outright rather than answered wrongly**, all of them
+// with `problems` and no steps taken: no striking mass, no approach speed, nothing
+// to bound the run, and a footprint that grips nothing. Falling back on the
+// prescribed drive for any of them would hand the caller exactly the assumed
+// penetration this entry point exists to remove -- and the last is not
+// hypothetical, since a punch that grips nothing is never decelerated by anything
+// and would coast to the cap reporting a perforation it never made.
+//
+// **Two things widen the speed bound and both are named rather than assumed away.**
+// A `Preload` hands the patch `initialStrainEnergy` it did not pay for, and a
+// driven perimeter keeps putting `boundaryWork` in; either can be released into the
+// punch, so the honest statement on such a patch is
+// `1/2 m v^2 <= 1/2 m v_0^2 + initialStrainEnergy + boundaryWork`. Both are in
+// `SolveResult` already, so the wider bound is checkable and not merely stated.
+//
+// The step's own arithmetic gives a second, exact statement that needs no bound at
+// all: the grip conserves momentum, so `mass * (v_before - v_after)` is precisely
+// `force * timestep` every step. That is a closed form to floating point rather
+// than to an order, and it is what the tests assert the grip against.
+//
+// **What is given up.** Three things, and none of them is the speed bound above:
+//
+//   * **The cost is not knowable before the run, and it is not bounded by the
+//     prescribed run's either.** A prescribed punch takes `stopAt / speed` seconds
+//     and `estimatedCost()` turns that into wall time. An inertial one takes as
+//     long as it takes, and the tail is the expensive part: the step is fixed by
+//     the material, so a striker that has nearly stopped needs many steps per
+//     centimetre. On the ferry's own patch the same 0.22 m cost 45 970 steps by
+//     energy against 21 290 by travel, and a striker that perforated and then
+//     coasted at 0.5 m/s took 216 000. **`stopAt` bounds the reach and `duration`
+//     bounds the cost; they are not the same bound and a run that can perforate
+//     wants both.**
+//   * **The answer at a given travel becomes path dependent.** The punch is fast at
+//     first and slow at the end, where a prescribed one is neither, so the two
+//     drives do not pass through the same states. They agree wherever the run is
+//     quasi-static and they are entitled to differ where it is not; how far apart
+//     they land is measured in `tests/test_zone.cpp` rather than assumed small.
+//   * **Rebound is still not modelled.** The punch grips, so at arrest the plate
+//     would spring back and drag it out; the run ends there instead. The reported
+//     penetration is therefore the deepest the punch got, which is the number a
+//     hole is read from, and not a residual dent.
+//
+// **Where it errs, and in which direction.** The punch is rigid, so every joule
+// goes into the struck plating. That is the same bias `indentation.hpp` records
+// against its own high-energy holes, for the same reason, and it makes this an
+// **upper bound on the struck side's damage** -- tight when the striking bow is far
+// stronger than what it hits, loose when the two are comparable, which for two
+// ship sides is the usual case. Reducing the delivered energy by a share to stand
+// for the bow is *not* offered, because that share is a coefficient nothing here
+// measures. What has changed is that the honest fix is now representable at all:
+// the punch is a body with a mass, so giving it a crushing characteristic is one
+// force law between it and the plating. It could never have been put on a
+// prescribed motion, which has no force to share.
+//
+// **This does not duplicate `indentation.hpp`.** That model has been energy-driven
+// from the start and stays: it spends a budget *outward across panels*, bay after
+// bay, with no dynamics in it at all, and costs microseconds. This spends one
+// striking body's kinetic energy *through a single solve*, and the two answer
+// different questions -- "how far does the damage reach" against "what does this
+// patch do". `tools/zone_probe` now runs them against each other on energy as well
+// as on force.
 //
 // SI units, body frame per CLAUDE.md.
 #pragma once
@@ -405,12 +527,27 @@ Patch buildPatch(const StructuralMesh& structure, const Vec3& impact,
 
 // --- Driving it ----------------------------------------------------------------
 
-// A rigid flat punch, rectangular in the patch's own in-plane frame, moving at a
-// constant speed along -axis. Nodes on the **outer face only** are driven, so the
-// plate is free to thin under the punch -- which is the whole reason the element
-// keeps a thickness stretch mode. It grips: a driven node is held to the punch
-// rather than released, which is right for a monotonic push and wrong for
-// rebound.
+// Where the punch's motion comes from. See §6 -- the two are the same rigid
+// gripping punch and differ only in what sets its speed.
+enum class Drive {
+    // A travel is prescribed: the punch moves at `speed` whatever the plating
+    // does, as if infinitely heavy. The original, and still the default, because
+    // it is the drive a *convergence* question wants -- two meshes compared at one
+    // penetration are comparable, where two meshes compared at one energy stop at
+    // two different penetrations and the difference has both effects in it.
+    Prescribed,
+    // A striking body of `mass` arrives at `speed` and the plating decelerates it.
+    // The run ends when it stops, having spent `1/2 mass speed^2` on the patch --
+    // so the travel is an output and the energy is the input, which is the way
+    // round a collision actually delivers it.
+    Inertial,
+};
+
+// A rigid flat punch, rectangular in the patch's own in-plane frame, travelling
+// along -axis. Nodes on the **outer face only** are driven, so the plate is free
+// to thin under the punch -- which is the whole reason the element keeps a
+// thickness stretch mode. It grips: a driven node is held to the punch rather than
+// released, which is right for a monotonic push and wrong for rebound.
 // A footprint with a non-positive half-extent is **no punch at all**, which is
 // how a patch is asked to carry no load. Leaving the footprint and setting the
 // speed to zero is a different thing -- a stationary punch still holds the nodes
@@ -419,15 +556,66 @@ Patch buildPatch(const StructuralMesh& structure, const Vec3& impact,
 struct Indenter {
     double halfLength = 1.0;  // m along `Patch::right`
     double halfWidth = 1.0;   // m along `Patch::up`
-    double speed = 6.0;       // m/s
-    double stopAt = 0.5;      // m of penetration; the run ends here
+    // m/s. Constant under `Prescribed`; the speed the striking body *arrives* at
+    // under `Inertial`, after which it is the solver's to decide.
+    //
+    // Zero is a *stationary punch* under `Prescribed` -- it still holds the nodes
+    // it touches, which is what stops an unloaded patch translating freely -- and
+    // is **refused** under `Inertial`, where it is a body carrying no energy. It is
+    // refused rather than allowed to stop on the first step, because that would
+    // make a run's termination turn on an exact floating-point zero and it does not
+    // reach one: the internal force at the rest configuration is a rounding residue,
+    // and a striker released at zero picks up ~1e-29 m/s from it and runs to
+    // `maxSteps` having travelled 1e-33 m. Measured, not supposed.
+    double speed = 6.0;
+    // m of penetration at which the run ends. Under `Inertial` it is a **cap and
+    // not the answer** -- the energy is meant to end the run -- so a run that hits
+    // it says so in `SolveResult::problems`, for the same reason
+    // `ImpactDamage::energyUnspent` exists. Zero removes the cap; under `Inertial`
+    // that is only allowed when `SolveParams::duration` bounds the run instead,
+    // because a perforating punch coasts and `maxSteps` is a budget rather than a
+    // bound. See §6.
+    double stopAt = 0.5;
     // Seconds over which the speed rises linearly from zero. Zero starts the punch
     // at full speed, which is a genuine step in velocity: the plate ahead of it
     // sees rho*c*v, 280 MPa at 6 m/s, and rings for as long as the run lasts. A
     // ramp is a statement about the striking body's own compliance rather than a
     // numerical fudge, and the energy account holds either way.
+    //
+    // **`Prescribed` only.** An inertial punch's speed is its own state, and a body
+    // with a mass genuinely does arrive travelling; a ramp on it would be a
+    // statement about a compliance the mass has now made representable properly.
+    // Setting one anyway is reported rather than quietly honoured or dropped.
     double rampTime = 0.0;    // s
+
+    Drive drive = Drive::Prescribed;
+    // kg, `Inertial` only, and it is the *effective* mass of the striking pair at
+    // the contact rather than either ship's -- `collision.hpp`'s
+    // `ImpulseSolution::effectiveMass`. A published damage table in this repo once
+    // used one whole ship's mass as though all of it reached the plating; the
+    // reduced mass is the quantity that does not make that mistake.
+    double mass = 0.0;
+
+    // There was a `kineticEnergy()` here, `1/2 mass speed^2`, and it is gone. It
+    // had no consumer -- `SolveResult::indenterEnergy` is the same quantity, taken
+    // from the state the solver actually ran with -- and mutation testing found it
+    // by dropping the half and surviving the entire suite. An accessor nothing
+    // calls is an accessor nothing tests; the table in CLAUDE.md already records
+    // that exact shape shipping in a well-tested commit.
 };
+
+// The speed at which a body of `mass` carries `energy`: sqrt(2E/m). What to set
+// `Indenter::speed` to when the collision is known by its joules rather than by a
+// closing speed -- `collision.hpp` names both halves, so
+//
+//     indenter.mass  = solution.effectiveMass;
+//     indenter.speed = zone::impactSpeed(solution.energyLost, solution.effectiveMass);
+//
+// makes `1/2 m v^2` exactly the `(1 - e^2)/2 m_eff u^2` that collision took out of
+// the two ships' motion. Zero for a non-positive mass or energy, because there is
+// no such body; the caller gets a punch that does not move rather than an
+// infinity.
+double impactSpeed(double energy, double mass);
 
 // The stress the hull girder is *already* carrying through this patch when it is
 // promoted, and the thing §5 item 1 records as missing.
@@ -554,6 +742,10 @@ struct SolveParams {
 struct Sample {
     double time = 0, penetration = 0, force = 0;
     double work = 0, strainEnergy = 0, dissipation = 0, kinetic = 0;
+    // The punch's own speed. Constant on the prescribed drive and the whole story
+    // on the inertial one, where it is what turns a travel history into an energy
+    // history -- see §6.
+    double indenterSpeed = 0;
     int tornElements = 0;
 };
 
@@ -588,10 +780,49 @@ struct SolveResult {
     // a drive, so the balance below is unchanged for every case that has none.
     double boundaryWork = 0;         // J
     int drivenEdgeDof = 0;           // DOF the perimeter drive actually moves
+    // **How far this is from closing at ship scale, which was never written down.**
+    // The unit fixtures close it to a fraction of a percent, and that is what the
+    // suite asserts. On the ferry's own patch it is **-9.5% before anything tears
+    // and -102% once it does** -- dissipation 4.638 MJ against work 2.755 MJ, so
+    // the dissipation alone exceeds the work. The mechanism is already diagnosed
+    // (the co-rotational small-strain measure, which is why the residual does not
+    // move with the timestep); what was missing is its *size* on a real run, and a
+    // reader who had only seen the unit figures would reasonably take this as a
+    // primary check on a tearing solve. It is not one.
+    //
+    // `indenterResidual()` below is, on exactly those runs: 0.02-0.16% where this
+    // is 25-102% open, because it involves only the punch's kinematics and the
+    // force actually reported, and it converges with the step where this does not.
     double energyResidual() const {
         return (work + boundaryWork) -
                ((strainEnergy - initialStrainEnergy) + dissipation + kinetic + dampingLoss);
     }
+
+    // --- The striking body's half of the same account, `Drive::Inertial` only ----
+    //
+    // The account above says where the energy the indenter spent *went*. These say
+    // where it came *from*, which a prescribed punch cannot answer -- it has an
+    // unbounded supply by construction. All zero on the prescribed drive, so
+    // nothing that has none of these changes.
+    double indenterMass = 0;      // kg, the striking body's effective mass
+    double indenterSpeed = 0;     // m/s, its travel speed now
+    double indenterEnergy = 0;    // J, 1/2 m v0^2 -- what it arrived with
+    double indenterKinetic = 0;   // J, 1/2 m v^2  -- what it still has
+    // True when the run ended because the striker stopped, which is the *intended*
+    // ending: the energy was spent and the penetration below is what it bought.
+    // False on a run that hit `stopAt`, `duration` or `maxSteps` first, and those
+    // are travel caps rather than answers.
+    bool indenterArrested = false;
+
+    // What the striker lost, against what the indenter spent. They differ by the
+    // grip: bringing the punch and the plating it holds to a common speed each step
+    // is a perfectly inelastic collision, and the punch's own share of that loss is
+    // `1/2 m (dv)^2` summed over the run -- second order in the step, so this is
+    // **first order in dt overall** and goes to zero under refinement. That makes
+    // it a convergence check with a rate rather than a tolerance, which is more
+    // than `energyResidual()` can offer: that one is limited by the co-rotational
+    // strain measure and does *not* move with the step.
+    double indenterResidual() const { return (indenterEnergy - indenterKinetic) - work; }
 
     int yieldedElements = 0;
     int tornElements = 0;
@@ -781,6 +1012,16 @@ private:
     std::vector<std::uint32_t> edgeDof_;
     std::vector<double> edgeFree_;
     double edgeFraction(double time) const;
+
+    // The striking body, `Drive::Inertial` only. `punchMass_` stays at zero on the
+    // prescribed drive and **is the branch the step loop tests**, so that path
+    // executes the same arithmetic in the same order it always did -- a negative
+    // control the tests assert bit-for-bit rather than to a tolerance.
+    // `drivenMass_` is the plating the punch grips, which moves with it and is
+    // therefore part of the assembly's inertia, not part of what resists.
+    double punchMass_ = 0;    // kg
+    double drivenMass_ = 0;   // kg
+    double punchSpeed_ = 0;   // m/s
     bool done_ = false;
 };
 
