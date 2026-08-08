@@ -1802,6 +1802,502 @@ void testAdoptingAStateReproducesTheRunThatMadeIt() {
                historyUntouched);
 }
 
+// --- 23. A collision delivers joules, not a travel ------------------------------
+//
+// `zone.hpp` §6. The four things these have to say, in order of how badly a wrong
+// implementation would hide:
+//
+//   * the two drives are **one formulation**, not two that agree -- a heavy enough
+//     inertial punch reproduces a prescribed one, and the error falls like 1/mass;
+//   * driving by the energy a travel absorbed reproduces that travel, which is the
+//     closed-form tie the whole entry point exists for;
+//   * the striker cannot end up faster than it arrived, on a run that tears --
+//     the property `Prescribed` had for free and the one an energy drive is
+//     suspected of losing;
+//   * and the membrane model, asked the same question in the same units.
+
+// The small strip's punch, in one place: three of the tests below drive it.
+zone::SolveParams smallStripPunch(double stopAt) {
+    zone::SolveParams solve;
+    solve.indenter.halfLength = 0.03;
+    solve.indenter.halfWidth = 0.08;
+    solve.indenter.speed = 20.0;
+    solve.indenter.stopAt = stopAt;
+    return solve;
+}
+
+// And the long strip's line punch, which is the geometry `testAgainstTheMembraneModel`
+// uses because it is the one the membrane model's own idealisation holds on.
+zone::SolveParams lineStripPunch(double stopAt) {
+    zone::SolveParams solve;
+    solve.indenter.halfLength = 0.06;  // a line across the strip
+    solve.indenter.halfWidth = 1e3;    // the full length
+    solve.indenter.speed = 20.0;
+    solve.indenter.stopAt = stopAt;
+    return solve;
+}
+
+void testTheTwoDrivesAreOneFormulation() {
+    std::printf("\n   the inertial punch is the prescribed one with a finite mass\n");
+    const StructuralMesh strip = flatStrip(0.6, 0.3, 0.006, 3, 1);
+    const zone::Patch patch = zone::buildPatch(strip, {0.05, 0, 0}, flatParams(2));
+
+    zone::Solver prescribed(patch, unbreakableSteel(), smallStripPunch(0.05));
+    const zone::SolveResult reference = prescribed.run();
+
+    // **The negative control, and it is bit-for-bit.** `Indenter::mass` is set to
+    // something enormous on a run that never asks for it. Nothing may move: a
+    // future edit that decided the drive from `mass != 0` -- which is the idiom
+    // the driven perimeter three fields away legitimately uses -- would silently
+    // convert every existing caller, and no tolerance could tell.
+    zone::SolveParams carrying = smallStripPunch(0.05);
+    carrying.indenter.mass = 1.0e9;
+    zone::Solver ignored(patch, unbreakableSteel(), carrying);
+    const zone::SolveResult inert = ignored.run();
+    bool identical = inert.work == reference.work && inert.force == reference.force &&
+                     inert.steps == reference.steps;
+    for (std::size_t i = 0; i < prescribed.position().size(); ++i)
+        identical = identical && ignored.position()[i] == prescribed.position()[i];
+    expectTrue("a striking mass on a prescribed drive changes not one bit", identical);
+
+    // The limit itself. A punch heavy enough is a prescribed punch, and the *rate*
+    // is the claim rather than any one tolerance: the grip redistributes momentum
+    // between the striker and the plating it holds, so the departure from the
+    // prescribed answer is the mass ratio and falls like 1/mass. Three decades of
+    // it, which no single tolerance could assert.
+    std::printf("     %14s %14s %14s\n", "striking mass", "worst node", "of travel");
+    double previous = 0;
+    double ratio = 0;
+    for (double mass : {1.0e9, 1.0e12}) {
+        zone::SolveParams heavy = smallStripPunch(0.05);
+        heavy.indenter.drive = zone::Drive::Inertial;
+        heavy.indenter.mass = mass;
+        zone::Solver solver(patch, unbreakableSteel(), heavy);
+        solver.run();
+        double worst = 0, travelled = 0;
+        for (std::size_t i = 0; i < prescribed.position().size(); ++i) {
+            worst = std::max(worst, std::abs(solver.position()[i] - prescribed.position()[i]));
+            travelled =
+                std::max(travelled, std::abs(prescribed.position()[i] - patch.mesh.position[i]));
+        }
+        std::printf("     %14.0e %14.3e %14.3e\n", mass, worst, worst / travelled);
+        if (previous > 0) ratio = previous / worst;
+        previous = worst;
+        expectTrue("a striker of 1e9 kg or more follows the prescribed punch to a part in 1e7",
+                   worst < 1e-7 * travelled);
+    }
+    std::printf("     a thousandfold heavier striker is %.1f times closer\n", ratio);
+    // 1000, measured at 1000.9 -- the departure is first order in the mass ratio
+    // and nothing else, so this is allowed to be asserted to a per cent.
+    expectNear("and the departure falls exactly like 1 / mass", ratio, 1000.0, 20.0);
+
+    // The guard the limit needs: a striker light enough to be stopped must *not*
+    // reproduce the prescribed run, or every line above is a statement about a
+    // branch that never ran.
+    zone::SolveParams light = smallStripPunch(0.05);
+    light.indenter.drive = zone::Drive::Inertial;
+    light.indenter.mass = 150.0;
+    zone::Solver stopped(patch, unbreakableSteel(), light);
+    const zone::SolveResult arrested = stopped.run();
+    std::printf("     a 150 kg striker stops at %.5f m where the prescribed punch reached %.5f\n",
+                arrested.penetration, reference.penetration);
+    expectTrue("a striker light enough to be stopped is stopped",
+               arrested.indenterArrested && arrested.penetration < 0.95 * reference.penetration);
+}
+
+void testDrivingByEnergyReproducesDrivingByTravel() {
+    std::printf("\n   the same collision by travel and by energy\n");
+    const StructuralMesh strip = flatStrip(1.6, 0.8, 0.020, 8, 4);
+    const zone::Patch patch = zone::buildPatch(strip, {0, 0, 0}, flatParams(1));
+
+    const double depth = 0.24;
+    zone::Solver prescribed(patch, unbreakableSteel(), lineStripPunch(depth));
+    const zone::SolveResult travelled = prescribed.run();
+    std::printf("     driven to %.3f m it absorbed %.6g J\n", travelled.penetration,
+                travelled.work);
+
+    // Hand that back as a striking body: the mass a 20 m/s striker needs to carry
+    // exactly those joules. `impactSpeed` inverts the same relation, so it is used
+    // the other way round here as a check that it does.
+    const double speed = 20.0;
+    const double mass = 2.0 * travelled.work / (speed * speed);
+    expectNear("impactSpeed inverts the energy the mass was chosen from",
+               zone::impactSpeed(travelled.work, mass), speed, 1e-12 * speed);
+
+    zone::SolveParams spending = lineStripPunch(2.5 * depth);  // a cap, not the answer
+    spending.indenter.drive = zone::Drive::Inertial;
+    spending.indenter.mass = mass;
+    zone::Solver striker(patch, unbreakableSteel(), spending);
+    const zone::SolveResult spent = striker.run();
+
+    std::printf("     %.0f kg at %.0f m/s carries the same %.6g J and stops at %.6f m"
+                " (%+.3f%%)\n", mass, speed, spent.indenterEnergy, spent.penetration,
+                100.0 * (spent.penetration / travelled.penetration - 1.0));
+    expectTrue("the striker stopped because it ran out, not because a cap ended it",
+               spent.indenterArrested);
+    // 0.156%, measured. The two runs are not the same trajectory -- one is at
+    // constant speed and the other decelerates to nothing -- so this is a statement
+    // that the answer is a function of the energy and not of the path, which holds
+    // only because the run is quasi-static. It is asserted at three times what was
+    // measured rather than at a round number.
+    expectNear("driving by the energy a travel absorbed reproduces that travel",
+               spent.penetration, travelled.penetration, 0.005 * travelled.penetration);
+    expectNear("having spent it", spent.work, travelled.work, 0.01 * travelled.work);
+
+    // **The vacuity guard, and it is the load-bearing one.** If the travel cap were
+    // silently deciding the answer, or if the energy were not reaching the plating,
+    // every energy would give the same depth. Half the energy has to give a
+    // materially shorter travel.
+    zone::SolveParams half = spending;
+    half.indenter.mass = 0.5 * mass;
+    zone::Solver lighter(patch, unbreakableSteel(), half);
+    const zone::SolveResult shorter = lighter.run();
+    std::printf("     half the energy reaches %.6f m, %.1f%% of the way\n", shorter.penetration,
+                100.0 * shorter.penetration / travelled.penetration);
+    expectTrue("half the energy gets materially less far, so energy decides the travel",
+               shorter.indenterArrested && shorter.penetration < 0.8 * travelled.penetration);
+    expectTrue("and it is not simply proportional, because the resistance rises",
+               shorter.penetration > 0.5 * travelled.penetration);
+
+    // The patch's own account closes the same either way -- the drive does not
+    // change what the residual is limited by, which is the co-rotational strain
+    // measure `testTheEnergyAccountCloses` measures.
+    std::printf("     energy residual: %+.3f%% driven by travel, %+.3f%% driven by energy\n",
+                100.0 * travelled.energyResidual() / travelled.work,
+                100.0 * spent.energyResidual() / spent.work);
+    expectNear("the account closes to the same figure whichever way it was driven",
+               spent.energyResidual() / spent.work, travelled.energyResidual() / travelled.work,
+               0.01);
+
+    // **And an energy-driven run ends at rest**, which is not a detail: the
+    // prescribed run stops mid-motion with 0.34% of its work still in the plating's
+    // velocity, and the energy-driven one has handed over everything. The answer is
+    // a settled deformation rather than a snapshot.
+    std::printf("     kinetic energy left: %.3e of the work by travel, %.3e by energy\n",
+                travelled.kinetic / travelled.work, spent.kinetic / spent.work);
+    expectTrue("a run that ends because the striker stopped ends at rest",
+               spent.kinetic < 1e-6 * spent.work);
+    expectTrue("where the prescribed run is still moving", travelled.kinetic > 1e-4 * travelled.work);
+
+    // --- The striker's own ledger, and why it is worth having --------------------
+    //
+    // `indenterResidual()` compares what the striking body lost with what the
+    // indenter spent. They differ only by the grip, which is second order in the
+    // step, so **this residual halves when the step does** -- a convergence rate
+    // rather than a tolerance, and something `energyResidual()` cannot offer
+    // because it is limited by the strain measure and does not move with the step
+    // at all.
+    const StructuralMesh small = flatStrip(0.6, 0.3, 0.006, 3, 1);
+    const zone::Patch bay = zone::buildPatch(small, {0.05, 0, 0}, flatParams(2));
+    std::printf("     %10s %8s %16s %10s\n", "safety", "steps", "striker residual", "halving");
+    double previous = 0;
+    for (double safety : {0.9, 0.45, 0.225}) {
+        zone::SolveParams refine = smallStripPunch(0.05);
+        refine.timestepSafety = safety;
+        refine.maxSteps = 400000;
+        refine.indenter.drive = zone::Drive::Inertial;
+        refine.indenter.mass = 150.0;
+        zone::Solver solver(bay, unbreakableSteel(), refine);
+        const zone::SolveResult run = solver.run();
+        std::printf("     %10.4f %8d %16.4f %10.3f\n", safety, run.steps, run.indenterResidual(),
+                    previous > 0 ? previous / run.indenterResidual() : 0.0);
+        expectTrue("the striker's ledger closes to a part in a thousand",
+                   std::abs(run.indenterResidual()) < 1.0e-3 * run.work);
+        if (previous > 0)
+            // 1.97 then 1.86, measured. First order, which is what a grip loss of
+            // 1/2 m (dv)^2 per step summed over 1/dt steps has to be.
+            expectTrue("and halving the step at least 1.7-folds it",
+                       previous / run.indenterResidual() > 1.7);
+        previous = run.indenterResidual();
+    }
+}
+
+void testAnInertialPunchCannotOutrunItsOwnEnergy() {
+    std::printf("\n   the bound that replaces a prescribed travel\n");
+    const StructuralMesh strip = flatStrip(1.6, 0.8, 0.020, 8, 4);
+    const zone::Patch patch = zone::buildPatch(strip, {0, 0, 0}, flatParams(1));
+
+    // What it costs to tear the first element, taken from a prescribed run so the
+    // energies below are multiples of a measured quantity rather than of a guess.
+    zone::SolveParams driven = lineStripPunch(0.30);
+    driven.historyStride = 10;
+    zone::Solver prescribed(patch, plasticity::shipSteel(), driven);
+    const zone::SolveResult reference = prescribed.run();
+    double tearEnergy = 0, tearDepth = 0;
+    for (const zone::Sample& sample : reference.history)
+        if (sample.tornElements > 0 && tearEnergy == 0) {
+            tearEnergy = sample.work;
+            tearDepth = sample.penetration;
+        }
+    std::printf("     the first element lets go at %.5f m, having cost %.6g J\n", tearDepth,
+                tearEnergy);
+    expectTrue("the reference run tore, so there is an energy to be a multiple of",
+               tearEnergy > 0);
+
+    const double speed = 20.0;
+    for (double multiple : {1.2, 2.0}) {
+        zone::SolveParams spending = lineStripPunch(0.30);
+        spending.indenter.drive = zone::Drive::Inertial;
+        spending.indenter.mass = 2.0 * multiple * tearEnergy / (speed * speed);
+        spending.maxSteps = 200000;
+        spending.historyStride = 1;   // every step, because the bound is on every step
+        zone::Solver solver(patch, plasticity::shipSteel(), spending);
+        const zone::SolveResult run = solver.run();
+
+        double fastest = 0;
+        for (const zone::Sample& sample : run.history)
+            fastest = std::max(fastest, sample.indenterSpeed);
+        std::printf("     %.1fx that energy: %d of %zu elements torn, %.5f m, fastest %.9f m/s"
+                    " against %.1f arriving, %.5g J unspent\n", multiple, run.tornElements,
+                    patch.elementCount(), run.penetration, fastest, speed, run.indenterKinetic);
+
+        // **The property `Prescribed` had for free.** Nothing does work on the
+        // punch, so its kinetic energy cannot rise -- through the tearing, through
+        // the release of every element it deletes, through the elastic springback
+        // behind it. Asserted on every step of the run and not on the last one.
+        expectTrue("the striker is never going faster than it arrived", fastest <= speed);
+
+        // **And the grip conserves momentum, exactly.** Bringing the striker and
+        // the plating it holds to a common speed is a perfectly inelastic
+        // collision, so the impulse the punch reports is precisely the momentum it
+        // lost -- `m (v_before - v_after) = F dt` -- every step, to floating point
+        // rather than to an order. It is the one closed form in this whole file
+        // that the constitutive path cannot get in the way of, and it is checked on
+        // every one of the thousands of steps rather than on a total.
+        double worstImpulse = 0, largestForce = 0;
+        double before = speed;
+        for (const zone::Sample& sample : run.history) {
+            const double momentum = spending.indenter.mass * (before - sample.indenterSpeed);
+            worstImpulse = std::max(worstImpulse,
+                                    std::abs(momentum - sample.force * run.timestep));
+            largestForce = std::max(largestForce, std::abs(sample.force) * run.timestep);
+            before = sample.indenterSpeed;
+        }
+        std::printf("       the grip's momentum balance is out by at most %.3e N s on"
+                    " impulses up to %.4g\n", worstImpulse, largestForce);
+        // 1.0e-14 relative, measured, on the worst step of both runs. Asserted at
+        // ten times that rather than at a round number: the identity is exact in
+        // real arithmetic, so what is left is the ulps of a sum over the gripped
+        // nodes and one division, and a tolerance a thousand times looser would
+        // pass on a grip that had lost the property and merely stayed close.
+        expectTrue("the impulse the punch reports is the momentum it lost, every step",
+                   worstImpulse < 1e-13 * largestForce);
+        expectTrue("and there were real impulses to balance", largestForce > 0);
+        expectTrue("and it really did tear something, so the release was there to survive",
+                   run.tornElements > 0);
+        // Guard: a punch that never slowed would satisfy the bound trivially.
+        expectTrue("and it really was decelerated", fastest < 0.999 * speed);
+
+        // **`indenterKinetic` against its own definition, as an identity.** It is
+        // reported rather than derived by a reader, so nothing else in the file
+        // pins it -- and mutation testing found exactly that: doubling it survived
+        // the whole suite, because every other assertion on it is made at *arrest*,
+        // where it is zero and the error cancels. Two checks that do not have that
+        // blind spot: the closed form, and the striker's ledger on the run that
+        // does not arrest.
+        expectNear("what the striker still carries is 1/2 m v^2 of what it is doing",
+                   run.indenterKinetic,
+                   0.5 * spending.indenter.mass * run.indenterSpeed * run.indenterSpeed,
+                   1e-12 * run.indenterEnergy);
+
+        if (multiple < 1.5) {
+            // Enough to tear, not enough to get through: the striker stops.
+            expectTrue("a striker that tears and stops reports that it stopped",
+                       run.indenterArrested);
+            expectTrue("with nothing left", run.indenterKinetic < 1e-6 * run.indenterEnergy);
+            expectTrue("and it did not tear its way clear", run.tornElements <
+                       static_cast<int>(patch.elementCount()) / 2);
+            expectTrue("nothing complained", run.problems.empty());
+        } else {
+            // Enough to get through. **The travel cap ends it, and that is the case
+            // §6 is about**: a punch with nothing left under it meets no force and
+            // coasts, so `stopAt` is doing real work here and the run has to say so
+            // rather than report a penetration the energy did not decide.
+            expectTrue("a striker that punches through does not arrest", !run.indenterArrested);
+            expectTrue("it is still carrying energy the patch could not take",
+                       run.indenterKinetic > 0.05 * run.indenterEnergy);
+            // The ledger, on the one run in this file where what is left over is a
+            // large number rather than zero: what the striker lost is what the
+            // indenter spent, to 0.17% -- measured, and the grip loss is all of it.
+            std::printf("       arrived with %.6g J, spent %.6g, still carrying %.6g;"
+                        " ledger %+.4g\n", run.indenterEnergy, run.work, run.indenterKinetic,
+                        run.indenterResidual());
+            expectTrue("and the striker's ledger closes with that much still in hand",
+                       std::abs(run.indenterResidual()) < 5e-3 * run.work);
+            bool warned = false;
+            for (const std::string& problem : run.problems)
+                warned = warned || problem.find("travel cap") != std::string::npos;
+            expectTrue("and the run says the cap decided the penetration, not the energy",
+                       warned);
+        }
+    }
+
+    // The refusals. An inertial drive with no mass, or with nothing to bound its
+    // travel, is a request that cannot be honoured; falling back on the prescribed
+    // drive would hand back exactly the assumed penetration this entry point
+    // exists to remove, so it refuses instead. The *reason* is checked and not just
+    // the refusal, because a refusal for the wrong reason is a passing test over a
+    // broken check.
+    struct Bad {
+        const char* what;
+        const char* says;
+        double mass, stopAt, duration, halfLength;
+    };
+    for (const Bad& bad :
+         {Bad{"no striking mass", "striking mass and approach speed", 0.0, 0.10, 0.0, 0.06},
+          Bad{"nothing to bound it", "travel or a duration", 1000.0, 0.0, 0.0, 0.06},
+          // A footprint that touches nothing. The prescribed drive tolerates it --
+          // that is how a patch is asked to carry no load -- but an inertial punch
+          // that grips nothing is never decelerated by anything, so it coasts to
+          // the cap and reports a perforation it never made.
+          Bad{"a footprint on nothing", "touches nothing", 1000.0, 0.10, 0.0, 0.0}}) {
+        zone::SolveParams broken = lineStripPunch(bad.stopAt);
+        broken.indenter.halfLength = bad.halfLength;
+        broken.indenter.drive = zone::Drive::Inertial;
+        broken.indenter.mass = bad.mass;
+        broken.duration = bad.duration;
+        zone::Solver solver(patch, plasticity::shipSteel(), broken);
+        const zone::SolveResult run = solver.run();
+        bool why = false;
+        for (const std::string& problem : run.problems)
+            why = why || problem.find(bad.says) != std::string::npos;
+        std::printf("     %-22s -> %d step(s), %zu problem(s), the right one: %d\n", bad.what,
+                    run.steps, run.problems.size(), static_cast<int>(why));
+        expectTrue("a drive that cannot be honoured solves nothing rather than falling back",
+                   run.steps == 0 && why);
+    }
+
+    // **A duration alone is a bound**, which is the other half of that refusal and
+    // would otherwise be documented and untested -- a check demanding *both* would
+    // pass every test above and refuse a legitimate caller.
+    zone::SolveParams timed = lineStripPunch(0.0);
+    timed.indenter.drive = zone::Drive::Inertial;
+    timed.indenter.mass = 1.0e5;
+    timed.duration = 5.0e-4;
+    zone::Solver timedSolver(patch, plasticity::shipSteel(), timed);
+    const zone::SolveResult ranOnTime = timedSolver.run();
+    std::printf("     a duration alone bounds it -> %d step(s), %.5f m\n", ranOnTime.steps,
+                ranOnTime.penetration);
+    expectTrue("a duration is a bound even with no travel cap",
+               ranOnTime.steps > 0 && ranOnTime.completed && ranOnTime.penetration > 0);
+
+    // **A striker arriving at rest is refused, and the first version of this test
+    // expected it to arrest instead.** That was the wrong expectation and the run
+    // said so: `arrested` is `!(speed > 0)`, and a striker released at zero picks up
+    // about 1e-29 m/s from the rounding residue in the internal force at the rest
+    // configuration, so it never satisfies the test and travels 1e-33 m over
+    // `maxSteps`. A termination decided by an exact floating-point zero is the
+    // trapdoor `sectionElements` fell through; the input is refused instead. Worth
+    // pinning because `impactSpeed` hands back zero for an energy or a mass it
+    // cannot use, so this is the shape a mis-piped collision arrives in.
+    zone::SolveParams still = lineStripPunch(0.10);
+    still.indenter.drive = zone::Drive::Inertial;
+    still.indenter.mass = 1000.0;
+    still.indenter.speed = 0.0;
+    still.maxSteps = 64;   // so a solver that did not refuse is cheap to catch
+    zone::Solver stillSolver(patch, plasticity::shipSteel(), still);
+    const zone::SolveResult wentNowhere = stillSolver.run();
+    bool announced = false;
+    for (const std::string& problem : wentNowhere.problems)
+        announced = announced || problem.find("approach speed") != std::string::npos;
+    std::printf("     a striker at rest -> %d step(s), refused: %d\n", wentNowhere.steps,
+                static_cast<int>(announced));
+    expectTrue("a striker with no energy is refused rather than left to run the clock out",
+               wentNowhere.steps == 0 && announced);
+    expectTrue("and `impactSpeed` produces exactly that input from an energy it cannot use",
+               zone::impactSpeed(-1.0, 1000.0) == 0.0 && zone::impactSpeed(1.0, 0.0) == 0.0);
+    // And a ramp, which belongs to the other drive, is reported rather than
+    // honoured or dropped in silence.
+    zone::SolveParams ramped = lineStripPunch(0.02);
+    ramped.indenter.drive = zone::Drive::Inertial;
+    ramped.indenter.mass = 1.0e6;
+    ramped.indenter.rampTime = 1.0e-3;
+    zone::Solver rampedSolver(patch, plasticity::shipSteel(), ramped);
+    const zone::SolveResult ranAnyway = rampedSolver.run();
+    bool said = false;
+    for (const std::string& problem : ranAnyway.problems)
+        said = said || problem.find("rampTime") != std::string::npos;
+    expectTrue("a ramp on an inertial punch is reported, not silently applied", said);
+    expectTrue("and the run still happened", ranAnyway.steps > 0);
+}
+
+void testAgainstTheMembraneModelOnEnergy() {
+    std::printf("\n   against indentation.hpp with the same joules given to both\n");
+    // `testAgainstTheMembraneModel` drives both models to one depth and compares
+    // the energies. This is the same comparison run the other way -- the way a
+    // collision actually poses it -- and it is a different assertion rather than a
+    // restatement: the FEM's depth is now an output of a solve rather than an input
+    // to one, and the membrane model's is the closed-form inverse of its own energy
+    // integral.
+    const double lengthX = 1.6, spanY = 0.8, thickness = 0.020;
+    const StructuralMesh strip = flatStrip(lengthX, spanY, thickness, 8, 4);
+    const zone::Patch patch = zone::buildPatch(strip, {0, 0, 0}, flatParams(1));
+
+    IndentedPanel membrane;
+    membrane.span = spanY;
+    membrane.thickness = thickness;
+    membrane.contactWidth = lengthX;
+    membrane.yieldStrength = ah36Steel().yieldStrength;
+    membrane.failureStrain = 1.0;
+    expectTrue("the membrane model is being used inside what it claims",
+               validateIndentation(membrane).empty());
+
+    std::printf("     %12s %12s %12s %12s %10s %10s\n", "energy (MJ)", "membrane", "corrected",
+                "FEM", "FEM/mem", "FEM/corr");
+    const double speed = 20.0;
+    for (double energy : {1.5e6, 3.0e6}) {
+        zone::SolveParams spending = lineStripPunch(0.60);
+        spending.indenter.drive = zone::Drive::Inertial;
+        spending.indenter.mass = 2.0 * energy / (speed * speed);
+        spending.maxSteps = 200000;
+        zone::Solver solver(patch, unbreakableSteel(), spending);
+        const zone::SolveResult fem = solver.run();
+        expectTrue("the striker spent its energy rather than hitting the cap",
+                   fem.indenterArrested);
+
+        const double membraneDepth = penetrationForEnergy(membrane, energy);
+        // The same two corrections `testAgainstTheMembraneModel` derives and asserts
+        // on energy at a fixed depth: the FEM carries the tension at the hardening
+        // flow stress averaged over the path, under the plane-strain constraint the
+        // clamped side edges impose. Applied here to the *energy* before inverting,
+        // which is the only place it can go when the depth is what is being
+        // predicted.
+        const double strain = membraneStrain(spanY, fem.penetration);
+        double meanFlow = 0;
+        const int samples = 2000;
+        for (int i = 0; i < samples; ++i)
+            meanFlow += plasticity::flowStress(unbreakableSteel().flow,
+                                               strain * (i + 0.5) / samples) / samples;
+        const double stiffer = (meanFlow / membrane.yieldStrength) * 2.0 / std::sqrt(3.0);
+        const double corrected = penetrationForEnergy(membrane, energy / stiffer);
+        std::printf("     %12.3f %12.5f %12.5f %12.5f %10.4f %10.4f\n", energy / 1e6,
+                    membraneDepth, corrected, fem.penetration, fem.penetration / membraneDepth,
+                    fem.penetration / corrected);
+
+        // The direction is predicted, not observed: the FEM is the stiffer model on
+        // force -- 1.8 to 2.4 times, which `zone.hpp` §3 and `02-simulation.md` §3
+        // both publish -- so for the same joules it must get in *less* far.
+        expectTrue("the same energy gets the FEM less deep, because it resists harder",
+                   fem.penetration < membraneDepth);
+        // 0.706 and 0.683, measured, over a twofold range of energy. Flat, which is
+        // the same thing `indentation.hpp` records when it says the span reaches the
+        // hole only through the failure-strain regularisation: what sets a
+        // penetration is energy per unit struck area.
+        expectTrue("and by a factor that is nearly the same at both energies",
+                   fem.penetration > 0.65 * membraneDepth &&
+                       fem.penetration < 0.75 * membraneDepth);
+        // With the two corrections in, most of that gap is accounted for and the
+        // rest is bending and the strip's own ends -- the same residue the
+        // fixed-depth comparison attributes 25% of the energy to, which at a
+        // roughly linear energy-depth relation is this much of a depth.
+        expectNear("corrected, the two models agree to a tenth on penetration",
+                   fem.penetration / corrected, 1.0, 0.15);
+        // Guard: the correction has to move the answer, or the line above is the
+        // uncorrected comparison wearing a hat.
+        expectTrue("and the correction is a substantial one", corrected < 0.85 * membraneDepth);
+    }
+}
+
 }  // namespace
 
 void runZoneTests() {
@@ -1828,4 +2324,8 @@ void runZoneTests() {
     testStiffenersHoldOnlyWhatTheyReach();
     testTheRestFormsCacheChangesNothing();
     testAdoptingAStateReproducesTheRunThatMadeIt();
+    testTheTwoDrivesAreOneFormulation();
+    testDrivingByEnergyReproducesDrivingByTravel();
+    testAnInertialPunchCannotOutrunItsOwnEnergy();
+    testAgainstTheMembraneModelOnEnergy();
 }

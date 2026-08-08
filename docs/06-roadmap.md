@@ -615,10 +615,28 @@ The longest and highest-risk phase.
   elements and plasticity that now exist. Every piece needed to replace it is now
   here — `promotion.hpp` sites a zone from the contact patch, hands it the
   girder's stress, and takes its damage back — and `tools/zone_probe` runs that
-  chain end to end on her side. What `ram_view` still lacks is the *energy*
-  bookkeeping: the zone takes a prescribed punch travel where a collision delivers
-  a number of joules, and closing that needs the striking body's mass, which is
-  `collision.hpp`'s to supply.
+  chain end to end on her side.
+
+  ~~What `ram_view` still lacks is the *energy* bookkeeping: the zone takes a
+  prescribed punch travel where a collision delivers a number of joules, and
+  closing that needs the striking body's mass, which is `collision.hpp`'s to
+  supply.~~ **The zone takes the joules now** — `zone.hpp` §6,
+  `zone::Drive::Inertial`, and `zone::impactSpeed` turns `collision.hpp`'s own
+  `ImpulseSolution::effectiveMass` and `energyLost` into the arrival speed that
+  carries them. `zone_probe` drives the same collision both ways and prints the two
+  answers against the membrane model's closed-form inverse.
+
+  **Nothing in the figures above moves, and that is the point rather than a
+  let-off.** `ram_view` spends its energy through `indentation.hpp`, which has been
+  energy-driven since it was written; the gap was that the *Tier-2* zone had no
+  such entry point, so the expensive model could not be asked the question the
+  cheap one already answered. What the two now say about the ferry's own side, on
+  the 2.755 MJ a 0.22 m punch costs: the membrane model on the longitudinal span
+  tears the bay outright, and the FEM reaches the same 0.22 m with 11% of the
+  striker's energy still unspent, tearing 42 elements where a punch driven at a
+  constant 6 m/s tears 80. Replacing the tool's membrane with a zone is a
+  core-minutes decision and is not made here; what is made is that the question can
+  now be put to it.
 
   With the zone solver, the Tier-0 coupling and the Craig–Bampton reduction done,
   the largest thing outstanding in Phase 3 was **the Tier-1 coupling** — three

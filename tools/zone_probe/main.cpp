@@ -24,9 +24,17 @@
 // -- so it is the instrument that settles it, and the number it produces is
 // printed against both readings.
 //
+// **And it drives the same collision twice.** `zone.hpp` §6: a collision delivers
+// joules, and until `Drive::Inertial` existed the zone consumed a prescribed
+// travel, so the depth of the hole was an assumption. The tool now runs the punch
+// to `--depth`, takes the energy that cost, and hands it straight back as a
+// striking body carrying exactly those joules -- and prints where *that* stops,
+// beside what the membrane model says the same joules would do. Three answers to
+// one question in the units a collision poses it in.
+//
 //   ./zone_probe [--speed=M_PER_S] [--depth=METRES] [--radius=METRES]
 //                [--sub=N] [--aim=X_METRES] [--height=Z_METRES] [--threads=N]
-//                [--elastic] [--no-preload]
+//                [--elastic] [--no-preload] [--no-energy] [--time-budget=X]
 #include "engine/core/jobs.hpp"
 #include "engine/sim/breach.hpp"
 #include "engine/sim/indentation.hpp"
@@ -65,6 +73,18 @@ struct Options {
     // stops a cost sweep from reaching the sizes the budget exists to refuse --
     // which are exactly the sizes a cost sweep wants.
     bool force = false;
+    // Skip the second, energy-driven solve. It roughly doubles the run, and a cost
+    // sweep or a mesh-convergence study wants the prescribed drive alone -- two
+    // meshes compared at one penetration are comparable, where two meshes compared
+    // at one energy stop at two different penetrations.
+    bool noEnergy = false;
+    // How much longer than the prescribed run the energy-driven one may take. It is
+    // a **cost** bound and not a travel one, and it is needed because the two are
+    // not the same: a striker that has nearly stopped crawls, so the last
+    // centimetres of an arresting run are the expensive ones. Measured on this very
+    // patch, an inertial punch that perforated and then coasted at 0.5 m/s took
+    // 216 000 steps against the prescribed run's 21 000.
+    double timeBudget = 3.0;
 };
 
 bool parse(int argc, char** argv, Options& o) {
@@ -82,6 +102,8 @@ bool parse(int argc, char** argv, Options& o) {
         else if (const char* v = value("sub")) o.subdivision = std::atoi(v);
         else if (const char* v = value("threads")) o.threads = std::atoi(v);
         else if (const char* v = value("forms-cache")) o.formsCache = v;
+        else if (const char* v = value("time-budget")) o.timeBudget = std::atof(v);
+        else if (a == "--no-energy") o.noEnergy = true;
         else if (a == "--force") o.force = true;
         else if (a == "--elastic") o.elastic = true;
         else if (a == "--no-preload") o.noPreload = true;
@@ -377,6 +399,97 @@ int main(int argc, char** argv) {
                 membrane(longSpan, before, false) / 1e6, membrane(longSpan, before, true) / 1e6);
     std::printf("%-38s %10s %12.2f %12.3f\n", "solid-shell FEM", "-", forceBefore / 1e6,
                 workBefore / 1e6);
+
+    // --- 5. The same collision, delivered as energy ------------------------------
+    //
+    // Everything above took a travel and reported the joules. A collision arrives
+    // the other way round, so the joules go back in: a striking body whose kinetic
+    // energy is exactly what the run above absorbed, released at the same approach
+    // speed, and stopped by the plating rather than by a number in a struct. See
+    // `zone.hpp` §6 for why the entry point is a mass and a velocity and not the
+    // energy itself.
+    //
+    // The membrane model is asked the same question in the same units --
+    // `penetrationForEnergy` is the closed-form inverse of its energy integral --
+    // so the three answers are comparable without either model being run twice.
+    if (!options.noEnergy && result.work > 0) {
+        const double energy = result.work;
+        const double mass = 2.0 * energy / (options.speed * options.speed);
+        sim::zone::SolveParams spending = solve;
+        spending.indenter.drive = sim::zone::Drive::Inertial;
+        spending.indenter.mass = mass;
+        spending.indenter.rampTime = 0.0;   // a body with a mass arrives travelling
+        // The travel cap stays where the prescribed run stopped, so the two answers
+        // are the same question; the *time* budget is the one that matters for cost,
+        // because a striker that has nearly stopped crawls and the last centimetres
+        // are the expensive ones.
+        spending.duration = options.timeBudget * options.depth / options.speed;
+        spending.maxSteps = 8000000;
+
+        sim::zone::Solver striker(patch, sim::plasticity::shipSteel(), spending);
+        const sim::zone::SolveResult& spent = striker.run();
+
+        std::printf("\nenergy : the %.3f MJ that travel cost, handed back as a %.0f t striker at"
+                    " %.1f m/s\n", energy / 1e6, mass / 1000.0, options.speed);
+        std::printf("         %s at %.4f m against the prescribed %.4f m; %.4f MJ of %.4f left"
+                    " unspent\n",
+                    spent.indenterArrested ? "stopped" : "still moving",
+                    spent.penetration, result.penetration, spent.indenterKinetic / 1e6,
+                    spent.indenterEnergy / 1e6);
+        std::printf("         %d element(s) torn against %d, %zu panel(s) against %zu;"
+                    " %d steps against %d, %.2f s wall\n",
+                    spent.tornElements, result.tornElements, spent.tornPanels.size(),
+                    result.tornPanels.size(), spent.steps, result.steps, spent.wallSeconds);
+        // The striker's own ledger. It closes far tighter than the patch's does --
+        // it involves only the punch's kinematics and the force it was handed, where
+        // the patch's runs through the whole constitutive path -- so the two are
+        // printed together rather than one standing for the other.
+        std::printf("         striker ledger %+.4g J on %.4g (%.4f%%); patch account"
+                    " %+.2f%%\n", spent.indenterResidual(), spent.work,
+                    spent.work > 0 ? 100.0 * spent.indenterResidual() / spent.work : 0.0,
+                    spent.work > 0 ? 100.0 * spent.energyResidual() / spent.work : 0.0);
+        for (const std::string& problem : spent.problems)
+            std::printf("       ! %s\n", problem.c_str());
+
+        // And the membrane model on the same joules, at both readings of the span.
+        // `membrane(span, d, true)` is the energy at a depth; this is its inverse,
+        // taken through `indentation.hpp`'s own closed form rather than by search.
+        //
+        // **Whether it tore is printed beside the depth, because otherwise the
+        // number is not a penetration at all.** `penetrationForEnergy` returns the
+        // *tearing* penetration once the energy exceeds what a bay can absorb
+        // intact, so a torn row is a bay that let go and not a bay that stopped the
+        // strike -- the two read identically in a column of metres.
+        std::printf("\n%.3f MJ into her side, three ways:\n", energy / 1e6);
+        std::printf("%-38s %10s %14s %10s\n", "", "span (m)", "depth (m)", "tore");
+        const char* label[2] = {"membrane, span = longitudinal spacing",
+                                "membrane, span = frame spacing"};
+        const double spans[2] = {shortSpan, longSpan};
+        for (int which = 0; which < 2; ++which) {
+            const double span = spans[which];
+            sim::IndentedPanel model;
+            model.span = span;
+            model.contactWidth = 2.0 * solve.indenter.halfLength;
+            model.thickness = patch.thickness;
+            model.yieldStrength = patch.material.yieldStrength;
+            model.failureStrain = sim::plasticity::regularisedFailureStrain(
+                sim::plasticity::shipSteel().failure, span, model.thickness);
+            const double bays = std::max(1.0, 2.0 * solve.indenter.halfWidth / span);
+            const double perBay = energy / bays;
+            const bool tore = perBay >= sim::energyToTear(model);
+            std::printf("%-38s %10.2f %14.4f %10s\n", label[which], span,
+                        sim::penetrationForEnergy(model, perBay), tore ? "yes, capped" : "no");
+        }
+        std::printf("%-38s %10s %14.4f %10s%s\n", "solid-shell FEM, energy-driven", "-",
+                    spent.penetration,
+                    spent.tornElements > 0 ? "yes" : "no",
+                    spent.indenterArrested ? "" : "   (depth is a cap, not the answer)");
+        // The bias, stated at the point of use rather than left in a header: this
+        // striker is rigid, so all of it went into her plating. A real bow crushes
+        // and takes a share, which makes every depth above an upper bound.
+        std::printf("the striking bow is rigid here, so every joule tore her plating: an upper"
+                    " bound on all three\n");
+    }
 
     std::printf("\nok\n");
     return 0;
