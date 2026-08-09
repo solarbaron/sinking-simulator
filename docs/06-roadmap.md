@@ -789,16 +789,68 @@ should be honest about that.
   already has: the stored stress starts outside the new surface and is returned to
   it, which is stress relaxation.
 
-  **What is missing is elongation, not strength, and it is four times larger.**
-  §3.4.1.1 gives 7.08e-3 of free strain at a 500 K rise against a 1.72e-3 yield
-  strain; a fully restrained member yields on expansion alone at 164.6 °C, where
-  `k_y` is still 1. That is the next item. Creep is *not* missing in the same
-  sense: §3.2.1's curves carry it implicitly for 2–50 K/min, and both fires
-  measured here (43 K/min under ISO 834, 114 K/min post-flashover) sit at or above
-  that band, where the implicit treatment is conservative. A fire that stabilises
-  and soaks is the case to revisit.
-- Thermal elongation and restraint (EN 1993-1-2 §3.4.1.1). The strength half is
-  done and this is the larger term for any restrained member — see above.
+  **What was missing was elongation, not strength, and it is four times larger.**
+  Done, and the item below records what it turned out to be. Creep is *not*
+  missing in the same sense: §3.2.1's curves carry it implicitly for 2–50 K/min,
+  and both fires measured here (43 K/min under ISO 834, 114 K/min post-flashover)
+  sit at or above that band, where the implicit treatment is conservative. A fire
+  that stabilises and soaks is the case to revisit.
+- ✅ **Thermal elongation and restraint (EN 1993-1-2 §3.4.1.1).**
+  `thermal::carbonSteelElongation` and the eigenstrain path through
+  `solidshell::elementStress`, `elementPlasticUpdate` and `thermalLoad`.
+
+  **Where the strain enters, settled.** A thermal strain is an eigenstrain, not a
+  load: `σ = C(ε_total − ε*)`, and the subtraction goes in the constitutive law —
+  in both `elementStress` and `elementPlasticUpdate`, immediately before the
+  material sees the strain. The equivalent nodal force `∫BᵀCε* dV` is a
+  *consequence* of that and not an alternative to it; it is needed only where the
+  constitutive law has been linearised away, which is the static solve.
+  `elementPlasticUpdate` needs no load term at all — it already returns
+  `−∫Bᵀσ dV` with the real `σ`. Doing only one of the two produces the same
+  2.68 GPa fiction with opposite signs, on a bar under no load at all. A freely
+  expanding body carries **exactly zero** stress, asserted at zero.
+
+  **The 164.6 °C anchor reproduces: 164.630 °C**, `k_y` exactly 1 and `k_E`
+  0.9354 — all expansion, no weakening — and it is right for E = 206 GPa and only
+  for 206 GPa. At the 210 GPa `carbonSteelStress` defaults to it is 161.546 °C.
+
+  **But it is the right answer to the wrong question, and buckling is why.** A
+  restrained member goes into *compression*, and against `buckling.hpp`'s own
+  checks on this ferry's own scantlings the plating goes long first: the 8 mm
+  vehicle deck head in its 0.70 × 2.40 m bay at **59.0 °C — a 39 K rise**, the
+  12 mm side shell at 103.1 °C, the 14.5 mm bottom at 121.1 °C, and only then the
+  side longitudinal as an Euler column at 149.8 °C. Run through
+  `collapseElementsAt` over the whole midship section, the ferry loses her first
+  panel at **59.0 °C with no wave, no cargo and no bending moment at all**, at a
+  temperature where `k_y` is exactly 1 and the panel has lost 0.0% of its own
+  capacity to heat. Thermal expansion does not weaken the ship; it uses her up.
+
+  **Two closed forms carry that.** On the elastic branch `k_E` **cancels exactly** —
+  the restraint stress is `k_E E ε*` and the elastic buckling stress is `k_E E`
+  times a pure geometry — so the buckling temperature is a function of geometry
+  and the elongation curve *alone*, independent of E, of the grade and of the
+  reduction factor. Asserted by changing all three. For a column that reads
+  `ε*(T) = π²/λ²`, and equating it to the restrained yield strain gives a
+  **critical slenderness of 73.19**: the ferry's longitudinals sit at 34–45, which
+  is exactly why they pre-empt yield only through the plasticity cap and the
+  plating pre-empts it by a factor of three in temperature rise.
+
+  **What "restrained" means on a ship, because a fully restrained bar is a
+  laboratory object.** A uniformly heated region expands freely and carries
+  nothing; an axially heated chain with free ends is statically determinate and
+  carries nothing either, however the temperature varies along it. Stress comes
+  from a *transverse* gradient — a hot strake beside a cold one, sharing a seam.
+  For two parallel strips tied at both ends, hot fraction *f*, the fully
+  restrained figure is the *f* → 0 limit, and **the limit is approached fast**:
+  181.5 °C at *f* = 0.1 against 164.6 at *f* = 0, and 313.6 °C only when half the
+  section is hot. One compartment of a ferry is nearer a tenth than a half, so
+  this is not a laboratory result.
+
+  **A correction to the standard's own curve.** EN 1993-1-2 §3.4.1.1 is *not*
+  continuous at both ends of the 750–860 °C phase change. It is exact at 860 —
+  `2e-5·860 − 6.2e-3 == 1.1e-2` to the last bit in binary as well as in decimal —
+  and it steps **down by exactly 8.4e-6 at 750 °C**, 0.076% of the elongation and
+  1.73 MPa of restrained stress. Asserted rather than smoothed away.
 - Suppression systems, and their effect on stability
 - LES promotion for the local compartment
 - Volumetric fire and smoke rendering

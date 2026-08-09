@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "thermal.hpp"
 
+#include "buckling.hpp"   // johnsonOstenfeld, for the restrained-buckling temperature
 #include "reduction.hpp"  // bandwidthReducingOrder
 
 #include <algorithm>
@@ -245,6 +246,104 @@ double carbonSteelStress(double strain, double kelvin, double yieldStrength,
     const double inside = aSquared - reach * reach;
     if (!(inside > 0.0) || !(aSquared > 0.0)) return sign * fy;
     return sign * (fp - c + std::sqrt(bSquared / aSquared) * std::sqrt(inside));
+}
+
+// --- Thermal elongation -------------------------------------------------------------
+
+double carbonSteelElongation(double kelvin) {
+    const double t = celsius(kelvin);
+    // Below 20 C the standard says nothing. Clamping to zero rather than running
+    // the polynomial backwards is the same choice the conductivity makes, and it
+    // has a consequence worth stating: a structure *cooled* below its reference
+    // temperature contracts and goes into tension, which this does not model. A
+    // fire is not that problem and inventing an extrapolation for it here would
+    // put an unvalidated branch on the path of every heated element.
+    if (t <= 20.0) return 0.0;
+    if (t < 750.0) return 1.2e-5 * t + 0.4e-8 * t * t - 2.416e-4;
+    if (t <= 860.0) return 1.1e-2;
+    if (t <= 1200.0) return 2.0e-5 * t - 6.2e-3;
+    return 2.0e-5 * 1200.0 - 6.2e-3;
+}
+
+double thermalStrain(double kelvin, double referenceKelvin) {
+    return carbonSteelElongation(kelvin) - carbonSteelElongation(referenceKelvin);
+}
+
+void thermalEigenstrain(double kelvin, double referenceKelvin, double out[6]) {
+    const double e = thermalStrain(kelvin, referenceKelvin);
+    out[0] = out[1] = out[2] = e;
+    out[3] = out[4] = out[5] = 0.0;
+}
+
+double restrainedStress(const StructuralMaterial& material, double kelvin,
+                        double referenceKelvin) {
+    return -carbonSteelModulusFactor(kelvin) * material.youngsModulus *
+           thermalStrain(kelvin, referenceKelvin);
+}
+
+namespace {
+
+// First temperature above `referenceKelvin` at which `margin` changes sign, by a
+// scan and then a bisection. Kelvin, or zero when it never does.
+//
+// A scan is used rather than a root find from one end because the margin is
+// **piecewise** in temperature -- kinked at every hundred-degree station of
+// Table 3.1, and genuinely discontinuous at the 750 C step in the elongation and
+// at the Johnson-Ostenfeld transition -- so a method that assumes smoothness would
+// converge on whichever root it happened to bracket. The half-kelvin grid is
+// finer than any feature of either curve; the tabulated stations are 100 K apart
+// and the two discontinuities are single points, so no crossing can hide between
+// two samples of a function that is monotone between kinks.
+template <typename Margin>
+double firstCrossing(const Margin& margin, double referenceKelvin) {
+    const double top = kCelsius + 1200.0;
+    if (!(referenceKelvin < top)) return 0.0;
+    double lo = referenceKelvin, fLo = margin(lo);
+    if (fLo >= 0.0) return lo;
+    for (double t = referenceKelvin + 0.5; t <= top + 0.25; t += 0.5) {
+        const double hi = std::min(t, top);
+        const double fHi = margin(hi);
+        if (fHi >= 0.0) {
+            // 200 bisections is far past what a double can distinguish over this
+            // range; it costs microseconds and removes the question of whether the
+            // count was tuned to the answer.
+            double a = lo, b = hi;
+            for (int i = 0; i < 200; ++i) {
+                const double m = 0.5 * (a + b);
+                if (margin(m) >= 0.0) b = m;
+                else a = m;
+            }
+            return 0.5 * (a + b);
+        }
+        lo = hi;
+        fLo = fHi;
+        if (hi >= top) break;
+    }
+    return 0.0;
+}
+
+}  // namespace
+
+double restrainedYieldTemperature(const StructuralMaterial& material, double referenceKelvin) {
+    return firstCrossing(
+        [&](double k) {
+            return std::abs(restrainedStress(material, k, referenceKelvin)) -
+                   carbonSteelYieldFactor(k) * material.yieldStrength;
+        },
+        referenceKelvin);
+}
+
+double restrainedBucklingTemperature(double elasticStress, const StructuralMaterial& material,
+                                     double referenceKelvin) {
+    if (!(elasticStress > 0.0)) return 0.0;
+    return firstCrossing(
+        [&](double k) {
+            const SteelReduction r = carbonSteelReduction(k);
+            return std::abs(restrainedStress(material, k, referenceKelvin)) -
+                   johnsonOstenfeld(r.youngsModulus * elasticStress,
+                                    r.effectiveYield * material.yieldStrength);
+        },
+        referenceKelvin);
 }
 
 StructuralMaterial atTemperature(const StructuralMaterial& material, double kelvin) {
