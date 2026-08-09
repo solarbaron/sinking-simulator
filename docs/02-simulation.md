@@ -13,7 +13,8 @@ what exists and what it still needs.
 **Done:** closed-mesh volume/centroid integration under an arbitrary plane;
 internal free surfaces re-levelled per tick; floodwater as real mass at its real
 centroid (free-surface effect emergent, validated against ρ·i/Δ); compressible
-trapped air per compartment with isothermal state and pressure-limited transfer;
+trapped air per compartment carrying its own temperature, isothermal by default
+and thermodynamic when asked, with pressure-limited transfer;
 a single two-phase orifice network covering breaches, doors, hatches, vents,
 pipes and cross-flood ducts; bilge and ballast pumps with head-dependent output;
 6-DOF rigid body with measured hydrostatic stiffness, added mass, quadratic drag
@@ -46,6 +47,86 @@ floodwater free to re-level.
    `Ship::openings` and are indistinguishable to the solver from authored ones.
    What is still missing is the other half — a fracture model to decide *which*
    panels fail. Today the failure set is supplied by the caller.
+
+### Gas temperature in the flooding network — **implemented, opt-in**
+
+The flooding network's gas used to be isothermal by construction: the pressure
+was recomputed as `m R T_amb / V` every tick and the donor density as
+`p / (R T_amb)`, so no compartment could be at any temperature but ambient. That
+is a good simplification for flooding alone — trapped air compresses and vents,
+and its temperature barely moves — and it stops being one the moment a fire is in
+the same network.
+
+**Temperature is the stored state; energy is the accumulated one.** For a single
+well-mixed compartment `U = m c_v T` and `p = m R T / V = (γ−1)U/V` carry exactly
+the same information, so the choice is decided by two things that are not
+physics. Storing `T` keeps the pressure line as `airMass * kRAir *
+gasTemperature / va` — character for character what it was — which is what makes
+the isothermal case *bit-identical* rather than merely close. And `T` stays
+well-defined as the gas mass goes to zero, where `U/(m c_v)` is 0/0; a
+compartment can flood solid. But temperatures do not *add*, and the orifice sweep
+is a sum, so the per-compartment accumulator is `m·T` — internal energy in units
+of `c_v` — and the mixing rule is that sum divided by the mass that arrived with
+it. Exact for constant `c_v`, no root find.
+
+**What crosses an opening is enthalpy, not internal energy.** The donor does the
+work of pushing gas through the orifice and the receiver collects it, so the term
+is `γ T_donor dm` on both sides. That is not a detail: it is what gives a vessel
+blowing down its isentropic cooling and a vessel being charged its rise *above*
+the reservoir it is charging from, and both are asserted. Being antisymmetric
+across the opening, it conserves the network's energy to roundoff whatever the
+clamps do — measured at `< 1e-9` of the ferry's gas energy over 40 000 steps.
+
+**The pressure-equalising clamp survives, and stays closed-form.** The worry is
+that the mass which equalises two pressures now depends on the temperature the
+receiving side reaches, which depends on the mass — a circularity that would want
+an implicit solve. It does not: pressure is linear in the energy delivered and
+the energy is linear in `dm`, so the `(m + dm)` of the mixing rule cancels
+against the one in the gas law and each branch solves one linear equation.
+`(p V/R − m T) / (γ T_donor)` for a compartment keeping its heat, and Boyle's
+`p V/(R T) − m` for one that is not.
+
+**The clamp does have to be stated at the compartment's own pressure datum**, and
+this was a real defect on the way in. `sideStateAt` returns a pressure *at the
+hole*, while the mass a compartment holds fixes its pressure at the middle of its
+gas space; equalising the wrong pair pins the transfer to zero, so a hot space
+whose gas is 25 Pa lighter at a high doorway reads as already equal to the cold
+space next door and sends nothing at all through a door that should be pouring
+smoke. Subtracting each side's own buoyancy head puts the target back on the
+datum the mass is measured against.
+
+**Adding a temperature alone buys nothing — the gas also needed weight.**
+`airPressure` was returned at every height in a compartment, so two spaces joined
+by a high opening and a low one saw the *same* pressure difference at both and
+moved gas the same way through each. There is no neutral plane in that and
+therefore no buoyant exchange, which is the entire mechanism of smoke spread. The
+head is taken against a reference atmosphere at `kTAmbient` rather than
+absolutely — absolutely, two *cold* compartments at different heights would
+exchange air for ever, a real stratification this model has never carried and not
+the effect being added. Against the reference the coefficient is exactly `+0.0`
+at ambient, so the term vanishes by IEEE arithmetic rather than by being small.
+
+Note that `Opening` has a position and an area and **no height**, so one of them
+samples the pressure difference at exactly one elevation — at its own neutral
+plane it transports nothing at all. A doorway is therefore two openings, which is
+also how a two-layer fire model discretises the same doorway.
+
+**Isothermal stays the default, and that is a measurement rather than a taste.**
+`Compartment::gasThermalTime` is the relaxation time to the structure; zero means
+instantaneous, which pins the temperature to ambient by exact assignment and
+recovers the old model. On the reference trapped-air barge, air allowed to heat
+as it is compressed pushes back harder and arrests the flooding at **15.4% full
+against the isothermal 20.2%** — a 24% difference in how much water gets in, far
+too large to have absorbed into the published scenarios silently. It is also what
+`testTrappedAirArrestsFlooding` has always asserted, to 2%: that `pV` is
+conserved through a compression, which is the statement that the work goes into
+the steel and not into the gas. Given a relaxation time the same compartment
+follows `T/T₀ = (p/p₀)^((γ−1)/γ)` instead, matched to **1e-14**.
+
+This is the idiom `radiation`, `propulsion` and `rollDampingForm` already use:
+the real model arrives alongside the lumped one and replaces it only where it is
+asked for. The cost is that a fire must set the relaxation time on the
+compartments the smoke travels through, or they will hold it at ambient.
 
 ---
 
