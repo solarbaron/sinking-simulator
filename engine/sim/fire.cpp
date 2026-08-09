@@ -1,0 +1,1109 @@
+// SPDX-License-Identifier: MIT
+#include "fire.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
+
+namespace sim::fire {
+namespace {
+
+constexpr double kInf = std::numeric_limits<double>::infinity();
+
+// Below this a layer is treated as absent rather than as a very cold gas: a
+// temperature of U/(m c_v) with m at machine epsilon is a number, not a
+// temperature.
+constexpr double kMassFloor = 1e-9;      // kg
+
+// Pressure differences smaller than this do not move gas. The same idea as
+// `Ship::solveFlowNetwork`'s 1e-3 Pa noise floor, and the same reason: below it
+// the orifice law is resolving round-off. Tighter than the ship's because the
+// buoyancy pressures that drive a fire are two orders of magnitude smaller than
+// the water heads that drive flooding -- a doorway with a 300 K layer behind it
+// is working on about 6 Pa per metre of height.
+constexpr double kPressureFloor = 1e-9;  // Pa
+
+// Incoming gas joins the receiving compartment's upper layer only if it is
+// warmer than the lower layer by at least this much. Without the margin, ambient
+// air entering a compartment whose lower layer is *exactly* at ambient would test
+// as buoyant and be deposited under the deckhead, which is precisely backwards.
+constexpr double kDepositionMargin = 0.5;   // K
+
+// Entrainment is tapered to zero over the last this-much of the compartment's
+// volume, as the interface reaches the floor.
+//
+// This is physics rather than a numerical guard: a plume rising through a lower
+// layer that has been consumed has no cool air left to entrain, and the fire is
+// then burning inside the hot layer. Without the taper the plume drains the last
+// of the lower layer in one step and leaves a residue of mass with no energy --
+// a layer at absolute zero, an infinite density, and a NaN one vent integral
+// later.
+constexpr double kEntrainmentTaperFraction = 0.02;
+
+// Sweeps of the implicit pressure solve, which is blocked by *vent* -- see
+// `substep`. Each vent's own pair is solved exactly, so a compartment with one
+// vent needs one sweep; the sweeps are only there for the coupling between
+// several vents on the same compartment, which is genuinely the weak one.
+constexpr int kPressureSweeps = 24;
+
+// Watts to kilowatts, for the plume and enclosure correlations, all of which are
+// published in kW. One place, one direction.
+constexpr double kWattsPerKilowatt = 1000.0;
+
+double cube(double x) { return x * x * x; }
+
+// `x^(3/2)` for x >= 0.
+double pow32(double x) { return x <= 0 ? 0.0 : x * std::sqrt(x); }
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Plume
+// ---------------------------------------------------------------------------
+
+double Plume::flameHeight() const {
+    if (heatRelease <= 0) return 0.0;
+    const double qkw = heatRelease / kWattsPerKilowatt;
+    return 0.235 * std::pow(qkw, 0.4) - 1.02 * diameter;
+}
+
+double Plume::virtualOrigin() const {
+    if (heatRelease <= 0) return 0.0;
+    const double qkw = heatRelease / kWattsPerKilowatt;
+    return 0.083 * std::pow(qkw, 0.4) - 1.02 * diameter;
+}
+
+double Plume::entrainment(double height) const {
+    if (height <= 0 || heatRelease <= 0) return 0.0;
+    const double qc = convectiveHeatRelease() / kWattsPerKilowatt;   // kW
+    if (qc <= 0) return 0.0;
+
+    const double lf = flameHeight();
+    if (lf > 0 && height <= lf) {
+        // Inside the flame the plume is still accelerating and the far-field
+        // power law does not hold. Heskestad's flame-region result is linear in
+        // height and anchored at the flame tip.
+        return 0.0056 * qc * (height / lf);
+    }
+
+    // Far field, measured from the virtual origin. `z0` is usually negative -- a
+    // wide fire behaves like a point source below the pan -- but a small, tall
+    // one can put it above the base, so the clamp is not decoration.
+    const double z = std::max(height - virtualOrigin(), 0.0);
+    return 0.071 * std::cbrt(qc) * std::pow(z, 5.0 / 3.0) + 0.0018 * qc;
+}
+
+// ---------------------------------------------------------------------------
+// Design fire
+// ---------------------------------------------------------------------------
+
+double DesignFire::heatRelease(double t) const {
+    if (t <= 0 || peakHeatRelease <= 0) return 0.0;
+    const double tGrow =
+        growthCoefficient > 0 ? std::sqrt(peakHeatRelease / growthCoefficient) : 0.0;
+    if (t < tGrow) return growthCoefficient * t * t;
+
+    const double tSteadyEnd = tGrow + steadyDuration;
+    if (t <= tSteadyEnd) return peakHeatRelease;
+    // No decay ramp means the fire burns at its peak indefinitely, which is the
+    // steady case every enclosure correlation is written for.
+    if (decayDuration <= 0) return peakHeatRelease;
+    const double into = t - tSteadyEnd;
+    if (into >= decayDuration) return 0.0;
+    return peakHeatRelease * (1.0 - into / decayDuration);
+}
+
+double DesignFire::totalEnergy() const {
+    if (peakHeatRelease <= 0) return 0.0;
+    if (decayDuration <= 0) return kInf;   // never goes out
+    const double tGrow =
+        growthCoefficient > 0 ? std::sqrt(peakHeatRelease / growthCoefficient) : 0.0;
+    return growthCoefficient * cube(tGrow) / 3.0 + peakHeatRelease * steadyDuration +
+           0.5 * peakHeatRelease * decayDuration;
+}
+
+// ---------------------------------------------------------------------------
+// Layers
+// ---------------------------------------------------------------------------
+
+double Layer::temperature() const {
+    // Both guards matter, and the second one is not symmetry. A layer that has
+    // been emptied down to a residue of mass while its energy has gone to zero
+    // reports T = 0, which becomes an infinite density in `sideOf` and a NaN in
+    // the next vent integral. `substep` tapers entrainment so the state should
+    // not arise; this is the second line of defence, and the tests assert it is
+    // never reached on a realistic case.
+    if (mass <= kMassFloor || energy <= 0) return kTAmbient;
+    return energy / (mass * kCvAir);
+}
+
+double Layer::productFraction() const {
+    if (mass <= kMassFloor) return 0.0;
+    return products / mass;
+}
+
+double GasCompartment::pressure() const {
+    if (gasVolume <= 0) return kPatm;
+    return (kGammaAir - 1.0) * totalEnergy() / gasVolume;
+}
+
+double GasCompartment::gaugeAtFloor() const {
+    return pressure() - (kPatm - kRhoAmbient * kGravity * floorZ);
+}
+
+double GasCompartment::upperVolume() const {
+    const double u = totalEnergy();
+    if (u <= 0) return 0.0;
+    // The exact closure: the volume split *is* the internal-energy split.
+    return gasVolume * (upper.energy / u);
+}
+
+double GasCompartment::interfaceZ() const {
+    if (floorArea <= 0) return ceilingZ;
+    const double z = ceilingZ - upperVolume() / floorArea;
+    return std::clamp(z, floorZ, ceilingZ);
+}
+
+void GasCompartment::fillAmbient(double seedFraction) {
+    const double f = std::clamp(seedFraction, 1e-12, 0.5);
+    // The absolute pressure that makes the gauge pressure exactly zero, so a
+    // compartment nobody has lit produces exactly zero vent flow.
+    const double pTarget = kPatm - kRhoAmbient * kGravity * floorZ;
+    const double u = pTarget * gasVolume / (kGammaAir - 1.0);
+    upper.energy = f * u;
+    lower.energy = u - upper.energy;
+    upper.mass = upper.energy / (kCvAir * kTAmbient);
+    lower.mass = lower.energy / (kCvAir * kTAmbient);
+    upper.products = 0;
+    lower.products = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Vent geometry
+// ---------------------------------------------------------------------------
+
+VentShape ventShapeFor(const Opening& o) {
+    VentShape s;
+    if (o.area <= 0) return s;
+    const double side = std::sqrt(o.area);
+    switch (o.kind) {
+        case OpeningKind::Door:
+            // A door is tall. 2.0 m is the standard clear height; below about
+            // 4 m^2 that leaves a plausible width, and above it the door would
+            // have to be absurdly wide, so fall back to square.
+            if (o.area <= 4.0) {
+                s.height = 2.0;
+                s.width = o.area / 2.0;
+            } else {
+                s.height = side;
+                s.width = side;
+            }
+            break;
+        case OpeningKind::Hatch:
+            s.horizontal = true;
+            s.height = 0.0;
+            s.width = side;
+            break;
+        case OpeningKind::Breach:
+        case OpeningKind::Vent:
+        case OpeningKind::Pipe:
+            s.height = side;
+            s.width = side;
+            break;
+    }
+    return s;
+}
+
+double VentSide::gaugeAt(double z) const {
+    // gauge(z) = gauge(floor) - integral of (rho_gas - rho_ambient) g dz.
+    // Subtracting the ambient column is what makes still air give exactly zero at
+    // every height, rather than two large numbers that nearly cancel.
+    const double zi = std::max(interfaceZ, floorZ);
+    if (z <= zi) return gaugeAtFloor - (rhoLower - kRhoAmbient) * kGravity * (z - floorZ);
+    return gaugeAtFloor - (rhoLower - kRhoAmbient) * kGravity * (zi - floorZ) -
+           (rhoUpper - kRhoAmbient) * kGravity * (z - zi);
+}
+
+VentSide ambientSide() {
+    VentSide s;
+    s.gaugeAtFloor = 0;
+    // A finite floor reference, because `gaugeAt` would otherwise evaluate
+    // `0.0 * infinity`; both densities are ambient, so the difference against the
+    // ambient column is exactly 0.0 at any finite reference anyway.
+    //
+    // The interface is at *positive* infinity, which makes the whole outside one
+    // cool lower layer. That is the meaningful reading -- outside air is not
+    // anybody's smoke layer -- and it is what makes `VentResult::fromUpperA/B`
+    // say what it claims to: gas drawn in from outdoors did not come out of an
+    // upper layer, and reporting that it did would be a diagnostic that lies.
+    s.floorZ = 0;
+    s.interfaceZ = kInf;
+    s.rhoLower = s.rhoUpper = kRhoAmbient;
+    s.tLower = s.tUpper = kTAmbient;
+    s.yLower = s.yUpper = 0;
+    return s;
+}
+
+namespace {
+
+// One constant-sign, constant-density band of the vent integral.
+void accumulateBand(const Vent& v, const VentSide& a, const VentSide& b, double z1, double z2,
+                    double dp1, double dp2, VentResult& r) {
+    if (z2 <= z1) return;
+    const double u1 = std::abs(dp1), u2 = std::abs(dp2);
+    if (std::max(u1, u2) < kPressureFloor) return;
+
+    const double zm = 0.5 * (z1 + z2);
+    const bool aToB = (dp1 + dp2) > 0;
+
+    // dp is linear in z over the band, so the integral of sqrt|dp| is closed
+    // form. Quadrature would converge at half order against the square root's
+    // infinite derivative at the neutral plane, which is why the band was split
+    // there in the first place.
+    const double slope = (dp2 - dp1) / (z2 - z1);
+    const double integral = std::abs(slope) > kPressureFloor
+                                ? (2.0 / (3.0 * std::abs(slope))) * std::abs(pow32(u2) - pow32(u1))
+                                : std::sqrt(u1) * (z2 - z1);
+
+    const VentSide& donor = aToB ? a : b;
+    const double rho = donor.densityAt(zm);
+    const double mdot = v.dischargeCoeff * v.width * std::sqrt(2.0 * rho) * integral;
+    if (mdot <= 0) return;
+
+    const bool fromUpper = zm >= donor.interfaceZ;
+    const double temp = donor.temperatureAt(zm);
+    if (aToB) {
+        r.massAToB += mdot;
+        r.enthalpyAToB += mdot * kCpAir * temp;
+        if (fromUpper) r.fromUpperA += mdot;
+    } else {
+        r.massBToA += mdot;
+        r.enthalpyBToA += mdot * kCpAir * temp;
+        if (fromUpper) r.fromUpperB += mdot;
+    }
+}
+
+}  // namespace
+
+VentResult ventMassFlow(const Vent& v, const VentSide& a, const VentSide& b) {
+    VentResult r;
+    if (!v.open || v.blockedByWater) return r;
+
+    if (v.horizontal) {
+        // No height to integrate over. A single pressure difference is all this
+        // geometry offers -- and see fire.hpp for what it therefore misses.
+        if (v.area <= 0) return r;
+        const double z = v.sillZ;
+        const double dp = a.gaugeAt(z) - b.gaugeAt(z);
+        if (std::abs(dp) < kPressureFloor) return r;
+        const VentSide& donor = dp > 0 ? a : b;
+        const double rho = donor.densityAt(z);
+        const double mdot = v.dischargeCoeff * v.area * std::sqrt(2.0 * rho * std::abs(dp));
+        const bool fromUpper = z >= donor.interfaceZ;
+        if (dp > 0) {
+            r.massAToB = mdot;
+            r.enthalpyAToB = mdot * kCpAir * donor.temperatureAt(z);
+            if (fromUpper) r.fromUpperA = mdot;
+        } else {
+            r.massBToA = mdot;
+            r.enthalpyBToA = mdot * kCpAir * donor.temperatureAt(z);
+            if (fromUpper) r.fromUpperB = mdot;
+        }
+        return r;
+    }
+
+    if (v.width <= 0 || v.soffitZ <= v.sillZ) return r;
+
+    // Break the span at each side's layer interface: within a band both densities
+    // are constant, so dp is linear and the neutral plane is exactly locatable.
+    //
+    // A **fixed** four-element sort, with the unused slots parked on the soffit
+    // and the duplicates falling out as zero-width bands the loop already skips.
+    // The natural version fills the first `n` slots and sorts `[begin, begin+n)`,
+    // and at -O3 GCC cannot bound `n`: it reasons the range could run to
+    // `SIZE_MAX/8` and reports five `-Warray-bounds` inside `std::sort`. Nothing
+    // below -O3 sees them, which is the entire reason `verify.sh full` compiles
+    // the engine there -- the same class of thing that sat on `reduction.cpp`'s
+    // triangular solves for as long as they existed.
+    std::array<double, 4> pts{v.sillZ, v.soffitZ, v.soffitZ, v.soffitZ};
+    if (a.interfaceZ > v.sillZ && a.interfaceZ < v.soffitZ) pts[2] = a.interfaceZ;
+    if (b.interfaceZ > v.sillZ && b.interfaceZ < v.soffitZ) pts[3] = b.interfaceZ;
+    std::sort(pts.begin(), pts.end());
+
+    for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+        const double z1 = pts[i];
+        const double z2 = pts[i + 1];
+        if (z2 <= z1) continue;
+        const double dp1 = a.gaugeAt(z1) - b.gaugeAt(z1);
+        const double dp2 = a.gaugeAt(z2) - b.gaugeAt(z2);
+
+        if (dp1 * dp2 < 0) {
+            // The neutral plane: the elevation at which the flow reverses. Split
+            // exactly on it. This is the whole reason a doorway is not one orifice
+            // with one pressure difference.
+            const double zn = z1 + (z2 - z1) * dp1 / (dp1 - dp2);
+            r.neutralPlaneZ = zn;
+            r.bidirectional = true;
+            accumulateBand(v, a, b, z1, zn, dp1, 0.0, r);
+            accumulateBand(v, a, b, zn, z2, 0.0, dp2, r);
+        } else {
+            accumulateBand(v, a, b, z1, z2, dp1, dp2, r);
+        }
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Account
+// ---------------------------------------------------------------------------
+
+// Normalised by the largest term in the account, **including the state itself**.
+//
+// The fluxes alone are not enough. A model whose compartments only exchange with
+// each other has every boundary term at exactly zero, and normalising by those
+// would report its own last-bit round-off as a whole-number fraction: 1.1e-8 J
+// of drift in 34 MJ of gas came out as 1.1e-8 "of scale", which reads like a
+// failure and is a hundred million times better than one.
+double Account::energyResidualFraction() const {
+    const double scale = std::max({std::abs(heatReleased), std::abs(enthalpyIn),
+                                   std::abs(enthalpyOut), std::abs(wallLoss),
+                                   std::abs(energy - initialEnergy), std::abs(energy), 1.0});
+    return energyResidual() / scale;
+}
+
+double Account::massResidualFraction() const {
+    const double scale = std::max({std::abs(massIn), std::abs(massOut),
+                                   std::abs(mass - initialMass), std::abs(mass), 1e-9});
+    return massResidual() / scale;
+}
+
+// ---------------------------------------------------------------------------
+// Model internals
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The per-substep rate accumulators, one entry per gas compartment, plus the
+// boundary crossings the account wants. Everything here is a *rate*: nothing is
+// multiplied by the step until the step has been accepted, which is what lets a
+// trial step be abandoned without leaving a mark on the account.
+struct Deltas {
+    std::vector<double> dmU, dmL, dEU, dEL, dsU, dsL;
+    double heat = 0, radiative = 0, wall = 0, entrained = 0;
+    double enthalpyIn = 0, enthalpyOut = 0;
+    double massIn = 0, massOut = 0;
+    double productsGenerated = 0, productsOut = 0;
+    explicit Deltas(std::size_t n)
+        : dmU(n, 0.0), dmL(n, 0.0), dEU(n, 0.0), dEL(n, 0.0), dsU(n, 0.0), dsL(n, 0.0) {}
+};
+
+// The gas column against one side of a vent.
+VentSide sideOf(const GasCompartment& g) {
+    VentSide s;
+    s.gaugeAtFloor = g.gaugeAtFloor();
+    s.floorZ = g.floorZ;
+    s.interfaceZ = g.interfaceZ();
+    s.tUpper = g.upper.temperature();
+    s.tLower = g.lower.temperature();
+    // Densities for the *buoyancy* term come off `kPatm`, not off the
+    // compartment's own pressure.
+    //
+    // That is deliberate and it is the one place where this file separates the
+    // thermodynamic pressure from the hydrostatic one. Density varies by a factor
+    // of four across a fire's temperature range and by one part in a hundred
+    // thousand across its pressure range, so taking the reference pressure loses
+    // nothing physical -- and it buys an exact property that the alternative
+    // destroys: at `T = kTAmbient` this returns `kRhoAmbient` **exactly**, so the
+    // gauge profile of a compartment full of still ambient air is exactly zero at
+    // every height and produces exactly zero flow.
+    //
+    // Using `g.pressure()` here instead leaves the layer density 2.6e-4 kg/m^3
+    // off ambient, which is a spurious buoyancy of a hundredth of a pascal per
+    // metre. That is invisible next to a fire and fatal to the control that says
+    // an unlit fire changes nothing: it moved 74 of the ship's state doubles.
+    s.rhoUpper = kPatm / (kRAir * s.tUpper);
+    s.rhoLower = kPatm / (kRAir * s.tLower);
+    s.yUpper = g.upper.productFraction();
+    s.yLower = g.lower.productFraction();
+    return s;
+}
+
+// Is there water sitting against this opening?
+//
+// A deliberate second reading of the rule `Ship::sideStateAt` applies, because
+// that one is private and returns a pressure this model does not want. Only the
+// phase question is duplicated, and `tests/test_fire.cpp` checks the two agree
+// across the ferry's whole opening list rather than trusting that they do.
+bool waterAgainst(const Ship& ship, const Sea& sea, int shipCompartment, const Vec3& bodyPos) {
+    const Vec3 worldPos = ship.state.orientation.toMat3() * bodyPos + ship.state.position;
+    if (shipCompartment == kSea) return worldPos.z < sea.heightAt(worldPos.x, worldPos.y);
+    const Compartment& c = ship.compartments[static_cast<std::size_t>(shipCompartment)];
+    return c.waterVolume > 1e-9 && worldPos.z < c.surfaceWorldZ;
+}
+
+// The pdV-consistent split of a compartment's energy input between its layers.
+//
+// With `V_u = V U_u / U` and both layers at one pressure, each does `p dV_k/dt`
+// of work on the other; substituting the closure gives
+// `dU_u/dt = [E_u + (gamma-1) f E] / gamma`. The lower layer's rate is taken as
+// the remainder rather than from its own formula, so the two sum to `E` in
+// floating point and not merely in algebra -- which is what lets the energy
+// account close to machine precision.
+void layerSplit(double energyUpper, double energyTotal, double eUpper, double eLower,
+                double& dUpper, double& dLower) {
+    const double e = eUpper + eLower;
+    const double f = energyTotal > 0 ? energyUpper / energyTotal : 0.0;
+    dUpper = (eUpper + (kGammaAir - 1.0) * f * e) / kGammaAir;
+    dLower = e - dUpper;
+}
+
+// Move one directed stream, resolved into the portion that left the donor's upper
+// layer and the portion that left its lower one. Those portions carry different
+// temperatures and different product loadings, which is exactly why they are kept
+// apart rather than averaged into one enthalpy: a doorway can be venting 600 K
+// smoke over the top while drawing 288 K air under the same lintel, and one mean
+// temperature for that stream would be a temperature nothing in the compartment
+// has.
+void applyStream(int fromGas, int toGas, const VentSide& donor, const VentSide& recv,
+                 double massUpper, double massLower, Deltas& d) {
+    for (int part = 0; part < 2; ++part) {
+        const bool upper = part == 0;
+        const double mass = upper ? massUpper : massLower;
+        if (mass <= 0) continue;
+        const double temp = upper ? donor.tUpper : donor.tLower;
+        const double yield = upper ? donor.yUpper : donor.yLower;
+        const double h = mass * kCpAir * temp;
+        const double s = mass * yield;
+
+        if (fromGas == kSea) {
+            d.massIn += mass;
+            d.enthalpyIn += h;
+        } else {
+            const std::size_t i = static_cast<std::size_t>(fromGas);
+            if (upper) {
+                d.dmU[i] -= mass;
+                d.dEU[i] -= h;
+                d.dsU[i] -= s;
+            } else {
+                d.dmL[i] -= mass;
+                d.dEL[i] -= h;
+                d.dsL[i] -= s;
+            }
+        }
+
+        if (toGas == kSea) {
+            d.massOut += mass;
+            d.enthalpyOut += h;
+            d.productsOut += s;
+        } else {
+            const std::size_t i = static_cast<std::size_t>(toGas);
+            // Buoyancy decides the destination, not which layer it left: gas that
+            // came out of a hot layer next door arrives buoyant and runs along the
+            // deckhead, and cool air arrives dense and sinks whatever door it came
+            // through.
+            const bool joinUpper = temp > recv.tLower + kDepositionMargin;
+            if (joinUpper) {
+                d.dmU[i] += mass;
+                d.dEU[i] += h;
+                d.dsU[i] += s;
+            } else {
+                d.dmL[i] += mass;
+                d.dEL[i] += h;
+                d.dsL[i] += s;
+            }
+        }
+    }
+}
+
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Model
+// ---------------------------------------------------------------------------
+
+int Model::gasIndexOf(int shipCompartment) const {
+    if (shipCompartment == kSea) return kSea;
+    for (std::size_t i = 0; i < gas.size(); ++i)
+        if (gas[i].shipCompartment == shipCompartment) return static_cast<int>(i);
+    return -1;
+}
+
+int Model::findGas(std::string_view name) const {
+    for (std::size_t i = 0; i < gas.size(); ++i)
+        if (gas[i].name == name) return static_cast<int>(i);
+    return -1;
+}
+
+void Model::attach(const Ship& ship, const std::vector<int>& shipCompartments) {
+    gas.clear();
+    vents.clear();
+
+    for (int idx : shipCompartments) {
+        if (idx < 0 || idx >= static_cast<int>(ship.compartments.size())) continue;
+        const Compartment& c = ship.compartments[static_cast<std::size_t>(idx)];
+        GasCompartment g;
+        g.shipCompartment = idx;
+        g.name = c.name;
+        // The gas floor is the floodwater surface when there is one and the bottom
+        // of the space when there is not. A half-flooded engine room has half the
+        // gas space and a much shorter distance for the layer to fall.
+        g.floorZ = c.bboxLo.z;
+        if (c.waterVolume > 1e-9) g.floorZ = std::max(g.floorZ, c.surfaceOffset);
+        g.ceilingZ = c.bboxHi.z;
+        g.gasVolume = std::max(c.airVolume(), 0.0);
+        const double height = std::max(g.ceilingZ - g.floorZ, 1e-6);
+        // Prismatic equivalent: the footprint that, at the space's own height,
+        // holds the gas it actually has. A ship compartment is not a box, it is a
+        // hull clipped to one, so the bounding box would over-state the floor area
+        // by the turn of the bilge and the interface would descend too slowly by
+        // exactly that ratio.
+        g.floorArea = g.gasVolume / height;
+        g.perimeter = 2.0 * ((c.bboxHi.x - c.bboxLo.x) + (c.bboxHi.y - c.bboxLo.y));
+        g.fillAmbient();
+        gas.push_back(std::move(g));
+    }
+
+    for (std::size_t i = 0; i < ship.openings.size(); ++i) {
+        const Opening& o = ship.openings[i];
+        const int ga = gasIndexOf(o.a);
+        const int gb = gasIndexOf(o.b);
+        // One end tracked and the other a compartment this model knows nothing
+        // about: dropped on purpose. Treating an untracked compartment as the
+        // atmosphere would put an infinite reservoir of cool air behind a
+        // bulkhead, which is worse than having no path at all.
+        const bool aOk = (ga >= 0) || (o.a == kSea);
+        const bool bOk = (gb >= 0) || (o.b == kSea);
+        if (!aOk || !bOk) continue;
+        if (ga < 0 && gb < 0) continue;
+
+        const VentShape shape = ventShapeFor(o);
+        Vent v;
+        v.opening = static_cast<int>(i);
+        v.name = o.name;
+        v.a = ga >= 0 ? ga : kSea;
+        v.b = gb >= 0 ? gb : kSea;
+        v.width = shape.width;
+        v.area = o.area;
+        v.horizontal = shape.horizontal;
+        v.sillZ = o.pos.z - 0.5 * shape.height;
+        v.soffitZ = o.pos.z + 0.5 * shape.height;
+        v.dischargeCoeff = o.dischargeCoeff;
+        v.open = o.open;
+        vents.push_back(std::move(v));
+    }
+
+    resetAccount();
+    time = 0;
+}
+
+void Model::resetAccount() {
+    appliedMass_.assign(gas.size(), 0.0);
+    for (std::size_t i = 0; i < gas.size(); ++i)
+        appliedMass_[i] = gas[i].pressure() * gas[i].gasVolume / (kRAir * kTAmbient);
+
+    account = Account{};
+    for (const GasCompartment& g : gas) {
+        account.initialEnergy += g.totalEnergy();
+        account.initialMass += g.totalMass();
+        account.products += g.upper.products + g.lower.products;
+    }
+    account.energy = account.initialEnergy;
+    account.mass = account.initialMass;
+}
+
+std::vector<std::string> Model::validate() const {
+    std::vector<std::string> problems;
+    for (const GasCompartment& g : gas) {
+        if (g.gasVolume <= 0) problems.push_back("gas space '" + g.name + "' has no volume");
+        if (g.ceilingZ <= g.floorZ)
+            problems.push_back("gas space '" + g.name + "' has a ceiling at or below its floor");
+        if (g.floorArea <= 0) problems.push_back("gas space '" + g.name + "' has no floor area");
+    }
+    const int n = static_cast<int>(gas.size());
+    for (const Vent& v : vents) {
+        if (v.a != kSea && (v.a < 0 || v.a >= n))
+            problems.push_back("vent '" + v.name + "' references a gas space that does not exist");
+        if (v.b != kSea && (v.b < 0 || v.b >= n))
+            problems.push_back("vent '" + v.name + "' references a gas space that does not exist");
+        if (v.a == v.b) problems.push_back("vent '" + v.name + "' connects a space to itself");
+        if (!v.horizontal && v.soffitZ <= v.sillZ)
+            problems.push_back("vent '" + v.name + "' has no height to integrate over");
+    }
+    for (const DesignFire& f : fires) {
+        if (f.compartment < 0 || f.compartment >= n)
+            problems.push_back("fire '" + f.name + "' is in a gas space that does not exist");
+        if (f.diameter <= 0) problems.push_back("fire '" + f.name + "' has non-positive diameter");
+        if (f.convectiveFraction <= 0 || f.convectiveFraction > 1)
+            problems.push_back("fire '" + f.name + "' has a convective fraction outside (0, 1]");
+    }
+    return problems;
+}
+
+double Model::totalEntrainment(double atTime) const {
+    double total = 0;
+    for (const DesignFire& f : fires) {
+        if (f.compartment < 0 || f.compartment >= static_cast<int>(gas.size())) continue;
+        const GasCompartment& g = gas[static_cast<std::size_t>(f.compartment)];
+        const Plume p{f.heatRelease(atTime), f.diameter, f.convectiveFraction};
+        total += p.entrainment(g.interfaceZ() - f.baseZ);
+    }
+    return total;
+}
+
+StepResult Model::step(double dt, const Ship& ship, const Sea& sea) {
+    StepResult out;
+    out.time = time;
+    if (dt <= 0) return out;
+
+    double remaining = dt;
+    double h = std::min(dt, maxSubstep);
+    int budget = maxSubsteps;
+    while (remaining > 1e-12 * dt && budget-- > 0) {
+        h = std::min(h, remaining);
+        if (substep(h, ship, sea, out)) {
+            remaining -= h;
+            ++out.substeps;
+            // Creep back up, so one transient does not pin the step for the whole
+            // run. Doubling oscillates against the rejection test; 1.5 settles.
+            h = std::min(h * 1.5, maxSubstep);
+        } else {
+            h *= 0.5;
+        }
+    }
+    out.time = time;
+    for (const DesignFire& f : fires) out.heatRelease += f.heatRelease(time);
+    return out;
+}
+
+bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out) {
+    const std::size_t n = gas.size();
+    Deltas d(n);
+    // The non-vent energy rate per compartment: what the fire and the boundary do
+    // to its pressure over this step whatever the vents carry. The implicit
+    // pressure solve below needs it as the constant term of each equation.
+    std::vector<double> sourceRate(n, 0.0);
+
+    // --- The fires and their plumes ----------------------------------------
+    for (const DesignFire& f : fires) {
+        if (f.compartment < 0 || f.compartment >= static_cast<int>(n)) continue;
+        const std::size_t i = static_cast<std::size_t>(f.compartment);
+        GasCompartment& g = gas[i];
+        // At the *midpoint* of the substep, not its start. The heat release is a
+        // known function of time rather than a state variable, so integrating it
+        // exactly costs nothing and is worth more than it looks: evaluated at the
+        // left end, the first substep of a fire that starts at t = 0 releases
+        // nothing at all, and the sealed compartment's closed form came out
+        // exactly one substep of heat short -- 50 kJ, forever, on every run. The
+        // midpoint rule is exact for a steady fire and second order on a t^2
+        // growth curve.
+        const double q = f.heatRelease(time + 0.5 * dt);
+        if (q <= 0) continue;
+
+        d.heat += q;
+        d.radiative += q * f.radiativeLossFraction;
+        const double toGas = q * (1.0 - f.radiativeLossFraction);
+        sourceRate[i] += toGas;
+
+        // Entrainment is evaluated at the interface: the plume drags air out of
+        // the lower layer over exactly the height it rises through it. This is the
+        // term that drives the layer down, and it dominates the fire's own thermal
+        // expansion by about two orders of magnitude.
+        const Plume plume{q, f.diameter, f.convectiveFraction};
+        double mp = plume.entrainment(g.interfaceZ() - f.baseZ);
+        // Taper as the lower layer is consumed: there is nothing left down there
+        // to entrain. See `kEntrainmentTaperFraction`.
+        const double lowerVolume = std::max(g.gasVolume - g.upperVolume(), 0.0);
+        mp *= std::clamp(lowerVolume / (kEntrainmentTaperFraction * g.gasVolume), 0.0, 1.0);
+        // And never more than half of what the layer holds in one step, so the
+        // explicit update cannot take it negative whatever the taper does.
+        mp = std::min(mp, 0.5 * std::max(g.lower.mass, 0.0) / dt);
+
+        d.entrained += mp;
+        const double tl = g.lower.temperature();
+        const double yl = g.lower.productFraction();
+        d.dmL[i] -= mp;
+        d.dmU[i] += mp;
+        d.dEL[i] -= mp * kCpAir * tl;
+        d.dEU[i] += mp * kCpAir * tl + toGas;
+        d.dsL[i] -= mp * yl;
+        d.dsU[i] += mp * yl;
+
+        // Products are a tracer riding the gas, not part of its mass: a 1 MW fire
+        // burns about 0.05 kg/s of fuel against several kg/s through the vent, so
+        // adding it to the gas mass would be noise dressed as physics -- and it
+        // would put a term in the mass account with nothing on the other side.
+        const double ms = f.productYield * q;
+        d.dsU[i] += ms;
+        d.productsGenerated += ms;
+    }
+
+    // --- Boundary heat loss -------------------------------------------------
+    //
+    // Before the vents, not after: the implicit pressure solve needs every
+    // non-vent energy rate as the constant term of its equation.
+    for (std::size_t i = 0; i < n; ++i) {
+        GasCompartment& g = gas[i];
+        if (g.wallConductance <= 0) continue;
+        const double zi = g.interfaceZ();
+        // Ceiling plus the walls the hot layer wets; floor plus the walls the cool
+        // one does. Two zones exist precisely so that this is not one area at one
+        // temperature -- charging the whole enclosure at the upper-layer
+        // temperature, which is what MQH's own `A_T` does, costs about a quarter
+        // of the steady temperature rise.
+        const double aUpper = g.floorArea + g.perimeter * (g.ceilingZ - zi);
+        const double aLower = g.floorArea + g.perimeter * (zi - g.floorZ);
+        // **Exactly, not explicitly.** In isolation this term is a linear
+        // relaxation towards the boundary temperature, `m c_v dT/dt = -h A dT`,
+        // whose solution over a step is an exponential; taking the average rate
+        // from that solution costs one `expm1` and is unconditionally stable.
+        //
+        // Explicit was tried and it is the stiffest term in the model, by a wide
+        // margin and from an unexpected direction. A layer of *negligible
+        // thickness* still wets the whole deckhead: the seed upper layer this
+        // model starts with is half a millimetre thick and holds 0.12 kg, while
+        // the ceiling it touches is 188 m^2. Its time constant is milliseconds.
+        // Explicitly, it oscillated -- 288 K, 300 K, 177 K, 1260 K on successive
+        // substeps -- and each excursion through zero energy tripped the
+        // non-negativity clamp, which is the only thing in this file that can
+        // break the energy account. It did, at 0.09%.
+        auto relax = [&](double area, double temp, double mass) {
+            const double capacity = mass * kCvAir;
+            const double rate = g.wallConductance * area;
+            if (capacity <= 0 || rate <= 0) return 0.0;
+            const double removed = capacity * (temp - g.wallTemperature) *
+                                   -std::expm1(-rate * dt / capacity);
+            return removed / dt;
+        };
+        const double qu = relax(aUpper, g.upper.temperature(), g.upper.mass);
+        const double ql = relax(aLower, g.lower.temperature(), g.lower.mass);
+        d.dEU[i] -= qu;
+        d.dEL[i] -= ql;
+        d.wall += qu + ql;
+        sourceRate[i] -= qu + ql;
+    }
+
+    // --- The opening network, solved implicitly in the pressures ------------
+    //
+    // `Ship::solveFlowNetwork` moves air explicitly and clamps the transfer to
+    // the mass that equalises the two pressures, because gas is the stiffest
+    // thing in that network and an explicit step that ignores the target state
+    // blows past equilibrium and rings.
+    //
+    // **That clamp does not carry over, and it was tried.** It fails twice:
+    //
+    //   * *Equal pressures is not equilibrium* once one side has a hot layer. A
+    //     doorway with equal floor pressures is exchanging kilograms a second in
+    //     both directions at once. The invariant is zero *net* mass flow.
+    //   * *A fire adds energy during the step.* Clamping the transfer to the
+    //     imbalance that exists at the start of the step ignores the pressure the
+    //     fire will add over the same dt. Measured: a 500 kW fire in an ISO room
+    //     held 800 Pa above atmosphere, venting a twentieth of what it should,
+    //     with the smoke layer driven onto the floor.
+    //
+    // Repairing the target by adding the source term fixes the pressure runaway
+    // and then rings anyway, because scaling one direction of a bidirectional
+    // flow to hit a net target is not a continuous function of the state: the
+    // measured steady state was a limit cycle alternating between -3 Pa and
+    // -590 Pa on successive substeps.
+    //
+    // So the clamp is not repaired here, it is replaced by the thing it was
+    // approximating: **the compartment pressures are solved implicitly.** Freeze
+    // the slow variables -- layer temperatures, the interface, the product
+    // loadings -- and find the end-of-step gauge pressures that satisfy
+    //
+    //     x_i = gauge_i + (gamma-1) dt E_i(x) / V_i
+    //
+    // where `E_i` is the net energy rate into compartment i. `E_i` is monotone
+    // decreasing in `x_i` -- raising a compartment's pressure can only increase
+    // what leaves and reduce what enters -- so each compartment's equation is a
+    // safe 1-D bisection, and Gauss-Seidel over the few compartments closes the
+    // coupling. A sealed compartment has no `x` dependence at all and the
+    // solution is exact in one evaluation, which is what keeps
+    // `p = p0 + (gamma-1) E / V` exact for the sealed case.
+    //
+    // Backward Euler in the fast variable, forward in the slow ones: stable at
+    // any step, and the step is then set by accuracy rather than by the 0.65 ms
+    // an explicit doorway would demand.
+    std::vector<VentSide> sides(n);
+    for (std::size_t i = 0; i < n; ++i) sides[i] = sideOf(gas[i]);
+    const VentSide outside = ambientSide();
+
+    // The vents that are actually in play this step, already clipped to the gas
+    // space on both sides. Collected once: the pressure solve evaluates them
+    // tens of times each.
+    std::vector<Vent> active;
+    std::vector<int> activeOwner;
+    for (std::size_t vi = 0; vi < vents.size(); ++vi) {
+        Vent& v = vents[vi];
+        v.massAToB = v.massBToA = 0;
+        v.bidirectional = false;
+        v.blockedByWater = false;
+        v.activeSillZ = v.activeSoffitZ = 0;
+        if (!v.open) continue;
+
+        // Water against either side means this opening belongs to the flooding
+        // solve this tick, not to the gas model. Splitting them by phase is the
+        // same rule `Ship::solveFlowNetwork` already applies, and it is what stops
+        // the two models moving the same mass twice.
+        if (v.opening >= 0) {
+            const Opening& o = ship.openings[static_cast<std::size_t>(v.opening)];
+            const int sca = v.a == kSea ? kSea : gas[static_cast<std::size_t>(v.a)].shipCompartment;
+            const int scb = v.b == kSea ? kSea : gas[static_cast<std::size_t>(v.b)].shipCompartment;
+            if (waterAgainst(ship, sea, sca, o.pos) || waterAgainst(ship, sea, scb, o.pos)) {
+                v.blockedByWater = true;
+                continue;
+            }
+        }
+
+        // Bring the span into the gas space on both sides.
+        //
+        // **Shifted before it is trimmed**, and that is not a nicety. The ferry
+        // authors its air escapes at the gooseneck -- `vent_er_s` sits at
+        // z = 12.5 m, on the weather deck -- while the engine room it drains tops
+        // out at 7.0 m. `Opening::pos` for a pipe is the *outboard* end, because
+        // that is the end whose height decides whether the sea is over it, which
+        // is all the flooding solve needs. Trimming alone would delete every vent
+        // on the ship and leave the machinery spaces sealed.
+        //
+        // So the vent is slid, at its own height, to the nearest end of the space
+        // it opens into: a pipe from a compartment terminates at the deckhead.
+        // **What this does not model is the pipe itself.** Five and a half metres
+        // of duct between the deckhead and the gooseneck is a chimney, and its
+        // stack effect on hot gas is a real driver that is simply not here.
+        double lo = -kInf, hi = kInf;
+        for (int side = 0; side < 2; ++side) {
+            const int gi = side == 0 ? v.a : v.b;
+            if (gi == kSea) continue;
+            const GasCompartment& g = gas[static_cast<std::size_t>(gi)];
+            lo = std::max(lo, g.floorZ);
+            hi = std::min(hi, g.ceilingZ);
+        }
+        if (hi <= lo) continue;
+
+        Vent clipped = v;
+        if (clipped.soffitZ > hi) {
+            const double shift = clipped.soffitZ - hi;
+            clipped.soffitZ -= shift;
+            clipped.sillZ -= shift;
+        }
+        if (clipped.sillZ < lo) {
+            const double shift = lo - clipped.sillZ;
+            clipped.sillZ += shift;
+            clipped.soffitZ += shift;
+        }
+        clipped.sillZ = std::max(clipped.sillZ, lo);
+        clipped.soffitZ = std::min(clipped.soffitZ, hi);
+        if (!clipped.horizontal && clipped.soffitZ <= clipped.sillZ) continue;
+        v.activeSillZ = clipped.sillZ;
+        v.activeSoffitZ = clipped.soffitZ;
+        active.push_back(clipped);
+        activeOwner.push_back(static_cast<int>(vi));
+    }
+
+    // The unknowns are the end-of-step gauge pressures. Start each compartment
+    // where its *own* sources alone would put it -- which is already the exact
+    // answer for a sealed space, and is what keeps `p0 + (gamma-1)E/V` exact.
+    std::vector<double> x(n, 0.0), cap(n, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        cap[i] = (kGammaAir - 1.0) * dt / std::max(gas[i].gasVolume, 1e-12);
+        x[i] = sides[i].gaugeAtFloor + cap[i] * sourceRate[i];
+    }
+
+    auto sideAt = [&](int gi, double gauge) -> VentSide {
+        if (gi == kSea) return outside;
+        VentSide s = sides[static_cast<std::size_t>(gi)];
+        s.gaugeAtFloor = gauge;
+        return s;
+    };
+
+    // **Blocked by vent, not by compartment**, and that distinction is the whole
+    // difference between this converging and not.
+    //
+    // Sweeping compartment by compartment -- solve A holding B, then B holding A
+    // -- is the obvious arrangement and it fails outright whenever a vent is
+    // large relative to the spaces it joins. Measured on two 60 m^3 boxes sharing
+    // a 2 m^2 doorway with a 200 Pa imbalance: each sweep closed **0.037 Pa** of
+    // it, because the orifice law is so flat near zero pressure difference that
+    // the iteration is sublinear, not merely slow. Twelve sweeps left the boxes
+    // 119 Pa apart and the test that found it saw two compartments that would not
+    // equalise in forty seconds through a doorway.
+    //
+    // Solving one *vent* at a time fixes it, because the unknown is then the
+    // energy the vent carries and both of its endpoints move together: the block
+    // is exactly the pair, and a single vent is solved in one sweep. `tv[k]` is
+    // what vent k is currently contributing, so removing and re-adding it keeps
+    // every compartment's pressure the sum of its sources and its vents.
+    std::vector<double> tv(active.size(), 0.0);   // W into side A of each vent
+
+    for (int sweep = 0; sweep < kPressureSweeps; ++sweep) {
+        double moved = 0;
+        for (std::size_t k = 0; k < active.size(); ++k) {
+            const Vent& v = active[k];
+            const double ca = v.a == kSea ? 0.0 : cap[static_cast<std::size_t>(v.a)];
+            const double cb = v.b == kSea ? 0.0 : cap[static_cast<std::size_t>(v.b)];
+            if (ca + cb <= 0) continue;
+
+            // Both endpoints with this vent's own contribution taken back out.
+            const double xa0 =
+                v.a == kSea ? 0.0 : x[static_cast<std::size_t>(v.a)] - ca * tv[k];
+            const double xb0 =
+                v.b == kSea ? 0.0 : x[static_cast<std::size_t>(v.b)] + cb * tv[k];
+
+            // `t - carried(t)` is monotone increasing: raising the vent's delivery
+            // to A raises A's pressure and lowers B's, which can only reduce what
+            // the vent then carries. Bisection is therefore safe and needs no
+            // derivative of an orifice law whose derivative is infinite at the
+            // neutral plane.
+            auto residual = [&](double t) {
+                const VentResult r =
+                    ventMassFlow(v, sideAt(v.a, xa0 + ca * t), sideAt(v.b, xb0 - cb * t));
+                return t - (r.enthalpyBToA - r.enthalpyAToB);
+            };
+
+            const double r0 = residual(0.0);
+            double lo = 0.0, hi = 0.0, t = 0.0;
+            if (r0 != 0) {
+                double span = std::max(std::abs(r0), 1e-9);
+                int guard = 0;
+                if (r0 < 0) {
+                    hi = span;
+                    while (residual(hi) < 0 && guard++ < 200) { span *= 2.0; hi = span; }
+                } else {
+                    lo = -span;
+                    while (residual(lo) > 0 && guard++ < 200) { span *= 2.0; lo = -span; }
+                }
+                if (guard >= 200) out.pressureSolveCapped = true;
+                for (int it = 0; it < 200; ++it) {
+                    const double mid = 0.5 * (lo + hi);
+                    if (hi - lo <= 1e-9 * std::max(1.0, std::abs(mid))) break;
+                    if (residual(mid) < 0) lo = mid; else hi = mid;
+                }
+                t = 0.5 * (lo + hi);
+            }
+
+            moved = std::max(moved, std::abs(t - tv[k]) * (ca + cb));
+            if (v.a != kSea) x[static_cast<std::size_t>(v.a)] = xa0 + ca * t;
+            if (v.b != kSea) x[static_cast<std::size_t>(v.b)] = xb0 - cb * t;
+            tv[k] = t;
+        }
+        out.pressureSweeps = sweep + 1;
+        if (moved < 1e-9) break;
+    }
+
+    // Evaluate each vent once at the solved pressures and move what it carries.
+    for (std::size_t k = 0; k < active.size(); ++k) {
+        const Vent& cv = active[k];
+        const VentSide sa = sideAt(cv.a, cv.a == kSea ? 0.0 : x[static_cast<std::size_t>(cv.a)]);
+        const VentSide sb = sideAt(cv.b, cv.b == kSea ? 0.0 : x[static_cast<std::size_t>(cv.b)]);
+        const VentResult res = ventMassFlow(cv, sa, sb);
+
+        Vent& v = vents[static_cast<std::size_t>(activeOwner[k])];
+        v.massAToB = res.massAToB;
+        v.massBToA = res.massBToA;
+        v.bidirectional = res.bidirectional;
+        v.neutralPlaneZ = res.neutralPlaneZ;
+        if (res.massAToB <= 0 && res.massBToA <= 0) continue;
+
+        applyStream(cv.a, cv.b, sa, sb, res.fromUpperA, res.massAToB - res.fromUpperA, d);
+        applyStream(cv.b, cv.a, sb, sa, res.fromUpperB, res.massBToA - res.fromUpperB, d);
+    }
+
+    // --- Accept or reject ---------------------------------------------------
+    //
+    // Nothing above has touched the state or the account, so a rejection here is
+    // free and leaves no trace. Below 1 ns there is nothing left to subdivide and
+    // the step is taken regardless, which is what stops the halving from spinning
+    // on a genuinely singular configuration.
+    if (dt > 1e-9) {
+        for (std::size_t i = 0; i < n; ++i) {
+            const GasCompartment& g = gas[i];
+            const double mScale = std::max(g.totalMass(), kMassFloor);
+            const double eScale = std::max(g.totalEnergy(), 1.0);
+            const double dm = std::abs(d.dmU[i]) + std::abs(d.dmL[i]);
+            const double de = std::abs(d.dEU[i]) + std::abs(d.dEL[i]);
+            if (dm * dt > maxRelativeChange * mScale) return false;
+            if (de * dt > maxRelativeChange * eScale) return false;
+            // A layer taken negative would be caught by the clamps below, and
+            // those clamps are the only thing here that can put a hole in the
+            // energy account -- they conjure whatever they clamp away. Rejecting
+            // the step instead keeps the account exact.
+            double dU = 0, dL = 0;
+            layerSplit(g.upper.energy, g.totalEnergy(), d.dEU[i], d.dEL[i], dU, dL);
+            if (g.upper.energy + dU * dt < 0 || g.lower.energy + dL * dt < 0) return false;
+            if (g.upper.mass + d.dmU[i] * dt < 0 || g.lower.mass + d.dmL[i] * dt < 0) return false;
+        }
+    }
+
+    // --- Commit -------------------------------------------------------------
+    for (std::size_t i = 0; i < n; ++i) {
+        GasCompartment& g = gas[i];
+        double dU = 0, dL = 0;
+        layerSplit(g.upper.energy, g.totalEnergy(), d.dEU[i], d.dEL[i], dU, dL);
+        g.upper.energy = std::max(g.upper.energy + dU * dt, 0.0);
+        g.lower.energy = std::max(g.lower.energy + dL * dt, 0.0);
+        g.upper.mass = std::max(g.upper.mass + d.dmU[i] * dt, 0.0);
+        g.lower.mass = std::max(g.lower.mass + d.dmL[i] * dt, 0.0);
+        g.upper.products = std::max(g.upper.products + d.dsU[i] * dt, 0.0);
+        g.lower.products = std::max(g.lower.products + d.dsL[i] * dt, 0.0);
+    }
+
+    account.heatReleased += d.heat * dt;
+    account.radiativeLoss += d.radiative * dt;
+    account.wallLoss += d.wall * dt;
+    account.enthalpyIn += d.enthalpyIn * dt;
+    account.enthalpyOut += d.enthalpyOut * dt;
+    account.massIn += d.massIn * dt;
+    account.massOut += d.massOut * dt;
+    account.productsGenerated += d.productsGenerated * dt;
+    account.productsOut += d.productsOut * dt;
+    out.entrainment = d.entrained;
+
+    time += dt;
+    account.energy = 0;
+    account.mass = 0;
+    account.products = 0;
+    for (const GasCompartment& g : gas) {
+        account.energy += g.totalEnergy();
+        account.mass += g.totalMass();
+        account.products += g.upper.products + g.lower.products;
+    }
+    return true;
+}
+
+void Model::applyTo(Ship& ship) {
+    for (std::size_t i = 0; i < gas.size(); ++i) {
+        const GasCompartment& g = gas[i];
+        if (g.shipCompartment == kSea) continue;
+        Compartment& c = ship.compartments[static_cast<std::size_t>(g.shipCompartment)];
+        // The mass that reproduces this model's pressure under the ship's own
+        // isothermal formula. See fire.hpp for why this is a pressure proxy rather
+        // than a mass, and why the write is a delta.
+        const double mEq = g.pressure() * g.gasVolume / (kRAir * kTAmbient);
+        c.airMass += mEq - appliedMass_[i];
+        appliedMass_[i] = mEq;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enclosure correlations
+// ---------------------------------------------------------------------------
+
+double mqhTemperatureRise(double heatRelease, double ventArea, double ventHeight,
+                          double wallConductance, double wallArea) {
+    if (heatRelease <= 0 || ventArea <= 0 || ventHeight <= 0 || wallConductance <= 0 ||
+        wallArea <= 0)
+        return 0.0;
+    const double qkw = heatRelease / kWattsPerKilowatt;
+    const double hk = wallConductance / kWattsPerKilowatt;   // kW/(m^2 K)
+    const double denom = ventArea * std::sqrt(ventHeight) * hk * wallArea;
+    return 6.85 * std::cbrt(qkw * qkw / denom);
+}
+
+double thomasFlashoverPower(double wallArea, double ventArea, double ventHeight) {
+    if (wallArea <= 0 || ventArea <= 0 || ventHeight <= 0) return 0.0;
+    return kWattsPerKilowatt * (7.8 * wallArea + 378.0 * ventArea * std::sqrt(ventHeight));
+}
+
+}  // namespace sim::fire

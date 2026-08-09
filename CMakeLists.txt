@@ -54,6 +54,7 @@ add_library(shipsim_engine
   engine/sim/rao.cpp
   engine/sim/scantlings.cpp
   engine/sim/fem.cpp
+  engine/sim/fire.cpp
   engine/sim/plasticity.cpp
   engine/sim/promotion.cpp
   engine/sim/reduction.cpp
@@ -117,6 +118,7 @@ add_executable(shipsim_tests
   tests/test_collision.cpp
   tests/test_constraint.cpp
   tests/test_coupling.cpp
+  tests/test_fire.cpp
   tests/test_girder.cpp
   tests/test_indentation.cpp
   tests/test_hullform.cpp
