@@ -689,7 +689,51 @@ should be honest about that.
 
 ## Phase 4 — Fire and heat — *~10 em*
 
-- Multi-zone compartment fire, species transport through the opening network
+- ✅ Multi-zone compartment fire, species transport through the opening network —
+  `engine/sim/fire.{hpp,cpp}`. A hot upper layer over a cool lower one per
+  compartment, Heskestad's plume entraining the one into the other, a design
+  fire as the input, and gas crossing the openings `ship.hpp` already carries.
+  Layer state is mass and *internal energy*, which makes the closure exact:
+  both layers share one pressure, so `p = (γ−1)U/V` and therefore
+  `V_u/V = U_u/U` — the volume split **is** the internal-energy split, with no
+  root find. Validated against Heskestad's two entrainment branches meeting at
+  the flame tip, the classical doorway integral and its
+  `(T_∞/T_h)^(1/3)` neutral plane, MQH, Thomas, and an account that closes to
+  1e-14 of scale on the ferry under a 4 MW fire.
+
+  **Two corrections to what the flooding network suggested would carry over.**
+
+  *A doorway is not one orifice.* `Ship::solveFlowNetwork` takes a single Δp at
+  the orifice centre. With a hot layer on one side that is not merely
+  inaccurate: the steady state of a doorway is hot gas out of the top and cool
+  air into the bottom in **equal** mass flows, so a model that sees only the net
+  is at rest and moves nothing, and the compartment behind it heats without
+  bound. The vent integral therefore runs over height, split at each layer
+  interface and at the neutral plane, closed form in each band. Measured on the
+  ferry: 2.4 kg/s exchanged through the watertight door, 0.004 kg/s through a
+  wing tank's air pipe, and the shortfall a single Δp reports is not a constant
+  factor — it runs from 14% to a factor of nine depending on where the orifice
+  centre happens to fall relative to the neutral plane.
+
+  *The equalisation clamp cannot be repaired.* Clamping a transfer to the mass
+  that equalises the two pressures starves a burning compartment, because it
+  ignores the pressure the fire adds over the same step — 500 kW in an ISO room
+  sat 800 Pa above atmosphere and vented a twentieth of what it should. Adding
+  the source term to the target fixes that and then rings, because scaling one
+  direction of a bidirectional flow to hit a net target is not continuous in the
+  state: the steady state became a limit cycle between −3 Pa and −590 Pa. The
+  clamp is replaced by what it approximates — the compartment pressures are
+  solved **implicitly**, Gauss-Seidel over a monotone 1-D bisection per
+  compartment. A 1.6 m² doorway relaxes a 100 Pa imbalance in 0.65 ms; unlike
+  conduction, the gas really is sub-millisecond and explicit was never viable.
+
+  Not here, and named rather than hidden: buoyancy-driven exchange through
+  *horizontal* openings (a hatch in a deck has no Δp at all), the stack effect
+  of the 5.5 m of air pipe between a deckhead and its gooseneck, a heeled
+  compartment's layer geometry, and the `p dV` term a compartment that floods
+  while it burns would need. `Ship`'s own gas is isothermal at `kTAmbient` by
+  construction, so the write-back is a pressure proxy until `ship.cpp` carries a
+  gas temperature.
 - ✅ Implicit thermal FEM on the structural mesh — `engine/sim/thermal.{hpp,cpp}`.
   Backward Euler on the same solid-shell mesh and the same `BandedSpd`
   factorisation the statics use, one scalar unknown per node; Dirichlet, flux and
