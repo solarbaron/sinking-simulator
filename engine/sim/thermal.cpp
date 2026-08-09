@@ -122,6 +122,154 @@ double carbonSteelEnthalpy(double kelvin) {
     return h;
 }
 
+// --- Strength at temperature -------------------------------------------------------
+
+namespace {
+
+// EN 1993-1-2:2005 Table 3.1, transcribed. Thirteen stations at hundred-degree
+// intervals from 20 C; the standard prescribes linear interpolation between them,
+// so this is the whole model and not a fit to it.
+//
+// It is *not* exported. A test that asserted the interpolant against this array
+// would be asserting the code against itself -- move a row and both sides move
+// together -- so `tests/test_thermal.cpp` carries its own transcription of the
+// published table and compares against that. Two independent transcriptions is
+// the point.
+constexpr int kReductionStations = 13;
+constexpr double kReductionCelsius[kReductionStations] = {20,  100, 200, 300,  400,  500, 600,
+                                                          700, 800, 900, 1000, 1100, 1200};
+constexpr double kYieldFactor[kReductionStations] = {1.000, 1.000, 1.000, 1.000, 1.000,
+                                                     0.780, 0.470, 0.230, 0.110, 0.060,
+                                                     0.040, 0.020, 0.000};
+constexpr double kProportionalFactor[kReductionStations] = {1.0000, 1.0000, 0.8070, 0.6130,
+                                                            0.4200, 0.3600, 0.1800, 0.0750,
+                                                            0.0500, 0.0375, 0.0250, 0.0125,
+                                                            0.0000};
+constexpr double kModulusFactor[kReductionStations] = {1.0000, 1.0000, 0.9000, 0.8000,
+                                                       0.7000, 0.6000, 0.3100, 0.1300,
+                                                       0.0900, 0.0675, 0.0450, 0.0225,
+                                                       0.0000};
+
+// Linear interpolation on the station list, clamped at both ends.
+//
+// **The tabulated points come back exactly.** The `t == station` early exit is
+// what says so, and it is worth being honest about what it currently buys:
+// **nothing, on this table.** `s` is exactly 1 at the upper station and exactly 0
+// at the lower, so the general expression is `a + (b - a) * 1` and `a + (b - a) *
+// 0`; the second is `a` for every finite `a` by IEEE, and the first happens to be
+// `b` for **all thirty-six adjacent pairs of Table 3.1**. That was assumed here
+// first -- with a worked example claiming 0.0675 and 0.045 were a unit in the last
+// place apart, which they are not -- and mutation testing found the branch
+// unobservable and the claim invented.
+//
+// It stays, because `a + (b - a) == b` is a property of *these numbers* and not of
+// the method, and a table row added later has no reason to keep it.
+// `tests/test_thermal.cpp` now asserts the property over every pair directly, so
+// the day it stops holding is caught there rather than in a caller.
+double interpolate(const double value[kReductionStations], double t) {
+    if (t <= kReductionCelsius[0]) return value[0];
+    if (t >= kReductionCelsius[kReductionStations - 1]) return value[kReductionStations - 1];
+    for (int i = 1; i < kReductionStations; ++i) {
+        if (t > kReductionCelsius[i]) continue;
+        if (t == kReductionCelsius[i]) return value[i];
+        const double lo = kReductionCelsius[i - 1], hi = kReductionCelsius[i];
+        const double s = (t - lo) / (hi - lo);
+        return value[i - 1] + (value[i] - value[i - 1]) * s;
+    }
+    return value[kReductionStations - 1];
+}
+
+}  // namespace
+
+SteelReduction carbonSteelReduction(double kelvin) {
+    const double t = celsius(kelvin);
+    SteelReduction out;
+    out.effectiveYield = interpolate(kYieldFactor, t);
+    out.proportionalLimit = interpolate(kProportionalFactor, t);
+    out.youngsModulus = interpolate(kModulusFactor, t);
+    return out;
+}
+
+double carbonSteelYieldFactor(double kelvin) {
+    return interpolate(kYieldFactor, celsius(kelvin));
+}
+double carbonSteelProportionalFactor(double kelvin) {
+    return interpolate(kProportionalFactor, celsius(kelvin));
+}
+double carbonSteelModulusFactor(double kelvin) {
+    return interpolate(kModulusFactor, celsius(kelvin));
+}
+
+double carbonSteelStress(double strain, double kelvin, double yieldStrength,
+                         double youngsModulus) {
+    // The standard writes the curve in tension and takes compression as its
+    // mirror. Doing the reflection here rather than in four branches keeps the
+    // ellipse's construction in one place.
+    const double sign = strain < 0.0 ? -1.0 : 1.0;
+    const double eps = std::abs(strain);
+
+    const SteelReduction k = carbonSteelReduction(kelvin);
+    const double fy = k.effectiveYield * yieldStrength;
+    const double fp = k.proportionalLimit * yieldStrength;
+    const double ea = k.youngsModulus * youngsModulus;
+
+    // The four strain landmarks. Only the first depends on temperature; 2%, 15%
+    // and 20% are fixed by the standard.
+    const double epsY = 0.02, epsT = 0.15, epsU = 0.20;
+    if (!(ea > 0.0)) return 0.0;             // 1200 C: no stiffness and no strength
+    const double epsP = fp / ea;
+
+    if (eps <= epsP) return sign * ea * eps;
+    if (eps >= epsU) return 0.0;
+    if (eps >= epsT) return sign * fy * (1.0 - (eps - epsT) / (epsU - epsT));
+    if (eps >= epsY) return sign * fy;
+
+    // The elliptical transition. `c`, `a` and `b` are the standard's own symbols;
+    // the construction makes the ellipse tangent to the elastic line at `epsP` and
+    // horizontal at `epsY`, which is why it is an ellipse and not a spline.
+    //
+    // Degenerate when `fy == fp` -- every temperature at or below 100 C, where both
+    // factors are 1 -- and there the curve is elastic-perfectly-plastic with no
+    // transition at all. `c` is then zero over a zero denominator, so the case is
+    // taken rather than divided.
+    const double gap = fy - fp;
+    const double span = epsY - epsP;
+    if (!(gap > 0.0) || !(span > 0.0)) return sign * fy;
+
+    const double denominator = span * ea - 2.0 * gap;
+    if (!(denominator > 0.0)) return sign * fy;
+    const double c = gap * gap / denominator;
+    const double aSquared = span * (span + c / ea);
+    const double bSquared = c * span * ea + c * c;
+    const double reach = epsY - eps;
+    const double inside = aSquared - reach * reach;
+    if (!(inside > 0.0) || !(aSquared > 0.0)) return sign * fy;
+    return sign * (fp - c + std::sqrt(bSquared / aSquared) * std::sqrt(inside));
+}
+
+StructuralMaterial atTemperature(const StructuralMaterial& material, double kelvin) {
+    const SteelReduction k = carbonSteelReduction(kelvin);
+    StructuralMaterial out = material;
+    out.youngsModulus *= k.youngsModulus;
+    out.yieldStrength *= k.effectiveYield;
+    return out;
+}
+
+plasticity::Material atTemperature(const plasticity::Material& material, double kelvin) {
+    const SteelReduction k = carbonSteelReduction(kelvin);
+    plasticity::Material out = material;
+    out.youngsModulus *= k.youngsModulus;
+    // The whole curve, so that `flowStress` scales by `k_y` at every plastic
+    // strain and Considere's root does not move. Which of these are live depends
+    // on `flow.kind`, and scaling all of them is what keeps a curve that is
+    // switched from Linear to Swift after being reduced still reduced.
+    out.flow.yieldStrength *= k.effectiveYield;
+    out.flow.hardeningModulus *= k.effectiveYield;
+    out.flow.strengthCoefficient *= k.effectiveYield;
+    out.flow.kinematicModulus *= k.effectiveYield;
+    return out;
+}
+
 // --- Element forms ---------------------------------------------------------------
 
 bool computeForms(const double nodes[kDof], Forms& out) {
@@ -169,6 +317,62 @@ bool computeForms(const double nodes[kDof], Forms& out) {
             }
     }
     return true;
+}
+
+void gaussTemperature(const double nodal[kNodes], double out[kGauss]) {
+    const double q = 1.0 / std::sqrt(3.0);
+    for (int gp = 0; gp < kGauss; ++gp) {
+        // The same bit pattern `computeForms` uses, which is the same one
+        // `solidshell` uses: xi from bit 0, eta from bit 1, zeta from bit 2.
+        const double xi = (gp & 1) ? q : -q;
+        const double eta = (gp & 2) ? q : -q;
+        const double zta = (gp & 4) ? q : -q;
+        double sum = 0.0;
+        for (int a = 0; a < kNodes; ++a)
+            sum += 0.125 * (1.0 + xi * kXi[a]) * (1.0 + eta * kEta[a]) * (1.0 + zta * kZta[a]) *
+                   nodal[a];
+        out[gp] = sum;
+    }
+}
+
+double elementTemperature(const Forms& forms, const double nodal[kNodes]) {
+    if (!forms.ok) return 0.0;
+    double gauss[kGauss];
+    gaussTemperature(nodal, gauss);
+    double weighted = 0.0, volume = 0.0;
+    for (int gp = 0; gp < kGauss; ++gp) {
+        weighted += forms.weight[gp] * gauss[gp];
+        volume += forms.weight[gp];
+    }
+    return volume > 0.0 ? weighted / volume : 0.0;
+}
+
+bool elementTemperatures(const solidshell::HexMesh& mesh, const std::vector<double>& nodal,
+                         std::vector<double>& out) {
+    out.clear();
+    if (nodal.size() != mesh.nodeCount()) return false;
+    out.resize(mesh.elementCount(), 0.0);
+    bool ok = true;
+    for (std::size_t e = 0; e < mesh.elementCount(); ++e) {
+        double nodes[kDof], value[kNodes];
+        for (int a = 0; a < kNodes; ++a) {
+            const std::size_t n = mesh.index[e * kNodes + static_cast<std::size_t>(a)];
+            value[a] = nodal[n];
+            for (int i = 0; i < 3; ++i) nodes[a * 3 + i] = mesh.position[n * 3 + static_cast<std::size_t>(i)];
+        }
+        Forms forms;
+        if (!computeForms(nodes, forms)) {
+            // The `continue` is belt-and-braces: `elementTemperature` refuses a
+            // `Forms` that did not build and returns zero, which is the fill value
+            // this element already has. Mutation testing scored deleting it as an
+            // equivalent mutant for exactly that reason, and it is kept because
+            // two readers of "this element has no answer" agreeing is the point.
+            ok = false;
+            continue;
+        }
+        out[e] = elementTemperature(forms, value);
+    }
+    return ok;
 }
 
 void conductance(const Forms& forms, const double conductivity[kGauss],

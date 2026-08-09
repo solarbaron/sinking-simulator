@@ -48,8 +48,14 @@
 // one checks the gradient is not zero; the nonlinear ones check that the
 // temperature dependence actually moved the answer.
 #include "engine/sim/thermal.hpp"
+#include "engine/sim/buckling.hpp"
+#include "engine/sim/collapse.hpp"
+#include "engine/sim/constraint.hpp"
+#include "engine/sim/plasticity.hpp"
+#include "engine/sim/promotion.hpp"
 #include "engine/sim/scantlings.hpp"
 #include "engine/sim/solid_shell.hpp"
+#include "game/prototype/ferry.hpp"
 #include "harness.hpp"
 
 #include <chrono>
@@ -2102,6 +2108,1033 @@ void testCost() {
                std::abs(a.residual()) < 1e-12 * std::abs(a.enthalpyChange));
 }
 
+// ================================================================================
+// Hot steel: EN 1993-1-2 §3.2, and what it does to a structure
+// ================================================================================
+//
+// The conduction solve above says what the steel's temperature is. Everything
+// below says what the steel then carries, and the tests divide into three kinds:
+// the standard reproduced exactly, the coupling shown to be exact at 20 C, and a
+// structural consequence with hand-computed ends.
+
+// --- 1. The standard's own table ------------------------------------------------
+
+// **This is a second, independent transcription of EN 1993-1-2:2005 Table 3.1.**
+// `thermal.cpp` has its own and does not export it, deliberately: a test that read
+// the implementation's array would move with it, and a mutant that changed one row
+// would change both sides and survive. Two transcriptions is the whole point, and
+// it is the reason the numbers below are written out rather than generated.
+struct TabulatedReduction {
+    double celsius, yield, proportional, modulus;
+};
+constexpr TabulatedReduction kTable32[] = {
+    {  20.0, 1.000, 1.0000, 1.0000},
+    { 100.0, 1.000, 1.0000, 1.0000},
+    { 200.0, 1.000, 0.8070, 0.9000},
+    { 300.0, 1.000, 0.6130, 0.8000},
+    { 400.0, 1.000, 0.4200, 0.7000},
+    { 500.0, 0.780, 0.3600, 0.6000},
+    { 600.0, 0.470, 0.1800, 0.3100},
+    { 700.0, 0.230, 0.0750, 0.1300},
+    { 800.0, 0.110, 0.0500, 0.0900},
+    { 900.0, 0.060, 0.0375, 0.0675},
+    {1000.0, 0.040, 0.0250, 0.0450},
+    {1100.0, 0.020, 0.0125, 0.0225},
+    {1200.0, 0.000, 0.0000, 0.0000},
+};
+constexpr int kTableRows = static_cast<int>(sizeof(kTable32) / sizeof(kTable32[0]));
+
+void testReductionTable() {
+    // **Every tabulated point exactly -- and the three where "exactly" is not
+    // available, with the reason.** The interpolant takes a station branch rather
+    // than trusting `a + (b - a) * 1.0` to land on `b`, so given the exact Celsius
+    // station it returns the standard's literal. What it is given is
+    // `celsius(kelvin)`, and **the Celsius-to-Kelvin round trip is not exact at
+    // 800, 900 and 1000 C**: the nearest double to 1073.15 differs from
+    // `800 + 273.15` by 1.1e-13 K, and no double at all satisfies
+    // `k - 273.15 == 800` because the spacing at 1073 is twice the spacing at 800.
+    // That is a property of the Kelvin interface `thermal.hpp` chose, not of the
+    // table, and the resulting error is bounded by the steepest slope in Table 3.1
+    // -- 0.0031 per K, between 500 and 600 C -- times 1.1e-13 K, so 3.5e-16, which
+    // is three units in the last place of the factor.
+    //
+    // So the test asserts bit-equality wherever the round trip is exact, counts
+    // those so the check cannot quietly become vacuous, and holds the remaining
+    // three to that derived bound rather than loosening all thirteen to it.
+    int exactStations = 0;
+    for (const TabulatedReduction& row : kTable32) {
+        const double k = row.celsius + kC;
+        const th::SteelReduction r = th::carbonSteelReduction(k);
+        const bool roundTrips = (k - kC) == row.celsius;
+        const double tolerance = roundTrips ? 0.0 : 4e-16;
+        if (roundTrips) ++exactStations;
+        expectNear("k_y at a tabulated temperature is the tabulated value", r.effectiveYield,
+                   row.yield, tolerance);
+        expectNear("k_p at a tabulated temperature is the tabulated value",
+                   r.proportionalLimit, row.proportional, tolerance);
+        expectNear("k_E at a tabulated temperature is the tabulated value", r.youngsModulus,
+                   row.modulus, tolerance);
+        // The three scalar accessors are the same numbers, bit for bit. They are
+        // separate entry points and a caller may use either; nothing but this
+        // stops them drifting.
+        expectTrue("carbonSteelYieldFactor agrees with the struct bit for bit",
+                   th::carbonSteelYieldFactor(k) == r.effectiveYield);
+        expectTrue("carbonSteelProportionalFactor agrees with the struct bit for bit",
+                   th::carbonSteelProportionalFactor(k) == r.proportionalLimit);
+        expectTrue("carbonSteelModulusFactor agrees with the struct bit for bit",
+                   th::carbonSteelModulusFactor(k) == r.youngsModulus);
+    }
+    expectEqual("ten of the thirteen stations are reached exactly through kelvin",
+                exactStations, 10);
+
+    // **Linear between them, and monotone.** Linearity is asserted at the midpoint
+    // of every interval against the mean of its ends -- which is what linear
+    // interpolation *means*, and is a different statement from "it is between
+    // them". A quadratic through the same points passes a betweenness check and
+    // fails this one.
+    for (int i = 1; i < kTableRows; ++i) {
+        const double lo = kTable32[i - 1].celsius, hi = kTable32[i].celsius;
+        const double mid = 0.5 * (lo + hi);
+        const th::SteelReduction r = th::carbonSteelReduction(mid + kC);
+        expectNear("k_y at the midpoint is the mean of the ends", r.effectiveYield,
+                   0.5 * (kTable32[i - 1].yield + kTable32[i].yield), 1e-15);
+        expectNear("k_p at the midpoint is the mean of the ends", r.proportionalLimit,
+                   0.5 * (kTable32[i - 1].proportional + kTable32[i].proportional), 1e-15);
+        expectNear("k_E at the midpoint is the mean of the ends", r.youngsModulus,
+                   0.5 * (kTable32[i - 1].modulus + kTable32[i].modulus), 1e-15);
+
+        // And at a quarter and three quarters, so an implementation that split the
+        // interval in half and recursed would still have to be linear.
+        for (double s : {0.25, 0.75}) {
+            const double t = lo + s * (hi - lo);
+            const th::SteelReduction q = th::carbonSteelReduction(t + kC);
+            expectNear("k_y interpolates linearly across the interval", q.effectiveYield,
+                       kTable32[i - 1].yield + s * (kTable32[i].yield - kTable32[i - 1].yield),
+                       1e-15);
+        }
+    }
+
+    // **Why the interpolant's `t == station` branch is currently unobservable**,
+    // asserted rather than assumed. `s` is exactly 1 at the upper station, so the
+    // general expression reduces to `a + (b - a)` -- and for all thirty-six
+    // adjacent pairs of Table 3.1 that is bit-exactly `b`. Mutation testing found
+    // the branch dead and found the comment that justified it inventing a unit in
+    // the last place between 0.0675 and 0.045 that does not exist. The branch is
+    // kept because this is a property of these particular numbers; this check is
+    // what fires the day a row is added that does not have it.
+    for (int i = 1; i < kTableRows; ++i) {
+        expectTrue("k_y interpolates to its upper station exactly without the branch",
+                   kTable32[i - 1].yield + (kTable32[i].yield - kTable32[i - 1].yield) ==
+                       kTable32[i].yield);
+        expectTrue("k_p interpolates to its upper station exactly without the branch",
+                   kTable32[i - 1].proportional +
+                       (kTable32[i].proportional - kTable32[i - 1].proportional) ==
+                       kTable32[i].proportional);
+        expectTrue("k_E interpolates to its upper station exactly without the branch",
+                   kTable32[i - 1].modulus + (kTable32[i].modulus - kTable32[i - 1].modulus) ==
+                       kTable32[i].modulus);
+    }
+
+    // Monotone non-increasing over the whole range, sampled at 1 K. Steel does not
+    // get stronger as it heats, and a transposed pair of rows would show here.
+    double previousY = 2.0, previousP = 2.0, previousE = 2.0;
+    for (int c = 20; c <= 1200; ++c) {
+        const th::SteelReduction r = th::carbonSteelReduction(c + kC);
+        expectTrue("k_y never rises with temperature", r.effectiveYield <= previousY);
+        expectTrue("k_p never rises with temperature", r.proportionalLimit <= previousP);
+        expectTrue("k_E never rises with temperature", r.youngsModulus <= previousE);
+        expectTrue("the proportional limit never exceeds the effective yield",
+                   r.proportionalLimit <= r.effectiveYield);
+        previousY = r.effectiveYield;
+        previousP = r.proportionalLimit;
+        previousE = r.youngsModulus;
+    }
+
+    // Clamped outside the standard's range, the same way `carbonSteelConductivity`
+    // clamps. Below 20 C the factors are 1 -- cold steel is stronger and the
+    // standard says nothing, so the room-temperature value is the only defensible
+    // answer and it is also the conservative one.
+    for (double c : {-273.0, -100.0, 0.0, 19.99}) {
+        expectTrue("below 20 C every factor is exactly 1",
+                   th::carbonSteelYieldFactor(c + kC) == 1.0 &&
+                       th::carbonSteelProportionalFactor(c + kC) == 1.0 &&
+                       th::carbonSteelModulusFactor(c + kC) == 1.0);
+    }
+    for (double c : {1200.01, 1500.0, 5000.0}) {
+        expectTrue("above 1200 C every factor is exactly 0",
+                   th::carbonSteelYieldFactor(c + kC) == 0.0 &&
+                       th::carbonSteelProportionalFactor(c + kC) == 0.0 &&
+                       th::carbonSteelModulusFactor(c + kC) == 0.0);
+    }
+
+    // **Not vacuous.** The whole task is that these numbers move; a table of ones
+    // would satisfy every assertion above about ordering and clamping.
+    expectNear("k_y has lost 53% of the strength by 600 C",
+               th::carbonSteelYieldFactor(600.0 + kC), 0.470, 0.0);
+    expectTrue("and k_E has lost more than k_y has, from 500 C up",
+               th::carbonSteelModulusFactor(600.0 + kC) < th::carbonSteelYieldFactor(600.0 + kC));
+    expectTrue("while at 400 C the yield has not moved at all and the modulus has",
+               th::carbonSteelYieldFactor(400.0 + kC) == 1.0 &&
+                   th::carbonSteelModulusFactor(400.0 + kC) == 0.7);
+}
+
+// --- 2. The standard's stress-strain curve --------------------------------------
+
+void testStressStrainCurve() {
+    const double fy = 355.0e6, ea = 210.0e9;
+
+    for (const TabulatedReduction& row : kTable32) {
+        const double k = row.celsius + kC;
+        if (row.modulus == 0.0) {
+            expectTrue("at 1200 C the curve is identically zero",
+                       th::carbonSteelStress(0.001, k, fy, ea) == 0.0 &&
+                           th::carbonSteelStress(0.05, k, fy, ea) == 0.0);
+            continue;
+        }
+        const double fyT = row.yield * fy, fpT = row.proportional * fy, eaT = row.modulus * ea;
+        const double epsP = fpT / eaT;
+
+        // The three landmarks the four branches have to meet at. Each is a value
+        // the standard states, so each is asserted against arithmetic rather than
+        // against the neighbouring branch.
+        expectNear("the elastic branch is exactly E_a,theta times the strain",
+                   th::carbonSteelStress(0.5 * epsP, k, fy, ea), 0.5 * epsP * eaT,
+                   1e-9 * fyT);
+        expectNear("the curve reaches the proportional limit at eps_p",
+                   th::carbonSteelStress(epsP, k, fy, ea), fpT, 1e-9 * fy);
+        expectNear("and the effective yield at exactly 2% strain",
+                   th::carbonSteelStress(0.02, k, fy, ea), fyT, 1e-9 * fy);
+        expectNear("the plateau holds it to 15%", th::carbonSteelStress(0.15, k, fy, ea), fyT,
+                   1e-9 * fy);
+        expectNear("and it falls linearly to half of it at 17.5%",
+                   th::carbonSteelStress(0.175, k, fy, ea), 0.5 * fyT, 1e-9 * fy);
+        expectTrue("and to exactly zero at 20%", th::carbonSteelStress(0.20, k, fy, ea) == 0.0);
+        // **And stays there.** The standard's curve ends at eps_u; past it the
+        // material is gone. Without the `eps >= eps_u` branch the falling line
+        // would simply keep going and hand back a *negative* stress at 25% strain,
+        // which is a mutant that survived until this line existed.
+        for (double e : {0.2001, 0.25, 0.5, 2.0}) {
+            expectTrue("past 20% strain there is nothing left, in either direction",
+                       th::carbonSteelStress(e, k, fy, ea) == 0.0 &&
+                           th::carbonSteelStress(-e, k, fy, ea) == 0.0);
+        }
+
+        // **The ellipse is tangent at both ends, and that is what makes it an
+        // ellipse rather than any curve through the same two points.** At eps_p
+        // its slope is E_a,theta and at 2% it is zero, so a **centred** difference
+        // straddling the junction has to come back with the branch slope: a kink
+        // of size `delta` there would return `E - delta/2` and be caught at first
+        // order, where a one-sided difference on the smooth side would see
+        // nothing. `h = 1e-9` because the ellipse's curvature is highest at its
+        // steep end -- at 200 C a forward difference at 1e-6 is 6% low purely from
+        // truncation, which is what a first attempt at this read as a failure.
+        //
+        // **At 20 C and 100 C there is no ellipse and there should be a kink.**
+        // `k_p == k_y == 1` collapses the transition to nothing and the standard's
+        // own curve is elastic-perfectly-plastic, corner included. Asserting
+        // tangency there would be asserting against a curve the standard does not
+        // draw.
+        const double h = 1e-9;
+        const double slopeAtY = (th::carbonSteelStress(0.02, k, fy, ea) -
+                                 th::carbonSteelStress(0.02 - 1e-8, k, fy, ea)) / 1e-8;
+        expectTrue("the curve arrives at 2% strain horizontally",
+                   std::abs(slopeAtY) < 1e-6 * eaT);
+        if (row.proportional < row.yield) {
+            const double slopeAtP = (th::carbonSteelStress(epsP + h, k, fy, ea) -
+                                     th::carbonSteelStress(epsP - h, k, fy, ea)) / (2.0 * h);
+            expectTrue("the ellipse leaves eps_p along the elastic line",
+                       std::abs(slopeAtP - eaT) < 1e-3 * eaT);
+        } else {
+            // The degenerate case, asserted rather than skipped: the curve is
+            // exactly the effective yield everywhere past eps_p.
+            expectTrue("with no ellipse the curve is flat immediately past eps_p",
+                       th::carbonSteelStress(epsP + h, k, fy, ea) == fyT &&
+                           th::carbonSteelStress(0.01, k, fy, ea) == fyT);
+        }
+
+        // Monotone up to 2% and odd in the strain, both over a fine sweep.
+        double previous = 0.0;
+        for (int i = 0; i <= 4000; ++i) {
+            const double e = 0.02 * i / 4000.0;
+            const double s = th::carbonSteelStress(e, k, fy, ea);
+            expectTrue("the curve never falls before 2% strain", s >= previous - 1e-6);
+            expectTrue("the curve is odd in the strain",
+                       th::carbonSteelStress(-e, k, fy, ea) == -s);
+            expectTrue("and never exceeds the effective yield", s <= fyT * (1.0 + 1e-12));
+            previous = s;
+        }
+
+        // **The plateau, swept rather than sampled at three points.** Removing the
+        // `eps >= eps_y` branch does not break the plateau everywhere -- past
+        // about 3.9% strain the ellipse's argument goes negative and its guard
+        // returns `f_y` anyway, so 5%, 10% and 15% all still look right. What sags
+        // is the narrow band just past 2%, by 3e-4 of `f_y` at 2.1%, and three
+        // spot checks walked straight past it. This sweep is what caught it.
+        for (int i = 0; i <= 1300; ++i) {
+            const double e = 0.02 + (0.15 - 0.02) * i / 1300.0;
+            expectTrue("the plateau holds the effective yield across the whole of it",
+                       std::abs(th::carbonSteelStress(e, k, fy, ea) - fyT) <= 1e-9 * fy);
+        }
+    }
+
+    // **What the J2 model this file couples to gives up, measured.**
+    // `plasticity::Material` carries one yield strength; scaled by `k_y` it is an
+    // elastic-perfectly-plastic curve at `k_E E` and `k_y f_y`. Where it differs
+    // from the standard is between `k_p f_y` and `k_y f_y`, and the difference is
+    // bounded by `(k_y - k_p) f_y` by construction. The measurement is the point:
+    // the worst temperature is **400 C**, not the hottest one.
+    double worstGap = 0, worstAt = 0, worstTemperature = 0;
+    for (const TabulatedReduction& row : kTable32) {
+        if (row.modulus == 0.0) continue;
+        const double k = row.celsius + kC;
+        double gap = 0, at = 0;
+        for (int i = 0; i <= 4000; ++i) {
+            const double e = 0.02 * i / 4000.0;
+            const double j2 = std::min(row.modulus * ea * e, row.yield * fy);
+            const double d = std::abs(j2 - th::carbonSteelStress(e, k, fy, ea));
+            if (d > gap) { gap = d; at = e; }
+        }
+        expectTrue("the J2 gap never exceeds (k_y - k_p) f_y",
+                   gap <= (row.yield - row.proportional) * fy + 1e-6);
+        if (gap > worstGap) { worstGap = gap; worstAt = at; worstTemperature = row.celsius; }
+        // Past 2% strain the two are the same curve, identically.
+        for (double e : {0.02, 0.05, 0.10, 0.15}) {
+            expectNear("past 2% strain the J2 curve and the standard's agree",
+                       th::carbonSteelStress(e, k, fy, ea), row.yield * fy, 1e-9 * fy);
+        }
+    }
+    expectNear("the J2 model is exact at 20 C, where k_p == k_y",
+               th::carbonSteelStress(0.001, 20.0 + kC, fy, ea), 0.001 * ea, 1e-9 * fy);
+    expectNear("the worst J2 gap is 0.388 f_y", worstGap / fy, 0.388, 0.002);
+    expectNear("and it is at 400 C, where the yield has not moved and the limit has",
+               worstTemperature, 400.0, 0.0);
+    std::printf("     EN 1993-1-2 §3.2.1 vs a k_y-scaled J2 curve: worst gap %.3f f_y at %.0f C,"
+                " %.3f%% strain; identical at and past 2%%\n",
+                worstGap / fy, worstTemperature, 100.0 * worstAt);
+}
+
+// --- 3. The coupling, and the exact control at 20 C -------------------------------
+
+void testMaterialsAtTemperature() {
+    const StructuralMaterial cold = ah36Steel();
+
+    // **The exact control.** At 20 C -- and anywhere below it, where the factors
+    // clamp to 1 -- a reduced material is the same material, bit for bit, on every
+    // field. Not "close": `x *= 1.0` is exact for every finite double, and a
+    // reduction that came back merely nearly equal would put a difference into
+    // every downstream result on an unheated ship.
+    for (double c : {20.0, 0.0, -50.0}) {
+        const StructuralMaterial same = th::atTemperature(cold, c + kC);
+        expectTrue("an unheated StructuralMaterial is bit-identical",
+                   same.youngsModulus == cold.youngsModulus &&
+                       same.yieldStrength == cold.yieldStrength &&
+                       same.poissonRatio == cold.poissonRatio && same.density == cold.density &&
+                       same.conductivity == cold.conductivity &&
+                       same.specificHeat == cold.specificHeat && same.name == cold.name);
+    }
+
+    // The two that move, and the four that do not.
+    //
+    // **Against the published accessor, not against the table literal.** The claim
+    // being made is that `atTemperature` applies exactly the factor
+    // `carbonSteelModulusFactor` reports -- one multiply and no rounding of its
+    // own. Comparing against `row.modulus` instead would fold in the Kelvin
+    // round-trip error `testReductionTable` already isolates, and would make this
+    // check fail for a reason that has nothing to do with the coupling.
+    for (const TabulatedReduction& row : kTable32) {
+        const double k = row.celsius + kC;
+        const StructuralMaterial hot = th::atTemperature(cold, k);
+        expectTrue("E is scaled by exactly k_E",
+                   hot.youngsModulus == cold.youngsModulus * th::carbonSteelModulusFactor(k));
+        expectTrue("the yield strength is scaled by exactly k_y",
+                   hot.yieldStrength == cold.yieldStrength * th::carbonSteelYieldFactor(k));
+        expectTrue("density, Poisson ratio and the 20 C thermal properties are untouched",
+                   hot.density == cold.density && hot.poissonRatio == cold.poissonRatio &&
+                       hot.conductivity == cold.conductivity &&
+                       hot.specificHeat == cold.specificHeat);
+    }
+
+    // --- the flow model ---
+    //
+    // Two curves, because they scale through different fields: Linear carries a
+    // hardening modulus, Swift a strength coefficient, and a reduction that
+    // touched only `yieldStrength` would pass every Swift test while leaving a
+    // Linear curve hardening back to its cold strength.
+    sim::plasticity::Material swift = sim::plasticity::shipSteel();
+    sim::plasticity::Material linear = swift;
+    linear.flow = sim::plasticity::linearHardening(355.0e6, 1.2e9);
+    // **Kinematic hardening is off by default and that made its scaling
+    // untestable.** A mutant that deleted `kinematicModulus *= k_y` survived the
+    // whole suite because every material in it carried zero there. `plasticity.hpp`
+    // keeps the path live and tested precisely so switching it on is a parameter
+    // rather than a rewrite, so the reduction has to reach it too.
+    linear.flow.kinematicModulus = 8.0e8;
+    swift.flow.kinematicModulus = 6.0e8;
+
+    for (const sim::plasticity::Material& base : {swift, linear}) {
+        for (double c : {20.0, 0.0}) {
+            const sim::plasticity::Material same = th::atTemperature(base, c + kC);
+            expectTrue("an unheated plasticity::Material is bit-identical",
+                       same.youngsModulus == base.youngsModulus &&
+                           same.poissonRatio == base.poissonRatio &&
+                           same.flow.yieldStrength == base.flow.yieldStrength &&
+                           same.flow.hardeningModulus == base.flow.hardeningModulus &&
+                           same.flow.strengthCoefficient == base.flow.strengthCoefficient &&
+                           same.flow.referenceStrain == base.flow.referenceStrain &&
+                           same.flow.hardeningExponent == base.flow.hardeningExponent &&
+                           same.flow.kinematicModulus == base.flow.kinematicModulus &&
+                           same.failure.uniformStrain == base.failure.uniformStrain &&
+                           same.failure.fractureStrain == base.failure.fractureStrain);
+        }
+
+        for (const TabulatedReduction& row : kTable32) {
+            const double k = row.celsius + kC;
+            const sim::plasticity::Material hot = th::atTemperature(base, k);
+            expectTrue("E is scaled by exactly k_E",
+                       hot.youngsModulus == base.youngsModulus * th::carbonSteelModulusFactor(k));
+
+            // **The whole curve scales, at every plastic strain.** Sampling only
+            // at eps_p = 0 would be satisfied by scaling the intercept alone.
+            for (double p : {0.0, 0.001, 0.01, 0.05, 0.2, 0.5}) {
+                const double coldStress = sim::plasticity::flowStress(base.flow, p);
+                expectNear("the flow stress scales by k_y at every plastic strain",
+                           sim::plasticity::flowStress(hot.flow, p), row.yield * coldStress,
+                           1e-9 * coldStress + 1e-9);
+                const double coldSlope = sim::plasticity::flowSlope(base.flow, p);
+                expectNear("and so does the hardening slope",
+                           sim::plasticity::flowSlope(hot.flow, p), row.yield * coldSlope,
+                           1e-9 * std::abs(coldSlope) + 1e-9);
+            }
+
+            // **Considere's necking strain does not move.** `dsigma/deps = sigma`
+            // has both sides multiplied by the same positive number, so its root
+            // cannot move -- and that is why `Failure` is left alone rather than
+            // adjusted. At 1200 C the curve has no strength at all and the root is
+            // undefined, which is the one case excluded.
+            //
+            // For **Swift** it is bit-exact, and structurally so: `n - eps_0` is
+            // built from two fields `atTemperature` does not touch. For **Linear**
+            // it is `1 - sigma_y0/H`, and `(k sigma_y0)/(k H)` is not `sigma_y0/H`
+            // for every double -- the invariance is exact in the reals and one
+            // unit in the last place in floating point. Claiming bit-exactness for
+            // both was this test's first mistake; the two are asserted apart
+            // rather than to the looser of the two, which would have hidden a
+            // genuine drift on the Swift path.
+            if (row.yield > 0.0) {
+                const double got = sim::plasticity::uniformElongation(hot.flow);
+                const double want = sim::plasticity::uniformElongation(base.flow);
+                if (base.flow.kind == sim::plasticity::Hardening::Swift)
+                    expectTrue("a scaled Swift curve necks at exactly the same strain",
+                               got == want);
+                else
+                    expectNear("a scaled linear curve necks at the same strain to rounding",
+                               got, want, 4e-16 * std::abs(want));
+            }
+            expectTrue("and the failure constants are untouched",
+                       hot.failure.uniformStrain == base.failure.uniformStrain &&
+                           hot.failure.fractureStrain == base.failure.fractureStrain &&
+                           hot.failure.triaxialitySensitivity ==
+                               base.failure.triaxialitySensitivity);
+
+            // Every field of the flow curve that carries a stress, including the
+            // kinematic modulus a default material leaves at zero.
+            expectTrue("the kinematic modulus is scaled by exactly k_y too",
+                       hot.flow.kinematicModulus ==
+                           base.flow.kinematicModulus * th::carbonSteelYieldFactor(k));
+            expectTrue("the two strain-valued Swift parameters are not scaled",
+                       hot.flow.referenceStrain == base.flow.referenceStrain &&
+                           hot.flow.hardeningExponent == base.flow.hardeningExponent);
+            expectTrue("and the base curve really has a kinematic modulus to scale",
+                       base.flow.kinematicModulus > 0.0);
+        }
+    }
+
+    // A dead material at 1200 C has to come back finite rather than NaN: the
+    // return map divides by the shear modulus, and the standard's table ends at
+    // zero for all three factors.
+    const sim::plasticity::Material dead = th::atTemperature(swift, 1200.0 + kC);
+    double strain[6] = {0.01, 0.0, 0.0, 0.0, 0.0, 0.0}, stress[6] = {};
+    sim::plasticity::State state;
+    sim::plasticity::update(dead, sim::plasticity::kNeverFails, strain, state, stress);
+    expectTrue("a material with no strength and no stiffness returns zero, not NaN",
+               stress[0] == 0.0 && stress[1] == 0.0 && stress[2] == 0.0 &&
+                   std::isfinite(state.equivalentPlasticStrain));
+}
+
+// --- 4. Does the return map need a term it does not have? ------------------------
+
+void testReturnMapUnderAMovingYieldSurface() {
+    using namespace sim::plasticity;
+    const Material cold = shipSteel();
+    const double e = 0.006;  // deviatoric, well past yield at every temperature here
+
+    // **The map's single strongest property survives the reduction.** At a fixed
+    // temperature the reduced curve is still monotonically hardening -- `k_y` is a
+    // positive constant multiplying both `sigma_y` and its slope -- so the scalar
+    // consistency equation still has exactly one root and radial return still
+    // lands on it whatever the step count. That is `testStepIndependence` from
+    // `test_plasticity.cpp` re-run at 600 C, and it is what says the return map
+    // needs no new term: the softening is *between* steps, not inside one.
+    double reference[6] = {};
+    double referenceStrain = 0;
+    for (int n : {1, 7, 100}) {
+        State s;
+        double stress[6] = {};
+        for (int i = 1; i <= n; ++i) {
+            const double f = 0.01 * i / n;
+            double strain[6] = {f, -0.5 * f, -0.5 * f, 0, 0, 0};
+            update(th::atTemperature(cold, 600.0 + kC), kNeverFails, strain, s, stress);
+        }
+        if (n == 1) {
+            for (int i = 0; i < 6; ++i) reference[i] = stress[i];
+            referenceStrain = s.equivalentPlasticStrain;
+        } else {
+            expectNear("the return map at 600 C is step-independent to rounding",
+                       vonMises(stress), vonMises(reference), 1e-9 * vonMises(reference));
+            expectNear("and so is the plastic strain it accumulated",
+                       s.equivalentPlasticStrain, referenceStrain, 1e-12 * referenceStrain);
+        }
+    }
+    expectTrue("and it actually yielded, so there is something to be independent of",
+               referenceStrain > 1e-3);
+
+    // **The shrinking surface.** 400 C to 500 C at constant total strain: `k_y`
+    // falls from 1.00 to 0.78 while `k_E` falls only from 0.70 to 0.60, so the
+    // elastic demand falls *slower* than the capacity and the point has to flow
+    // again. This is the case a hardening-only return map is supposed not to
+    // handle, and it needs nothing: the stored stress simply starts outside the
+    // new surface and the map returns it, which is stress relaxation and is what a
+    // heated restrained member physically does.
+    {
+        const Material at400 = th::atTemperature(cold, 400.0 + kC);
+        const Material at500 = th::atTemperature(cold, 500.0 + kC);
+        double strain[6] = {e, -0.5 * e, -0.5 * e, 0, 0, 0}, stress[6] = {};
+        State s;
+        update(at400, kNeverFails, strain, s, stress);
+        const double before = s.equivalentPlasticStrain;
+        expectNear("at 400 C the point sits exactly on its yield surface", vonMises(stress),
+                   flowStress(at400.flow, before), 1e-9 * flowStress(at400.flow, before));
+
+        const Increment inc = update(at500, kNeverFails, strain, s, stress);
+        expectTrue("heating at constant strain makes it flow again", inc.yielded);
+        expectTrue("and the plastic strain grows by a real amount, not a rounding",
+                   s.equivalentPlasticStrain > before * 1.02);
+        expectNear("landing exactly on the smaller surface", vonMises(stress),
+                   flowStress(at500.flow, s.equivalentPlasticStrain),
+                   1e-9 * flowStress(at500.flow, s.equivalentPlasticStrain));
+        expectTrue("and the increment dissipated energy rather than absorbing it",
+                   inc.dissipation >= 0.0);
+    }
+
+    // **The other direction, and it is the one worth naming.** 200 C to 400 C:
+    // `k_y` is 1 at both ends while `k_E` falls 0.90 to 0.70, so the elastic
+    // demand falls *faster* than the capacity and the point unloads. The plastic
+    // strain must then be **bit-identical** -- not nearly -- and the stress must be
+    // exactly the elastic one at the frozen plastic strain.
+    {
+        const Material at200 = th::atTemperature(cold, 200.0 + kC);
+        const Material at400 = th::atTemperature(cold, 400.0 + kC);
+        double strain[6] = {e, -0.5 * e, -0.5 * e, 0, 0, 0}, stress[6] = {};
+        State s;
+        update(at200, kNeverFails, strain, s, stress);
+        const double frozen = s.equivalentPlasticStrain;
+        expectTrue("it yielded at 200 C first", frozen > 1e-4);
+
+        const Increment inc = update(at400, kNeverFails, strain, s, stress);
+        expectTrue("heating past it unloads elastically instead", !inc.yielded);
+        expectTrue("so the plastic strain is bit-identical",
+                   s.equivalentPlasticStrain == frozen);
+        // Uniaxial deviatoric: the von Mises stress of an elastic point at this
+        // strain is 3 G (e - e_p), and e_p here is the axial component of the
+        // stored plastic strain, which for this path is the equivalent one.
+        expectNear("and the stress is exactly the elastic stress of the hot material",
+                   vonMises(stress), 3.0 * at400.shearModulus() * (e - frozen),
+                   1e-9 * vonMises(stress));
+    }
+
+    // **What this means for a caller, stated as a measurement rather than a
+    // caveat.** Because `k_E` falls faster than `k_y` from 100 C to 400 C, a point
+    // held at constant strain accumulates *no* further plastic strain over that
+    // range -- the whole of its plastic history is set by the coldest, stiffest
+    // state it passed through. That is right for this model and wrong for real
+    // steel, and the missing term is thermal elongation, which is not here. The
+    // number is in `thermal.hpp`: 7.08e-3 of free expansion strain over a 500 K
+    // rise against a 1.72e-3 yield strain, a factor of 4.1, so for restrained
+    // structure the missing term arrives first and is four times the size.
+    {
+        const Material at100 = th::atTemperature(cold, 100.0 + kC);
+        double strain[6] = {e, -0.5 * e, -0.5 * e, 0, 0, 0}, stress[6] = {};
+        State s;
+        update(at100, kNeverFails, strain, s, stress);
+        const double at = s.equivalentPlasticStrain;
+        for (double c : {200.0, 300.0, 400.0})
+            update(th::atTemperature(cold, c + kC), kNeverFails, strain, s, stress);
+        expectTrue("no plastic strain is accumulated from 100 C to 400 C at constant strain",
+                   s.equivalentPlasticStrain == at);
+        expectTrue("and there was some to begin with", at > 1e-4);
+    }
+}
+
+// --- 5. Does the same material path reach a stiffener fibre? ----------------------
+
+void testFibresSoften() {
+    using namespace sim::constraint;
+    using sim::plasticity::Material;
+
+    // The smallest fibre set that is still a fibre set: one bar between two node
+    // pairs, tied at the mid-surface. `fiberForces` reads its stiffness, its flow
+    // curve and its failure constants from the `plasticity::Material` argument and
+    // from nothing else -- `Stiffening::material` is used for mass -- so the
+    // reduced material reaches the fibres through exactly the same door as the
+    // solid elements, with no interface change at all. That is what this asserts.
+    Stiffening stiffening;
+    stiffening.material = ah36Steel();
+    Fiber fiber;
+    fiber.area = 2.0e-3;
+    fiber.neckWidth = 0.010;
+    fiber.end[0].bottom = 0; fiber.end[0].top = 1; fiber.end[0].weight = 0.5;
+    fiber.end[1].bottom = 2; fiber.end[1].top = 3; fiber.end[1].weight = 0.5;
+    stiffening.fiber.push_back(fiber);
+
+    const std::vector<double> rest = {0, 0, 0,  0, 0, 0.012,  1, 0, 0,  1, 0, 0.012};
+    const RestFibers forms = restFibers(stiffening, rest);
+    expectTrue("the fibre set formed", forms.ok && forms.length.size() == 1);
+    expectNear("with the rest length it was built at", forms.length[0], 1.0, 1e-12);
+
+    const double stretch = 0.004;  // 0.4% strain: past yield at every temperature here
+    std::vector<double> current = rest;
+    current[6] += stretch;
+    current[9] += stretch;
+
+    double coldForce = 0, hotForce = 0;
+    for (int hot = 0; hot < 2; ++hot) {
+        const Material material =
+            th::atTemperature(sim::plasticity::shipSteel(), (hot ? 600.0 : 20.0) + kC);
+        std::vector<FiberState> state(1);
+        std::vector<double> force(rest.size(), 0.0);
+        fiberForces(stiffening, forms, current, material, &state, force);
+        // The axial force appears on the far pair, split by the tie weight.
+        const double axial = std::abs(force[6]) + std::abs(force[9]);
+        (hot ? hotForce : coldForce) = axial;
+        expectTrue("the fibre yielded", state[0].equivalentPlasticStrain > 0.0);
+        // On the yield surface: N = sigma_y(eps_p) A, in closed form.
+        const double want =
+            sim::plasticity::flowStress(material.flow, state[0].equivalentPlasticStrain) *
+            fiber.area;
+        expectNear("a yielded fibre carries sigma_y(eps_p) times its area", axial, want,
+                   1e-9 * want);
+    }
+
+    // **The consequence, and the guard against vacuity.** The same stretch through
+    // the same fibre carries roughly half the force at 600 C. If `atTemperature`
+    // ignored the reduction factors the two would be identical, which this cannot
+    // pass.
+    expectTrue("a hot fibre carries substantially less", hotForce < 0.6 * coldForce);
+    expectTrue("and it is not zero either", hotForce > 0.2 * coldForce);
+    std::printf("     one stiffener fibre at 0.4%% strain: %.1f kN cold, %.1f kN at 600 C"
+                " (%.0f%%)\n",
+                coldForce * 1e-3, hotForce * 1e-3, 100.0 * hotForce / coldForce);
+
+    // And an unheated fibre is bit-identical to one solved with the unreduced
+    // material -- the exact 20 C control, on this path too.
+    {
+        const Material base = sim::plasticity::shipSteel();
+        std::vector<double> a(rest.size(), 0.0), b(rest.size(), 0.0);
+        std::vector<FiberState> sa(1), sb(1);
+        fiberForces(stiffening, forms, current, base, &sa, a);
+        fiberForces(stiffening, forms, current, th::atTemperature(base, 20.0 + kC), &sb, b);
+        bool identical = true;
+        for (std::size_t i = 0; i < a.size(); ++i) identical = identical && a[i] == b[i];
+        expectTrue("an unheated fibre is bit-identical to the unreduced one",
+                   identical && sa[0].equivalentPlasticStrain == sb[0].equivalentPlasticStrain);
+    }
+}
+
+// --- 6. The structural consequence, with hand-computed ends ----------------------
+
+void testHotStructureIsWeaker() {
+    // (a) **A plate strip's collapse pressure**, which is a closed form: the
+    // three-hinge mechanism of a strip clamped at both ends, `4 f_y (t/s)^2`.
+    // Linear in the yield strength and in nothing else, so it falls by exactly
+    // `k_y` -- the one place in this test where the yield factor is the whole
+    // answer, and it is here to be contrasted with (b) and (c) where it is not.
+    {
+        const double t = 0.012, s = 0.70;
+        const double cold = sim::promotion::platingCollapsePressure(
+            th::atTemperature(ah36Steel(), 20.0 + kC).yieldStrength, t, s);
+        const double hot = sim::promotion::platingCollapsePressure(
+            th::atTemperature(ah36Steel(), 600.0 + kC).yieldStrength, t, s);
+        // By hand: 4 * 355e6 * (0.012/0.70)^2 = 417 306.12... Pa.
+        expectNear("the cold plate collapses at 4 f_y (t/s)^2", cold, 417306.122448979, 1e-6);
+        expectNear("and the hot one at exactly 0.47 of that", hot, 0.47 * 417306.122448979,
+                   1e-6);
+    }
+
+    // (b) **The compressive capacity of the plating between two stiffeners**,
+    // which is *not* linear in the yield strength, and this is the finding. The
+    // elastic buckling stress
+    // goes with `E` and the Johnson-Ostenfeld cap with `f_y`, and above 500 C
+    // `k_E < k_y`. On this panel it changes the regime outright: cold, it is
+    // squash-governed and the correction bites; at 600 C the elastic stress has
+    // fallen below half the hot yield and the panel is a pure elastic buckling
+    // problem again.
+    {
+        const StructuralMaterial cold = th::atTemperature(ah36Steel(), 20.0 + kC);
+        const StructuralMaterial hot = th::atTemperature(ah36Steel(), 600.0 + kC);
+        const sim::BucklingCheck c = sim::plateBuckling(0.012, 2.4, 0.70, 0.0, cold);
+        const sim::BucklingCheck h = sim::plateBuckling(0.012, 2.4, 0.70, 0.0, hot);
+
+        // Hand-computed. alpha = 2.4/0.7 = 3.4286, so m = 3 half-waves and
+        // k = (3/alpha + alpha/3)^2 = 4.071747...
+        //   sigma_e = k pi^2 E / (12 (1 - nu^2)) (t/b)^2
+        //           = 4.071747 * 9.8696044 * 206e9 / 10.92 * (0.012/0.70)^2
+        //           = 2.22788e8 Pa
+        // and sigma_e > f_y/2 = 1.775e8, so Johnson-Ostenfeld applies:
+        //   sigma_c = 355e6 (1 - 355e6 / (4 * 2.22788e8)) = 2.13582e8 Pa.
+        expectNear("the cold panel's buckling coefficient is the m = 3 minimum", c.coefficient,
+                   4.0717474490, 1e-8);
+        expectNear("its elastic buckling stress is the hand value", c.elasticStress, 2.227879e8,
+                   1e3);
+        expectNear("and Johnson-Ostenfeld caps it at the hand value", c.criticalStress,
+                   2.135819e8, 1e3);
+        expectTrue("because the cold panel is squash-governed",
+                   c.elasticStress > 0.5 * cold.yieldStrength);
+
+        // At 600 C: sigma_e scales by exactly k_E = 0.31 to 6.90642e7, and
+        // f_y/2 = 0.5 * 0.47 * 355e6 = 8.3425e7, which is now *above* it -- so the
+        // correction switches off and the capacity is the raw eigenvalue.
+        expectNear("the hot elastic buckling stress is exactly 0.31 of the cold one",
+                   h.elasticStress, 0.31 * c.elasticStress, 1e-9 * c.elasticStress);
+        expectTrue("and the hot panel is elastic-buckling-governed instead",
+                   h.elasticStress <= 0.5 * hot.yieldStrength);
+        expectTrue("so no correction is applied at all",
+                   h.criticalStress == h.elasticStress);
+        expectNear("the hot capacity is the hand value", h.criticalStress, 6.906424e7, 1e2);
+
+        // **The point.** The capacity falls to 0.323, well below k_y = 0.47: a
+        // model that reduced only the yield strength would over-predict this panel
+        // by 45%.
+        const double ratio = h.criticalStress / c.criticalStress;
+        expectNear("the hot panel keeps 0.323 of its capacity", ratio, 0.3233, 5e-4);
+        expectTrue("which is well below the yield reduction factor",
+                   ratio < 0.85 * th::carbonSteelYieldFactor(600.0 + kC));
+        std::printf("     0.7 x 2.4 m x 12 mm panel: capacity %.1f MPa cold, %.1f MPa at 600 C"
+                    " (%.3f, against k_y = %.2f) -- squash-governed becomes"
+                    " buckling-governed\n",
+                    c.criticalStress * 1e-6, h.criticalStress * 1e-6, ratio,
+                    th::carbonSteelYieldFactor(600.0 + kC));
+    }
+
+    // (c) **The ferry's midship section**, all the way through Smith's method. A
+    // hot ship is the same ship with a reduced material: nothing in `collapse.cpp`
+    // or `scantlings.cpp` changes, because every element already looks its
+    // material up by index in `StructuralMesh::materials`.
+    {
+        const sim::StructuralMesh mesh =
+            sim::makeStructuralMesh(game::buildFerry().hull, sim::ferryScantlings());
+        const sim::Scantlings scantlings = sim::ferryScantlings();
+        expectTrue("the reference section was built", !mesh.panels.empty());
+
+        const auto at = [&](double c) {
+            sim::StructuralMesh hot = mesh;
+            for (StructuralMaterial& m : hot.materials) m = th::atTemperature(m, c + kC);
+            return sim::collapseElementsAt(hot, scantlings, 0.0);
+        };
+
+        const std::vector<sim::CollapseElement> cold = at(20.0);
+        const std::vector<sim::CollapseElement> warm = at(400.0);
+        const std::vector<sim::CollapseElement> hot = at(600.0);
+
+        // **The exact control**, on the whole chain rather than on one function:
+        // the section built through `atTemperature` at 20 C is bit-identical to the
+        // one built without it.
+        const std::vector<sim::CollapseElement> control =
+            sim::collapseElementsAt(mesh, scantlings, 0.0);
+        expectEqual("the section has the same elements at 20 C",
+                    static_cast<long long>(cold.size()),
+                    static_cast<long long>(control.size()));
+        bool identical = !cold.empty();
+        for (std::size_t i = 0; i < cold.size() && i < control.size(); ++i)
+            identical = identical && cold[i].area == control[i].area &&
+                        cold[i].height == control[i].height &&
+                        cold[i].curve.yieldStrength == control[i].curve.yieldStrength &&
+                        cold[i].curve.youngsModulus == control[i].curve.youngsModulus &&
+                        cold[i].curve.bucklingStress == control[i].curve.bucklingStress;
+        expectTrue("and every one of them is bit-identical to the unheated section",
+                   identical);
+
+        // The fully plastic moment is linear in every element's yield strength, so
+        // it scales by exactly `k_y`. That is the one closed form Smith's method
+        // has, and it is the anchor.
+        const double mpCold = sim::fullyPlasticMoment(cold);
+        expectTrue("the section has a fully plastic moment", mpCold > 1e9);
+        expectNear("the fully plastic moment scales by exactly k_y at 400 C",
+                   sim::fullyPlasticMoment(warm), mpCold, 1e-9 * mpCold);
+        expectNear("and by exactly k_y at 600 C", sim::fullyPlasticMoment(hot), 0.47 * mpCold,
+                   1e-9 * mpCold);
+
+        // The ultimate moment does not, and that is the consequence worth having.
+        const double uCold = std::abs(sim::collapseCurve(cold, -1.0).ultimateMoment);
+        const double uWarm = std::abs(sim::collapseCurve(warm, -1.0).ultimateMoment);
+        const double uHot = std::abs(sim::collapseCurve(hot, -1.0).ultimateMoment);
+        expectTrue("the cold section collapses well below its fully plastic moment",
+                   uCold > 0.3 * mpCold && uCold < 0.8 * mpCold);
+
+        // **The test that fails if the modulus factor is ignored.** At 400 C
+        // `k_y` is exactly 1, so a yield-only reduction leaves the section
+        // completely unchanged -- and it is not: it has lost 17.6% of its ultimate
+        // strength through `k_E` alone, because the plate panels' buckling stress
+        // is proportional to E.
+        expectTrue("at 400 C the yield strength has not moved at all",
+                   th::carbonSteelYieldFactor(400.0 + kC) == 1.0);
+        expectNear("yet the section has lost 17.6% of its ultimate strength", uWarm / uCold,
+                   0.824, 0.01);
+
+        // And at 600 C it loses more than `k_y` says, for the same reason.
+        expectNear("at 600 C it keeps 0.376 of its ultimate strength", uHot / uCold, 0.376,
+                   0.01);
+        expectTrue("which is below the yield reduction factor of 0.47",
+                   uHot / uCold < 0.9 * th::carbonSteelYieldFactor(600.0 + kC));
+        std::printf("     ferry midship, sagging: Mu = %.3f GN m cold, %.3f at 400 C (%.3f),"
+                    " %.3f at 600 C (%.3f vs k_y = 0.47); Mp scales by k_y exactly\n",
+                    uCold * 1e-9, uWarm * 1e-9, uWarm / uCold, uHot * 1e-9, uHot / uCold);
+    }
+}
+
+// --- 7. From a nodal field to an element's temperature ---------------------------
+
+void testElementTemperatureField() {
+    // A box, so the volume average of a linear field has a closed form: the field
+    // at the box centre. On a general trilinear hex the interpolant of a linear
+    // field is not that field, which is why the closed form is claimed here and
+    // not there.
+    const double h = 0.4, w = 0.3, d = 0.012;
+    double nodes[ss::kDof];
+    double nodal[ss::kNodes];
+    const double x[8] = {0, h, h, 0, 0, h, h, 0};
+    const double y[8] = {0, 0, w, w, 0, 0, w, w};
+    const double z[8] = {0, 0, 0, 0, d, d, d, d};
+    for (int a = 0; a < ss::kNodes; ++a) {
+        nodes[a * 3] = x[a];
+        nodes[a * 3 + 1] = y[a];
+        nodes[a * 3 + 2] = z[a];
+        // An oblique linear field, so a routine that got one axis right and two
+        // wrong does not pass.
+        nodal[a] = kC + 300.0 + 500.0 * x[a] / h + 200.0 * y[a] / w + 700.0 * z[a] / d;
+    }
+    th::Forms forms;
+    expectTrue("the box forms", th::computeForms(nodes, forms));
+
+    expectNear("the element mean of a linear field is the field at the centre",
+               th::elementTemperature(forms, nodal), kC + 300.0 + 250.0 + 100.0 + 350.0, 1e-9);
+
+    double gauss[ss::kGauss];
+    th::gaussTemperature(nodal, gauss);
+    const double q = 1.0 / std::sqrt(3.0);
+    for (int gp = 0; gp < ss::kGauss; ++gp) {
+        // **The Gauss points are at +-1/sqrt(3) in each direction, in the bit
+        // order `solid_shell.cpp` uses.** Written as a closed form in the field's
+        // own values rather than by reading either file's constants, so a routine
+        // that sampled the corners, the centre, or the right points in the wrong
+        // order fails.
+        const double want = kC + 300.0 + 250.0 * (1.0 + ((gp & 1) ? q : -q)) +
+                            100.0 * (1.0 + ((gp & 2) ? q : -q)) +
+                            350.0 * (1.0 + ((gp & 4) ? q : -q));
+        expectNear("a nodal field interpolates to the 2x2x2 Gauss points", gauss[gp], want,
+                   1e-9);
+        // And it is exactly what the conduction element's own shape functions say,
+        // which is the tie to the operator this field will be read beside.
+        double byShape = 0.0;
+        for (int a = 0; a < ss::kNodes; ++a) byShape += forms.shape[gp][a] * nodal[a];
+        expectNear("and agrees with Forms::shape to rounding", gauss[gp], byShape, 1e-9);
+    }
+
+    // The mesh-level bridge, on a plate with four elements through the thickness:
+    // a field linear in z gives each element the temperature of its own mid-plane,
+    // in closed form, and the four are distinct.
+    //
+    // **The expectation is derived from the mesh's own coordinates**, because
+    // `makePlateMesh` centres the plate on `z = 0` rather than resting it on it --
+    // this test first asserted the wrong four numbers, all of them 500 K out, for
+    // exactly that reason. Reading the extent back means the closed form cannot be
+    // wrong about where the plate is while still being a closed form about what
+    // the average of a linear field over an element is.
+    ss::HexMesh mesh = ss::makePlateMesh(0.2, 0.2, 0.012, 1, 1, 4);
+    double zLo = 1e30, zHi = -1e30;
+    for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+        zLo = std::min(zLo, mesh.position[n * 3 + 2]);
+        zHi = std::max(zHi, mesh.position[n * 3 + 2]);
+    }
+    expectNear("the plate is 12 mm thick however it is placed", zHi - zLo, 0.012, 1e-15);
+    std::vector<double> field(mesh.nodeCount());
+    for (std::size_t n = 0; n < mesh.nodeCount(); ++n)
+        field[n] = kC + 20.0 + 1000.0 * (mesh.position[n * 3 + 2] - zLo) / (zHi - zLo);
+    std::vector<double> perElement;
+    expectTrue("the mesh-level bridge works", th::elementTemperatures(mesh, field, perElement));
+    expectEqual("one temperature per element", static_cast<long long>(perElement.size()),
+                static_cast<long long>(mesh.elementCount()));
+    std::vector<double> sorted = perElement;
+    std::sort(sorted.begin(), sorted.end());
+    for (int i = 0; i < 4; ++i)
+        expectNear("each element sees its own layer's mid-plane temperature", sorted[i],
+                   kC + 20.0 + 1000.0 * (i + 0.5) / 4.0, 1e-9);
+    expectTrue("and the four layers are genuinely different temperatures",
+               sorted[3] - sorted[0] > 700.0);
+    expectTrue("a field of the wrong length is refused",
+               !th::elementTemperatures(mesh, std::vector<double>(3, kC), perElement) &&
+                   perElement.empty());
+
+    // **The refusal paths, which nothing reached until mutation testing said so.**
+    // Three mutants survived here: deleting `if (!forms.ok) return 0`, deleting the
+    // `ok = false` on a bad element, and deleting the `continue` that skips it. All
+    // three are on the same road and nothing in this file had driven down it.
+    {
+        // **A `Forms` with good weights and `ok` false**, not a default-constructed
+        // one. Only `ok` has an initialiser, so a default `Forms` has indeterminate
+        // weights -- which in practice come out zero, so `volume > 0` is false and
+        // the answer is zero whether or not the `ok` guard is there. That made
+        // deleting the guard an accidental survivor. Copying a good set and
+        // clearing the flag is what makes the flag the only thing being tested.
+        th::Forms broken = forms;
+        broken.ok = false;
+        expectTrue("an element whose forms did not build has no temperature",
+                   th::elementTemperature(broken, nodal) == 0.0);
+        expectTrue("and a good one does, so the check is not passing by accident",
+                   th::elementTemperature(forms, nodal) != 0.0);
+    }
+    {
+        // Invert one element by turning its through-thickness direction inside
+        // out: `computeForms` refuses a non-positive Jacobian, which is the same
+        // condition `solidshell::computeRestForms` refuses on.
+        ss::HexMesh bad = ss::makePlateMesh(0.2, 0.2, 0.012, 2, 1, 1);
+        for (int a = 0; a < 4; ++a)
+            std::swap(bad.index[static_cast<std::size_t>(a)],
+                      bad.index[static_cast<std::size_t>(a) + 4]);
+        std::vector<double> hot(bad.nodeCount());
+        for (std::size_t n = 0; n < bad.nodeCount(); ++n)
+            hot[n] = kC + 500.0 + 100.0 * bad.position[n * 3];
+        std::vector<double> got;
+        expectTrue("a mesh with an inverted element is reported, not silently averaged",
+                   !th::elementTemperatures(bad, hot, got));
+        expectEqual("but the good elements are still filled in",
+                    static_cast<long long>(got.size()),
+                    static_cast<long long>(bad.elementCount()));
+        expectTrue("the inverted element is left at the fill value and the sound one is not",
+                   got[0] == 0.0 && got[1] > kC + 100.0);
+    }
+}
+
+// --- 8. What the gradient actually is, and what per-element averaging costs -------
+
+void testGradientThroughPlating() {
+    // A 12 mm plate with a post-flashover compartment on one face and nothing on
+    // the other. This is the measurement that decides whether a per-element
+    // temperature is enough, and it is run rather than argued.
+    ss::HexMesh mesh = ss::makePlateMesh(0.10, 0.10, 0.012, 1, 1, 4);
+    th::Problem problem;
+    problem.mesh = &mesh;
+    problem.material = ah36Steel();
+    problem.temperatureDependent = true;
+
+    th::Film fire;
+    fire.coefficient = 200.0;  // EN's 25 W/(m^2 K) convective plus ~175 radiative
+    fire.ambient = kC + 900.0;
+    for (const th::BoundaryFace& f : th::boundaryFaces(mesh))
+        if (f.normal.z < -0.9) fire.face.push_back(f);
+    expectTrue("the fire lands on the one face it should", fire.face.size() == 1);
+    problem.film.push_back(fire);
+
+    th::Solver solver;
+    std::string why;
+    expectTrue("the fire problem prepares", solver.prepare(problem, kC + 20.0, &why));
+
+    double worstSpread = 0, worstFactorSpread = 0, hottest = 0;
+    for (int step = 0; step < 1800; ++step) {
+        expectTrue("the fire steps", solver.step(1.0, &why));
+        double lo = 1e30, hi = -1e30;
+        for (double v : solver.temperature()) {
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
+        worstSpread = std::max(worstSpread, hi - lo);
+        worstFactorSpread = std::max(worstFactorSpread, std::abs(th::carbonSteelYieldFactor(lo) -
+                                                                 th::carbonSteelYieldFactor(hi)));
+        hottest = std::max(hottest, hi);
+    }
+    expectTrue("the plate actually got hot enough to lose strength",
+               th::carbonSteelYieldFactor(hottest) < 0.2);
+    // Biot number 0.07: steel plating is thermally thin and has no
+    // through-thickness gradient worth resolving. The bound is on the *whole
+    // plate*, so it bounds any element in it whatever the layer count.
+    expectTrue("the spread across the whole plate never exceeds 20 K", worstSpread < 20.0);
+    expectTrue("and the spread in k_y across it never exceeds 0.04", worstFactorSpread < 0.04);
+    expectTrue("but there was a gradient at all, so this is not vacuous", worstSpread > 1.0);
+    std::printf("     12 mm plate, 900 C compartment, h = 200 W/(m^2 K): worst spread across the"
+                " whole plate %.1f K, worst k_y spread %.3f, Bi = %.3f\n",
+                worstSpread, worstFactorSpread,
+                200.0 * 0.012 / th::carbonSteelConductivity(kC + 600.0));
+
+    // **The same plate under the ISO 834 standard fire**, which is the ramp a
+    // furnace test actually follows: `T_g = 20 + 345 log10(8 t + 1)` with `t` in
+    // minutes. A gentler boundary condition gives a gentler gradient, and the
+    // heating *rate* it produces is the number that decides whether creep needs
+    // modelling at all -- EN 1993-1-2 §3.2.1's curves carry creep implicitly for
+    // 2 to 50 K/min. The solver copies its `Problem`, so a moving ambient means
+    // re-preparing; on twenty nodes that is cheap and it is what makes the claim a
+    // measurement rather than a quotation.
+    {
+        th::Problem ramp = problem;
+        th::Solver iso;
+        std::vector<double> state(mesh.nodeCount(), kC + 20.0);
+        double atFourteen = 0, worstRamp = 0;
+        for (int step = 0; step < 1200; ++step) {
+            const double minutes = (step + 1) / 60.0;
+            ramp.film[0].ambient = kC + 20.0 + 345.0 * std::log10(8.0 * minutes + 1.0);
+            expectTrue("the ramped fire prepares", iso.prepare(ramp, state, &why));
+            expectTrue("and steps", iso.step(1.0, &why));
+            state = iso.temperature();
+            double lo = 1e30, hi = -1e30;
+            for (double v : state) {
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+            }
+            worstRamp = std::max(worstRamp, hi - lo);
+            if (step == 839) atFourteen = hi;  // fourteen minutes
+        }
+        const double rate = (atFourteen - (kC + 20.0)) / 14.0;
+        expectTrue("the ISO 834 curve is gentler than a step change", worstRamp < 8.0);
+        expectTrue("and it heats the plate at a rate inside EN's 2-50 K/min band, so the"
+                   " curves' implicit creep applies",
+                   rate > 2.0 && rate < 50.0);
+        expectTrue("having reached the strength-losing range by then",
+                   atFourteen > kC + 550.0);
+        std::printf("     ISO 834 on the same plate: %.0f C at 14 min, %.0f K/min, worst spread"
+                    " %.1f K -- inside EN 1993-1-2 §3.2.1's 2-50 K/min band\n",
+                    atFourteen - kC, rate, worstRamp);
+    }
+
+    // The quadrature error the per-element choice actually costs: `k_y` of the
+    // element mean against the mean of `k_y` at the two Gauss levels of a linear
+    // profile. Worst at the 400 C kink, which is the sharpest in Table 3.1.
+    for (double spread : {20.0, 100.0}) {
+        double worst = 0, at = 0;
+        for (double centre = 20.0; centre <= 1200.0; centre += 0.5) {
+            const double q = 1.0 / std::sqrt(3.0);
+            const double mean = 0.5 * (th::carbonSteelYieldFactor(centre - 0.5 * spread * q + kC) +
+                                       th::carbonSteelYieldFactor(centre + 0.5 * spread * q + kC));
+            const double d = std::abs(mean - th::carbonSteelYieldFactor(centre + kC));
+            if (d > worst) { worst = d; at = centre; }
+        }
+        if (spread == 20.0) {
+            expectNear("a 20 K spread across an element costs 0.006 in k_y", worst, 0.0064,
+                       5e-4);
+            expectNear("and the worst place for it is the 400 C kink", at, 400.0, 1.0);
+        } else {
+            expectNear("a 100 K spread costs 0.032", worst, 0.0318, 5e-4);
+        }
+    }
+}
+
 }  // namespace
 
 void runThermalTests() {
@@ -2128,4 +3161,14 @@ void runThermalTests() {
     testRefusals();
     testUncovered();
     testCost();
+
+    std::printf("\n=== hot steel: EN 1993-1-2 §3.2 strength at temperature ===\n");
+    testReductionTable();
+    testStressStrainCurve();
+    testMaterialsAtTemperature();
+    testReturnMapUnderAMovingYieldSurface();
+    testFibresSoften();
+    testHotStructureIsWeaker();
+    testElementTemperatureField();
+    testGradientThroughPlating();
 }
