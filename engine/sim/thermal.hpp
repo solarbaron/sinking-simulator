@@ -91,6 +91,7 @@
 // Body frame and SI units per CLAUDE.md.
 #pragma once
 
+#include "plasticity.hpp"    // Material, for the strength model at temperature
 #include "scantlings.hpp"    // StructuralMaterial
 #include "solid_shell.hpp"   // HexMesh, BandedSpd, kNodes/kGauss/kDof
 
@@ -155,6 +156,189 @@ double carbonSteelSpecificHeat(double kelvin);  // J/(kg K)
 // through it carries about six times what the endpoint `c` values would suggest.
 double carbonSteelEnthalpy(double kelvin);  // J/kg
 
+// --- Strength at temperature, EN 1993-1-2:2005 §3.2 -----------------------------
+//
+// The other half of the same standard, and the half a fire is actually *for*:
+// conduction says what the steel's temperature is, and this says what the steel
+// then carries. Three factors, all dimensionless, all 1 at 20 C, tabulated at
+// hundred-degree stations from 20 C to 1200 C with **linear interpolation between
+// them** -- the interpolation is the standard's, not a smoothing applied here, so
+// the kinks are load-bearing and are asserted rather than rounded off.
+//
+//   * `effectiveYield`, `k_y,theta`: the strength at 2% strain. This is the factor
+//     every member-resistance calculation in EN 1993-1-2 uses, and it is the one
+//     that makes 600 C the number fire engineers quote -- 0.47 there, so a little
+//     over half the strength is gone.
+//   * `proportionalLimit`, `k_p,theta`: where the response stops being linear.
+//     **It falls far faster than the yield does**, and that difference is the whole
+//     shape of the hot stress-strain curve: 0.18 at 600 C against the yield's 0.47,
+//     a factor of 2.6. A model that scales one number and calls it "the yield" is
+//     making a choice, and `carbonSteelStress` below is what measures its size.
+//   * `youngsModulus`, `k_E,theta`: 0.31 at 600 C. **Also below the yield factor**,
+//     from 500 C up, and that is not a detail -- an elastic buckling stress is
+//     proportional to E and a squash load is proportional to f_y, so a structure
+//     that fails by instability loses strength *faster* than `k_y` says. Measured
+//     on the reference ferry at 600 C: the midship section keeps 0.376 of its
+//     ultimate sagging moment against `k_y` = 0.47, and one 0.7 x 2.4 m panel of
+//     12 mm plating keeps 0.323. At **400 C**, where `k_y` is still exactly 1, the
+//     section has already lost 17.6% -- all of it through `k_E`.
+//
+// **What is not here, and what it costs.** Two things, and the first is much the
+// larger.
+//
+// **Thermal elongation, §3.4.1.1, is absent and it dominates.** The standard's own
+// expression, `1.2e-5 theta + 0.4e-8 theta^2 - 2.416e-4`, gives **7.08e-3** of free
+// strain at 520 C -- a 500 K rise -- against a yield strain of
+// `355e6 / 206e9 = 1.72e-3`. That is a factor of **4.1**. A *fully restrained*
+// member therefore reaches yield on expansion alone at **164.6 C**, a 145 K rise,
+// solved where `k_E E (dl/l) = k_y f_y` -- and at that temperature `k_y` is still
+// exactly 1 and `k_E` is 0.94, so the whole of the effect is expansion and none of
+// it is the reduction factors above. For restrained structure the missing term
+// arrives first and is four times the size. It is the next roadmap item and not a
+// refinement of this one.
+//
+// **Creep, §3.2.4, is absent and it does not matter here -- with a number.**
+// EN 1993-1-2 §3.2.1 states that the curves above already carry creep implicitly,
+// for heating rates between **2 and 50 K/min**. Both fires measured in
+// `tests/test_thermal.cpp` sit at or above that band: the ISO 834 standard curve
+// takes this ferry's 12 mm plating from 20 C to 618 C in 14 minutes, **43 K/min**,
+// which is inside it; a post-flashover compartment held at 900 C does it in five,
+// **114 K/min**, which is above it and is the direction in which the implicit
+// creep is *conservative*. So for a fire that grows, creep is already in the
+// numbers. What is outside them is a fire that stabilises and holds -- a
+// twenty-minute soak at temperature under sustained load -- and that is the case
+// to revisit, not the growth phase.
+//
+// Outside 20..1200 C these clamp, matching `carbonSteelConductivity` and for the
+// same reason. Below 20 C they clamp to 1: steel is *stronger* cold, and returning
+// the room-temperature strength there is the conservative direction as well as the
+// only one the standard supports.
+struct SteelReduction {
+    double effectiveYield = 1.0;     // k_y,theta -- f_y,theta / f_y
+    double proportionalLimit = 1.0;  // k_p,theta -- f_p,theta / f_y
+    double youngsModulus = 1.0;      // k_E,theta -- E_a,theta / E_a
+};
+
+SteelReduction carbonSteelReduction(double kelvin);
+
+// The three separately, for a caller that wants one. Each is exactly the matching
+// member of `carbonSteelReduction`, which the tests assert rather than assume.
+double carbonSteelYieldFactor(double kelvin);
+double carbonSteelProportionalFactor(double kelvin);
+double carbonSteelModulusFactor(double kelvin);
+
+// The standard's own stress-strain relation, §3.2.1 Table 3.1 and Figure 3.1, at
+// engineering strain `strain` and temperature `kelvin`. Four branches:
+//
+//   * linear at `k_E E` up to `f_p = k_p f_y`;
+//   * an **ellipse** from there to `f_y,theta = k_y f_y` at exactly 2% strain,
+//     constructed to be tangent to the line at one end and horizontal at the
+//     other -- both of those are exact and both are asserted;
+//   * a plateau at `f_y,theta` to 15%;
+//   * a straight fall to zero at 20%.
+//
+// It is here as the **reference the reduced material is measured against**, not as
+// something the solver evaluates. `plasticity::Material` is a J2 flow curve with
+// one yield strength, and `atTemperature` below scales it by `k_y`; that model is
+// exact at and beyond 2% strain and is *over-strong* below it, because the real
+// curve has already left the straight line at `k_p f_y`.
+//
+// **The size of that, measured, and it is not where it looks like it should be.**
+// The gap is bounded by `(k_y - k_p) f_y` by construction, and the temperature that
+// maximises it is not the hottest one -- it is **400 C**, where `k_y` is still
+// exactly 1 and `k_p` has already fallen to 0.42. Measured there: 0.388 f_y, at
+// 0.24% strain. At 600 C it is 0.189 f_y and at 700 C 0.095 f_y, because by then
+// both factors are small and their difference is smaller. At 20 C it is exactly
+// zero -- `k_p == k_y == 1`, the ellipse degenerates, and the standard's own curve
+// is elastic-perfectly-plastic. Past 2% strain, which is where a collapse, a
+// squash load or a plastic hinge lives, the two agree identically at every
+// temperature.
+//
+// Negative strain returns the negation of the positive branch: the standard writes
+// the curve in tension and says the compressive response is the same, which for a
+// hot member is the interesting direction.
+double carbonSteelStress(double strain, double kelvin, double yieldStrength = 355.0e6,
+                         double youngsModulus = 210.0e9);
+
+// --- Materials at temperature ----------------------------------------------------
+//
+// The coupling itself, and it is deliberately two free functions returning
+// *values* rather than a temperature field stored inside a material. A material
+// with a temperature in it would have to be kept in step with a thermal solve that
+// runs on its own clock, and the repo already records what a cache that quietly
+// goes stale costs. A reduced material is a value: build it, use it, throw it away.
+//
+// **This is also the whole answer to "where does temperature enter".** Every
+// element-level entry point in `solid_shell.hpp` already takes one material *per
+// call* -- `elementStiffness`, `elementStress`, `elementPlasticUpdate`,
+// `criticalTimestep` -- so a per-element temperature needs no interface change at
+// all, only a caller that builds a reduced material per element. The same is true
+// one tier down: `buckling.hpp`, `collapse.hpp` and `indentation.hpp` all look
+// their material up through `SectionElement::material`, an index into
+// `StructuralMesh::materials`, so a mesh with a temperature *field* is a mesh with
+// one material entry per distinct temperature and nothing else changes.
+//
+// What that does *not* reach without a signature change is per-Gauss-point
+// temperature: `elementPlasticUpdate` loops the eight points against one material,
+// and `elementStiffness` forms one elasticity matrix outside the loop.
+// `gaussTemperature` below exists so the size of that gap is a measurement rather
+// than an argument, and the measurement says **per element is enough**:
+//
+//   * **Cost.** `atTemperature` on a `plasticity::Material` is 11.5 ns against
+//     `elementPlasticUpdate`'s 5.65 us -- **0.20%** of one element update, so
+//     rebuilding the material every element every step is free. Per Gauss point
+//     would be eight times that, 1.6%, and still cheap; cost is not what decides
+//     this.
+//   * **What the gradient actually is.** A 12 mm plate with a post-flashover
+//     compartment on one face -- gas at 900 C through an effective film of
+//     200 W/(m^2 K), which is EN's 25 for convection plus about 175 for the
+//     radiation this file does not carry -- and adiabatic on the other, solved by
+//     `Solver` with `temperatureDependent`: the spread **across the whole plate**
+//     peaks at **19.1 K**, eight seconds in, and is under 1 K by half an hour. The
+//     corresponding spread in `k_y` never exceeds **0.039**. Steel plating is not
+//     thermally thick -- the Biot number is `h t / k(600 C) = 0.070` -- and a body
+//     at `Bi << 1` has no through-thickness gradient to resolve. A ramped fire is
+//     gentler still: the ISO 834 curve on the same plate peaks at 7.2 K. Both
+//     figures bound any single element's spread whatever `nz` is, because both are
+//     the spread of the whole plate.
+//   * **What the error would be if the gradient were large.** The quadrature error
+//     from reducing at the mean instead of averaging the reductions is at most
+//     `|delta slope| * dT / 8` at a kink of Table 3.1, and the sharpest kink is at
+//     400 C. Measured: 0.0064 in `k_y` for a 20 K spread across one element,
+//     0.032 for 100 K.
+//
+// So the through-thickness case is settled by the physics rather than by the
+// budget. The case per-Gauss-point *would* buy something is an **in-plane** one --
+// the edge of a fire crossing a 2.4 m frame bay -- and there the honest answer is
+// that a boundary condition the mesh does not resolve is a meshing problem, which
+// is the same statement this file already makes about refinement.
+
+// `youngsModulus` scaled by `k_E,theta` and `yieldStrength` by `k_y,theta`. Density
+// is left alone, per §3.4.1.4 and for the same reason `Problem` leaves it alone.
+// The thermal properties on this struct are the 20 C ones by construction and are
+// **not** re-evaluated here -- a caller who wants `k(T)` and `c(T)` has
+// `Problem::temperatureDependent`, and quietly moving them would give a solve two
+// different conductivities depending on which door it came in by.
+StructuralMaterial atTemperature(const StructuralMaterial& material, double kelvin);
+
+// The same for the flow model: `youngsModulus` by `k_E,theta` and **the whole flow
+// curve** by `k_y,theta` -- yield strength, hardening modulus, Swift strength
+// coefficient and kinematic modulus alike.
+//
+// Scaling the whole curve rather than only its intercept is what keeps the model
+// consistent, and it has an exact consequence: Considere's necking strain is
+// `d sigma_y / d eps_p = sigma_y`, and multiplying both sides by the same positive
+// number does not move the root, so `plasticity::uniformElongation` is **invariant
+// under temperature** -- bit-exactly for a Swift curve, whose necking strain
+// `n - eps_0` is built from two fields this does not touch, and to one unit in the
+// last place for a linear one, where `(k sigma_y0)/(k H)` is not always
+// `sigma_y0/H`. `Failure` is therefore untouched too, which is the
+// honest answer rather than a convenient one: EN 1993-1-2 tabulates no ductility,
+// hot steel is *more* ductile rather than less, and inventing a temperature
+// dependence for the fracture strain would be a plausible wrong number in the one
+// place the tearing criterion depends on it.
+plasticity::Material atTemperature(const plasticity::Material& material, double kelvin);
+
 // --- One element ---------------------------------------------------------------
 //
 // The conduction analogue of `solidshell::RestForms`: everything the element
@@ -181,6 +365,34 @@ struct Forms {
 // coincident corners and only there, and positive at every point the element is
 // integrated at.
 bool computeForms(const double nodes[kDof], Forms& out);
+
+// --- From a nodal temperature field to a material ---------------------------------
+//
+// `Solver::temperature()` is per node; a material is per element or per Gauss
+// point. These two are the whole of the bridge.
+
+// A nodal field interpolated to the eight Gauss points. Geometry-independent --
+// the trilinear shape functions at +-1/sqrt(3) are the same numbers for every
+// element -- so it takes no `Forms`, and it uses **the same eight points in the
+// same order** as `solidshell`'s integration rule. That is a contract between two
+// files rather than a coincidence, so `tests/test_thermal.cpp` asserts it by
+// interpolating a linear field and comparing against `solidshell::gaussVolumes`'
+// own weighting rather than by reading either file's constants.
+void gaussTemperature(const double nodal[kNodes], double out[kGauss]);
+
+// The volume-weighted mean of a nodal field over the element: `integral T dV / V`,
+// by the same 2x2x2 rule everything else here uses. This is the temperature a
+// per-element material is built at.
+//
+// It is a *volume* average and not the mean of the eight nodes, and on a
+// distorted element those differ for exactly the reason `elementMass` is row-sum
+// lumped rather than volume/8.
+double elementTemperature(const Forms& forms, const double nodal[kNodes]);
+
+// Per-element mean temperature over a whole mesh, from a nodal field. Empty, and
+// `false`, if the field is not one value per node or an element will not form.
+bool elementTemperatures(const solidshell::HexMesh& mesh, const std::vector<double>& nodal,
+                         std::vector<double>& out);
 
 // Conductance, 8x8 row-major: `integral grad N_a . k grad N_b dV`, with `k` given
 // per Gauss point so a temperature-dependent conductivity costs nothing extra.

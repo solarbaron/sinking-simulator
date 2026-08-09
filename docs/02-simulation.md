@@ -2140,8 +2140,19 @@ what makes the crush zone expensive, not the element.
    discontinuously, which an explicit scheme feels as a small shock. The maximum
    principal direction at the moment of failure is returned — it is the plane a
    tear would open on — but nothing consumes it yet.
-3. **No rate dependence, no temperature, no Gurson.** See above for why the first
-   is deferred deliberately rather than forgotten.
+3. **No rate dependence and no Gurson.** See above for why the first is deferred
+   deliberately rather than forgotten. **Temperature is no longer on this list**:
+   `thermal::atTemperature` returns a `plasticity::Material` with `E` scaled by
+   `k_E,θ` and the whole flow curve by `k_y,θ`, and the return map needed no new
+   term for it — at a fixed temperature the scaled curve still hardens
+   monotonically, so the consistency equation still has one root and step
+   independence still holds exactly. Two things it does *not* carry: the
+   standard's proportional limit `k_p,θ`, so the model is over-strong below 2%
+   strain by at most 0.388 `f_y` (worst at 400 °C, and zero at 20 °C); and any
+   temperature dependence in `Failure`, because EN 1993-1-2 tabulates no ductility
+   and hot steel is more ductile rather than less. Scaling the whole curve leaves
+   Considère's necking strain invariant, so `Failure` is *consistent* with the
+   reduction rather than merely unadjusted.
 4. **No `StructuralMesh` consumer.** `plasticity::shipSteel()` exists because the
    material database this section plans does not; its elastic constants are
    asserted against `ah36Steel()` so the two cannot drift, but the hardening curve
@@ -5470,12 +5481,27 @@ there: `thermal::carbonSteelConductivity` and `carbonSteelSpecificHeat` carry th
 published curves, and `thermal::Problem::temperatureDependent` uses them.
 Conductivity falls 36% by 600 °C; specific heat spikes elevenfold at 735 °C.
 
-Per material: density, E, ν, yield and ultimate strength, hardening curve,
-fracture strain vs triaxiality, Johnson–Cook rate and thermal coefficients,
-thermal conductivity, specific heat, expansion, melting point, and — critically —
-**temperature-dependent strength reduction curves** (Eurocode 3 for structural
-steel, which loses roughly half its yield at 550 °C and nearly all of it at
-800 °C). Coverage: mild steel, higher-tensile grades AH/DH/EH 32/36/40, stainless,
+**The strength reduction curves are now in**, for carbon steel:
+`thermal::carbonSteelReduction` is EN 1993-1-2 §3.2 Table 3.1 — `k_y,θ` on the
+effective yield, `k_p,θ` on the proportional limit, `k_E,θ` on Young's modulus —
+and `thermal::atTemperature` applies them to a `StructuralMaterial` or a
+`plasticity::Material` by value. **A figure this document carried was wrong**: it
+said steel loses roughly half its yield at 550 °C, and Table 3.1 puts `k_y` at
+0.625 there. Half is gone at **590 °C**, which is why 600 °C — `k_y` = 0.47 — is
+the number fire engineers quote. "Nearly all of it at 800 °C" stands: 0.11.
+
+Two things that table makes plain and a single reduction factor would hide.
+`k_p,θ` falls *far* faster than `k_y,θ` — 0.42 against 1.00 at 400 °C — so the
+elastic limit is gone long before the yield moves. And `k_E,θ` is below `k_y,θ`
+from 500 °C up, so anything that fails by instability rather than by squashing
+loses strength faster than the yield factor says: the ferry's midship section
+sheds 17.6% of its ultimate sagging moment at 400 °C, at which temperature `k_y`
+is still exactly 1.
+
+Still per material, and still to come: ultimate strength, Johnson–Cook rate and
+thermal coefficients, **thermal expansion** (§3.4.1.1, and for a restrained member
+it is four times the size of the strength effect), melting point. Coverage: mild
+steel, higher-tensile grades AH/DH/EH 32/36/40, stainless,
 aluminium 5083/5383/6082 (which loses strength at *200* °C — the reason aluminium
 superstructures are a fire problem), GRP and sandwich laminates, timber, ferro-
 cement, and HY-80/100 for naval hulls.

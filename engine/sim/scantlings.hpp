@@ -116,6 +116,13 @@ namespace sim {
 // needs. Strength and thermal properties arrive with the constitutive model;
 // putting placeholders here would be a plausible wrong number, which is the
 // failure mode this repo keeps finding.
+// **Every value here is at 20 C**, and `thermal::atTemperature` is what turns one
+// into the material a hot member has: `youngsModulus` scaled by EN 1993-1-2 §3.2's
+// `k_E,theta` and `yieldStrength` by `k_y,theta`. It returns a value rather than
+// storing a temperature, so a mesh with a temperature field is a mesh with one
+// entry per distinct temperature in `StructuralMesh::materials` and every consumer
+// -- `buckling`, `collapse`, `indentation`, `solid_shell` -- reaches it through the
+// material index it already uses. Nothing here needs to know.
 struct StructuralMaterial {
     std::string name = "steel_ah36";
     double density = 7850.0;         // kg/m^3

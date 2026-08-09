@@ -710,11 +710,51 @@ should be honest about that.
   gradient is what bows a plate — takes the limit to 0.29 s, and a 1.5 mm
   surface layer to 0.073 s. `thermal.hpp` carries the measurement and
   `explicitLimit()` reproduces it as a closed form.
-- Temperature-dependent material strength (fire → FEM coupling). The thermal
-  half is in place and `StructuralMaterial` now carries `conductivity` and
-  `specificHeat`; what is missing is the reduction factors for `E` and
-  `f_y` (EN 1993-1-2 §3.2), and a decision about whether the strength model
-  reads a nodal temperature field or an element-averaged one.
+- ✅ Temperature-dependent material strength (fire → FEM coupling) —
+  `thermal::carbonSteelReduction` and `thermal::atTemperature`. EN 1993-1-2 §3.2
+  Table 3.1 with the standard's own linear interpolation: `k_y,θ` on the
+  effective yield, `k_p,θ` on the proportional limit, `k_E,θ` on Young's modulus.
+  `atTemperature` returns a reduced `StructuralMaterial` or `plasticity::Material`
+  by value, so a hot ship is the same ship with a reduced material and nothing
+  downstream changed. The standard's four-branch σ(ε) curve, ellipse included, is
+  there as the reference the reduced model is measured against.
+
+  **The temperature-field question is settled by measurement, and the answer is
+  per element.** Every element-level entry point in `solid_shell.hpp` and every
+  material lookup in `buckling`, `collapse` and `indentation` already takes one
+  material per element, so per-element temperature needed **no interface change at
+  all**; building the reduced material costs 11.5 ns against
+  `elementPlasticUpdate`'s 5.65 µs, 0.20%. Per-Gauss-point would need a signature
+  change, and does not earn it: a 12 mm plate against a 900 °C compartment through
+  a 200 W/(m²·K) film has a spread of **19.1 K across the whole plate** at its
+  worst and under 1 K after half an hour, because the Biot number is 0.070. The
+  worst spread in `k_y` that implies is 0.039.
+
+  **A structural consequence that is not the yield factor.** The ferry's midship
+  section loses **17.6% of its ultimate sagging moment at 400 °C, where `k_y` is
+  still exactly 1** — plate buckling goes with `E`, and `k_E` is 0.70 there. At
+  600 °C it keeps 0.376 against `k_y = 0.47`. A single 0.7 × 2.4 m × 12 mm panel
+  changes regime outright: squash-governed cold (Johnson-Ostenfeld biting at
+  213.6 MPa), elastic-buckling-governed at 600 °C (69.1 MPa, 0.323 of cold). The
+  fully plastic moment does scale by exactly `k_y`, and is the closed-form anchor.
+
+  **The return map needed nothing.** At any fixed temperature the scaled curve is
+  still monotonically hardening — `k_y` multiplies `σ_y` and its slope alike — so
+  radial return still lands on the unique root and step-independence still holds
+  exactly. A yield surface that *shrinks* between steps is handled by the map it
+  already has: the stored stress starts outside the new surface and is returned to
+  it, which is stress relaxation.
+
+  **What is missing is elongation, not strength, and it is four times larger.**
+  §3.4.1.1 gives 7.08e-3 of free strain at a 500 K rise against a 1.72e-3 yield
+  strain; a fully restrained member yields on expansion alone at 164.6 °C, where
+  `k_y` is still 1. That is the next item. Creep is *not* missing in the same
+  sense: §3.2.1's curves carry it implicitly for 2–50 K/min, and both fires
+  measured here (43 K/min under ISO 834, 114 K/min post-flashover) sit at or above
+  that band, where the implicit treatment is conservative. A fire that stabilises
+  and soaks is the case to revisit.
+- Thermal elongation and restraint (EN 1993-1-2 §3.4.1.1). The strength half is
+  done and this is the larger term for any restrained member — see above.
 - Suppression systems, and their effect on stability
 - LES promotion for the local compartment
 - Volumetric fire and smoke rendering
