@@ -1,9 +1,32 @@
+# --- Nothing new at the repository root without saying so ----------------------
+#
+# A mutation harness wrote its scratch into a worktree root and a `git add -A` swept
+# **176 files** into a commit -- names like `, kind: operator, line: 1033}` -- so more
+# than half of what this repo tracked was debris. The warning below about agent
+# worktrees already existed; it did not generalise to "anything else at the root".
+#
+# So the root is an allowlist: ignore everything there, keep every directory, and name
+# the four files that belong. A genuinely new top-level file needs a line here, which
+# is the point -- it makes adding one a decision rather than an accident.
+#
+# **This block must come first.** `!*/` re-includes every directory, so anything that
+# ignores a directory has to be stated *after* it or the negation wins. Putting this
+# at the end silently un-ignored `build-asan/` and the pre-commit hook caught it.
+/*
+!*/
+!/.gitignore
+!/CLAUDE.md
+!/CMakeLists.txt
+!/README.md
+
+# --- Build output, which the rule above would otherwise have re-admitted --------
 build/
+build-*/
 compile_commands.json
-*.csv
 .cache/
+*.csv
+
 # Agent worktrees and transient session state only -- .claude/settings.json is
 # project configuration and is tracked deliberately.
 .claude/worktrees/
 .claude/state/
-build-*/
