@@ -6,9 +6,13 @@
 #include "engine/core/geometry.hpp"
 #include "engine/sim/ship.hpp"
 #include "engine/sim/waves.hpp"
+#include "game/prototype/ferry.hpp"
 #include "harness.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <limits>
 #include <string>
 
 using namespace sim;
@@ -17,6 +21,11 @@ using testing::expectNear;
 using testing::expectTrue;
 
 namespace {
+
+// The adiabatic limit: gas that gives its heat to nothing at all. A compartment
+// with a fire in it is nearer this than it is to the isothermal default over the
+// seconds that decide where the smoke goes.
+constexpr double kInfinity = std::numeric_limits<double>::infinity();
 
 // --- Closed-mesh integration -----------------------------------------------
 
@@ -718,6 +727,683 @@ void testTrappedAirArrestsFlooding() {
                p0V0, 0.02 * p0V0);
 }
 
+// --- Gas temperature --------------------------------------------------------
+
+// A barge with one sealed compartment and one hole low in its side, so the
+// rising water compresses the air it traps. The shape the trapped-air tests all
+// need.
+Ship makeTrappedAirBarge(double thermalTime) {
+    Ship s;
+    s.hull = makeBox({-25, -6, 0}, {25, 6, 8});
+    s.deckEdgeZ = 8.0;
+
+    Compartment sealed;
+    sealed.name = "sealed_void";
+    sealed.mesh = makeBox({-10, -4, 0.0}, {10, 4, 3.0});
+    sealed.permeability = 1.0;
+    sealed.gasThermalTime = thermalTime;
+    s.compartments = {sealed};
+
+    Opening hole;
+    hole.name = "hole";
+    hole.a = kSea;
+    hole.b = 0;
+    hole.pos = {0, -4, 0.2};
+    hole.area = 0.5;
+    s.openings = {hole};
+
+    s.lightshipMass = 50.0 * 12.0 * 3.0 * kRhoSeawater;
+    s.lightshipCog = {0, 0, 4.0};
+    s.gyradii = {4.0, 14.0, 14.0};
+    s.initialise(0.0);
+    return s;
+}
+
+// The closed form. Air trapped in a compartment and compressed by the water
+// rising into it, with nowhere to send the heat, follows the isentrope:
+//
+//     T / T0 = (p / p0) ^ ((gamma - 1) / gamma)
+//
+// This is the sharp test that the energy is being *carried* rather than reset
+// every tick, because an implementation that recomputed the temperature from
+// anything else would land on the isotherm instead, and the two differ by 30% by
+// the time a compartment is half full.
+//
+// The same barge with the default thermal time is the control, and it must land
+// on Boyle instead -- which is not a second-best answer but the model the
+// flooding scenarios are validated against, so both are asserted here.
+void testAdiabaticCompressionFollowsTheIsentrope() {
+    Ship s = makeTrappedAirBarge(kInfinity);
+    const Compartment& c = s.compartments[0];
+
+    const double p0 = c.airPressure;
+    const double t0 = c.gasTemperature;
+    const double v0 = c.airVolume();
+    for (int i = 0; i < 120000; ++i) s.step(0.005, 0.0);
+
+    // Non-vacuous: the compartment has to have actually been compressed, or the
+    // isentrope and the isotherm agree trivially at a ratio of one. It settles at
+    // p/p0 = 1.264 on a void 3 m deep with the hole 0.2 m off its floor, which is
+    // all the head there is to compress with.
+    expectTrue("the trapped air was really compressed", c.airPressure > 1.2 * p0);
+    expectTrue("and the gas space really shrank", c.airVolume() < 0.9 * v0);
+    expectTrue("adiabatic compression heated the trapped air", c.gasTemperature > t0 + 15.0);
+
+    const double ratio = c.airPressure / p0;
+    const double expected = t0 * std::pow(ratio, (kGammaAir - 1.0) / kGammaAir);
+    // 1e-12 and not something comfortable: this is an exact relation between two
+    // stored numbers, not a converged one, and it comes back at 1e-14. A
+    // tolerance loose enough to be safe would also be loose enough to pass on a
+    // model that had lost the property and was merely in the right region.
+    expectNear("trapped air follows T/T0 = (p/p0)^((gamma-1)/gamma)", c.gasTemperature,
+               expected, 1e-12 * expected);
+
+    // And the mass never moved, so pV^gamma is the same statement seen from the
+    // other side. Asserting it as well is what distinguishes carrying the energy
+    // from having fitted the temperature to the pressure after the fact -- the
+    // first form would still hold if the temperature were being *derived* from
+    // the pressure each tick, and this one would not.
+    const double pvg0 = p0 * std::pow(v0, kGammaAir);
+    expectNear("and equivalently conserves p V^gamma",
+               c.airPressure * std::pow(c.airVolume(), kGammaAir), pvg0, 1e-12 * pvg0);
+
+    // The control: the default gas is isothermal, so the *same* barge must sit on
+    // Boyle's law and nowhere near the isentrope. The two answers are far apart,
+    // which is the point -- this is the difference the state variable makes.
+    Ship cold = makeTrappedAirBarge(0.0);
+    for (int i = 0; i < 120000; ++i) cold.step(0.005, 0.0);
+    const Compartment& cc = cold.compartments[0];
+    expectNear("the default gas stays exactly at ambient", cc.gasTemperature, kTAmbient, 0.0);
+    expectNear("and compresses isothermally", cc.airPressure * cc.airVolume(),
+               kPatm * cc.grossVolume, 0.02 * kPatm * cc.grossVolume);
+    // The two models are being asked the same question and must give visibly
+    // different answers, or neither assertion above proves anything. They do, and
+    // by more than a temperature: air that is allowed to heat as it is compressed
+    // pushes back harder, so the adiabatic void arrests the flooding at 15.4% full
+    // where the isothermal one goes to 20.2%. A **24% difference in how much water
+    // gets in** is the measurement behind keeping the isothermal model the default
+    // -- it is far too large to have absorbed into the published scenarios
+    // silently, and far too large for the choice to be a matter of taste.
+    expectTrue("the isentrope and the isotherm are far apart here",
+               c.gasTemperature > 1.05 * cc.gasTemperature);
+    expectTrue("and adiabatic air keeps materially more water out",
+               c.fillFraction() < 0.85 * cc.fillFraction());
+}
+
+// Two compartments at different temperatures, joined by a high opening and a low
+// one, must exchange gas: hot out the top, cold in the bottom, with no net mass
+// going anywhere once it settles. This is the whole mechanism of smoke spread,
+// and it is what a network at a single temperature structurally cannot express.
+//
+// **The direction is the assertion, not the magnitude.** A transport term with
+// the wrong sign, or a buoyancy head taken about the wrong datum, produces
+// exchange of entirely plausible size flowing the wrong way through both holes.
+void testBuoyancyDrivesGasThroughAVerticalOpeningPair() {
+    auto makePair = [](double tHot) {
+        Ship s;
+        s.hull = makeBox({-25, -6, 0}, {25, 6, 12});
+        s.deckEdgeZ = 12.0;
+        auto room = [&](const char* name, double x0, double x1) {
+            Compartment c;
+            c.name = name;
+            c.mesh = makeBox({x0, -4, 2.0}, {x1, 4, 10.0});
+            c.permeability = 1.0;
+            c.gasThermalTime = kInfinity;  // adiabatic: nothing to cool the smoke
+            return c;
+        };
+        s.compartments = {room("hot", -20, 0), room("cold", 0, 20)};
+        s.compartments[0].gasTemperature = tHot;
+
+        // A doorway is not one orifice. `Opening` has a position and an area and
+        // no height at all, so a single one of them samples the pressure
+        // difference at exactly one elevation and moves gas one way through it --
+        // at its own neutral plane it transports nothing whatever. The two-way
+        // formulation the docs specify is expressed here as two openings, one
+        // each side of where the neutral plane falls, which is also how a
+        // two-layer fire model discretises the same doorway.
+        auto door = [&](const char* name, double z) {
+            Opening o;
+            o.name = name;
+            o.a = 0;
+            o.b = 1;
+            o.pos = {0, 0, z};
+            o.area = 0.9;
+            o.kind = OpeningKind::Door;
+            return o;
+        };
+        s.openings = {door("door_top", 8.5), door("door_bottom", 3.5)};
+
+        s.lightshipMass = 50.0 * 12.0 * 3.0 * kRhoSeawater;
+        s.lightshipCog = {0, 0, 4.0};
+        s.gyradii = {4.0, 14.0, 14.0};
+        s.initialise(0.0);
+        return s;
+    };
+
+    Ship s = makePair(900.0);
+    // Hold the two temperatures where they were put, the way a sustained fire in
+    // one space and open sea air in the other would. Left to mix they equalise
+    // and the exchange correctly stops, which would make the steady state this
+    // test is about unreachable.
+    for (int i = 0; i < 4000; ++i) {
+        s.compartments[0].gasTemperature = 900.0;
+        s.compartments[1].gasTemperature = kTAmbient;
+        s.step(0.002, 0.0);
+    }
+
+    const double top = s.openings[0].lastGasMassFlow;     // + is hot -> cold
+    const double bottom = s.openings[1].lastGasMassFlow;
+
+    expectTrue("hot gas leaves the burning space through the high opening", top > 0);
+    expectTrue("cool air is drawn back in through the low opening", bottom < 0);
+    expectTrue("the exchange is not a rounding artefact", top > 1e-3);
+
+    // Zero *net* mass flow: the compartment is neither filling nor emptying, it is
+    // circulating. Scaled against the size of the exchange itself, because an
+    // absolute tolerance would pass on an exchange of zero.
+    const double exchange = 0.5 * (std::abs(top) + std::abs(bottom));
+    expectNear("no net mass crosses the bulkhead at equilibrium", (top + bottom) / exchange,
+               0.0, 1e-3);
+
+    // Guard against vacuity from the other end: the temperatures really did
+    // differ, and with them equal the same geometry must exchange *exactly*
+    // nothing. Exactly, not nearly -- the buoyancy head is built to vanish by IEEE
+    // arithmetic at ambient rather than merely to be small, which is what keeps a
+    // cold ship bit-identical to the model that had no temperature in it.
+    expectTrue("the two spaces were really at different temperatures",
+               s.compartments[0].gasTemperature > 3.0 * s.compartments[1].gasTemperature);
+
+    Ship flat = makePair(kTAmbient);
+    for (int i = 0; i < 4000; ++i) flat.step(0.002, 0.0);
+    expectNear("at one temperature the high opening moves exactly nothing",
+               flat.openings[0].lastGasMassFlow, 0.0, 0.0);
+    expectNear("and so does the low one", flat.openings[1].lastGasMassFlow, 0.0, 0.0);
+}
+
+// Energy in the gas must balance what crossed the openings, the way the flooding
+// solve already balances mass -- and on the ferry rather than on a toy, because a
+// toy closes at roundoff while hiding whatever the real network's stiffness does.
+// The ferry's air pipes are 0.02 m2 against compartments of hundreds of cubic
+// metres, which is the stiffest corner of this solve.
+//
+// The account is taken over the *sealed* compartments only. A vented space is
+// held at atmospheric by exchanging mass with an atmosphere this ledger cannot
+// see, so it belongs outside the boundary along with the sea; every opening with
+// one endpoint inside and one outside is then a boundary flux.
+void testGasEnergyBalancesWhatCrossedTheOpenings() {
+    Ship s = game::buildFerry();
+    for (Compartment& c : s.compartments) c.gasThermalTime = kInfinity;
+    // The hull breaches are shut, so no water rises against the trapped air and
+    // the only energy in the ledger is what came through a hole. That is
+    // deliberate and it is not a retreat to a toy: this is the ferry's whole
+    // network -- eighteen spaces, thirty-odd openings, and air pipes of 0.02 m2
+    // serving compartments of hundreds of cubic metres, which is the stiffest
+    // corner of this solve and the one a two-box fixture does not have. The pdV
+    // work the flooding case adds is a *closed-system* term with an exact answer
+    // of its own, and it is asserted against that answer in the isentrope test
+    // above rather than folded into this sum where it could only be estimated.
+    for (Opening& o : s.openings)
+        if (o.kind == OpeningKind::Breach) o.open = false;
+    s.initialise(0.0);
+
+    // Set one machinery space alight, in the sense that matters here: hot gas,
+    // which is less dense, higher pressure and free to go looking for a way out.
+    const int seat = s.findCompartment("engine_room_s");
+    expectTrue("the ferry has the compartment this test heats", seat != kSea);
+    s.compartments[static_cast<std::size_t>(seat)].gasTemperature = 1100.0;
+
+    const auto& comps = s.compartments;
+    auto inside = [&](int i) { return i != kSea && !comps[static_cast<std::size_t>(i)].ventedToAtmosphere; };
+    auto energy = [&] {
+        double e = 0;
+        for (const Compartment& c : comps)
+            if (!c.ventedToAtmosphere) e += c.airMass * c.gasTemperature;
+        return e;
+    };
+
+    const double e0 = energy();
+    double crossed = 0.0;   // enthalpy in, in the same kg*K units as m*T
+    const double dt = 0.005;
+    double worst = 0.0;
+    for (int i = 0; i < 40000; ++i) {
+        s.step(dt, 0.0);
+        for (const Opening& o : s.openings) {
+            if (o.lastGasMassFlow == 0.0) continue;
+            const double dm = o.lastGasMassFlow * dt;      // + is a -> b
+            const double h = kGammaAir * o.lastGasDonorTemperature * dm;
+            if (inside(o.b) && !inside(o.a)) crossed += h;
+            if (inside(o.a) && !inside(o.b)) crossed -= h;
+        }
+        worst = std::max(worst, std::abs(energy() - e0 - crossed));
+    }
+
+    // Non-vacuous: real energy has to have crossed the boundary, or a solve that
+    // moved nothing at all would balance perfectly.
+    expectTrue("gas really did cross the ferry's boundary", std::abs(crossed) > 0.02 * e0);
+    expectTrue("and the compartment cooled as it vented",
+               comps[static_cast<std::size_t>(seat)].gasTemperature < 1000.0);
+
+    // Tight, because this is an exactly-conservative update rather than a
+    // converged one: every opening adds the same gamma*T*dm to one side that it
+    // takes from the other, so the only error is floating-point summation over
+    // 40 000 steps and 30-odd openings.
+    expectNear("gas energy balances the enthalpy that crossed the openings", worst / e0, 0.0,
+               1e-9);
+}
+
+// A barge shell the gas fixtures below hang compartments inside.
+Ship makeGasShell() {
+    Ship s;
+    s.hull = makeBox({-25, -6, 0}, {25, 6, 12});
+    s.deckEdgeZ = 12.0;
+    s.lightshipMass = 50.0 * 12.0 * 3.0 * kRhoSeawater;
+    s.lightshipCog = {0, 0, 4.0};
+    s.gyradii = {4.0, 14.0, 14.0};
+    return s;
+}
+
+// Heat leaves the gas on the time constant it was given, and the closed form for
+// that is an exponential. Asserted against exp() rather than against a shape,
+// because the whole reason this is an exact relaxation rather than an explicit
+// step is that the fire's time constant is seconds while the flooding solve steps
+// at milliseconds.
+void testGasRelaxesToTheStructureExponentially() {
+    Ship s = makeGasShell();
+    Compartment c;
+    c.name = "hot";
+    c.mesh = makeBox({-10, -4, 2.0}, {10, 4, 8.0});
+    c.permeability = 1.0;
+    c.gasThermalTime = 5.0;
+    c.gasTemperature = 800.0;
+    s.compartments = {c};   // sealed, no openings: nothing but the relaxation acts
+    s.initialise(0.0);
+
+    const double t0 = s.compartments[0].gasTemperature;
+    const double dt = 0.01;
+    // **An odd number of steps, deliberately.** Flip the sign of the increment in
+    // the relaxation and the map becomes T <- Tamb - (T - Tamb) a, whose *square*
+    // is exactly the correct two-step map T <- Tamb + (T - Tamb) a^2. Over an even
+    // number of steps that mutation therefore lands on the right answer to the
+    // last bit and the test proves nothing. This is the error that cancels when it
+    // is asked globally, and an odd count is what refuses to let it.
+    const int n = 1501;
+    for (int i = 0; i < n; ++i) s.step(dt, 0.0);
+
+    const double want = kTAmbient + (t0 - kTAmbient) * std::exp(-n * dt / 5.0);
+    expectTrue("the gas started well away from ambient", t0 > 2.0 * kTAmbient);
+    expectTrue("and has not finished relaxing", want > kTAmbient + 20.0);
+    // 3e-15 measured over 1 500 steps, so the tolerance is set at what a chain of
+    // that many exact exponentials is entitled to and no looser.
+    expectNear("gas cools to the structure as exp(-t/tau)", s.compartments[0].gasTemperature,
+               want, 1e-12 * want);
+}
+
+// Charging a rigid space from the atmosphere *heats* it, even though the
+// atmosphere is at ambient and the space started at ambient. That is not a quirk:
+// the arriving gas is pushed in by the reservoir behind it, so it brings cp T
+// while only cv T is needed to sit there, and the difference is the flow work.
+//
+// It is also the sharpest available check that gas leaving the *sea* leaves at
+// ambient and that the transport is enthalpy: the closed form
+// T1 = T0 (m0 + gamma dm) / m1 contains gamma explicitly, and an implementation
+// that moved internal energy instead would land on T1 = T0 exactly.
+void testChargingFromTheSeaHeatsTheCompartment() {
+    Ship s = makeGasShell();
+    Compartment c;
+    c.name = "void";
+    c.mesh = makeBox({-10, -4, 2.0}, {10, 4, 8.0});
+    c.permeability = 1.0;
+    c.gasThermalTime = kInfinity;
+    s.compartments = {c};
+    Opening o;
+    o.name = "pipe";
+    o.a = kSea;
+    o.b = 0;
+    o.pos = {0, 0, 9.0};
+    o.area = 0.05;
+    o.kind = OpeningKind::Vent;
+    s.openings = {o};
+    s.initialise(0.0);
+
+    // Pump half the air out and let the sea push it back.
+    s.compartments[0].airMass *= 0.5;
+    const double m0 = s.compartments[0].airMass;
+    const double t0 = s.compartments[0].gasTemperature;
+    for (int i = 0; i < 20000; ++i) s.step(0.005, 0.0);
+
+    const Compartment& g = s.compartments[0];
+    expectTrue("air really was drawn in from outside", g.airMass > 1.5 * m0);
+
+    // It equalises with the atmosphere *at the vent*, which is not the same
+    // number as `airPressure`: that is quoted at the middle of the gas space, and
+    // this vent is four metres above it through a gas at 336 K. The gap is 6.9 Pa
+    // and it is the datum convention rather than an error, so it is asserted as
+    // the convention rather than tolerated as slop.
+    const double head = -(kPatm / (kRAir * g.gasTemperature) - kPatm / (kRAir * kTAmbient)) *
+                        kGravity * ((o.pos.z + s.state.position.z) - g.gasCentroidWorldZ);
+    expectTrue("the datum correction is real and not noise", std::abs(head) > 1.0);
+    expectNear("the gas equalises with the atmosphere at the vent", g.airPressure + head, kPatm,
+               0.05);
+
+    const double want = t0 * (m0 + kGammaAir * (g.airMass - m0)) / g.airMass;
+    expectNear("charging from the sea gives T1 = T0 (m0 + gamma dm) / m1", g.gasTemperature,
+               want, 1e-9 * want);
+    // Non-vacuous, and the discriminating half: internal-energy transport would
+    // have left this at exactly ambient.
+    expectTrue("and that is materially hotter than ambient", g.gasTemperature > t0 + 30.0);
+}
+
+// The clamp, under the condition it exists for: a big door onto a space whose gas
+// volume is almost nothing, so an explicit Torricelli step wants to move far more
+// mass than equilibrium can absorb. Master clamped to Boyle's equalising mass;
+// with a temperature the equalising mass depends on the temperature the arriving
+// gas produces, and the question this test settles is whether that circularity
+// needs an implicit solve. It does not -- pressure is linear in the energy
+// delivered -- and the evidence is that the pressures converge instead of ringing.
+void testStiffGasTransferStaysStableWithATemperature() {
+    auto makeStiff = [](double tt) {
+        Ship s = makeGasShell();
+        auto room = [&](const char* n, double x0, double x1, double fill) {
+            Compartment c;
+            c.name = n;
+            c.mesh = makeBox({x0, -4, 0.0}, {x1, 4, 8.0});
+            c.permeability = 1.0;
+            c.gasThermalTime = tt;
+            c.waterVolume = fill * (x1 - x0) * 8.0 * 8.0;
+            return c;
+        };
+        s.compartments = {room("nearly_full", -20, 0, 0.97), room("pressurised", 0, 20, 0.0)};
+        // **Two** doors into the same sliver of gas, not one. With a single
+        // opening the Jacobi accumulators are still zero when that opening's
+        // clamp is evaluated, so whether the clamp reads them at all -- or reads
+        // them with the wrong sign -- makes no difference to anything. A second
+        // opening into the same compartment is what gives them a value to be
+        // wrong about.
+        auto door = [&](const char* n, double z) {
+            Opening o;
+            o.name = n;
+            o.a = 1;
+            o.b = 0;
+            o.pos = {0, 0, z};      // in the thin gas layer, not under its water
+            o.area = 3.0;
+            o.dischargeCoeff = 0.9;
+            o.kind = OpeningKind::Door;
+            return o;
+        };
+        s.openings = {door("upper", 7.95), door("lower", 7.80)};
+        s.initialise(0.0);
+        s.compartments[1].airMass *= 3.0;   // three atmospheres against a sliver of gas
+        return s;
+    };
+
+    for (double tt : {0.0, kInfinity}) {
+        Ship s = makeStiff(tt);
+        const char* label = tt == 0.0 ? "isothermal" : "adiabatic";
+        double peak = 0;
+        bool sane = true;
+        for (int i = 0; i < 20000; ++i) {
+            s.step(0.005, 0.0);
+            for (const Compartment& c : s.compartments) {
+                sane = sane && std::isfinite(c.airPressure) && c.airPressure > 0;
+                peak = std::max(peak, c.airPressure);
+            }
+        }
+        expectTrue(std::string("stiff ") + label + " gas pressure stays finite and positive",
+                   sane);
+        const double pa = s.compartments[0].airPressure;
+        const double pb = s.compartments[1].airPressure;
+        // It equalises, and it never went anywhere near the excursion an unclamped
+        // explicit step produces on a gas volume this small.
+        expectTrue(std::string("stiff ") + label + " pressures equalise",
+                   std::abs(pa - pb) < 1e-3 * pa);
+        expectTrue(std::string("stiff ") + label + " never rang past the starting pressure",
+                   peak < 1.02 * 3.0 * kPatm);
+    }
+
+    // And the two regimes are distinguishable in exactly the way the enthalpy
+    // argument says they must be: with somewhere to put the heat, nothing moves
+    // off ambient; with nowhere, the space being charged ends up hotter than it
+    // started and the one blowing down ends up cooler. Both, in one fixture --
+    // a global check of "temperature changed" would be satisfied by either sign.
+    Ship cold = makeStiff(0.0);
+    Ship hot = makeStiff(kInfinity);
+    for (int i = 0; i < 20000; ++i) { cold.step(0.005, 0.0); hot.step(0.005, 0.0); }
+    expectNear("with a heat sink the receiver stays exactly at ambient",
+               cold.compartments[0].gasTemperature, kTAmbient, 0.0);
+    expectNear("and so does the donor", cold.compartments[1].gasTemperature, kTAmbient, 0.0);
+    expectTrue("without one the charged space heats", hot.compartments[0].gasTemperature > kTAmbient + 40.0);
+    expectTrue("and the space that blew down cools", hot.compartments[1].gasTemperature < kTAmbient - 1.0);
+}
+
+// The gas head has to reach the *water* too. A lighter column of gas presses down
+// less, so a hot space sits at a lower pressure on its own water surface than a
+// cold one at the same well-mixed pressure -- and water therefore runs towards
+// the fire. Aimed at the branch of sideStateAt that a dry fixture never enters.
+void testHotGasPullsWaterThroughASubmergedOpening() {
+    Ship s = makeGasShell();
+    auto room = [&](const char* n, double x0, double x1, double t) {
+        Compartment c;
+        c.name = n;
+        c.mesh = makeBox({x0, -4, 0.0}, {x1, 4, 9.0});
+        c.permeability = 1.0;
+        c.gasThermalTime = kInfinity;
+        c.waterVolume = 0.5 * (x1 - x0) * 8.0 * 9.0;
+        c.gasTemperature = t;
+        return c;
+    };
+    s.compartments = {room("hot", -20, 0, 1200.0), room("cold", 0, 20, kTAmbient)};
+    Opening o;
+    o.name = "low";
+    o.a = 0;
+    o.b = 1;
+    o.pos = {0, 0, 0.5};           // well below both internal free surfaces
+    o.area = 0.4;
+    o.kind = OpeningKind::Door;
+    s.openings = {o};
+    s.initialise(0.0);
+
+    const double w0 = s.compartments[0].waterVolume;
+    for (int i = 0; i < 6000; ++i) {
+        s.compartments[0].gasTemperature = 1200.0;
+        s.compartments[1].gasTemperature = kTAmbient;
+        s.step(0.002, 0.0);
+    }
+
+    expectTrue("the submerged opening carried water, not gas", s.openings[0].lastFlowWasWater);
+    expectTrue("water runs towards the lighter gas column",
+               s.compartments[0].waterVolume > w0 + 1e-3);
+    expectNear("a water opening reports exactly no gas mass flow",
+               s.openings[0].lastGasMassFlow, 0.0, 0.0);
+    expectNear("and no donor temperature", s.openings[0].lastGasDonorTemperature, 0.0, 0.0);
+}
+
+// An opening that carries gas and is then drowned must stop reporting gas. The
+// two assertions above are satisfied by a field that was simply never written, so
+// they say nothing about the per-tick reset; this drives the same opening through
+// both phases and asks the question in the order that can fail. Without the
+// reset, a downstream energy or species account reads last tick's mass against
+// this tick's phase and books the same joules twice.
+void testADrownedOpeningStopsReportingGasFlow() {
+    Ship s = makeGasShell();
+    auto room = [&](const char* n, double x0, double x1, double t) {
+        Compartment c;
+        c.name = n;
+        c.mesh = makeBox({x0, -4, 0.0}, {x1, 4, 9.0});
+        c.permeability = 1.0;
+        c.gasThermalTime = kInfinity;
+        c.gasTemperature = t;
+        return c;
+    };
+    s.compartments = {room("hot", -20, 0, 900.0), room("cold", 0, 20, kTAmbient)};
+    Opening o;
+    o.name = "door";
+    o.a = 0;
+    o.b = 1;
+    o.pos = {0, 0, 2.0};
+    o.area = 0.8;
+    o.kind = OpeningKind::Door;
+    s.openings = {o};
+    s.initialise(0.0);
+
+    // Phase one: dry, so the door moves gas. Taken as the largest rate over the
+    // phase rather than the last one, because a single opening equalises the two
+    // pressures and then correctly falls quiet -- reading only the final tick
+    // would confuse "has finished" with "never started".
+    double movedGas = 0;
+    for (int i = 0; i < 500; ++i) {
+        s.compartments[0].gasTemperature = 900.0;
+        s.compartments[1].gasTemperature = kTAmbient;
+        s.step(0.002, 0.0);
+        movedGas = std::max(movedGas, std::abs(s.openings[0].lastGasMassFlow));
+    }
+    expectTrue("the door was moving gas before it was drowned", movedGas > 1e-6);
+
+    // Phase two: drown it, and it must go quiet on the gas channel immediately.
+    for (Compartment& c : s.compartments) c.waterVolume = 0.7 * c.floodableVolume();
+    for (int i = 0; i < 200; ++i) {
+        s.compartments[0].gasTemperature = 900.0;
+        s.compartments[1].gasTemperature = kTAmbient;
+        s.step(0.002, 0.0);
+    }
+    expectTrue("the drowned door now carries water", s.openings[0].lastFlowWasWater);
+    expectNear("and reports exactly no gas mass flow once drowned",
+               s.openings[0].lastGasMassFlow, 0.0, 0.0);
+    expectNear("nor a stale donor temperature", s.openings[0].lastGasDonorTemperature, 0.0, 0.0);
+}
+
+// The datum the gas pressure is quoted at, against geometry derived here rather
+// than read back out of the ship.
+//
+// **This is the assertion the rest of the buoyancy tests structurally cannot
+// make.** A constant error in the datum is invisible to any pair of openings
+// between the same two compartments: it shifts both openings' heads by the same
+// amount, the well-mixed pressure absorbs the shift, and the circulation comes
+// out identical. What it does change is every comparison against a space with a
+// *different* datum -- the sea, or a compartment on another deck. So the datum
+// has to be pinned to an independently computed number, and checking it with the
+// ship's own `gasCentroidWorldZ` on both sides of the equation would prove
+// nothing at all.
+//
+// Checked heeled as well as upright, because the gas space is bounded along the
+// ship's `up`, and while she is upright the transverse terms of that are
+// multiplied by a component of exactly zero -- so an error in either of them is
+// perfectly hidden until she lists.
+void testTheGasDatumSitsAtTheMiddleOfTheGasSpace() {
+    // Both signs of both angles. The gas space is bounded by picking, per axis,
+    // whichever end of the box lies further along `up` -- so at any one attitude
+    // half of those choices are the branch not taken, and an error in it is
+    // invisible. Listing to port and to starboard, by the bow and by the stern,
+    // is what makes every branch load-bearing in at least one case.
+    const double attitudes[5][2] = {{0.0, 0.0}, {0.28, 0.11}, {-0.28, 0.11},
+                                    {0.28, -0.11}, {-0.28, -0.11}};
+    for (const auto& att : attitudes) {
+        const double heel = att[0], trim = att[1];
+        Ship s = makeGasShell();
+        Compartment c;
+        c.name = "space";
+        // Deliberately off-centre in y, so a transverse term that is wrong shows
+        // up as soon as there is any heel at all to expose it.
+        c.mesh = makeBox({-10, 1.0, 2.0}, {10, 4.5, 8.0});
+        c.permeability = 1.0;
+        c.gasThermalTime = kInfinity;
+        c.gasTemperature = 700.0;
+        s.compartments = {c};
+        // Heel *and* trim. Heeling alone leaves `up` with an x component of
+        // exactly zero, and the longitudinal term of the gas-space bound is then
+        // multiplied by zero however wrong it is.
+        s.state.orientation = Quat::fromAxisAngle(Vec3{1, 0, 0}, heel) *
+                              Quat::fromAxisAngle(Vec3{0, 1, 0}, trim);
+        s.initialise(0.0);
+
+        // Independently derived: the gas fills the whole space (it is dry), so its
+        // middle is halfway between the lowest and highest corners of the box
+        // measured along the ship's own up, plus wherever the origin has floated to.
+        const Mat3 R = s.state.orientation.toMat3();
+        const Vec3 up = R.transposed() * Vec3{0, 0, 1};
+        const Vec3 lo{-10, 1.0, 2.0}, hi{10, 4.5, 8.0};
+        double bottom = 1e30, top = -1e30;
+        for (int k = 0; k < 8; ++k) {
+            const Vec3 corner{(k & 1) ? hi.x : lo.x, (k & 2) ? hi.y : lo.y, (k & 4) ? hi.z : lo.z};
+            const double d = dot(up, corner);
+            bottom = std::min(bottom, d);
+            top = std::max(top, d);
+        }
+        const double want = 0.5 * (bottom + top) + s.state.position.z;
+        expectNear(heel == 0.0 ? "the gas datum is the mid-height of the gas space"
+                               : "and still is at every heel and trim, either way",
+                   s.compartments[0].gasCentroidWorldZ, want, 1e-12);
+    }
+
+    // And the heel really did move it, so the pair above is two measurements
+    // rather than one repeated.
+    Ship a = makeGasShell(), b = makeGasShell();
+    Compartment c;
+    c.name = "space";
+    c.mesh = makeBox({-10, 1.0, 2.0}, {10, 4.5, 8.0});
+    c.permeability = 1.0;
+    a.compartments = {c};
+    b.compartments = {c};
+    b.state.orientation = Quat::fromAxisAngle(Vec3{1, 0, 0}, 0.28) *
+                          Quat::fromAxisAngle(Vec3{0, 1, 0}, 0.112);
+    a.initialise(0.0);
+    b.initialise(0.0);
+    expectTrue("heeling actually moves the gas datum",
+               std::abs(a.compartments[0].gasCentroidWorldZ -
+                        b.compartments[0].gasCentroidWorldZ) > 0.05);
+}
+
+// A vented space is held at atmospheric by swapping mass with the outside air,
+// and that air arrives at ambient. So a hot vented compartment whose gas space is
+// growing -- water draining out of it -- must be *diluted* by what comes in and
+// cool towards ambient, without ever overshooting past it. Left out, a vented
+// space could be filled from the atmosphere while keeping all its heat, which is
+// energy from nowhere.
+void testAVentedSpaceIsCooledByTheAirItDrawsIn() {
+    Ship s = makeGasShell();
+    Compartment c;
+    c.name = "hold";
+    c.mesh = makeBox({-15, -4, 0.0}, {15, 4, 9.0});
+    c.permeability = 1.0;
+    c.ventedToAtmosphere = true;
+    c.gasThermalTime = kInfinity;   // nothing but the incoming air can cool it
+    c.gasTemperature = 900.0;
+    c.waterVolume = 0.97 * 30.0 * 8.0 * 9.0;   // nearly full: room for a 33x dilution
+    s.compartments = {c};
+    Pump p;
+    p.name = "bilge";
+    p.compartment = 0;
+    p.capacity = 6.0;
+    p.maxHead = 40.0;
+    p.on = true;
+    s.pumps = {p};
+    s.initialise(0.0);
+
+    const double m0 = s.compartments[0].airMass;
+    const double t0 = s.compartments[0].gasTemperature;
+    double previous = t0;
+    bool monotone = true, aboveAmbient = true;
+    for (int i = 0; i < 120000; ++i) {
+        s.step(0.005, 0.0);
+        const double t = s.compartments[0].gasTemperature;
+        monotone = monotone && t <= previous + 1e-9;
+        aboveAmbient = aboveAmbient && t >= kTAmbient - 1e-9;
+        previous = t;
+    }
+
+    const Compartment& g = s.compartments[0];
+    expectTrue("the pump really did open the gas space up", g.airMass > 20.0 * m0);
+    expectTrue("the vented space was diluted and cooled", g.gasTemperature < t0 - 100.0);
+    // Diluted thirty-three fold, so it must have come down to *ambient* and not
+    // merely downwards. This is what pins the temperature the incoming air is
+    // carrying: mixing towards anything else settles visibly short of here.
+    expectTrue("dilution drives it towards ambient, not just downwards",
+               g.gasTemperature < kTAmbient + 25.0);
+    expectTrue("it cooled monotonically", monotone);
+    // The sharp half: mixing with a reservoir cannot take it past the reservoir.
+    expectTrue("and never overshot below the air it was mixing with", aboveAmbient);
+    expectNear("a vented space stays at atmospheric throughout", g.airPressure, kPatm, 1e-9);
+}
+
 // Water must not appear or vanish: the sum over compartments has to equal what
 // crossed the hull boundary.
 void testMassConservation() {
@@ -813,5 +1499,15 @@ void runCoreTests() {
     testArchimedes();
     testFreeSurfaceEffect();
     testTrappedAirArrestsFlooding();
+    testAdiabaticCompressionFollowsTheIsentrope();
+    testBuoyancyDrivesGasThroughAVerticalOpeningPair();
+    testGasEnergyBalancesWhatCrossedTheOpenings();
+    testGasRelaxesToTheStructureExponentially();
+    testChargingFromTheSeaHeatsTheCompartment();
+    testStiffGasTransferStaysStableWithATemperature();
+    testHotGasPullsWaterThroughASubmergedOpening();
+    testADrownedOpeningStopsReportingGasFlow();
+    testTheGasDatumSitsAtTheMiddleOfTheGasSpace();
+    testAVentedSpaceIsCooledByTheAirItDrawsIn();
     testMassConservation();
 }

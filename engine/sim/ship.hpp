@@ -60,7 +60,37 @@ struct Compartment {
     // State.
     double waterVolume = 0;        // m^3 of liquid water held
     double airMass = 0;            // kg of gas trapped
+    double gasTemperature = kTAmbient;  // K, well mixed over the gas space
     bool   ventedToAtmosphere = false;  // open compartments never pressurise
+
+    // How fast this compartment's gas gives its heat up to the structure around
+    // it, as a relaxation time towards kTAmbient. **Zero is the default and it
+    // means instantaneous**, which reproduces the isothermal gas this model
+    // carried before temperature was a state at all: a few tonnes of steel
+    // bulkhead is an enormous heat sink next to the air in a compartment, so
+    // trapped air tracks ambient far faster than a compartment floods, and
+    // Boyle's law is then the right pressure law for flooding.
+    //
+    // That default is not laziness, it is what the flooding scenarios were
+    // validated under -- `testTrappedAirArrestsFlooding` asserts pV is conserved
+    // through a compression to 2%, which is a statement that the work of
+    // compression goes into the steel and not into the gas. It is also what makes
+    // a cold ship bit-identical to the model without temperature: at zero the
+    // temperature is pinned to kTAmbient by exact assignment, and every
+    // expression below that reads it recovers its old form character for
+    // character.
+    //
+    // Set it positive and the gas becomes a real thermodynamic system: pdV work
+    // heats it under compression, flow carries enthalpy rather than just mass,
+    // and density -- hence buoyancy through a vertical opening -- follows the
+    // temperature. Infinity is the adiabatic limit and is where the isentropic
+    // closed form T/T0 = (p/p0)^((gamma-1)/gamma) is exact. A compartment with a
+    // fire in it wants this; a cold one has no use for it.
+    //
+    // This is the same idiom as `radiation` and `rollDampingForm`: the real model
+    // arrives alongside the lumped stand-in and replaces it only where it is
+    // asked for, so nothing that was validated against the stand-in moves.
+    double gasThermalTime = 0;     // s
 
     // Cached at initialise().
     double grossVolume = 0;        // m^3, geometric
@@ -71,6 +101,19 @@ struct Compartment {
     double surfaceWorldZ = 0;      // world height of that surface
     Vec3   waterCentroid{};        // body frame
     double airPressure = kPatm;    // Pa
+
+    // World height of the middle of the gas space -- the free surface when there
+    // is water, the bottom of the space when there is not, up to the deckhead.
+    // This is the datum `airPressure` is quoted at: a well-mixed gas is only
+    // uniform in pressure to the extent its own weight is negligible, and the
+    // whole mechanism of smoke spread is that for a hot gas it is not. Openings
+    // above this height see less than airPressure, below it more.
+    double gasCentroidWorldZ = 0;
+
+    // Gas volume at the end of the previous free-surface update, so the pdV work
+    // of the water rising against the trapped air can be taken between one update
+    // and the next. Only read when gasThermalTime is non-zero.
+    double lastAirVolume = 0;      // m^3
 
     double floodableVolume() const { return grossVolume * permeability; }
     double airVolume()       const { return floodableVolume() - waterVolume; }
@@ -96,6 +139,15 @@ struct Opening {
     // Diagnostic, filled each tick.
     double lastFlow = 0;           // m^3/s, positive means a -> b
     bool   lastFlowWasWater = false;
+
+    // The gas side of the same flow, which a volumetric rate cannot express on
+    // its own: `lastFlow` is quoted at the donor's density, and the donor's
+    // density is now a function of its temperature. Mass and the temperature it
+    // arrives at are what a species or energy account downstream actually needs,
+    // and deriving them back out of a volume would mean re-deriving the donor.
+    // Zero on a tick that moved water, or nothing.
+    double lastGasMassFlow = 0;         // kg/s, positive means a -> b
+    double lastGasDonorTemperature = 0; // K, the temperature the gas left at
 };
 
 // A bilge or ballast pump moving water out of a compartment, overboard.
@@ -305,6 +357,11 @@ private:
     void updateInternalFreeSurfaces(const Sea& sea);
     void solveFlowNetwork(double dt, const Sea& sea);
     void integrateRigidBody(double dt, const Sea& sea);
+
+    // Heat leaking from the gas into the structure around it, once per step.
+    // Separate from the free-surface update because that runs twice a step and a
+    // relaxation applied twice would relax at twice the rate it was asked for.
+    void relaxGasToStructure(double dt);
 
     // Pressure and phase presented by one side of an opening.
     struct SideState {

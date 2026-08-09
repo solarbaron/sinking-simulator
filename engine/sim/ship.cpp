@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "ship.hpp"
 
+#include <cmath>
 #include <limits>
 #include <string_view>
 
@@ -9,9 +10,67 @@ namespace {
 
 constexpr double kInf = std::numeric_limits<double>::infinity();
 
+// Density of the reference atmosphere: the air outside the hull, and the air in
+// every compartment that has not been given a reason to be anything else.
+//
+// **Written as this expression and not as a number.** Everything below that
+// carries a gas temperature subtracts this from `kPatm / (kRAir * T)`, and at
+// T == kTAmbient the two operands are then the same double bit for bit, so the
+// difference is exactly +0.0 and the whole buoyancy term drops out by IEEE
+// arithmetic rather than by being small. That is what makes a cold ship
+// bit-identical to the model that had no temperature in it.
+constexpr double kRhoAirAmbient = kPatm / (kRAir * kTAmbient);
+
+// Gas density at `kelvin`, at the reference pressure.
+//
+// Deliberately *not* p/(R T) with the compartment's own pressure. This value is
+// used only for the buoyancy head between two spaces, and there it is the
+// thermal part of the density difference that matters -- a fire takes the gas
+// from 288 K to 800 K and halves its density, while pressurising a compartment
+// enough to flood it moves the density by around a percent. Taking the pressure
+// term as well would make the head non-zero for two cold compartments at
+// different pressures, which is a real effect the flooding model has never had
+// and is not the effect being added here.
+inline double gasBuoyancyDensity(double kelvin) { return kPatm / (kRAir * kelvin); }
+
+// The head a compartment's gas carries between the datum its pressure is quoted
+// at -- the middle of the gas space -- and some other height in the same space.
+//
+// The gas has weight, and until now this model did not admit it: `airPressure`
+// was returned at every height in the compartment, so two spaces joined by a high
+// opening and a low one saw the *same* pressure difference at both and moved gas
+// the same way through each. There is no neutral plane in that, and therefore no
+// buoyant exchange -- which is the entire mechanism by which smoke leaves a
+// burning compartment. Adding a temperature without adding this would have bought
+// a hotter gas that still went nowhere.
+//
+// The head is taken against the reference atmosphere rather than absolutely.
+// Absolutely, two *cold* compartments whose gas centroids sit at different
+// heights would exchange air through a shared opening for ever -- a real
+// stratification, but one this flooding model has never carried and not the
+// effect being added. Against the reference it is the thermal buoyancy that
+// survives, and at ambient the coefficient is exactly +0.0, so a cold ship gets
+// `airPressure` back unchanged, bit for bit.
+inline double gasBuoyancyHead(const Compartment& c, double worldZ) {
+    return -(gasBuoyancyDensity(c.gasTemperature) - kRhoAirAmbient) * kGravity *
+           (worldZ - c.gasCentroidWorldZ);
+}
+
 // Ship "up" expressed in the body frame. Every free surface -- the sea outside and
 // the floodwater inside -- is a plane with this normal.
 inline Vec3 bodyFrameUp(const Mat3& R) { return R.transposed() * Vec3{0, 0, 1}; }
+
+// Highest and lowest points of an axis-aligned box in the `up` direction. Exact
+// for the box-carved compartments this engine builds, and a bound for anything
+// else.
+inline double boxTopAlong(const Vec3& up, const Vec3& lo, const Vec3& hi) {
+    return (up.x > 0 ? up.x * hi.x : up.x * lo.x) + (up.y > 0 ? up.y * hi.y : up.y * lo.y) +
+           (up.z > 0 ? up.z * hi.z : up.z * lo.z);
+}
+inline double boxBottomAlong(const Vec3& up, const Vec3& lo, const Vec3& hi) {
+    return (up.x > 0 ? up.x * lo.x : up.x * hi.x) + (up.y > 0 ? up.y * lo.y : up.y * hi.y) +
+           (up.z > 0 ? up.z * lo.z : up.z * hi.z);
+}
 
 void boundingBox(const TriMesh& m, Vec3& lo, Vec3& hi) {
     lo = {kInf, kInf, kInf};
@@ -44,9 +103,12 @@ void Ship::initialise(const Sea& sea) {
         c.grossVolume = integrate(c.mesh).volume;
         boundingBox(c.mesh, c.bboxLo, c.bboxHi);
         c.waterVolume = std::clamp(c.waterVolume, 0.0, c.floodableVolume());
-        // Start dry compartments full of air at atmospheric pressure.
-        c.airMass = kPatm * std::max(c.airVolume(), 0.0) / (kRAir * kTAmbient);
+        // Start dry compartments full of air at atmospheric pressure, at whatever
+        // temperature the caller asked for -- a compartment that opens already
+        // hot holds correspondingly less air.
+        c.airMass = kPatm * std::max(c.airVolume(), 0.0) / (kRAir * c.gasTemperature);
         c.airPressure = kPatm;
+        c.lastAirVolume = std::max(c.airVolume(), 0.0);
     }
 
     // Drop the hull to its floating waterline before the first tick, so the sim
@@ -180,16 +242,80 @@ void Ship::updateInternalFreeSurfaces(const Sea& sea) {
                                                : (c.bboxLo + c.bboxHi) * 0.5;
         }
 
-        // Isothermal, not adiabatic: a few tonnes of steel bulkhead is an enormous
-        // heat sink next to the air in a compartment, so trapped air tracks ambient
-        // temperature far faster than a compartment floods.
+        // The datum the gas pressure is quoted at: the middle of the gas space,
+        // between whatever the water surface is standing at and the deckhead.
+        // For a box compartment that is the centroid of the gas region, which is
+        // the height at which the well-mixed value m R T / V is the true local
+        // pressure of a column in hydrostatic balance.
+        // A dry compartment parks its free surface a metre *below* its own floor
+        // so that an opening down there still reads as being in air, so the
+        // surface offset cannot be used as the bottom of the gas space directly.
+        const double top = boxTopAlong(up, c.bboxLo, c.bboxHi);
+        const double floorOffset = boxBottomAlong(up, c.bboxLo, c.bboxHi);
+        const double gasBottom = std::clamp(c.surfaceOffset, floorOffset, top);
+        c.gasCentroidWorldZ = 0.5 * (gasBottom + top) + state.position.z;
+
+        // The work the rising water does on the trapped air.
+        //
+        // At the default gasThermalTime of zero there is none to account for: the
+        // structure takes it as fast as it is done, the gas stays at ambient, and
+        // Boyle's law is the pressure law -- which is the model this file has
+        // always had and the one the flooding scenarios are validated against. The
+        // assignment below is exact, so every expression that reads the
+        // temperature afterwards is character for character what it was.
+        //
+        // Given a relaxation time, the same compression is adiabatic on the way
+        // in and the gas heats: at constant mass T V^(gamma-1) is conserved, which
+        // is the isentropic relation T/T0 = (p/p0)^((gamma-1)/gamma) written the
+        // way this loop can actually evaluate it. Mass changes are *not* handled
+        // here -- solveFlowNetwork() has already taken the enthalpy they carried,
+        // and taking a volume term and a mass term in one expression would be
+        // taking the same joules twice.
+        const double vaRaw = std::max(c.airVolume(), 0.0);
+        if (c.gasThermalTime <= 0) {
+            c.gasTemperature = kTAmbient;
+        } else if (vaRaw > 1e-12 && c.lastAirVolume > 1e-12 && !c.ventedToAtmosphere) {
+            c.gasTemperature *= std::pow(c.lastAirVolume / vaRaw, kGammaAir - 1.0);
+        }
+        c.lastAirVolume = vaRaw;
+
         if (c.ventedToAtmosphere) {
+            // Open to the atmosphere, so the pressure is fixed and the mass is
+            // whatever fills the space at this temperature. Air *arriving* from
+            // outside arrives at ambient and cools whatever is in here; air
+            // leaving takes its own temperature with it and changes nothing. Left
+            // out, a vented space could be filled from the atmosphere without ever
+            // losing the heat that filling dilutes -- energy from nowhere.
+            const double mNew = kPatm * std::max(c.airVolume(), 0.0) / (kRAir * c.gasTemperature);
+            if (mNew > c.airMass && mNew > 0)
+                c.gasTemperature += (kTAmbient - c.gasTemperature) * ((mNew - c.airMass) / mNew);
             c.airPressure = kPatm;
-            c.airMass = kPatm * std::max(c.airVolume(), 0.0) / (kRAir * kTAmbient);
+            c.airMass = kPatm * std::max(c.airVolume(), 0.0) / (kRAir * c.gasTemperature);
         } else {
             const double va = std::max(c.airVolume(), 1e-3 * std::max(c.grossVolume, 1.0));
-            c.airPressure = c.airMass * kRAir * kTAmbient / va;
+            c.airPressure = c.airMass * kRAir * c.gasTemperature / va;
         }
+    }
+}
+
+// Heat out of the gas and into the steel around it.
+//
+// Exact exponential rather than an explicit Euler step, because the relaxation
+// time a fire wants is seconds while the flooding solve steps at milliseconds,
+// and an explicit step would be the one place in this file where a stiff term is
+// integrated by the least stable method available. `dt / tau` of any size is
+// stable and monotone here, and tau = infinity is the adiabatic limit rather than
+// a division by zero.
+void Ship::relaxGasToStructure(double dt) {
+    for (Compartment& c : compartments) {
+        // A zero thermal time is not relaxed here but pinned outright where the
+        // pressure is computed, which is the one place that has to see an exact
+        // kTAmbient. Repeating the pin here as well was dead code: it wrote a
+        // value that updateInternalFreeSurfaces overwrote with the same value a
+        // few lines later, and nothing between the two could read it.
+        if (c.gasThermalTime <= 0 || !std::isfinite(c.gasThermalTime) || dt <= 0) continue;
+        c.gasTemperature =
+            kTAmbient + (c.gasTemperature - kTAmbient) * std::exp(-dt / c.gasThermalTime);
     }
 }
 
@@ -206,8 +332,10 @@ Ship::SideState Ship::sideStateAt(int idx, const Vec3& worldPos, const Sea& sea)
     }
     const Compartment& c = compartments[static_cast<std::size_t>(idx)];
     if (c.waterVolume > 1e-9 && worldPos.z < c.surfaceWorldZ)
-        return {c.airPressure + seaDensity * kGravity * (c.surfaceWorldZ - worldPos.z), true};
-    return {c.airPressure, false};
+        return {c.airPressure + gasBuoyancyHead(c, c.surfaceWorldZ) +
+                    seaDensity * kGravity * (c.surfaceWorldZ - worldPos.z),
+                true};
+    return {c.airPressure + gasBuoyancyHead(c, worldPos.z), false};
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +348,15 @@ void Ship::solveFlowNetwork(double dt, const Sea& sea) {
 
     // Deltas are accumulated against the start-of-tick state so that opening order
     // does not bias the result -- an explicit Jacobi sweep over the network.
-    std::vector<double> dWater(n, 0.0), dAir(n, 0.0);
+    //
+    // `dMassT` is the third of these and it is the reason the *stored* state is a
+    // temperature while the *accumulated* one is an energy. Temperatures do not
+    // add: two openings delivering gas at 900 K and 300 K into the same space do
+    // not deliver 1200 K, and a Jacobi sweep is a sum. m*T is the gas's internal
+    // energy in units of cv, it is additive, and dividing it by the mass that
+    // arrived with it is the mixing rule -- exact, for a gas with constant cv, and
+    // with no root find anywhere.
+    std::vector<double> dWater(n, 0.0), dAir(n, 0.0), dMassT(n, 0.0);
 
     auto waterAvailable = [&](int i) {
         return i == kSea ? kInf : compartments[i].waterVolume + dWater[i];
@@ -233,8 +369,14 @@ void Ship::solveFlowNetwork(double dt, const Sea& sea) {
         return i == kSea ? kInf : compartments[i].airMass + dAir[i];
     };
 
+    auto gasTemperatureOf = [&](int i) {
+        return i == kSea ? kTAmbient : compartments[i].gasTemperature;
+    };
+
     for (Opening& o : openings) {
         o.lastFlow = 0;
+        o.lastGasMassFlow = 0;
+        o.lastGasDonorTemperature = 0;
         if (!o.open || o.area <= 0) continue;
 
         const Vec3 worldPos = R * o.pos + state.position;
@@ -253,7 +395,11 @@ void Ship::solveFlowNetwork(double dt, const Sea& sea) {
         const bool water = aIsDonor ? sa.isWater : sb.isWater;
 
         const double pDonor = std::max(sa.pressure, sb.pressure);
-        const double rho = water ? seaDensity : pDonor / (kRAir * kTAmbient);
+        // Hot gas is thin gas, and a thin gas leaves faster through the same hole
+        // for the same head: Torricelli goes as 1/sqrt(rho). This is the density
+        // the *donor* is at, which is now a question with an answer.
+        const double tDonor = gasTemperatureOf(donor);
+        const double rho = water ? seaDensity : pDonor / (kRAir * tDonor);
 
         // Torricelli / sharp-edged orifice.
         const double q = o.dischargeCoeff * o.area * std::sqrt(2.0 * std::abs(dp) / rho);
@@ -274,24 +420,86 @@ void Ship::solveFlowNetwork(double dt, const Sea& sea) {
             // the target state will blow straight past equilibrium and ring. Clamp
             // the transfer to the mass that equalises the two pressures, which is
             // the implicit answer this step is trying to approximate anyway.
+            //
+            // **The clamp survives the temperature intact, and it stays a closed
+            // form.** The worry is real -- the mass that equalises the pressures
+            // now depends on the temperature the receiving side ends up at, and
+            // that temperature depends on how much mass arrives -- but the
+            // circularity resolves algebraically rather than needing an implicit
+            // solve. Pressure is (gamma-1)U/V, so it is *linear in the energy
+            // delivered*, and the energy delivered is linear in dm: the (m + dm)
+            // in the mixing rule cancels against the m + dm in the gas law and
+            // never has to be inverted. What each branch below solves is one
+            // linear equation.
+            //
+            // The two branches are not two approximations of one thing, they are
+            // the clamp for the two energy equations a compartment can be running.
+            // A compartment at gasThermalTime = 0 is isothermal by construction --
+            // arriving gas does not change its temperature, because the structure
+            // takes the heat -- so the mass that equalises it is Boyle's, exactly
+            // as before. One with a relaxation time keeps what arrives, including
+            // the flow work, and equalises at a different mass.
+            // **Both clamps are stated at the compartment's own pressure datum,
+            // not at the opening.** `sa` and `sb` are pressures *at the hole*,
+            // while the mass a compartment holds sets its pressure at the middle
+            // of its gas space, and the two differ by that side's own buoyancy
+            // head. Equalising the wrong pair silently pins the transfer to zero:
+            // a hot space whose gas is 25 Pa lighter at a high doorway reads, at
+            // its own datum, as already equal to the cold space next door, and
+            // sends nothing at all through a door the physics says should be
+            // pouring smoke. Subtracting each side's own head puts the target back
+            // on the datum the mass is measured against. Zero at ambient, so a
+            // cold ship is untouched.
             const double pDonorSide = aIsDonor ? sa.pressure : sb.pressure;
             const double pRecvSide  = aIsDonor ? sb.pressure : sa.pressure;
             if (recv != kSea) {
                 const Compartment& rc = compartments[recv];
                 const double va = std::max(rc.airVolume(), 1e-3 * std::max(rc.grossVolume, 1.0));
-                const double mEq = pDonorSide * va / (kRAir * kTAmbient);
-                dm = std::min(dm, std::max(0.0, mEq - (rc.airMass + dAir[recv])));
+                const double pTarget = pDonorSide - gasBuoyancyHead(rc, worldPos.z);
+                if (rc.gasThermalTime <= 0) {
+                    const double mEq = pTarget * va / (kRAir * rc.gasTemperature);
+                    dm = std::min(dm, std::max(0.0, mEq - (rc.airMass + dAir[recv])));
+                } else {
+                    // (m T)_new = (m T) + gamma T_donor dm, and p = R (m T) / V.
+                    const double mtEq = pTarget * va / kRAir;
+                    const double mt = rc.airMass * rc.gasTemperature + dMassT[recv];
+                    dm = std::min(dm, std::max(0.0, (mtEq - mt) / (kGammaAir * tDonor)));
+                }
             }
             if (donor != kSea) {
                 const Compartment& dc = compartments[donor];
                 const double va = std::max(dc.airVolume(), 1e-3 * std::max(dc.grossVolume, 1.0));
-                const double mEq = pRecvSide * va / (kRAir * kTAmbient);
-                dm = std::min(dm, std::max(0.0, (dc.airMass + dAir[donor]) - mEq));
+                const double pTarget = pRecvSide - gasBuoyancyHead(dc, worldPos.z);
+                if (dc.gasThermalTime <= 0) {
+                    const double mEq = pTarget * va / (kRAir * dc.gasTemperature);
+                    dm = std::min(dm, std::max(0.0, (dc.airMass + dAir[donor]) - mEq));
+                } else {
+                    // The same equation from the other end. It also keeps the
+                    // donor's energy positive: the bound is (m T - p V/R)/(gamma T),
+                    // which is at most m/gamma, so the blowdown term below can
+                    // never take more energy out than the gas had.
+                    const double mtEq = pTarget * va / kRAir;
+                    const double mt = dc.airMass * dc.gasTemperature + dMassT[donor];
+                    dm = std::min(dm, std::max(0.0, (mt - mtEq) / (kGammaAir * tDonor)));
+                }
             }
 
-            if (donor != kSea) dAir[donor] -= dm;
-            if (recv  != kSea) dAir[recv]  += dm;
+            // What crosses the hole is mass and the energy riding on it, and the
+            // energy is *enthalpy*, not internal energy: the donor has to do the
+            // work of pushing the gas out through the orifice, and the receiver
+            // collects that work as well as the heat. Taking cv T here instead of
+            // cp T would leave the donor too warm and the receiver too cool by
+            // exactly the flow work, and would lose the two textbook limits this
+            // network is made of -- a vessel blowing down cools isentropically,
+            // and one being charged from a reservoir ends up hotter than the
+            // reservoir. It is antisymmetric across the opening, so the sum over
+            // the network is conserved to roundoff whatever the clamps do.
+            const double dEnergy = kGammaAir * tDonor * dm;
+            if (donor != kSea) { dAir[donor] -= dm; dMassT[donor] -= dEnergy; }
+            if (recv  != kSea) { dAir[recv]  += dm; dMassT[recv]  += dEnergy; }
             o.lastFlow = (aIsDonor ? 1.0 : -1.0) * (dt > 0 ? (rho > 0 ? dm / rho / dt : 0.0) : 0.0);
+            o.lastGasMassFlow = (aIsDonor ? 1.0 : -1.0) * (dt > 0 ? dm / dt : 0.0);
+            o.lastGasDonorTemperature = tDonor;
         }
         o.lastFlowWasWater = water;
     }
@@ -311,10 +519,18 @@ void Ship::solveFlowNetwork(double dt, const Sea& sea) {
     }
 
     for (std::size_t i = 0; i < n; ++i) {
-        compartments[i].waterVolume =
-            std::clamp(compartments[i].waterVolume + dWater[i], 0.0,
-                       compartments[i].floodableVolume());
-        compartments[i].airMass = std::max(0.0, compartments[i].airMass + dAir[i]);
+        Compartment& c = compartments[i];
+        c.waterVolume =
+            std::clamp(c.waterVolume + dWater[i], 0.0, c.floodableVolume());
+        const double mNew = std::max(0.0, c.airMass + dAir[i]);
+        // Back out of energy into the temperature that is actually stored. The
+        // guard is not a tolerance: a compartment can be flooded solid, and a gas
+        // with no mass has no temperature to speak of. Keeping the last one it had
+        // is harmless -- nothing reads it while the mass is zero -- and inventing
+        // a zero would put an absolute temperature of 0 K into the pressure law.
+        const double mt = c.airMass * c.gasTemperature + dMassT[i];
+        if (mNew > 1e-12 && mt > 0) c.gasTemperature = mt / mNew;
+        c.airMass = mNew;
     }
 }
 
@@ -743,6 +959,7 @@ RollDampingHull Ship::attachRollDamping(double waterlineZ, double bilgeKeelLengt
 void Ship::step(double dt, const Sea& sea) {
     updateInternalFreeSurfaces(sea);
     solveFlowNetwork(dt, sea);
+    relaxGasToStructure(dt);
     updateInternalFreeSurfaces(sea);
     integrateRigidBody(dt, sea);
 }
