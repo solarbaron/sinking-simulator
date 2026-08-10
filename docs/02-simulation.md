@@ -48,6 +48,100 @@ floodwater free to re-level.
    What is still missing is the other half — a fracture model to decide *which*
    panels fail. Today the failure set is supplied by the caller.
 
+### The angle a metacentric height is measured at — **implemented**
+
+A GM is the slope of the righting arm **at the origin**, so a finite difference
+only delivers one while the arm is linear across the angle it is taken at.
+`Diagnostics::gmTransverse` took it at a fixed ±0.03 rad, which is fine for a
+ship at a finite angle and is not fine for a shallow layer.
+
+**Where the linear region ends, and how it scales.** Tilt a compartment holding a
+layer of mean depth `h` across a breadth `b`. The free surface stays a
+full-breadth plane only while `tan θ ≤ 2h/b`; past that the water has pulled off
+the high side, the surface is a wedge of base `b/√τ`, and the free-surface moment
+falls as
+
+```
+moment(τ) / moment_linear(τ) = 3/τ − 2/τ^{3/2},        τ = tan θ · b / 2h
+```
+
+which is 1 at τ = 1 — the two regimes meet without a step — and 0.24 by τ = 10.
+Both halves were measured against the mesh integration on a box barge with
+permeability 0.85, so the depth (set by the *geometric* region `V/μ`) and the
+moment (which carries μ linearly) are exercised apart: the pocketing angle is
+`atan(h/(b/2))` to 1e-12, and the collapse follows the closed form to **5.4e-4
+relative** over τ = 1.1 … 10. On the ferry's *tapered* vehicle deck, which is not
+a box, the same form holds to about 1%.
+
+So the linear region ends at depth over half-breadth exactly, and the scaling was
+measured rather than assumed: the angle at which the loss has fallen 1% below the
+linear theory sits at **1.1291 × the pocketing angle** — which is the closed
+form's own root — and is proportional to depth across an eight-fold sweep.
+
+**A smaller sampling angle is a fix, not a trade, and that is a property of this
+GZ implementation rather than a general truth.** `rightingArmAtHeel` is
+deterministic and its round-off very nearly cancels across a central difference:
+measured, the ferry's GZ(0) is 6e-18 m intact and 5e-12 m with a free surface,
+and `GZ(ε) − GZ(−ε)` carries about **5e-16 m** of noise — on the ferry and on a
+box barge alike. The slope error is then ~5e-16/(2ε), which is 2.7e-10 m at
+ε = 1e-6 rad and still only 1.5e-7 m at ε = 1e-9. The usable window is eight
+decades wide. There is no sampling angle here that is wrong in both directions at
+once.
+
+**What the code does.** `Ship::diagnostics()` halves the sampling angle until the
+slope stops moving, by 1e-6 m of GM or 1e-4 of it, whichever is larger. The
+secant slope is monotone in the sampling angle and constant below the pocketing
+angle, so "it stopped moving" *is* "we are inside the linear region", and the
+angle it settles at is a lower bound on where that region ends. It is published
+as `Diagnostics::gmSampledAtRad`, with `gmSlopeConverged` false when no window is
+wide enough to establish anything.
+
+**How deep to halve is a round-off question and not a policy one, and getting
+that backwards is the one thing mutation testing caught here.** The bound was 15
+halvings — 9.2e-7 rad — justified in a comment as a safety rail nothing reaches.
+A *control* in `scripts/mutate-stability.py` that raised it was killed, and the
+sweep behind that shows why: between 10 and 100 kg of water on the ferry's
+vehicle deck the answer is perfectly well posed and 15 halvings could not reach
+it. 100 kg came out right and was flagged unreliable; 10 kg came out at −3.25 m
+against a true −3.78 m. The bound is now **24 halvings, 1.79e-9 rad** — where the
+5e-16 m of difference noise costs 1.4e-7 m of slope, seven times under the
+tolerance floor and the last power of two that stays there.
+
+**The flag's remaining case is the sharpest statement of the problem.** A
+free-surface moment does not depend on how *much* water there is, only on the
+shape of its surface — while the angle that surface survives to does. So the
+initial GM is **discontinuous** in the amount of loose water, and the ferry
+straddles the discontinuity inside a factor of two:
+
+| water on the deck | layer | pockets at | reported GM | over | flag |
+|---|---|---|---|---|---|
+| 1000 kg | 0.6 mm | 6.2e-5 rad | **−3.782 m** | ±5.9e-5 rad | converged |
+| 1 kg | 0.6 µm | 6.2e-8 rad | *not published as meaningful* | ±1.8e-9 rad | **unresolved** |
+| 0.5 kg | 0.3 µm | 3.1e-8 rad | **+2.000 m** | ±3.8e-3 rad | converged |
+
+Half a kilogram is not a free surface at any angle anything can measure, and
+reporting her own intact GM over a window she will never roll out of is the
+operationally right answer. A kilogram is the same statement one step further in,
+where no window is wide enough — and the honest report is that she has no
+metacentric height, not that she has one of either sign. `test_core.cpp` asserts
+all three rows.
+
+Deliberately no free-surface *correction* term, no compartment idealised as a
+box, and no count of which compartments are wet — none of which this model has
+anywhere else, and each of which would be a second opinion about the free surface
+that agrees until the day it does not.
+
+**A ship with no free surface is left bit-identical**, checked as an identity
+against the expression that preceded this rather than against a remembered
+constant. That is a guarantee and not an optimisation: an intact ship has no free
+surface to pocket, so the figures `scripts/check-figures.sh` gates — 69 of them
+the day this was written — and two of the three flooding scenarios stand
+un-re-derived. The third moved and it moved a *verdict*; see `06-roadmap.md`
+Phase 4. What this leaves in place is the hull's own O(ε²) truncation at
+0.03 rad — **+0.13% on the ferry, +0.34% on the box barge** — which is a
+different and much smaller error, and moving it would move all of them for no
+gain.
+
 ### Gas temperature in the flooding network — **implemented, opt-in**
 
 The flooding network's gas used to be isothermal by construction: the pressure

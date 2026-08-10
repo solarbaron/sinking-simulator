@@ -889,15 +889,44 @@ should be honest about that.
   of twelve. The ports hold the deck at the weir's own equilibrium depth,
   `h = (q / ((2/3) C_d b √(2g)))^(2/3)`, verified as a fixed point to 1e-3.
 
-  **A caveat on a published quantity.** `Diagnostics::gmTransverse` is
-  finite-differenced at ±0.03 rad, which is the right question for a ship at a
-  finite angle and the wrong one for a shallow layer. With 50 t on the vehicle
-  deck — a 2.9 cm layer, which spans the deck only out to 0.0031 rad — it reads
-  **+0.59 m where the initial GM is −3.77 m**, because the water has pulled off
-  the high side long before ±0.03. The pocketing is real, and it is why she lolls
-  rather than capsizing; the reported number is not wrong so much as answering a
-  different question. Reported rather than repaired: 0.03 is what the 35
-  published figures were taken under.
+  **A caveat on a published quantity — since repaired.**
+  `Diagnostics::gmTransverse` was finite-differenced at a fixed ±0.03 rad, which
+  is the right question for a ship at a finite angle and the wrong one for a
+  shallow layer. With 50 t on the vehicle deck — a 2.9 cm layer, which spans the
+  deck only out to 0.0031 rad — it read **+0.59 m where the initial GM is
+  −3.77 m**, because the water has pulled off the high side long before ±0.03.
+  The pocketing is real, and it is why she lolls rather than capsizing; but a
+  positive GM where the truth is −3.77 m is the unsafe direction on the one
+  number every stability judgement here keys off, so it was repaired rather than
+  left standing. `Ship::diagnostics()` now halves the sampling angle until the
+  slope stops moving and publishes the angle it settled at; the write-up, the
+  wedge closed form and what the linear region actually costs are in
+  `02-simulation.md` §1.
+
+  **One published result moved, and it is a verdict rather than a figure.** GM
+  feeds no physics — it is read, never integrated — so no tonnage, heel, draft or
+  torn-panel count anywhere moves, and the 69 figures `scripts/check-figures.sh`
+  gates are unchanged to the digit. What moved is `shipsim --scenario=full`,
+  whose outcome line is decided by the sign of GM. Every figure below is measured
+  at the end of the gate's own 900 s runs:
+
+  | scenario | water on the deck | layer | pockets at | GM at ±0.03 | converged GM | verdict |
+  |---|---|---|---|---|---|---|
+  | `none`  | 119 t  | 6.9 cm | 7.4e-3 rad | −0.62 m | **−3.01 m** | LOST, unchanged |
+  | `doors` | 3842 t | 2.23 m | 0.234 rad  | −2.51 m | **−2.51 m** | LOST, unchanged |
+  | `full`  | 11 t   | 6.4 mm | 6.8e-4 rad | **+1.37 m** | **−3.30 m** | **SURVIVED → LOST** |
+
+  `full` is the *successful* damage-control response — every action taken, 1442 t
+  aboard, 7.2° of heel — and it has been reporting "SURVIVED but the deck edge is
+  under" on the strength of a 6 mm puddle sampled at forty-four times the angle
+  it spans the deck to. `doors` does not move at all, its water being deep enough
+  that ±0.03 rad was inside the linear region all along, which is the control
+  that says this is pocketing and not a global change of scale.
+
+  **And a fixed smaller angle would not have fixed it.** ±0.001 rad — thirty
+  times finer, and comfortably inside the 50 t case that started this — is still
+  outside the linear region of a 6 mm layer, and reports −2.91 m for `full`
+  against the converged −3.30 m. There is no fixed angle: the layer sets it.
 
   **The evaporated fraction, which is the coefficient nothing here measures.**
   Per kilogram, cooling runs 582 kJ at `e = 0.1` to 2387 kJ at 0.9 — a factor of

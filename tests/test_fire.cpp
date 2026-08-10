@@ -1777,10 +1777,13 @@ Barge makeBarge(double draft) {
     return b;
 }
 
-// GM by central difference on the ship's own righting arm. `Diagnostics` takes
-// this at eps = 0.03 rad, which is the right question for a ship at a finite
-// angle and the wrong one for the initial metacentric height of a shallow layer
-// -- see `testPocketingLimitsFreeSurfaceExactlyWhereGeometrySays`.
+// GM by central difference on the ship's own righting arm, at an angle this file
+// chooses. `Diagnostics` runs the same difference but picks the angle itself,
+// halving it until the slope stops moving; a fixed 0.03 rad is the right question
+// for a ship at a finite angle and the wrong one for the initial metacentric
+// height of a shallow layer -- see
+// `testPocketingLimitsFreeSurfaceExactlyWhereGeometrySays` for why, and
+// `test_core.cpp` for what the ship does about it.
 double gmAt(const Ship& s, const Sea& sea, double eps) {
     return (s.rightingArmAtHeel(eps, sea) - s.rightingArmAtHeel(-eps, sea)) / (2 * eps);
 }
@@ -2223,8 +2226,9 @@ void testSuppressionWaterIsFloodwaterAndItsFreeSurfaceIsTheClosedForm() {
 // water still spans the compartment. Tilt far enough and a shallow layer runs off
 // the high side; the surface is then narrower than the deck and the moment
 // collapses. That is real -- it is why a ship with no GM lolls instead of
-// capsizing -- and it is the reason `Diagnostics::gmTransverse`, taken at
-// eps = 0.03 rad, is not the initial GM of a centimetres-deep layer.
+// capsizing -- and it is the reason `Diagnostics::gmTransverse` cannot be taken at
+// a fixed eps = 0.03 rad on a centimetres-deep layer, which is what it used to do
+// and what `Ship::diagnostics()` now refines its way out of.
 void testPocketingLimitsFreeSurfaceExactlyWhereGeometrySays() {
     const double tonnes = 100.0;
     Barge liquid = makeBarge(3.0);
@@ -2263,23 +2267,28 @@ void testPocketingLimitsFreeSurfaceExactlyWhereGeometrySays() {
     expectTrue("monotonically", ratio(3.0 * limit) < ratio(2.0 * limit) &&
                                     ratio(2.0 * limit) < ratio(1.2 * limit) &&
                                     ratio(1.2 * limit) < ratio(0.9 * limit));
-    // Which is exactly why the ship's own published GM is not the initial one for
+    // Which is exactly why a GM sampled at a fixed angle is not the initial one for
     // a layer this shallow: eps = 0.03 rad is 1.1 times the limit here, and the
     // deviation it reports is a hundred times the one just inside it.
-    expectTrue("so the ship's own eps = 0.03 GM is not the initial GM of this layer",
+    expectTrue("so a fixed eps = 0.03 GM is not the initial GM of this layer",
                std::abs(ratio(0.03) - 1.0) > 20.0 * std::abs(ratio(0.5 * limit) - 1.0));
 }
 
 // And on the ferry the same effect is not a technicality, it is the difference
 // between a stability report that says she is safe and one that says she is not.
-// **`Diagnostics::gmTransverse` reads +0.59 m with 50 tonnes on the vehicle deck,
-// where the true initial GM is -3.77 m**, because 50 tonnes is a 2.9 cm layer and
-// eps = 0.03 rad is ten times the angle it spans the deck to.
+// **`Diagnostics::gmTransverse` used to read +0.59 m with 50 tonnes on the vehicle
+// deck, where the true initial GM is -3.77 m**, because 50 tonnes is a 2.9 cm layer
+// and the eps = 0.03 rad it was finite-differenced at is ten times the angle that
+// layer spans the deck to.
 //
-// Reported rather than repaired: eps = 0.03 is the right question for a ship at a
-// finite angle, it is what the 35 published figures were taken under, and moving
-// it would move all of them.
-void testTheFerrysPublishedGmIsNotTheInitialGmOfAShallowLayer() {
+// It was reported rather than repaired here, because eps = 0.03 was what the
+// published figures had been taken under. It has since been repaired:
+// `Ship::diagnostics()` now halves the sampling angle until the slope stops moving,
+// and `test_core.cpp` carries the closed forms. What this test keeps is the check
+// that the ferry's *published* number and the initial GM this file measures for its
+// own drencher table are now the same number -- two routes to it, one of which
+// belongs to another file.
+void testTheFerrysPublishedGmIsTheInitialGmOfAShallowLayer() {
     Sea sea{0.0};
     Ship s = game::buildFerry();
     s.initialise(sea);
@@ -2287,12 +2296,19 @@ void testTheFerrysPublishedGmIsNotTheInitialGmOfAShallowLayer() {
     s.compartments[static_cast<std::size_t>(vd)].waterVolume = 50.0e3 / kRhoSeawater;
     s.step(1e-9, sea);
 
-    const double published = s.diagnostics(sea).gmTransverse;
+    const Diagnostics d = s.diagnostics(sea);
+    const double published = d.gmTransverse;
     const double initial = gmAt(s, sea, 0.001);
-    expectTrue("with 50 t on the vehicle deck the published GM still reads positive",
-               published > 0.4 && published < 0.8);
-    expectTrue("while the initial GM is strongly negative", initial < -3.5);
-    expectTrue("a gap of over four metres", published - initial > 4.0);
+    expectTrue("with 50 t on the vehicle deck the published GM is strongly negative",
+               published < -3.5);
+    expectTrue("and so is the initial GM measured here", initial < -3.5);
+    expectTrue("and they are the same number", std::abs(published - initial) < 0.01);
+    // Vacuity, and the assertion that fails if the sampling angle is put back: the
+    // old fixed 0.03 rad is still there to be sampled at and still reads +0.59 m.
+    expectTrue("where sampling at 0.03 rad would have said the opposite",
+               gmAt(s, sea, 0.03) > 0.4 && gmAt(s, sea, 0.03) - published > 4.0);
+    expectTrue("so the ship sampled well inside 0.03 rad to get it",
+               d.gmSampledAtRad < 0.0031 && d.gmSlopeConverged);
 
     // The mechanism, so that this is a statement about pocketing and not about
     // two numbers: the layer is 2.9 cm deep and spans the deck only to 0.0031 rad.
@@ -3264,7 +3280,7 @@ void runFireTests() {
     testTheSuppressionSinkConvergesAndTheWaterLandingConvergesFaster();
     testSuppressionWaterIsFloodwaterAndItsFreeSurfaceIsTheClosedForm();
     testPocketingLimitsFreeSurfaceExactlyWhereGeometrySays();
-    testTheFerrysPublishedGmIsNotTheInitialGmOfAShallowLayer();
+    testTheFerrysPublishedGmIsTheInitialGmOfAShallowLayer();
     testFreeingPortsHoldTheDeckAtTheWeirsEquilibriumDepth();
     testABlockedFreeingPortLetsTheDeckFillWithoutBound();
     testAFreeingPortUnderTheSeaAdmitsInsteadOfDraining();

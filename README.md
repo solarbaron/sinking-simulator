@@ -43,17 +43,26 @@ Three runs, same ship, same damage, different decisions:
 
 | Scenario | Action taken | Outcome |
 |---|---|---|
-| `none` | nothing | GM negative by t+900 s, lolls to **53° by t+1800 s**, 7293 t aboard at the end |
-| `doors` | close the watertight door at t+45 s | **capsizes at t+915 s** |
-| `full` | door, pumps, early counterflood, secure the vehicle deck | **survives** — 12.4° list, GM +1.41 m, 1733 t |
+| `none` | nothing | GM negative by t+900 s, lolls to **53° by t+1800 s**, 6311 t aboard at the end |
+| `doors` | close the watertight door at t+45 s | **capsizes at t+930 s** |
+| `full` | door, pumps, early counterflood, secure the vehicle deck | **lost** — GM −3.23 m under 6 mm of water on the vehicle deck, 9.3° list, 1556 t |
 
 The middle row is not a bug and it is the reason this is worth building. Closing
 the door stops the two engine rooms cross-equalising, so the asymmetric
 floodwater becomes a list; the list pushes the starboard vehicle-deck openings
-under; water spreads across a 100 × 19 m undivided deck — 3896 t of it by the
+under; water spreads across a 100 × 19 m undivided deck — 3950 t of it by the
 end — and the free surface moment finishes her. Symmetric flooding drowns her
 more slowly than asymmetric flooding rolls her. Nobody scripted that; it falls
 out of the integrals.
+
+The bottom row used to read "survives", and it changed on the day GM stopped
+being finite-differenced at a fixed ±0.03 rad. Every tonnage, list and draft in
+it is the same; what moved is the number that judges them. Eleven tonnes of water
+on that deck is a **6 mm** layer, and it pulls off the high side at 6.8e-4 rad —
+so a slope taken at forty-four times that angle sees **6%** of that deck's free
+surface and reports +1.38 m where the metacentric height is −3.23 m. The full
+damage-control response buys her a great deal and it does not buy her positive
+stability. See `docs/02-simulation.md` §1.
 
 The same physics declines to let you cheat. In an earlier run the counterflooding
 attempt failed, and it failed for the right reason: by the time the valves were

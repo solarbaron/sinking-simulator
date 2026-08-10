@@ -687,6 +687,389 @@ void testFreeSurfaceEffect() {
                expectedLoss, 0.15 * expectedLoss);
 }
 
+// --- Where a free surface stops being linear, and what GM is sampled at -------
+//
+// A metacentric height is the slope of the righting arm *at the origin*, so a
+// finite difference only delivers one while the arm is linear across the angle it
+// is taken at. A shallow layer in a wide compartment stops being linear almost
+// immediately: past `atan(2h/b)` the water has pulled off the high side, the
+// surface is narrower than the compartment, and the free-surface moment collapses.
+//
+// The six tests below establish, in order: that the collapse follows a closed
+// form; that the angle it starts at scales as depth over half-breadth; that
+// `Diagnostics::gmTransverse` is sampled inside the linear region and is the
+// actual slope there; that the ferry's 50 t case reads -3.77 m and not the
+// +0.59 m it used to; that a linear region too narrow to resolve is reported as
+// one; and that a ship with no free surface is untouched, bit for bit.
+
+// A box barge with a shallow layer in one tank. Everything about it is
+// arithmetic: the free-surface moment is `rho mu b^3 l / 12`, the pocketing angle
+// is `atan(2h/b)`, and both are independent of the mesh integration that computes
+// the answer.
+//
+// **Permeability is deliberately not 1.** It enters the two closed forms
+// differently -- the water occupies the geometric region `V/mu`, so it sets the
+// depth and hence the pocketing angle, while the moment is the *water's* mass
+// times that region's centroid shift and so carries `mu` linearly. A model that
+// dropped it from either would be caught by only one of the assertions.
+constexpr double kFsL = 60.0, kFsB = 14.0, kFsD = 9.0;
+constexpr double kFsTankL = 48.0, kFsTankB = 11.0;
+constexpr double kFsMu = 0.85;
+constexpr double kFsTankI = kFsTankB * kFsTankB * kFsTankB * kFsTankL / 12.0;
+
+Ship freeSurfaceBarge() {
+    Ship s;
+    s.hull = makeBox({-kFsL / 2, -kFsB / 2, 0}, {kFsL / 2, kFsB / 2, kFsD});
+    s.deckEdgeZ = kFsD;
+    Compartment c;
+    c.name = "tank";
+    c.permeability = kFsMu;
+    c.ventedToAtmosphere = true;
+    c.mesh = makeBox({-kFsTankL / 2, -kFsTankB / 2, 3.0}, {kFsTankL / 2, kFsTankB / 2, 6.0});
+    s.compartments.push_back(c);
+    s.lightshipMass = kFsL * kFsB * 3.5 * kRhoSeawater;
+    s.lightshipCog = {0, 0, 5.0};
+    s.gyradii = {5, 16, 16};
+    s.initialise(0.0);
+    return s;
+}
+
+// The same barge twice: once with the water loose, once with the identical mass
+// bolted down at the identical centre of gravity. Their GZ curves differ by the
+// free surface and by nothing else, which is what makes the difference assertable
+// against a closed form.
+struct FreeSurfacePair {
+    Ship liquid, solid;
+    double layerDepth = 0;    // m, over the *geometric* region
+    double pocketingRad = 0;  // atan(2h/b)
+    double correction = 0;    // m, rho mu I / displacement
+};
+
+FreeSurfacePair freeSurfacePair(double tonnes) {
+    FreeSurfacePair p{freeSurfaceBarge(), freeSurfaceBarge(), 0, 0, 0};
+    p.liquid.compartments[0].waterVolume = tonnes * 1000.0 / kRhoSeawater;
+    p.liquid.step(1e-9, 0.0);
+
+    const double m = tonnes * 1000.0, lm = p.solid.lightshipMass;
+    p.solid.lightshipCog =
+        (p.solid.lightshipCog * lm + p.liquid.compartments[0].waterCentroid * m) / (lm + m);
+    p.solid.lightshipMass = lm + m;
+    p.solid.step(1e-9, 0.0);
+
+    p.layerDepth = p.liquid.compartments[0].waterVolume / kFsMu / (kFsTankL * kFsTankB);
+    p.pocketingRad = std::atan(2.0 * p.layerDepth / kFsTankB);
+    p.correction =
+        kRhoSeawater * kFsMu * kFsTankI / p.liquid.diagnostics(0.0).displacementMass;
+    return p;
+}
+
+double slopeAtHeel(const Ship& s, const Sea& sea, double eps) {
+    return (s.rightingArmAtHeel(eps, sea) - s.rightingArmAtHeel(-eps, sea)) / (2 * eps);
+}
+
+// The free-surface loss at `heel`, as a fraction of the loss the linear theory
+// predicts. Both ships are sampled at the *same* angle, so the hull's own O(eps^2)
+// curvature cancels out of the difference and what is left is the free surface.
+double freeSurfaceFraction(const FreeSurfacePair& p, double heel) {
+    return (slopeAtHeel(p.solid, 0.0, heel) - slopeAtHeel(p.liquid, 0.0, heel)) / p.correction;
+}
+
+// The wedge closed form. Once `tan(heel) > 2h/b` the water is a triangular prism
+// of the same area, whose base is `b/sqrt(tau)` wide; its centroid sits
+// `b/2 - b/(3 sqrt(tau))` off the upright one, and dividing that by the linear
+// theory's `b^2 tan(heel) / 12h` gives this. It is 1 at tau = 1 -- the two regimes
+// meet without a step -- and falls away as tau^-1 thereafter.
+double pocketedMomentFraction(double tau) {
+    return tau <= 1.0 ? 1.0 : 3.0 / tau - 2.0 / (tau * std::sqrt(tau));
+}
+
+void testShallowLayerPocketingFollowsTheWedgeClosedForm() {
+    const FreeSurfacePair p = freeSurfacePair(30.0);
+
+    // Vacuity: the layer has to be shallow enough that it pockets well inside the
+    // angles anyone samples GM at, or every assertion below is about the linear
+    // regime and proves nothing.
+    expectTrue("the layer is a few centimetres deep",
+               p.layerDepth > 0.06 && p.layerDepth < 0.07);
+    expectTrue("so it spans the tank only out to 0.012 rad, well inside 0.03",
+               p.pocketingRad > 0.011 && p.pocketingRad < 0.0125);
+
+    // Inside the linear region the loss is the textbook one to five decimals. The
+    // deviation grows as eps^2 -- 5.0e-7 at a quarter of the pocketing angle,
+    // 3.8e-5 at nine tenths -- so both tolerances are what was measured.
+    expectTrue("well inside the pocketing angle the loss is rho mu I / displacement",
+               std::abs(freeSurfaceFraction(p, 0.25 * p.pocketingRad) - 1.0) < 1e-5);
+    expectTrue("and still at nine tenths of it",
+               std::abs(freeSurfaceFraction(p, 0.9 * p.pocketingRad) - 1.0) < 1e-4);
+
+    // **The permeability is in the closed form and it is not optional.** Dropping
+    // it under-states the loss by 15% here, which is four orders of magnitude
+    // outside the tolerance above and would still look entirely plausible.
+    expectTrue("with the compartment's permeability genuinely in the answer",
+               std::abs(freeSurfaceFraction(p, 0.25 * p.pocketingRad) * kFsMu - 1.0) > 0.14);
+
+    // Past it, against the wedge. This is the part no free-surface *correction*
+    // knows about, and it is the whole reason a ship with no GM lolls rather than
+    // capsizing.
+    double worst = 0, previous = 1.0;
+    for (double tau : {1.1, 1.5, 2.0, 3.0, 5.0, 10.0}) {
+        // tau is defined on the tangent, so invert it there rather than scaling
+        // the angle -- at ten times the pocketing angle the two differ by 8%.
+        const double heel = std::atan(tau * 2.0 * p.layerDepth / kFsTankB);
+        const double measured = freeSurfaceFraction(p, heel);
+        worst = std::max(worst, std::abs(measured / pocketedMomentFraction(tau) - 1.0));
+        expectTrue("and the moment falls away monotonically", measured < previous);
+        previous = measured;
+    }
+    expectTrue("the pocketed free-surface moment is 3/tau - 2/tau^1.5", worst < 1e-3);
+
+    // Vacuity again: a closed form that stayed near 1 would make the loop above
+    // pass on a model with no pocketing in it at all.
+    expectTrue("and that closed form has to actually collapse",
+               pocketedMomentFraction(10.0) < 0.25);
+}
+
+// The pocketing angle is geometric -- the surface reaches the high side when the
+// layer's depth equals half the breadth times the tangent -- so it must scale as
+// depth over half-breadth and nothing else.
+void testTheLinearRegionScalesAsDepthOverHalfBreadth() {
+    // Where the closed form itself crosses 99%, by bisection on tau. Asserting the
+    // measured departure against *this* rather than against a remembered constant
+    // is what makes the claim "the mesh follows the wedge" instead of "the mesh
+    // gives the number it gave last time".
+    double lo = 1.0, hi = 4.0;
+    for (int k = 0; k < 60; ++k) {
+        const double mid = 0.5 * (lo + hi);
+        if (pocketedMomentFraction(mid) > 0.99) lo = mid; else hi = mid;
+    }
+    const double tauAt99 = 0.5 * (lo + hi);
+    expectNear("the wedge form is 99% of linear at tau = 1.1291", tauAt99, 1.12912, 1e-4);
+
+    double firstRatio = 0, spread = 0, firstPocket = 0;
+    for (double tonnes : {7.5, 15.0, 30.0, 60.0}) {
+        const FreeSurfacePair p = freeSurfacePair(tonnes);
+        expectNear("the pocketing angle is the depth over the half breadth",
+                   p.pocketingRad, std::atan(p.layerDepth / (kFsTankB / 2)), 1e-12);
+
+        // The measured departure: the angle at which the loss has fallen 1% below
+        // the linear theory, bisected geometrically.
+        double a = 1e-6, b = 0.5;
+        for (int k = 0; k < 45; ++k) {
+            const double mid = std::sqrt(a * b);
+            if (freeSurfaceFraction(p, mid) > 0.99) a = mid; else b = mid;
+        }
+        const double departure = std::sqrt(a * b);
+        expectNear("and the measured 1% departure sits at the closed form's own root",
+                   departure / p.pocketingRad, tauAt99, 3e-3);
+
+        if (firstRatio == 0) { firstRatio = departure / p.layerDepth; firstPocket = p.pocketingRad; }
+        else expectNear("so the departure angle is proportional to the layer depth",
+                        departure / p.layerDepth, firstRatio, 0.02 * firstRatio);
+        spread = p.pocketingRad / firstPocket;
+    }
+    // Vacuity: the sweep has to have actually swept. Eight-fold in depth, and the
+    // proportionality above is only worth asserting across that.
+    expectTrue("over an eight-fold range of layer depth", spread > 7.9 && spread < 8.1);
+}
+
+// What `Diagnostics` publishes has to be the slope of the righting arm near zero,
+// and it has to be sampled somewhere that slope means something. Both halves are
+// checked against a least-squares fit to the arm itself, which shares no code with
+// the central difference in `Ship::diagnostics()`.
+void testGmIsSampledInsideTheLinearRegionAndIsTheSlopeThere() {
+    // dGZ/dheel by least squares through ten points either side of upright,
+    // deliberately over half the angle the ship reports so that the fit is inside
+    // whatever window it chose rather than straddling its edge.
+    auto fittedSlope = [](const Ship& s, const Sea& sea, double window) {
+        double sxx = 0, sxy = 0;
+        for (int k = -5; k <= 5; ++k) {
+            if (k == 0) continue;
+            const double heel = k * window / 5.0;
+            sxx += heel * heel;
+            sxy += heel * s.rightingArmAtHeel(heel, sea);
+        }
+        return sxy / sxx;
+    };
+
+    const FreeSurfacePair p = freeSurfacePair(30.0);
+    const Diagnostics barge = p.liquid.diagnostics(0.0);
+    expectTrue("the barge samples GM inside its own pocketing angle",
+               barge.gmSampledAtRad > 0 && barge.gmSampledAtRad < p.pocketingRad);
+    expectTrue("and says so", barge.gmSlopeConverged);
+    // Agreement is asserted in metres, because that is the scale the refinement
+    // works to: it stops when halving the angle moves GM by less than 1e-6 m.
+    // Measured 3.5e-7 m on the barge and 4.7e-7 m on the ferry.
+    expectTrue("and the GM it publishes is the fitted slope of its own righting arm",
+               std::abs(barge.gmTransverse - fittedSlope(p.liquid, 0.0, barge.gmSampledAtRad / 2))
+                   < 2e-6);
+
+    Sea sea{0.0};
+    Ship ferry = game::buildFerry();
+    ferry.initialise(sea);
+    const int deck = ferry.findCompartment("vehicle_deck");
+    ferry.compartments[static_cast<std::size_t>(deck)].waterVolume = 50.0e3 / kRhoSeawater;
+    ferry.step(1e-9, sea);
+    const Diagnostics d = ferry.diagnostics(sea);
+    expectTrue("the ferry too", std::abs(d.gmTransverse -
+                                         fittedSlope(ferry, sea, d.gmSampledAtRad / 2)) < 2e-6);
+
+    // The other half of the claim, and the reason any of this was worth doing: the
+    // slope at 0.03 rad is a different number, and it is a number of the wrong
+    // sign. A ship that went back to sampling there would fail here.
+    const double atThirtyMilliradians = slopeAtHeel(ferry, sea, 0.03);
+    expectTrue("while the slope at 0.03 rad is positive and four metres away",
+               atThirtyMilliradians > 0.4 && atThirtyMilliradians - d.gmTransverse > 4.0);
+}
+
+// The 50 t case, which is the one that started this: a 2.9 cm layer on an
+// undivided 100 x 19 m vehicle deck. The published GM read **+0.59 m where the
+// initial GM is -3.77 m** -- positive, and positive is the unsafe direction on the
+// one number every stability judgement in this project keys off.
+void testTheFerrysShallowLayerGmIsTheNegativeOne() {
+    Sea sea{0.0};
+    Ship s = game::buildFerry();
+    s.initialise(sea);
+    const int deck = s.findCompartment("vehicle_deck");
+    s.compartments[static_cast<std::size_t>(deck)].waterVolume = 50.0e3 / kRhoSeawater;
+    s.step(1e-9, sea);
+
+    const Diagnostics d = s.diagnostics(sea);
+    expectNear("with 50 t on the vehicle deck the ferry's GM is -3.77 m", d.gmTransverse,
+               -3.7696, 0.01);
+    expectTrue("and the sampling converged", d.gmSlopeConverged);
+
+    // The mechanism, so this is a statement about pocketing rather than about two
+    // numbers. The deck's plan area comes off its own mesh: a 5 cm slab on the
+    // floor, one-sided upward so it is not measured through a slab half outside
+    // the space.
+    const Compartment& c = s.compartments[static_cast<std::size_t>(deck)];
+    const double planArea =
+        integrate(clipToBox(c.mesh, c.bboxLo, {c.bboxHi.x, c.bboxHi.y, c.bboxLo.z + 0.05}))
+            .volume / 0.05;
+    const double depth = c.waterVolume / c.permeability / planArea;
+    const double pocketing = std::atan(2.0 * depth / (planArea / (c.bboxHi.x - c.bboxLo.x)));
+    expectTrue("because the layer is under three centimetres deep",
+               depth > 0.028 && depth < 0.030);
+    expectTrue("and spans the deck only out to a fifth of a degree",
+               pocketing > 0.0030 && pocketing < 0.0032);
+    expectTrue("so GM is sampled inside that and not at 0.03 rad",
+               d.gmSampledAtRad < pocketing && d.gmSampledAtRad > 0.5 * pocketing);
+
+    // **This is the assertion that fails if the sampling angle is put back.** The
+    // old fixed 0.03 rad is ten times the angle this layer spans the deck to and
+    // delivers a quarter of the free-surface effect; it reported +0.59 m.
+    expectTrue("where the answer would be positive and wrong",
+               slopeAtHeel(s, sea, 0.03) > 0.5 && slopeAtHeel(s, sea, 0.03) < 0.7);
+
+    // Vacuity: the two GMs have to be measuring the same ship, and the ship has to
+    // have been stable before the water arrived.
+    Ship dry = game::buildFerry();
+    dry.initialise(sea);
+    const Diagnostics intact = dry.diagnostics(sea);
+    expectNear("intact she has 2.00 m of GM", intact.gmTransverse, 2.0, 0.01);
+    expectTrue("sampled at the unrefined angle, there being no free surface to pocket",
+               intact.gmSampledAtRad == 0.03);
+}
+
+// The free-surface moment `rho mu I` does not depend on how *much* water there is,
+// only on the shape of its surface -- while the angle that surface survives to
+// does. So the initial GM is **discontinuous** in the amount of loose water, and
+// the ferry's vehicle deck straddles that discontinuity inside a factor of two.
+//
+// Half a litre spread over 1868 m2 is a third of a micron deep and pockets at
+// 3e-8 rad. There is no angle anything can measure at which that water has a free
+// surface, and the ship correctly reports her own +2.00 m over a window six
+// decades wider than the layer. One litre is the same statement one step further
+// in: no window is wide enough to establish anything, and `gmSlopeConverged` says
+// so rather than publishing a slope with a domain of two nanoradians.
+//
+// **The number behind an unset flag is deliberately not asserted here.** It is
+// whatever the refinement was holding when it ran out of room, and asserting it
+// would be asserting that an unreliable number stays unreliable in the same way.
+void testAnUnresolvableLinearRegionIsReportedAsOne() {
+    Sea sea{0.0};
+    const int deck = game::buildFerry().findCompartment("vehicle_deck");
+
+    auto ferryHolding = [&](double cubicMetres) {
+        Ship s = game::buildFerry();
+        s.initialise(sea);
+        s.compartments[static_cast<std::size_t>(deck)].waterVolume = cubicMetres;
+        s.step(1e-9, sea);
+        return s.diagnostics(sea);
+    };
+
+    const Diagnostics litre = ferryHolding(0.001);
+    expectTrue("one litre on the vehicle deck has no resolvable linear region",
+               !litre.gmSlopeConverged);
+    expectTrue("so the refinement bottomed out at 1.8 nanoradians",
+               litre.gmSampledAtRad < 2e-9);
+
+    // Half of it, and the ship is back to a perfectly ordinary answer: the layer
+    // is too thin to have a free surface at any measurable angle, so what she
+    // reports is her own intact GM over a window wider than she will ever roll in.
+    const Diagnostics half = ferryHolding(0.0005);
+    expectTrue("half a litre converges", half.gmSlopeConverged);
+    expectNear("to her own intact GM", half.gmTransverse, 2.0, 0.01);
+    expectTrue("over a window six decades wider than that layer pockets at",
+               half.gmSampledAtRad > 1e-3);
+
+    // And a tonne, which is still only a 0.6 mm layer, resolves the other way --
+    // so the flag distinguishes three regimes rather than firing on any free
+    // surface at all.
+    const Diagnostics tonne = ferryHolding(1.0);
+    expectTrue("a tonne of it converges too", tonne.gmSlopeConverged);
+    expectNear("to a GM of -3.78 m", tonne.gmTransverse, -3.7819, 0.01);
+    expectTrue("over a window between the two", tonne.gmSampledAtRad > 5e-5 &&
+                                                    tonne.gmSampledAtRad < 7e-5);
+
+    // Vacuity: the discontinuity has to actually be a discontinuity. Half a litre
+    // and a tonne differ by a factor of 2000 in water and by 5.8 m of GM, in
+    // opposite signs, and that is the whole reason a bare GM is not enough.
+    expectTrue("and the two answers straddle zero by nearly six metres",
+               half.gmTransverse - tonne.gmTransverse > 5.7);
+}
+
+// **The exact control.** Refining the sampling angle is a repair to a case that
+// only arises with a free surface, so a ship without one has to come out not
+// merely close but bit-identical -- which is what lets every published figure
+// taken on an intact ship stand un-re-derived. `scripts/check-figures.sh` is where
+// the count of those lives; putting it here too would be a second copy to rot.
+//
+// Asserted as an identity against the expression `diagnostics()` used before this
+// existed, rather than against a remembered constant, so it holds under any
+// compiler and says what it means.
+void testAnIntactShipsGmIsTheUnrefinedDifferenceExactly() {
+    Sea sea{0.0};
+    Ship ferry = game::buildFerry();
+    ferry.initialise(sea);
+
+    Ship barge = freeSurfaceBarge();  // same hull, tank left dry
+
+    int checked = 0;
+    for (Ship* s : {&ferry, &barge}) {
+        for (double heelDeg : {0.0, 8.0}) {
+            s->state.orientation = Quat::fromAxisAngle(Vec3{1, 0, 0}, heelDeg * kDegToRad);
+            const Diagnostics d = s->diagnostics(sea);
+            const double unrefined =
+                (s->rightingArmAtHeel(0.03, sea) - s->rightingArmAtHeel(-0.03, sea)) / (2 * 0.03);
+            expectTrue("with no free surface GM is the 0.03 rad difference, bit for bit",
+                       d.gmTransverse == unrefined);
+            expectTrue("taken at 0.03 rad exactly", d.gmSampledAtRad == 0.03);
+            ++checked;
+        }
+    }
+    expectEqual("over four dry configurations", checked, 4);
+
+    // Vacuity: put water in the same barge and the identity must break, or the
+    // assertions above would pass on a build that never refines anything.
+    Ship wet = freeSurfaceBarge();
+    wet.compartments[0].waterVolume = 30.0e3 / kRhoSeawater;
+    wet.step(1e-9, 0.0);
+    const Diagnostics d = wet.diagnostics(0.0);
+    expectTrue("while with a shallow layer in it, it does not",
+               d.gmTransverse != slopeAtHeel(wet, 0.0, 0.03) && d.gmSampledAtRad < 0.03);
+}
+
 // Air trapped in a sealed compartment must arrest flooding once its pressure
 // balances the outside head -- the reason capsized hulls stay up for hours.
 void testTrappedAirArrestsFlooding() {
@@ -1498,6 +1881,12 @@ void runCoreTests() {
     testHullMustResolveTheWavelength();
     testArchimedes();
     testFreeSurfaceEffect();
+    testShallowLayerPocketingFollowsTheWedgeClosedForm();
+    testTheLinearRegionScalesAsDepthOverHalfBreadth();
+    testGmIsSampledInsideTheLinearRegionAndIsTheSlopeThere();
+    testTheFerrysShallowLayerGmIsTheNegativeOne();
+    testAnUnresolvableLinearRegionIsReportedAsOne();
+    testAnIntactShipsGmIsTheUnrefinedDifferenceExactly();
     testTrappedAirArrestsFlooding();
     testAdiabaticCompressionFollowsTheIsentrope();
     testBuoyancyDrivesGasThroughAVerticalOpeningPair();
