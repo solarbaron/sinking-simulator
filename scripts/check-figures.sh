@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Every number docs/06-roadmap.md publishes about the Phase 3 milestone, checked
-# against the tool that produces them.
+# Every number the documents publish about a tool, checked against a re-run of that
+# tool. It started on docs/06-roadmap.md's Phase 3 milestone and now covers the FEM
+# findings, the simulation and renderer docs, and README.md.
 #
 # **Why this exists.** The repo's rule is that docs must not drift from the code,
 # and nothing enforced it. Two drifts had accumulated by the time anyone re-ran
@@ -29,9 +30,10 @@
 # ship does.
 #
 # Cost: the damage figures need no flooding at all and run with `--duration=1` in
-# about a second each; three runs pay for the full 900 s. Around 105 s against the
-# ~580 s the `full` gate already costs, and the same budget the first version
-# spent on figures that said less.
+# about a second each; three runs pay for the full 900 s. Around 105 s for the
+# `ram_view` half, and another ~230 s for the README block below it -- the front
+# page quotes three 1800 s scenario runs and the size of the test suite, and none of
+# those can be had without running the thing.
 set -u
 
 RAM=${RAM:-./build/ram_view}
@@ -248,81 +250,279 @@ else
   echo "  - bulkhead_probe not built, skipping the Phase 4 milestone figures"
 fi
 
-if [ ! -x "$RAM" ]; then
-  echo "  - ram_view not built, skipping published-figure check"
-  exit 0
-fi
-
-for h in "opens 3.4 m" "63 bays torn, 107.7" "amidships she goes over" \
-         "at the quarter she takes" "she lolls to 63"; do
-  hint "$h"
-done
-
-# Every figure below comes off one of two lines, and *only* off that line. The
-# first version of this script matched `GM` anywhere in the output and picked up
-# the intact ship's GM from the banner as well as the flooded one from the
-# outcome, reporting "2.00" and "-1.62" together. A checker that misparses is
-# worse than no checker, so each reader is anchored to its own line.
-damage_line() { printf '%s\n' "$1" | grep '^damage'; }
-outcome_line() { printf '%s\n' "$1" | grep '^outcome'; }
-
-# --- damage, which needs no flooding -------------------------------------------
-quick6=$("$RAM" --speed=6 --duration=1 2>&1)
-quick15=$("$RAM" --speed=1.5 --duration=1 2>&1)
-
-area6=$(damage_line "$quick6" | sed -n 's/.*torn, \([0-9.]*\) m2 of hole.*/\1/p')
-area15=$(damage_line "$quick15" | sed -n 's/.*torn, \([0-9.]*\) m2 of hole.*/\1/p')
-torn=$(damage_line "$quick6" | sed -n 's/.*over [0-9]* bays, \([0-9]*\) torn.*/\1/p')
-check "hole at 1.5 m/s (m2)" 3.4 0.3 "$area15" "opens 3.4 m"
-check "hole at 6 m/s (m2)" 107.7 0.6 "$area6" "107.7 m² of hole"
-check "bays torn at 6 m/s" 63 1 "$torn" "63 bays torn, 107.7"
-
-# --- the headline outcome, which needs the full 900 s ---------------------------
+# --- the front page ---------------------------------------------------------------
 #
-# Three full runs, which is the same budget the first version of this script
-# spent, but aimed at the thing that turned out to matter: the amidships strike
-# sits just above a capsize threshold, so a figure alone says very little. 5.5 m/s
-# and 6 m/s straddle it, and asserting both is what makes the pair a finding
-# rather than two numbers.
-out=$("$RAM" --speed=6 2>&1)
-water=$(outcome_line "$out" | sed -n 's/.*-- \([0-9]*\) t of water.*/\1/p')
-heel=$(outcome_line "$out" | sed -n 's/.*heel \(-\{0,1\}[0-9.]*\) deg.*/\1/p')
-check "floodwater amidships at 6 m/s (t)" 16613 400 "$water" "amidships she goes over"
-checks=$((checks + 1))
-if [ -n "$heel" ] && awk -v h="$heel" 'BEGIN { if (h < 0) h = -h; exit !(h > 90) }'; then
-  printf '  %s✓%s and she goes right over: heel %s deg, past 90\n' "$green" "$off" "$heel"
+# **98 gated figures and not one of them on `README.md`.** This script grew a
+# document at a time -- the roadmap, then the FEM findings, then the simulation and
+# renderer docs -- and the one page every reader opens first was never in it. It had
+# drifted about as far as that suggests:
+#
+#   - `16 compartments` for 18. The mid wing tanks were added when a ram amidships
+#     turned out to tear 26 bays open onto nothing, and the front page still counted
+#     the ship without them.
+#   - a compartment table from *before* the wing tank authored inside a hold was
+#     pulled back out of it: `fwd_hold_s` published at 1074 m3, which is 965 plus the
+#     108 m3 tank that was double-counted inside it. The same drift the header of
+#     this file was written about, one document further out.
+#   - two mutually contradictory counts of the same test suite, `116` and `1309`,
+#     against a measured 195 086.
+#
+# **The durations are the interesting part and they are now written into the README.**
+# `full` is still flooding when the run ends, so its figures are a function of how
+# long anyone watched: -3.30 m, 7.2 deg and 1442 t at t+900, -3.23 m, 9.3 deg and
+# 1556 t at t+1800. `06-roadmap.md` publishes the first and the README the second,
+# which reads as a contradiction until the duration is written next to each -- and
+# a reader reconciling them by editing one to match the other would be destroying a
+# correct figure. Both are re-run here, each at the length its own document claims
+# it at.
+#
+# **And the verdicts, not only the figures.** `full` went SURVIVED -> LOST one commit
+# before this block existed, on a change to how GM is sampled that moved no tonnage,
+# heel or draft at all. Every figure in that row would have matched while the row's
+# own verdict had reversed, so each scenario's verdict is asserted as well.
+#
+# ~230 s, of which 112 s is the test suite: the front page publishes its check count
+# and nothing else here re-derives it. Adding a test is *expected* to fail this, and
+# updating the README line is part of adding the test.
+SHIPSIM=${SHIPSIM:-./build/shipsim}
+TESTS=${TESTS:-./build/shipsim_tests}
+FRONT=README.md
+SHIPFILE=ships/ferry.ship
+
+if [ -x "$SHIPSIM" ]; then
+  # The intact banner, which needs no flooding: `--duration=0` runs no steps.
+  intact=$("$SHIPSIM" --scenario=none --duration=0 2>&1)
+  disp=$(printf '%s\n' "$intact" | sed -n 's/^  displacement  *\([0-9.]*\) t/\1/p')
+  cb=$(printf '%s\n'   "$intact" | sed -n 's/^  block coeff Cb  *\([0-9.]*\)/\1/p')
+  # The trailing `.*` is not decoration: `s/.../\1/` replaces only what it matched
+  # and leaves the rest of the line, so without it this reads back "2.00 m" -- which
+  # `awk` then converts to 2.00 and passes, having parsed a unit as a number.
+  gm0=$(printf '%s\n'  "$intact" | sed -n 's/^  GM (transverse)  *\(-\{0,1\}[0-9.]*\).*/\1/p')
+  # Cb and GM are quoted to two figures on the front page where the tool prints
+  # three, so the expectation is the *published* value and the tolerance is the
+  # rounding it published at. Anything looser would accept a different ship.
+  check "the ferry's intact displacement (t)" 8984 1 "$disp" \
+        "8984 t, Cb 0.66" "$FRONT"
+  check "the ferry's block coefficient" 0.66 0.005 "$cb" \
+        "Cb 0.66, intact GM 2.00 m" "$FRONT"
+  check "the ferry's intact GM (m)" 2.00 0.005 "$gm0" \
+        "intact GM 2.00 m, 18 compartments" "$FRONT"
+  # Counted off `ships/ferry.ship` rather than the compiled ferry, because no tool
+  # prints a compartment count -- and `verify.sh` already requires the two to reach
+  # identical outcome strings over 900 s in all three scenarios, so the file's count
+  # is the ship's count or that gate is already red.
+  check "compartments in the ferry" 18 0 "$(grep -c '^compartment ' "$SHIPFILE")" \
+        "18 compartments carved" "$FRONT"
+
+  # Each row of the scenario table, at the duration the table now names. The
+  # readers are anchored to their own lines for the reason the damage figures are:
+  # `heel` opens the outcome summary *and* the two righting-arm curves, and `GM`
+  # appears in the banner as well as the verdict.
+  fin_heel()  { printf '%s\n' "$1" | sed -n 's/^  heel \(-\{0,1\}[0-9.]*\) deg.*/\1/p'; }
+  # **`\([0-9]*\) t of floodwater` on its own reads back empty**, and silently: the
+  # greedy `.*` in front of it eats the digits, the group matches zero characters and
+  # is happy, and `check` then reports "could not parse" for a figure that is right
+  # there. It needs a delimiter the `.*` cannot cross and at least one digit.
+  fin_water() { printf '%s\n' "$1" | sed -n 's/.*, \([0-9][0-9]*\) t of floodwater.*/\1/p'; }
+  fin_gm()    { printf '%s\n' "$1" | sed -n 's/^  effective GM \(-\{0,1\}[0-9.]*\) m.*/\1/p'; }
+  fin_t()     { printf '%s\n' "$1" | sed -n 's/^=== Outcome at t+\([0-9]*\)s.*/\1/p'; }
+  verdict()   { printf '%s\n' "$1" | sed -n 's/^=== Outcome at t+[0-9]*s: \(.*\) ===$/\1/p'; }
+  # A compartment row is `name gross fill% kPa water`, and every name here is one
+  # token, so the fields count forward from it.
+  space()     { printf '%s\n' "$1" | grep "^  $2  *" | awk -v c="$3" '{ print $c }'; }
+
+  none=$("$SHIPSIM" --scenario=none --duration=1800 2>&1)
+  # The first report at which GM has gone negative. The run table is the only place
+  # this is visible and it is printed every 15 s, which is the tolerance. `NF == 8`
+  # alone would also match a five-word event line, so the first field has to be a
+  # time as well.
+  gmneg=$(printf '%s\n' "$none" |
+          awk 'NF == 8 && $1 ~ /^[0-9]+$/ && $5 + 0 < 0 { print $1; exit }')
+  check "'none': when GM goes negative (s)" 690 15 "$gmneg" \
+        "GM negative at t+690 s" "$FRONT"
+  check "'none': the angle she lolls to (deg)" 53 0.5 "$(fin_heel "$none")" \
+        "lolls to **53° by t+1800 s**" "$FRONT"
+  check "'none': floodwater at t+1800 (t)" 6311 1 "$(fin_water "$none")" \
+        "6311 t aboard at the end" "$FRONT"
+
+  doors=$("$SHIPSIM" --scenario=doors --duration=1800 2>&1)
+  check "'doors': when she capsizes (s)" 930 15 "$(fin_t "$doors")" \
+        "**capsizes at t+930 s**" "$FRONT"
+  # The pointer carries the deck's dimensions as well as the tonnage, because the
+  # 19 m is a figure too and no tool prints it: the vehicle deck's plan area comes
+  # out at 1868 m² over the 100 m box, 18.7 m of mean breadth.
+  check "'doors': water on the vehicle deck at capsize (t)" 3950 1 \
+        "$(space "$doors" vehicle_deck 5)" "100 × 19 m undivided deck — 3950 t of it by the" \
+        "$FRONT"
+  # The trapped-air table, every cell of it. This is the block that had gone stale,
+  # and it went stale in the *gross volume* column -- a number that cannot move
+  # unless the ship itself changes -- so all four columns are checked and not only
+  # the ones the flooding drives.
+  #
+  # One pointer per row and it is the row's whole numeric tail, verbatim as the
+  # README prints it. That is what makes an edit *to the README* fail here: `check`
+  # compares the tool against a constant in this file, so a doc that drifts on its
+  # own is caught by the pointer or it is not caught at all.
+  air_p="965     20.6    127.7       194"
+  air_w="108     32.5    150.1        35"
+  air_a="1232     25.9    123.2       311"
+  check "'doors': fwd_hold_s gross volume (m3)" 965   1   "$(space "$doors" fwd_hold_s 2)" "$air_p" "$FRONT"
+  check "'doors': fwd_hold_s fill (%)"          20.6  0.1 "$(space "$doors" fwd_hold_s 3)" "$air_p" "$FRONT"
+  check "'doors': fwd_hold_s air pressure (kPa)" 127.7 0.2 "$(space "$doors" fwd_hold_s 4)" "$air_p" "$FRONT"
+  check "'doors': fwd_hold_s water (t)"         194   1   "$(space "$doors" fwd_hold_s 5)" "$air_p" "$FRONT"
+  check "'doors': wing_tank_fwd_s gross volume (m3)" 108 1 "$(space "$doors" wing_tank_fwd_s 2)" "$air_w" "$FRONT"
+  check "'doors': wing_tank_fwd_s fill (%)"     32.5  0.1 "$(space "$doors" wing_tank_fwd_s 3)" "$air_w" "$FRONT"
+  check "'doors': wing_tank_fwd_s air pressure (kPa)" 150.1 0.2 "$(space "$doors" wing_tank_fwd_s 4)" "$air_w" "$FRONT"
+  check "'doors': wing_tank_fwd_s water (t)"    35    1   "$(space "$doors" wing_tank_fwd_s 5)" "$air_w" "$FRONT"
+  check "'doors': aft_hold_s gross volume (m3)" 1232  1   "$(space "$doors" aft_hold_s 2)" "$air_a" "$FRONT"
+  check "'doors': aft_hold_s fill (%)"          25.9  0.1 "$(space "$doors" aft_hold_s 3)" "$air_a" "$FRONT"
+  check "'doors': aft_hold_s air pressure (kPa)" 123.2 0.2 "$(space "$doors" aft_hold_s 4)" "$air_a" "$FRONT"
+  check "'doors': aft_hold_s water (t)"         311   1   "$(space "$doors" aft_hold_s 5)" "$air_a" "$FRONT"
+  # No separate check that these stand at "1.2 to 1.5 atmospheres": three pressures
+  # gated to 0.2 kPa already say it, and a relation that cannot fail while the
+  # figures above hold is coverage that is not there.
+
+  full=$("$SHIPSIM" --scenario=full --duration=1800 2>&1)
+  check "'full': GM at t+1800 (m)" -3.23 0.005 "$(fin_gm "$full")" \
+        "GM −3.23 m under 6 mm of water" "$FRONT"
+  check "'full': list at t+1800 (deg)" 9.3 0.05 "$(fin_heel "$full")" \
+        "9.3° list, 1556 t" "$FRONT"
+  check "'full': floodwater at t+1800 (t)" 1556 1 "$(fin_water "$full")" \
+        "9.3° list, 1556 t" "$FRONT"
+  check "'full': water on the vehicle deck (t)" 11 1 "$(space "$full" vehicle_deck 5)" \
+        "under 6 mm of water on the vehicle deck" "$FRONT"
+  # **And the same run at t+900, which is the figure the README and the roadmap read
+  # as disagreeing about.** Gating both is the point: with only one of them checked,
+  # the obvious way to reconcile two documents is to overwrite whichever one is not
+  # gated, and it is a correct measurement of a different instant.
+  #
+  # Free rather than a second run -- the row the 1800 s run prints at t = 900 is the
+  # state a 900 s run ends on, the trajectory to there being the same one. Note the
+  # table prints heel to 2 dp (7.19) where the outcome line rounds to 1 (7.2).
+  row900=$(printf '%s\n' "$full" | awk 'NF == 8 && $1 == 900')
+  check "'full' at t+900: GM (m)" -3.30 0.005 \
+        "$(printf '%s\n' "$row900" | awk '{ print $5 }')" \
+        "at −3.30 m, 7.2° and 1442 t" "$FRONT"
+  check "'full' at t+900: heel (deg)" 7.2 0.05 \
+        "$(printf '%s\n' "$row900" | awk '{ print $3 }')" \
+        "at −3.30 m, 7.2° and 1442 t" "$FRONT"
+  check "'full' at t+900: floodwater (t)" 1442 1 \
+        "$(printf '%s\n' "$row900" | awk '{ print $7 }')" \
+        "at −3.30 m, 7.2° and 1442 t" "$FRONT"
+
+  # **And the three verdicts.** The figures above are what the ship is doing; these
+  # are what the front page says has happened to her, and the two moved apart once
+  # already -- `full` went SURVIVED -> LOST with every tonnage, heel and draft in
+  # that row unchanged to the digit.
+  checks=$((checks + 1))
+  if [ "$(verdict "$none")"  = "LOST - lolled over with negative GM, flooding continuing" ] &&
+     [ "$(verdict "$doors")" = "CAPSIZED" ] &&
+     [ "$(verdict "$full")"  = "LOST - negative GM, loll imminent" ]; then
+    printf '  %s✓%s and the three verdicts still read lolled over / capsized / lost\n' \
+           "$green" "$off"
+  else
+    printf '  %s✗%s a scenario verdict has changed: none=%s doors=%s full=%s\n' \
+           "$red" "$off" "$(verdict "$none")" "$(verdict "$doors")" "$(verdict "$full")"
+    printf '      %s%s publishes these as nothing / capsizes / lost%s\n' \
+           "$dim" "$FRONT" "$off"
+    fails=$((fails + 1))
+  fi
 else
-  printf '  %s✗%s she no longer capsizes at 6 m/s: heel %s deg\n' "$red" "$off" "$heel"
-  printf '      %s%s describes this as a capsize under "amidships she goes over"%s\n' \
-         "$dim" "$DOC" "$off"
-  fails=$((fails + 1))
+  echo "  - shipsim not built, skipping the README's scenario figures"
 fi
 
-# Below the threshold, where she lolls instead. The pair is the point: a change
-# that moved the threshold past 6 m/s, or below 5.5, would leave both tonnages
-# looking reasonable on their own and still have altered what the ship does.
-lo=$("$RAM" --speed=5.5 2>&1)
-lowater=$(outcome_line "$lo" | sed -n 's/.*-- \([0-9]*\) t of water.*/\1/p')
-loheel=$(outcome_line "$lo" | sed -n 's/.*heel \(-\{0,1\}[0-9.]*\) deg.*/\1/p')
-check "floodwater amidships at 5.5 m/s (t)" 7415 300 "$lowater" "she lolls to 63"
-checks=$((checks + 1))
-if [ -n "$loheel" ] && awk -v h="$loheel" 'BEGIN { if (h < 0) h = -h; exit !(h < 90) }'; then
-  printf '  %s✓%s and at 5.5 m/s she lolls instead: heel %s deg, short of 90\n' \
-         "$green" "$off" "$loheel"
+# The front page's own count of the validation suite, which is the one figure here
+# that a *test* changes rather than the physics. 112 s, and it is the only thing in
+# the repository that re-derives it: `verify.sh` prints the count and asserts only
+# that the failures are zero.
+if [ -x "$TESTS" ]; then
+  suite=$("$TESTS" 2>&1 | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
+  check "closed-form validation checks in the suite" 195086 0 "$suite" \
+        "195086 validation checks" "$FRONT"
 else
-  printf '  %s✗%s the capsize threshold has moved below 5.5 m/s: heel %s deg\n' \
-         "$red" "$off" "$loheel"
-  printf '      %sthe threshold between 5.5 and 5.75 m/s is a finding in %s%s\n' \
-         "$dim" "$DOC" "$off"
-  fails=$((fails + 1))
+  echo "  - shipsim_tests not built, skipping the README's check count"
 fi
 
-# --- and that being struck at the quarter is worse, and the other way -----------
-out=$("$RAM" --speed=6 --aim=-30 2>&1)
-qwater=$(outcome_line "$out" | sed -n 's/.*-- \([0-9]*\) t of water.*/\1/p')
-qheel=$(outcome_line "$out" | sed -n 's/.*heel \(-\{0,1\}[0-9.]*\) deg.*/\1/p')
-check "floodwater at the quarter (t)" 7323 150 "$qwater" "at the quarter she takes"
-check "heel at the quarter (deg)"    -47.8 1.0 "$qheel" "at the quarter she takes"
+# **`ram_view` is a Vulkan target, so a machine with no device never builds it --
+# and this used to `exit 0` at that point.** That took the section and the smoke
+# blocks below down with it, neither of which needs a GPU, and it threw away any
+# failure already counted: a red gate exiting 0. The README figures above are what
+# made it matter, because they are pure CPU and a machine with no device is exactly
+# where nobody is watching the output.
+if [ -x "$RAM" ]; then
+  for h in "opens 3.4 m" "63 bays torn, 107.7" "amidships she goes over" \
+           "at the quarter she takes" "she lolls to 63"; do
+    hint "$h"
+  done
+
+  # Every figure below comes off one of two lines, and *only* off that line. The
+  # first version of this script matched `GM` anywhere in the output and picked up
+  # the intact ship's GM from the banner as well as the flooded one from the
+  # outcome, reporting "2.00" and "-1.62" together. A checker that misparses is
+  # worse than no checker, so each reader is anchored to its own line.
+  damage_line() { printf '%s\n' "$1" | grep '^damage'; }
+  outcome_line() { printf '%s\n' "$1" | grep '^outcome'; }
+
+  # --- damage, which needs no flooding -------------------------------------------
+  quick6=$("$RAM" --speed=6 --duration=1 2>&1)
+  quick15=$("$RAM" --speed=1.5 --duration=1 2>&1)
+
+  area6=$(damage_line "$quick6" | sed -n 's/.*torn, \([0-9.]*\) m2 of hole.*/\1/p')
+  area15=$(damage_line "$quick15" | sed -n 's/.*torn, \([0-9.]*\) m2 of hole.*/\1/p')
+  torn=$(damage_line "$quick6" | sed -n 's/.*over [0-9]* bays, \([0-9]*\) torn.*/\1/p')
+  check "hole at 1.5 m/s (m2)" 3.4 0.3 "$area15" "opens 3.4 m"
+  check "hole at 6 m/s (m2)" 107.7 0.6 "$area6" "107.7 m² of hole"
+  check "bays torn at 6 m/s" 63 1 "$torn" "63 bays torn, 107.7"
+
+  # --- the headline outcome, which needs the full 900 s ---------------------------
+  #
+  # Three full runs, which is the same budget the first version of this script
+  # spent, but aimed at the thing that turned out to matter: the amidships strike
+  # sits just above a capsize threshold, so a figure alone says very little. 5.5 m/s
+  # and 6 m/s straddle it, and asserting both is what makes the pair a finding
+  # rather than two numbers.
+  out=$("$RAM" --speed=6 2>&1)
+  water=$(outcome_line "$out" | sed -n 's/.*-- \([0-9]*\) t of water.*/\1/p')
+  heel=$(outcome_line "$out" | sed -n 's/.*heel \(-\{0,1\}[0-9.]*\) deg.*/\1/p')
+  check "floodwater amidships at 6 m/s (t)" 16613 400 "$water" "amidships she goes over"
+  checks=$((checks + 1))
+  if [ -n "$heel" ] && awk -v h="$heel" 'BEGIN { if (h < 0) h = -h; exit !(h > 90) }'; then
+    printf '  %s✓%s and she goes right over: heel %s deg, past 90\n' "$green" "$off" "$heel"
+  else
+    printf '  %s✗%s she no longer capsizes at 6 m/s: heel %s deg\n' "$red" "$off" "$heel"
+    printf '      %s%s describes this as a capsize under "amidships she goes over"%s\n' \
+           "$dim" "$DOC" "$off"
+    fails=$((fails + 1))
+  fi
+
+  # Below the threshold, where she lolls instead. The pair is the point: a change
+  # that moved the threshold past 6 m/s, or below 5.5, would leave both tonnages
+  # looking reasonable on their own and still have altered what the ship does.
+  lo=$("$RAM" --speed=5.5 2>&1)
+  lowater=$(outcome_line "$lo" | sed -n 's/.*-- \([0-9]*\) t of water.*/\1/p')
+  loheel=$(outcome_line "$lo" | sed -n 's/.*heel \(-\{0,1\}[0-9.]*\) deg.*/\1/p')
+  check "floodwater amidships at 5.5 m/s (t)" 7415 300 "$lowater" "she lolls to 63"
+  checks=$((checks + 1))
+  if [ -n "$loheel" ] && awk -v h="$loheel" 'BEGIN { if (h < 0) h = -h; exit !(h < 90) }'; then
+    printf '  %s✓%s and at 5.5 m/s she lolls instead: heel %s deg, short of 90\n' \
+           "$green" "$off" "$loheel"
+  else
+    printf '  %s✗%s the capsize threshold has moved below 5.5 m/s: heel %s deg\n' \
+           "$red" "$off" "$loheel"
+    printf '      %sthe threshold between 5.5 and 5.75 m/s is a finding in %s%s\n' \
+           "$dim" "$DOC" "$off"
+    fails=$((fails + 1))
+  fi
+
+  # --- and that being struck at the quarter is worse, and the other way -----------
+  out=$("$RAM" --speed=6 --aim=-30 2>&1)
+  qwater=$(outcome_line "$out" | sed -n 's/.*-- \([0-9]*\) t of water.*/\1/p')
+  qheel=$(outcome_line "$out" | sed -n 's/.*heel \(-\{0,1\}[0-9.]*\) deg.*/\1/p')
+  check "floodwater at the quarter (t)" 7323 150 "$qwater" "at the quarter she takes"
+  check "heel at the quarter (deg)"    -47.8 1.0 "$qheel" "at the quarter she takes"
+else
+  echo "  - ram_view not built, skipping the collision-milestone figures"
+fi
 
 # --- the section mesher's reach ---------------------------------------------------
 #

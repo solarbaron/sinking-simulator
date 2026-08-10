@@ -22,7 +22,7 @@ slice.
 ```sh
 cmake -S . -B build -G Ninja
 ninja -C build
-./build/shipsim_tests                       # 116 validation checks against closed-form answers
+./build/shipsim_tests                       # 195086 validation checks against closed-form answers
 ./build/shipsim --scenario=none             # 120 m ferry, holed, nobody does anything
 ./build/shipsim --scenario=doors            # close the watertight door
 ./build/shipsim --scenario=full             # full damage control response
@@ -36,16 +36,21 @@ everything else still builds.
 
 ## What slice 1 already does
 
-A 120 m ro-pax ferry — 8984 t, Cb 0.66, intact GM 2.00 m, 16 compartments carved
+A 120 m ro-pax ferry — 8984 t, Cb 0.66, intact GM 2.00 m, 18 compartments carved
 out of the hull form over four levels — is holed by a 2.4 m² tear in the
 starboard shell 2.5 m below the waterline. From there the simulation takes over.
-Three runs, same ship, same damage, different decisions:
+Three runs, same ship, same damage, different decisions, each `--duration=1800`:
 
 | Scenario | Action taken | Outcome |
 |---|---|---|
-| `none` | nothing | GM negative by t+900 s, lolls to **53° by t+1800 s**, 6311 t aboard at the end |
+| `none` | nothing | GM negative at t+690 s, lolls to **53° by t+1800 s**, 6311 t aboard at the end |
 | `doors` | close the watertight door at t+45 s | **capsizes at t+930 s** |
 | `full` | door, pumps, early counterflood, secure the vehicle deck | **lost** — GM −3.23 m under 6 mm of water on the vehicle deck, 9.3° list, 1556 t |
+
+**The duration is part of the figure**, which is why it is written above the
+table: `full` is still flooding at the end, so a run of a different length
+publishes different numbers and neither is stale. `docs/06-roadmap.md` quotes the
+same run at the gate's own t+900 s, where she is at −3.30 m, 7.2° and 1442 t.
 
 The middle row is not a bug and it is the reason this is worth building. Closing
 the door stops the two engine rooms cross-equalising, so the asymmetric
@@ -75,17 +80,21 @@ table shows spaces the sea never directly reached:
 
 ```
 compartment            gross m3   fill %    P kPa   water t
-fwd_hold_s                 1074     18.8    124.8       197
-wing_tank_fwd_s             108     31.7    148.3        35
-aft_hold_s                 1232     25.3    122.2       304
+fwd_hold_s                  965     20.6    127.7       194
+wing_tank_fwd_s             108     32.5    150.1        35
+aft_hold_s                 1232     25.9    123.2       311
 ```
 
-Past about 40° of heel those compartments' vent pipes go under, so the sea starts
-down the vents — and stops, because the air it has to displace can only leave by
-the same submerged pipe. Each one settles at a fill fraction set by where its
-air pressure balances the outside head, 1.2 to 1.5 atmospheres. That behaviour
-was never written down anywhere; it is two lines of orifice physics meeting
-Boyle's law.
+Each vent goes under at its own angle, because each sits at its own half-breadth:
+the starboard wing tank's air pipe at about **32°** of heel and the forward
+hold's vent at about **42°**. Past that the sea starts down the vent — and stops,
+because the air it has to displace can only leave by the same submerged pipe.
+Each one settles at a fill fraction set by where its air pressure balances the
+outside head, 1.2 to 1.5 atmospheres. That behaviour was never written down
+anywhere; it is two lines of orifice physics meeting Boyle's law. The aft hold is
+in the table for a different reason — the sea reaches it through an unsealed
+cable transit from the engine room within the first minute — but its air is
+trapped by the same submerged vent.
 
 ## How the flooding model works
 
@@ -263,10 +272,16 @@ identifying one architectural change before any of that phase existed to rewrite
 
 ```sh
 ./scripts/install-git-hooks.sh   # once: conflict markers, stray binaries, worktrees
-./scripts/verify.sh              # quick    build + 1309 checks          ~10 s
-./scripts/verify.sh full         # + clean rebuild, GPU, scenarios       ~150 s
+./scripts/verify.sh              # quick    build + the test suite     ~110–150 s
+./scripts/verify.sh full         # + rebuild, GPU, scenarios, figures     ~2400 s
 ./scripts/verify.sh sanitize     # + AddressSanitizer and ThreadSanitizer
 ```
+
+Those are measured, on a box that was busy with other work — which it usually is,
+and `quick` came out at 112 s and 147 s an hour apart — and they grow with the
+suite, so re-measure rather than trusting them. Most of `full` is the suite
+again: six repeat runs for flakiness, and `scripts/check-figures.sh` re-running
+every tool this repository quotes a number from, including the ones on this page.
 
 **Warnings are failures.** The build is `-Wall -Wextra -Wpedantic` and has been
 warning-clean since Phase 0, so one warning means the signal is decaying. Note
