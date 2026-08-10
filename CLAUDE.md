@@ -118,6 +118,8 @@ most useful thing to know about this codebase:
 | A fire with no decay phase felling that bulkhead on its own at 2760 s, because steel asymptotes to the gas temperature and the restrained-buckling limit is a fixed one — so "the fire alone does not do it" was a statement about how long anyone watched | running the same control **three times longer** |
 | One convective film per gas layer misbooking **8%** of the boundary exchange: the radiative coefficient goes as `T_s²`, and the foot of a bulkhead is held near ambient by the water behind it while its head is at 500 K | publishing the linearisation error next to the exact integral instead of assuming a mean was good enough |
 | A restraint window that came back equal to whatever restraint the run was given, on every run — because the failure floods the compartment and **relieves the head that caused it** | asking the same question at two different inputs and getting the input back both times |
+| The gate's own build step failing and printing **nothing**: it greps the log for `error:`, and a compiler killed by a full disk never says that word | a negative control that fails *without* the word the reporter looks for |
+| 98 gated figures and **not one of them on `README.md`** — the front page, where the verdict a reader sees first had just changed | counting the gate's own coverage by document, rather than by figure |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct. **Nothing at all tests a comment** — three documents here repeated a
@@ -140,6 +142,17 @@ sequence decide one thing, they need the same notion of "on the boundary".
 **Writing a lesson down does not make it learned.** The rigid-body threshold above
 is the second time that mistake was made in this repo — the first was recorded, in
 this table, by the work that immediately preceded it.
+
+**A failure path that only reports the failures it already anticipated is not a
+failure path.** `verify.sh` had this twice in adjacent functions: `expect_ok` and
+`build_into` each summarised a failing step by grepping its log for the text a
+*foreseen* failure would contain, so an unforeseen one — a signal, a full disk —
+came out as silence. Both now print the exit status, separate a signal from an
+assertion, and show the tail regardless of whether anything matched. **Test a
+reporter with a negative control that fails in a way it was not written for**; the
+control is also what caught `$?` being the status of the *negation* after
+`if ! cmd`, which was written into both functions, hours apart, by someone who had
+already fixed it once.
 
 ## Settled decisions — do not reopen
 
