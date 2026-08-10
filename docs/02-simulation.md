@@ -5653,11 +5653,45 @@ that is modelled by a different subsystem and none of them know about the others
 
 ### Suppression
 
-Water spray and deluge (droplet evaporation cooling gas and wetting fuel), CO₂ and
-inert gas total flooding (oxygen displacement, with the compartment sealing
-requirement that makes it fail if a door is open), high-expansion foam, dry
-powder, and boundary cooling. All of them add water or gas mass to compartments,
-which is to say all of them affect stability. Firefighting has sunk ships.
+**Water spray and deluge are built** — `fire::Drencher` and `fire::Scupper`. A
+nozzle set is a mass flow into one compartment; a share of it evaporates in the
+hot layer and the rest lands on the deck. That split is the whole mechanism: the
+evaporated part is where the cooling comes from and the part that lands is where
+the stability cost comes from, and the same kilogram cannot do both.
+
+**Suppression water is floodwater.** This model has no free-surface *correction*
+anywhere — floodwater is real mass at the real centroid, re-levelled against
+gravity — so water written into `Compartment::waterVolume` arrives with its free
+surface already correct. Measured against `ρ μ I / Δ` to **1.4e-6** on a box
+barge, where the second moment is `b³l/12` and nothing is approximated, and to
+2e-4 on the ferry's vehicle deck, where the second moment is itself a numerical
+integration over the compartment's mesh. Firefighting has sunk ships, and on this one
+**ten tonnes on the vehicle deck takes 2.00 m of GM negative**; after that GM
+saturates near −3.7 m and the *angle of loll* is the quantity that tracks the
+water. See `06-roadmap.md` Phase 4 for the four-hour table and for why the
+freeing ports decide the outcome.
+
+Three details worth carrying forward:
+
+- The cooling sink is applied as an **exact relaxation** towards the water's own
+  temperature, not as a rate with a cap. A cap on the engaged mass binds at the
+  steady state here rather than on a transient — a drencher routinely
+  out-absorbs the fire it is aimed at, by ten times on the ISO-room fixture — and
+  the applied rate then becomes `available / dt`, which is a function of the
+  substep and not of the physics.
+- A freeing port needs a sill **position**, not a sill height.
+  `Compartment::surfaceOffset` is the water plane's offset along the *body*
+  up-vector; on a lolled ship it is not a height, and comparing it to one stops
+  the ports draining at exactly the moment they matter.
+- The evaporated fraction is a **ceiling, not a rate**. What evaporates is bounded
+  by the power available to boil it, so on the ferry a nominal 0.3 delivers 0.033.
+
+Still to build: CO₂ and inert gas total flooding (oxygen displacement, with the
+compartment sealing requirement that makes it fail if a door is open),
+high-expansion foam, and dry powder. Each needs a second gas species carrying its
+own `R` and `γ`, which is also what the steam this model currently omits would
+need. Boundary cooling needs nothing new — it is `GasCompartment`'s existing
+`wallConductance` and `wallTemperature`.
 
 ---
 

@@ -384,6 +384,175 @@ struct VentResult {
 VentResult ventMassFlow(const Vent& v, const VentSide& a, const VentSide& b);
 
 // ---------------------------------------------------------------------------
+// Suppression
+// ---------------------------------------------------------------------------
+//
+// `docs/06-roadmap.md` Phase 4's "suppression systems, **and their effect on
+// stability**", and the second half of that phrase is the whole item. Water put
+// into a compartment to fight a fire is water in a compartment. Firefighting has
+// capsized ships that the fire would not have.
+//
+// **Suppression water is floodwater, and it needed no new path.** `Ship` carries
+// floodwater as real mass at the real centroid of the real water body and
+// re-levels it against gravity every tick; `rightingArmAtHeel` re-levels it again
+// at each heel it is asked about. There is no free-surface *correction term*
+// anywhere in `ship.cpp` -- no `rho i / disp`, no tabulated allowance -- because
+// the effect is what the re-levelling does. So a cubic metre added to
+// `Compartment::waterVolume` arrives with its mass, its centroid, its free
+// surface and its cost to GM already correct, and `applyTo` writes exactly that.
+// `tests/test_fire.cpp` measures the emergent effect against the closed form it
+// is supposed to reproduce and finds `GM_solid - GM_liquid = rho mu I / disp` to
+// **1.4e-6** relative on a box barge, where `I` is `b^3 l / 12` and nothing is
+// approximated, and to 2e-4 on the ferry's own vehicle deck, where `I` is itself
+// a numerical integration over the compartment's mesh. The `mu` is not optional:
+// `rightingArmAtHeel` levels the *geometric* region `waterVolume / mu` while the
+// mass is `waterVolume * rho`, so on the ferry's 0.90 deck leaving it out
+// over-states the loss by 11%.
+
+// Water's caloric constants at one atmosphere. Quoted, not derived: unlike the
+// air constants above, nothing here has to satisfy an identity.
+inline constexpr double kCpWater      = 4186.0;    // J/(kg K), liquid
+inline constexpr double kLatentHeat   = 2.257e6;   // J/kg of vaporisation at 373.15 K
+inline constexpr double kTSaturation  = 373.15;    // K, boiling at kPatm
+
+// A spray density in litres per minute per square metre -- the unit every
+// suppression rule is written in, SOLAS II-2 Reg. 20's 5 L/(min m^2) for a
+// ro-ro space among them -- as a mass flow in kg/s over `area`.
+//
+// One line, and it exists for the reason `Plume`'s kilowatts do: this is the
+// single place a factor of sixty or a factor of a thousand could hide, and this
+// repo has already published a figure that was wrong by exactly such a factor in
+// a comment that nothing tested.
+double sprayMassFlow(double area, double litresPerMinutePerSquareMetre);
+
+// A drencher, sprinkler or watermist head set: a mass flow of water into one
+// compartment, part of which evaporates in the hot layer and part of which does
+// not.
+//
+// **The split is the entire mechanism.** What evaporates is where the cooling
+// comes from -- 2.257 MJ/kg, so a few kg/s is megawatts, comparable with the
+// fire itself. What does not evaporate lands on the deck, and on a ship that is
+// where the stability cost comes from. The same kilogram cannot do both.
+struct Drencher {
+    std::string name;
+    int    gasCompartment = 0;         // index into Model::gas
+    double flow = 0;                   // kg/s of water delivered
+    double waterTemperature = kTAmbient;   // K, as it leaves the nozzle
+    bool   on = false;
+
+    // The share of the *engaged* water that evaporates in the hot layer.
+    //
+    // **This is the coefficient nothing here measures**, and it is the one the
+    // answer turns on. The literature spreads it over most of the unit interval:
+    // a fine mist in a hot post-flashover layer converts nearly all of it, while
+    // a ro-ro drencher throwing coarse drops through a 500 K layer onto vehicles
+    // converts very little and puts the rest on the deck. 0.3 is a deliberately
+    // middling default and it is a guess.
+    //
+    // What `tests/test_fire.cpp` establishes instead of asserting a value is the
+    // *sensitivity*, and it has two halves that point opposite ways.
+    //
+    // Per kilogram, cooling runs 582 kJ at 0.1 to 2387 kJ at 0.9: a factor of
+    // **4.1**, not the factor of nine the latent heats alone suggest, because the
+    // sensible heat of raising the water to saturation is a floor no fraction can
+    // go below and is a third of the total at 0.3. The water landing runs the
+    // other way and by *more* -- the deck collects `1 - e`, so 0.1 and 0.9 differ
+    // by **9x**. On the arithmetic alone the coefficient matters more to the
+    // stability answer than to the cooling one.
+    //
+    // **And then on a real ship it barely matters at all**, which is the finding
+    // worth having. This fraction is a ceiling and not a rate: what actually
+    // evaporates is bounded by the power available to boil it. The ferry's 20 MW
+    // lorry fire against a 31 kg/s drencher converts **3.3%** of the flow over
+    // four hours, not 30%, because most of the fire's energy goes into raising
+    // 447 tonnes of water to saturation and out through the vents. So the water
+    // on the deck -- the whole stability half of this item -- is set by the fire's
+    // power and the freeing ports rather than by this number: on the ISO-room
+    // fixture, where the same over-supply holds, moving it from 0.1 to 0.9 moves
+    // the water landing by **2%** against the 9x the arithmetic alone predicts.
+    double evaporatedFraction = 0.3;
+
+    // Diagnostic, filled every step.
+    double lastCooling = 0;      // W taken out of the upper layer
+    double lastEvaporated = 0;   // kg/s that left as steam
+    double lastToDeck = 0;       // kg/s that landed
+};
+
+// A freeing port, scupper or drain: the thing that is supposed to get the water
+// back out, and the reason a drencher does not simply fill the ship.
+//
+// Modelled as a **rectangular notch of width `width` with its sill at `sillZ` and
+// no top**, which is what a freeing port in a bulwark is and, more to the point,
+// is what can be written down without inventing a height. `Opening` carries an
+// area and a centre and no height at all; deriving one is what `ventShapeFor`
+// has to do and it is a guess there. A notch with no top needs no such guess,
+// because a layer a drencher makes is centimetres deep and never reaches a
+// soffit.
+//
+// The discharge is one integral of Torricelli's velocity over the wetted band,
+// split at the outside water level exactly as `ventMassFlow` splits at a layer
+// interface, and closed form in each band -- see `scupperFlow`.
+struct Scupper {
+    std::string name;
+    // Indexed into `Model::gas` rather than into `Ship::compartments`, on the same
+    // terms as `DesignFire::compartment`, so that every entry in this file speaks
+    // one index space. The cost is that a deck with freeing ports has to be a
+    // tracked gas space even if nothing is burning in it; `validate()` says so
+    // rather than leaving a port that silently never runs, which is
+    // indistinguishable from a blocked one.
+    int    gasCompartment = 0;
+
+    // The middle of the sill, in the body frame, exactly as `Opening::pos` is the
+    // orifice centre.
+    //
+    // **A position and not a height, and that was found by measuring rather than
+    // by thinking.** The first version carried a `sillZ` and compared it against
+    // `Compartment::surfaceOffset`, which reads like a height and is not one: it
+    // is the offset of the water's plane along the *body* up-vector, and the
+    // moment this ship takes up an angle of loll the two differ by the beam times
+    // the sine of it. The ferry lolls within a minute of the drencher starting,
+    // so the ports silently stopped draining at the exact moment they were needed
+    // and the run looked like a suppression system with no freeing ports at all.
+    //
+    // With a position the head is `surfaceWorldZ - sillWorldZ`, which is the same
+    // comparison `Ship::sideStateAt` makes and is exact at any attitude. It also
+    // buys the physics the height could not express: on a lolled ship the low-side
+    // ports run hard and the high-side ones stand dry.
+    Vec3   sillPos{};
+    double width = 0;               // m of clear opening
+    double dischargeCoeff = 0.6;
+    // Blocked by a vehicle parked against it, by debris, by a lashing, or by
+    // nobody having opened it. The case that turns a survivable drencher run into
+    // a capsize, so it is a field rather than a caller deleting the entry.
+    bool   blocked = false;
+
+    double lastFlow = 0;            // m^3/s, positive means overboard
+    // The two heads the integral was taken between, m above the sill. Published
+    // because "the port did not run" has two quite different causes -- no water
+    // inside, or the sea standing over it -- and they want different actions.
+    double lastInsideHead = 0, lastOutsideHead = 0;
+};
+
+// Volumetric discharge through a notch of unit `Cd * width`, m^3/s per metre of
+// width, given the inside and outside water heads above the sill. Both heads are
+// clamped at zero: water below the sill cannot reach it.
+//
+// Positive means outward. The integral is Torricelli's `sqrt(2 g d)` over the
+// wetted height, split at the outside level:
+//
+//   * below it the notch is drowned and the driving head is the constant
+//     difference `a - c`, contributing `c sqrt(2 g (a - c))`;
+//   * above it the discharge is free and the head runs linearly to zero at the
+//     inside surface, contributing `(2/3) (a - c)^(3/2) sqrt(2 g)`.
+//
+// With a dry outside this is the classical free weir `(2/3) Cd b sqrt(2g) h^(3/2)`
+// exactly; with the two levels equal it is exactly zero; and with the outside
+// higher it runs backwards and the port admits the sea, which is what a freeing
+// port does once the ship has settled far enough to put it under. One formula for
+// all three, so there is no regime boundary to get wrong.
+double scupperFlow(double insideHead, double outsideHead);
+
+// ---------------------------------------------------------------------------
 // The account
 // ---------------------------------------------------------------------------
 
@@ -398,6 +567,7 @@ struct Account {
     double heatReleased = 0;     // J the design fires put into the gas
     double radiativeLoss = 0;    // J the design fires took straight back out
     double wallLoss = 0;         // J conducted into the boundaries
+    double suppressionCooling = 0;  // J the drenchers took out of the gas
     double enthalpyIn = 0;       // J in across the model's boundary (outside air)
     double enthalpyOut = 0;      // J out across it
     double massIn = 0;           // kg in across it
@@ -405,15 +575,34 @@ struct Account {
     double productsGenerated = 0;   // kg
     double productsOut = 0;         // kg across the boundary
 
+    // The water books, kept on the same terms as the gas ones and for the same
+    // reason. All three are *crossings*, not holdings: what is standing on the
+    // deck at any moment is the ship's own `Compartment::waterVolume`, because
+    // `applyTo` hands the water over and the flooding solve owns it from then on
+    // -- it may drain through the ship's own openings, or be pumped, or run to
+    // the low side and out. A second copy of that holding kept here would be the
+    // "two answers that agree until the day they do not" this file has already
+    // deleted once.
+    double waterDelivered = 0;   // kg out of the nozzles
+    double waterEvaporated = 0;  // kg of it that left as steam
+    double waterDrained = 0;     // kg over the freeing ports, negative if they admitted
+
     double initialEnergy = 0, initialMass = 0;   // at attach()
     double energy = 0, mass = 0, products = 0;   // now
 
     double energyResidual() const {
-        return (heatReleased - radiativeLoss + enthalpyIn - enthalpyOut - wallLoss) -
+        return (heatReleased - radiativeLoss + enthalpyIn - enthalpyOut - wallLoss -
+                suppressionCooling) -
                (energy - initialEnergy);
     }
     double massResidual() const { return (massIn - massOut) - (mass - initialMass); }
     double productsResidual() const { return (productsGenerated - productsOut) - products; }
+
+    // What suppression handed to the flooding network, kg. Delivered, less what
+    // evaporated, less what the freeing ports took back overboard -- which is
+    // exactly what `applyTo` has written into `Compartment::waterVolume` over the
+    // model's life, and `tests/test_fire.cpp` asserts the two agree to the bit.
+    double waterToShip() const { return waterDelivered - waterEvaporated - waterDrained; }
 
     // The residuals above are absolute. These are the fractions worth quoting,
     // normalised by the largest single term rather than by the net -- a net that
@@ -428,6 +617,14 @@ struct Account {
 struct StepResult {
     double time = 0;             // s, model time after the step
     double heatRelease = 0;      // W, summed over the design fires now
+    // Cooling as **applied** on the last internal step, after the cap that stops
+    // a drencher taking the layer below the temperature of its own water. Same
+    // discipline as `entrainment` below: the demand is
+    // `flow * (cp dT + e L)` and reporting that instead would be reporting a
+    // number the model did not use. On the ferry the two differ by two orders of
+    // magnitude, because a deck drencher can absorb far more than any fire in the
+    // space is releasing.
+    double suppressionCooling = 0;  // W
     // Entrainment as **applied** on the last internal step -- after the taper
     // that shuts the plume off as the cool layer is consumed, and after the cap
     // that stops it draining more than the layer holds. `Model::totalEntrainment`
@@ -452,6 +649,8 @@ public:
     std::vector<GasCompartment> gas;
     std::vector<DesignFire>     fires;
     std::vector<Vent>           vents;
+    std::vector<Drencher>       drenchers;
+    std::vector<Scupper>        scuppers;
     Account                     account;
 
     double time = 0;             // s of model time
@@ -505,7 +704,21 @@ public:
     // last call, rather than the absolute value, is what keeps a zero-heat-release
     // run bit-identical: the delta is then exactly 0.0 and `x += 0.0` changes
     // nothing.
+    //
+    // **This is also the path suppression water takes**, and it is the whole of
+    // it: the net of what the drenchers landed and the freeing ports took back
+    // goes into `Compartment::waterVolume`, and every stability consequence
+    // follows from the ship's own solve with nothing else added. The water half
+    // is written as a pending delta that this call consumes, so a model with no
+    // drenchers writes nothing at all -- not `+= 0.0`, but no store, which is
+    // what keeps the exact control exact even for a compartment whose water
+    // volume is a negative zero.
     void applyTo(Ship& ship);
+
+    // Water this model owes the ship, m^3, indexed like `gas`. Published because
+    // it is the number `applyTo` is about to write and because a caller stepping
+    // the gas faster than the ship needs to see it accumulate.
+    const std::vector<double>& pendingWater() const { return pendingWater_; }
 
     // Total plume entrainment now, kg/s. Published because "the layer descended"
     // is not evidence that entrainment did it -- the fire's own expansion pushes
@@ -524,6 +737,9 @@ private:
     // The air mass this model last wrote into each ship compartment, so `applyTo`
     // can write a delta. Indexed like `gas`.
     std::vector<double> appliedMass_;
+    // Water the drenchers have landed and the freeing ports have not yet taken
+    // back, m^3, waiting for `applyTo`. Signed: a submerged freeing port admits.
+    std::vector<double> pendingWater_;
 };
 
 // The correlations the tests check against, exposed because a caller wants them

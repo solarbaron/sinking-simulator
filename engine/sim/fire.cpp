@@ -41,6 +41,25 @@ constexpr double kDepositionMargin = 0.5;   // K
 // later.
 constexpr double kEntrainmentTaperFraction = 0.02;
 
+// The band above saturation over which a spray goes from wetting the deck to
+// boiling away, K.
+//
+// A smoothing of a boundary that is not sharp in reality: drops entering an
+// unsaturated gas evaporate well below the nominal boiling point, and drops that
+// are already hot evaporate above it. Switching the latent term on at exactly
+// 373.15 K instead would put a **discontinuity in the sink** into a term the
+// substep controller subdivides against, at the one temperature a drenched layer
+// actually settles at -- the ferry's deck sits within this band, not away from
+// it.
+//
+// The width is a modelling choice and it moves a *temperature*, not a mass: the
+// evaporating share at equilibrium is fixed by the energy balance
+// `Q_fire = flow (cp dT + e L s)`, so a wider band puts the same steam into the
+// layer at a higher temperature. `tests/test_fire.cpp` measures that the water
+// landing on the deck barely moves with it, which is what the stability half of
+// this file depends on.
+constexpr double kEvaporationBand = 50.0;   // K
+
 // Sweeps of the implicit pressure solve, which is blocked by *vent* -- see
 // `substep`. Each vent's own pair is solved exactly, so a compartment with one
 // vent needs one sweep; the sweeps are only there for the coupling between
@@ -366,8 +385,20 @@ VentResult ventMassFlow(const Vent& v, const VentSide& a, const VentSide& b) {
 // of drift in 34 MJ of gas came out as 1.1e-8 "of scale", which reads like a
 // failure and is a hundred million times better than one.
 double Account::energyResidualFraction() const {
+    // `suppressionCooling` belongs in the scale for exactly the reason the other
+    // fluxes do, and leaving it out would have been invisible on any run with a
+    // fire in it: a drencher on a compartment nobody lit removes real joules
+    // while `heatReleased` stays at zero, and the residual would then be
+    // normalised by the state instead of by the largest thing that moved.
+    //
+    // Mutation testing confirms that "invisible": deleting this line survives the
+    // whole suite, because every fixture that runs a drencher also has a fire,
+    // and `heatReleased` dominates the maximum in all of them. It stays because
+    // the case it covers is a real one -- a boundary-cooled or already-hot space
+    // with no design fire in it -- not because a test currently reaches it.
     const double scale = std::max({std::abs(heatReleased), std::abs(enthalpyIn),
                                    std::abs(enthalpyOut), std::abs(wallLoss),
+                                   std::abs(suppressionCooling),
                                    std::abs(energy - initialEnergy), std::abs(energy), 1.0});
     return energyResidual() / scale;
 }
@@ -376,6 +407,36 @@ double Account::massResidualFraction() const {
     const double scale = std::max({std::abs(massIn), std::abs(massOut),
                                    std::abs(mass - initialMass), std::abs(mass), 1e-9});
     return massResidual() / scale;
+}
+
+// ---------------------------------------------------------------------------
+// Suppression
+// ---------------------------------------------------------------------------
+
+double sprayMassFlow(double area, double litresPerMinutePerSquareMetre) {
+    if (area <= 0 || litresPerMinutePerSquareMetre <= 0) return 0.0;
+    // Litres of fresh water per minute to kilograms per second. Fresh, not sea:
+    // the density here converts a *rule's* unit, and the rules are written in
+    // litres. What lands on the deck is put into the ship at the ship's own
+    // `seaDensity`, in `applyTo`, because that is the density `Ship` weighs
+    // floodwater at and a second one would make the mass depend on which file
+    // asked.
+    return area * litresPerMinutePerSquareMetre * 1e-3 * kRhoFresh / 60.0;
+}
+
+double scupperFlow(double insideHead, double outsideHead) {
+    const double a = std::max(insideHead, 0.0);
+    const double c = std::max(outsideHead, 0.0);
+    if (a == c) return 0.0;
+    // Antisymmetric by construction rather than by two branches that have to be
+    // kept in step: a port with the sea above it is the same port run backwards.
+    const double sign = a > c ? 1.0 : -1.0;
+    const double hi = std::max(a, c), lo = std::min(a, c);
+    const double drop = hi - lo;
+    const double root2g = std::sqrt(2.0 * kGravity);
+    // The drowned band, of height `lo`, at the constant head `drop`; then the
+    // free band, over which the head falls linearly to zero at the surface.
+    return sign * root2g * (lo * std::sqrt(drop) + (2.0 / 3.0) * pow32(drop));
 }
 
 // ---------------------------------------------------------------------------
@@ -390,12 +451,18 @@ namespace {
 // trial step be abandoned without leaving a mark on the account.
 struct Deltas {
     std::vector<double> dmU, dmL, dEU, dEL, dsU, dsL;
+    // Water the drenchers landed less what the freeing ports took back, kg/s.
+    // Signed, and per compartment, because `applyTo` writes it per compartment.
+    std::vector<double> dWater;
     double heat = 0, radiative = 0, wall = 0, entrained = 0;
+    double suppression = 0;
+    double waterDelivered = 0, waterEvaporated = 0, waterDrained = 0;
     double enthalpyIn = 0, enthalpyOut = 0;
     double massIn = 0, massOut = 0;
     double productsGenerated = 0, productsOut = 0;
     explicit Deltas(std::size_t n)
-        : dmU(n, 0.0), dmL(n, 0.0), dEU(n, 0.0), dEL(n, 0.0), dsU(n, 0.0), dsL(n, 0.0) {}
+        : dmU(n, 0.0), dmL(n, 0.0), dEU(n, 0.0), dEL(n, 0.0), dsU(n, 0.0), dsL(n, 0.0),
+          dWater(n, 0.0) {}
 };
 
 // The gas column against one side of a vent.
@@ -600,6 +667,7 @@ void Model::attach(const Ship& ship, const std::vector<int>& shipCompartments) {
 
 void Model::resetAccount() {
     appliedMass_.assign(gas.size(), 0.0);
+    pendingWater_.assign(gas.size(), 0.0);
     for (std::size_t i = 0; i < gas.size(); ++i)
         appliedMass_[i] = gas[i].pressure() * gas[i].gasVolume / (kRAir * kTAmbient);
 
@@ -637,6 +705,36 @@ std::vector<std::string> Model::validate() const {
         if (f.diameter <= 0) problems.push_back("fire '" + f.name + "' has non-positive diameter");
         if (f.convectiveFraction <= 0 || f.convectiveFraction > 1)
             problems.push_back("fire '" + f.name + "' has a convective fraction outside (0, 1]");
+    }
+    for (const Drencher& s : drenchers) {
+        if (s.gasCompartment < 0 || s.gasCompartment >= n)
+            problems.push_back("drencher '" + s.name + "' is in a gas space that does not exist");
+        if (s.evaporatedFraction < 0 || s.evaporatedFraction > 1)
+            problems.push_back("drencher '" + s.name +
+                               "' has an evaporated fraction outside [0, 1]");
+        if (s.flow < 0) problems.push_back("drencher '" + s.name + "' has a negative flow");
+        // A nozzle hotter than saturation removes no sensible heat and the model
+        // would quietly deliver water that cools nothing.
+        if (s.waterTemperature >= kTSaturation)
+            problems.push_back("drencher '" + s.name + "' supplies water at or above boiling");
+    }
+    for (const Scupper& sc : scuppers) {
+        if (sc.gasCompartment < 0 || sc.gasCompartment >= n) {
+            problems.push_back("scupper '" + sc.name + "' is in a gas space that does not exist");
+            continue;
+        }
+        // A scupper drains a ship compartment's water, so a gas space that is not
+        // attached to one has nothing for it to drain. Silent otherwise: the port
+        // would simply never run, which looks exactly like a blocked one.
+        if (gas[static_cast<std::size_t>(sc.gasCompartment)].shipCompartment == kSea)
+            problems.push_back("scupper '" + sc.name +
+                               "' drains a gas space with no ship compartment behind it");
+        if (sc.width <= 0) problems.push_back("scupper '" + sc.name + "' has no width");
+        // A sill below the deck it drains would sit permanently under water and
+        // pass the whole compartment overboard.
+        const GasCompartment& g = gas[static_cast<std::size_t>(sc.gasCompartment)];
+        if (sc.sillPos.z < g.floorZ - 1e-9)
+            problems.push_back("scupper '" + sc.name + "' has its sill below the deck it drains");
     }
     return problems;
 }
@@ -679,6 +777,12 @@ StepResult Model::step(double dt, const Ship& ship, const Sea& sea) {
 
 bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out) {
     const std::size_t n = gas.size();
+    // A caller that pushed a compartment on after `attach()` without resetting
+    // the account would otherwise index past the end of this. `appliedMass_` has
+    // the same shape and the same exposure; resizing here rather than asserting
+    // keeps a hand-assembled model -- which is how every unit fixture in
+    // `tests/test_fire.cpp` is built -- from being a special case.
+    if (pendingWater_.size() != n) pendingWater_.resize(n, 0.0);
     Deltas d(n);
     // The non-vent energy rate per compartment: what the fire and the boundary do
     // to its pressure over this step whatever the vents carry. The implicit
@@ -737,6 +841,153 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
         const double ms = f.productYield * q;
         d.dsU[i] += ms;
         d.productsGenerated += ms;
+    }
+
+    // --- Suppression: what the drenchers take out ---------------------------
+    //
+    // Before the vents for the same reason the boundary loss is: this is a
+    // non-vent energy rate and the implicit pressure solve needs it as the
+    // constant term of its equation. It is not a small one. A ro-ro drencher
+    // sized to SOLAS puts 5 L/(min m^2) over the space, which over one 20 m
+    // section of the ferry's vehicle deck is 31.1 kg/s and a nominal cooling
+    // demand of 32.1 MW at the default evaporated fraction -- half as much again
+    // as the 20 MW lorry fire it is aimed at. Leaving it out of the pressure
+    // equation would let the vents carry what a compartment tens of megawatts
+    // hotter would have carried.
+    for (Drencher& s : drenchers) {
+        s.lastCooling = s.lastEvaporated = s.lastToDeck = 0;
+        if (!s.on || s.flow <= 0) continue;
+        if (s.gasCompartment < 0 || s.gasCompartment >= static_cast<int>(n)) continue;
+        const std::size_t i = static_cast<std::size_t>(s.gasCompartment);
+        GasCompartment& g = gas[i];
+        const double e = std::clamp(s.evaporatedFraction, 0.0, 1.0);
+
+        // What one kilogram of spray takes out of the layer it falls through.
+        //
+        //   * **Sensible**: the drops leave at the layer's own temperature, or at
+        //     saturation if the layer is hotter than that -- water cannot be
+        //     heated past boiling and cannot be heated past the gas heating it.
+        //   * **Latent**: `e L` on the evaporating share, ramped in over
+        //     `kEvaporationBand` above saturation rather than switched on at it.
+        //
+        // Both are functions of the layer temperature and that is the whole point.
+        // The first version made `perKg` a constant of the drencher and capped the
+        // *engaged mass* at what the layer could supply, which is the same idiom
+        // the entrainment cap uses -- and it was wrong here for a reason the
+        // entrainment cap does not have. Entrainment's cap binds on a transient;
+        // this one binds at the **steady state**, because a drencher routinely
+        // out-absorbs the fire it is aimed at. A cap that binds every step forever
+        // makes the applied rate `available / dt`, which is a function of the
+        // substep and not of the physics: the model stopped converging under
+        // refinement.
+        //
+        // Measured, on the fixture that shows it worst -- 20 kg/s into the ISO
+        // room's 2 MW fire, a nominal demand ten times the release. Under the cap
+        // the layer sat pinned at the water temperature and the applied rate was
+        // whatever the step made it. Under the relaxation it settles at a steady
+        // 333.4 K with 9.3% of the demand applied, and refining the substep 16x
+        // moves the water landing on the deck by 0.6%.
+        //
+        // Written this way the sink vanishes as the layer reaches the water's own
+        // temperature, so there is a real equilibrium -- `Q_fire = Q_spray(T)` --
+        // and it is the same at any step size.
+        const double tu = g.upper.temperature();
+        const double excess = tu - s.waterTemperature;
+        const double share = std::clamp((tu - kTSaturation) / kEvaporationBand, 0.0, 1.0);
+        const double perKg =
+            kCpWater * std::max(std::min(tu, kTSaturation) - s.waterTemperature, 0.0) +
+            e * kLatentHeat * share;
+        const double demand = s.flow * perKg;
+
+        // Applied **exactly, not explicitly**, as an equivalent relaxation of the
+        // layer towards the temperature of the water -- the same treatment, and
+        // for the same reason, as the boundary loss below. The layer a spray falls
+        // into can be arbitrarily thin: this model's seed layer is half a
+        // millimetre and holds 0.12 kg, against which 30 kg/s of water is a time
+        // constant of microseconds. Explicitly that is unusable at any step the
+        // rest of the model wants to take.
+        //
+        // `-expm1(-x)` lies in [0, 1] and is below `x`, so this can neither take
+        // the layer past the water's temperature at any dt, nor remove more than
+        // the demand; and it tends to the demand as dt shrinks, which is what
+        // makes the scheme converge.
+        const double capacity = g.upper.mass * kCvAir;
+        double cooling = 0;
+        if (demand > 0 && excess > 0 && capacity > 0 && dt > 0) {
+            const double kEff = demand / excess;   // W/K, the equivalent coefficient
+            cooling = capacity * excess * -std::expm1(-kEff * dt / capacity) / dt;
+        }
+
+        // The steam leaves in the same proportion as the heat: a step that could
+        // only take a fraction of the demand only boiled that fraction away.
+        const double evaporated =
+            demand > 0 ? e * share * s.flow * (cooling / demand) : 0.0;
+        // Everything that did not leave as steam lands. This is the term the
+        // stability half of the roadmap item is about, and it is the *whole* flow
+        // when the compartment is cold.
+        const double toDeck = s.flow - evaporated;
+
+        s.lastCooling = cooling;
+        s.lastEvaporated = evaporated;
+        s.lastToDeck = toDeck;
+
+        d.dEU[i] -= cooling;
+        d.suppression += cooling;
+        sourceRate[i] -= cooling;
+        d.waterDelivered += s.flow;
+        d.waterEvaporated += evaporated;
+        d.dWater[i] += toDeck;
+    }
+
+    // --- Suppression: what the freeing ports get back out -------------------
+    //
+    // No gas term at all, so this sits outside the pressure solve: a scupper
+    // moves water between the deck and the sea and the model's only interest in
+    // it is the water. It is still accumulated as a rate into `Deltas` rather
+    // than applied here, so that a rejected substep leaves no trace of it.
+    for (Scupper& sc : scuppers) {
+        sc.lastFlow = sc.lastInsideHead = sc.lastOutsideHead = 0;
+        if (sc.blocked || sc.width <= 0 || sc.dischargeCoeff <= 0) continue;
+        if (sc.gasCompartment < 0 || sc.gasCompartment >= static_cast<int>(n)) continue;
+        const std::size_t i = static_cast<std::size_t>(sc.gasCompartment);
+        const int shipIdx = gas[i].shipCompartment;
+        if (shipIdx == kSea || shipIdx >= static_cast<int>(ship.compartments.size())) continue;
+        const Compartment& c = ship.compartments[static_cast<std::size_t>(shipIdx)];
+
+        // Both heads are true vertical depths in world coordinates, taken at the
+        // port's own position -- the same comparison `Ship::sideStateAt` makes
+        // when it decides whether an opening has water against it. On a lolled
+        // ship the low-side ports carry a head the high-side ones do not, and
+        // that asymmetry is the physics, not an artefact.
+        const Vec3 sillWorld = ship.state.orientation.toMat3() * sc.sillPos + ship.state.position;
+        // A dry compartment parks its free surface a metre below its own floor, so
+        // `surfaceWorldZ` only means anything when there is water to have a
+        // surface.
+        const double insideHead =
+            c.waterVolume > 1e-9 ? std::max(c.surfaceWorldZ - sillWorld.z, 0.0) : 0.0;
+        const double outsideHead =
+            std::max(sea.heightAt(sillWorld.x, sillWorld.y) - sillWorld.z, 0.0);
+        sc.lastInsideHead = insideHead;
+        sc.lastOutsideHead = outsideHead;
+
+        double q = sc.dischargeCoeff * sc.width * scupperFlow(insideHead, outsideHead);
+        if (q == 0) continue;
+
+        // The ship's own water level is a step behind -- `step()` reads the ship
+        // const and may take many substeps against one snapshot of it -- so the
+        // rate is capped by what is actually there to move. At any sane tick the
+        // correction is nothing: a 2 m port under 0.1 m of head passes 0.056 m^3/s
+        // against a deck holding hundreds. It is here for the pathological caller,
+        // and because a port that drains water the ship does not have would show
+        // up as a broken water account rather than as anything visible.
+        const double held = c.waterVolume + pendingWater_[i];
+        if (q > 0) q = std::min(q, std::max(held, 0.0) / std::max(dt, 1e-12));
+        else q = -std::min(-q, std::max(c.floodableVolume() - held, 0.0) / std::max(dt, 1e-12));
+
+        sc.lastFlow = q;
+        const double kg = q * ship.seaDensity;
+        d.dWater[i] -= kg;
+        d.waterDrained += kg;
     }
 
     // --- Boundary heat loss -------------------------------------------------
@@ -1049,9 +1300,19 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
         g.lower.products = std::max(g.lower.products + d.dsL[i] * dt, 0.0);
     }
 
+    // The water the drenchers landed and the ports did not take back, converted
+    // to volume at the density `Ship` weighs floodwater with -- so that the mass
+    // this model says it delivered is the mass the ship's displacement gains.
+    for (std::size_t i = 0; i < n; ++i)
+        if (d.dWater[i] != 0.0) pendingWater_[i] += d.dWater[i] * dt / ship.seaDensity;
+
     account.heatReleased += d.heat * dt;
     account.radiativeLoss += d.radiative * dt;
     account.wallLoss += d.wall * dt;
+    account.suppressionCooling += d.suppression * dt;
+    account.waterDelivered += d.waterDelivered * dt;
+    account.waterEvaporated += d.waterEvaporated * dt;
+    account.waterDrained += d.waterDrained * dt;
     account.enthalpyIn += d.enthalpyIn * dt;
     account.enthalpyOut += d.enthalpyOut * dt;
     account.massIn += d.massIn * dt;
@@ -1059,6 +1320,7 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
     account.productsGenerated += d.productsGenerated * dt;
     account.productsOut += d.productsOut * dt;
     out.entrainment = d.entrained;
+    out.suppressionCooling = d.suppression;
 
     time += dt;
     account.energy = 0;
@@ -1073,6 +1335,7 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
 }
 
 void Model::applyTo(Ship& ship) {
+    if (pendingWater_.size() != gas.size()) pendingWater_.resize(gas.size(), 0.0);
     for (std::size_t i = 0; i < gas.size(); ++i) {
         const GasCompartment& g = gas[i];
         if (g.shipCompartment == kSea) continue;
@@ -1083,6 +1346,43 @@ void Model::applyTo(Ship& ship) {
         const double mEq = g.pressure() * g.gasVolume / (kRAir * kTAmbient);
         c.airMass += mEq - appliedMass_[i];
         appliedMass_[i] = mEq;
+
+        // Suppression water, handed over to the flooding solve and forgotten.
+        // From here the ship owns it: it re-levels against gravity, it moves the
+        // centre of gravity, it makes a free surface, and it may leave again
+        // through the ship's own openings. Nothing in this file models any of
+        // that, because `Ship` already does and doing it twice would be two
+        // answers to one question.
+        //
+        // **Guarded rather than written unconditionally.** `x += 0.0` is not
+        // quite the identity -- it turns a negative zero positive -- and
+        // `Compartment::waterVolume` is clamped by a `std::clamp` that returns
+        // its argument unchanged when it compares equal to the bound, so a
+        // negative zero is reachable. The exact control this file is under says
+        // *bit*-identical, so the store is skipped rather than made harmless.
+        //
+        // Mutation testing says the suite **cannot currently tell**: replacing
+        // this condition with `true` survives every test, because no fixture ever
+        // has a compartment at a negative zero or outside its own bounds when
+        // nothing is owed. It stays anyway. The condition costs one comparison,
+        // and the alternative is a write and a clamp on every tracked compartment
+        // on every call for a model that is doing nothing -- which is the shape of
+        // thing the exact control exists to forbid, whether or not today's
+        // fixtures can catch it.
+        //
+        // What will not fit stays **owed** rather than being dropped. A
+        // compartment flooded solid still has a drencher running into it, and
+        // discarding the overflow here would put a hole in the water account of
+        // exactly the kind the layer clamps put in the energy one. Kept, the
+        // invariant `written + owed == waterDelivered - evaporated - drained`
+        // holds for the model's whole life, which is what
+        // `tests/test_fire.cpp` asserts.
+        if (pendingWater_[i] != 0.0) {
+            const double want = c.waterVolume + pendingWater_[i];
+            const double got = std::clamp(want, 0.0, c.floodableVolume());
+            c.waterVolume = got;
+            pendingWater_[i] = want - got;
+        }
     }
 }
 

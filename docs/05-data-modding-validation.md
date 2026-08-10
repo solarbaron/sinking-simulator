@@ -324,7 +324,7 @@ right" — a number, compared against a number someone else measured.
 | Volume→plane-offset solve round trip | self-consistency to 1e-6 relative |
 | Floating draft of a homogeneous box | Archimedes |
 | Metacentric height of a box barge | KB + BM − KG with BM = L·B³/12V |
-| Free-surface loss of GM | ρ·i/Δ, matched within 15% |
+| Free-surface loss of GM | ρ·i/Δ, matched within 15% — the slack is the two barges not having quite the same KG, not the model. `test_fire.cpp` remakes the comparison with the centroid held identical and gets **1.4e-6** on a box barge, and 2e-4 on the ferry's vehicle deck where the second moment is itself a mesh integration |
 | Trapped air arresting flooding | Boyle's law, pV conserved within 2% |
 | Water mass conservation across a network | flow through the breach = water held |
 
