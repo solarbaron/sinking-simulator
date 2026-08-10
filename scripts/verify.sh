@@ -228,6 +228,18 @@ if [ -x ./build/section_probe ]; then
 else
   skip "section_probe not built"
 fi
+# The volumetric fire and smoke pass on the ferry. Its own closed-form checks live
+# in the unit suite; what this adds is the whole chain on a real casualty — a
+# two-zone fire model driving a renderer that must not invent anything it does not
+# have — and every figure `docs/03-renderer-audio.md`'s fire section publishes.
+# It asserts the *absence* of a glow at 4 MW, which is the finding that would go
+# stale first if someone reached for the exposure knob.
+if [ -x ./build/smoke_view ]; then
+  expect_ok "smoke_view" '^ok$|no usable GPU' \
+            ./build/smoke_view --out=/tmp --frames=8 --duration=600
+else
+  skip "smoke_view not built"
+fi
 if [ -x ./build/seaway_view ]; then
   expect_ok "seaway_view" '^ok$|no usable GPU' \
             ./build/seaway_view --out=/tmp --frames=2

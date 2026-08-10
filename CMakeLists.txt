@@ -39,6 +39,11 @@ add_library(shipsim_engine
   # and holes in it, with nothing in it that needs a device.
   engine/gpu/material.cpp
   engine/gpu/damage.cpp
+  # The optics of a two-zone fire: Planck, Beer-Lambert, and a segment against a
+  # half space. Not one line of it needs a device, and every formula the smoke
+  # shader evaluates is stated here as well, so a machine with no GPU still checks
+  # the whole model.
+  engine/gpu/smoke.cpp
   engine/sim/ship.cpp
   engine/sim/shipfile.cpp
   engine/sim/breach.cpp
@@ -131,6 +136,7 @@ add_executable(shipsim_tests
   tests/test_solid_shell.cpp
   tests/test_thermal.cpp
   tests/test_shipfile.cpp
+  tests/test_smoke.cpp
   tests/test_worldio.cpp
   tests/test_zone.cpp
   tests/test_jobs.cpp
@@ -161,7 +167,7 @@ if(Vulkan_FOUND AND GLSLC)
   foreach(SHADER tet_forces.comp node_integrate.comp solidshell_forces.comp
                  solidshell_forces_wg.comp
                  solidshell_integrate.comp mesh.vert mesh.frag ocean.vert ocean.frag
-                 hull.vert hull.frag)
+                 hull.vert hull.frag smoke.vert smoke.frag)
     add_custom_command(
       OUTPUT ${SHADER_OUT}/${SHADER}.spv
       COMMAND ${GLSLC} -O
@@ -200,17 +206,20 @@ if(Vulkan_FOUND AND GLSLC)
   add_custom_target(shipsim_shaders DEPENDS ${SPV_FILES})
 
   target_sources(shipsim_engine PRIVATE engine/gpu/device.cpp engine/gpu/offscreen.cpp
-                                        engine/gpu/ocean.cpp engine/gpu/hull.cpp)
+                                        engine/gpu/ocean.cpp engine/gpu/hull.cpp
+                                        engine/gpu/smoke_gpu.cpp)
   # The `{VK_STRUCTURE_TYPE_X}` idiom value-initialises the remaining fields,
   # which is exactly what Vulkan wants. Scoped to this file so the rest of the
   # library keeps the warning.
   set_source_files_properties(engine/gpu/device.cpp engine/gpu/offscreen.cpp
-                              engine/gpu/ocean.cpp engine/gpu/hull.cpp PROPERTIES
+                              engine/gpu/ocean.cpp engine/gpu/hull.cpp
+                              engine/gpu/smoke_gpu.cpp PROPERTIES
     COMPILE_OPTIONS "-Wno-missing-field-initializers")
   target_link_libraries(shipsim_engine PUBLIC Vulkan::Vulkan)
   target_compile_definitions(shipsim_engine PUBLIC SHIPSIM_HAS_VULKAN=1)
   target_sources(shipsim_tests PRIVATE tests/test_device.cpp tests/test_offscreen.cpp
                                        tests/test_ocean.cpp tests/test_hull_render.cpp
+                                       tests/test_smoke_render.cpp
                                        tests/test_zone_gpu.cpp engine/gpu/zone_gpu.cpp)
   set_source_files_properties(engine/gpu/zone_gpu.cpp PROPERTIES
     COMPILE_OPTIONS "-Wno-missing-field-initializers")
@@ -239,6 +248,17 @@ if(Vulkan_FOUND AND GLSLC)
   target_compile_definitions(seaway_view PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}"
     SHIPSIM_MATERIAL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/engine/gpu/materials")
   target_compile_options(seaway_view PRIVATE -Wall -Wextra)
+
+  # The Phase 4 milestone's picture: an engine-room fire drawn from the two-zone
+  # gas state, with the layer descending and the compartment next door filling
+  # through the door. Every figure `docs/03-renderer-audio.md`'s fire section
+  # publishes comes out of here.
+  add_executable(smoke_view tools/smoke_view/main.cpp game/prototype/ferry.cpp)
+  add_dependencies(smoke_view shipsim_shaders)
+  target_link_libraries(smoke_view PRIVATE shipsim_engine)
+  target_compile_definitions(smoke_view PRIVATE SHIPSIM_SHADER_DIR="${SHADER_OUT}"
+    SHIPSIM_MATERIAL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/engine/gpu/materials")
+  target_compile_options(smoke_view PRIVATE -Wall -Wextra)
 
   add_executable(ram_view tools/ram_view/main.cpp game/prototype/ferry.cpp)
   add_dependencies(ram_view shipsim_shaders)

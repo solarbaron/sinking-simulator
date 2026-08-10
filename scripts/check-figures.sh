@@ -305,6 +305,58 @@ else
   echo "  - section_probe not built, skipping the reach figures"
 fi
 
+# --- the volumetric fire and smoke figures ---------------------------------------
+#
+# `docs/03-renderer-audio.md`'s fire section publishes a table of what a two-zone
+# fire looks like and three findings taken off it, and the findings are the fragile
+# part: "this fire has no fire in it" is a *negative* result, and a negative result
+# is exactly what a well-meaning change to an exposure constant would quietly
+# reverse. So the glow threshold and the peak layer temperature are checked as a
+# pair, on either side of each other, rather than as two numbers.
+#
+# ~10 s. `smoke_view` asserts these itself and exits non-zero if they move; what
+# this adds is that the *document* still says what the tool says.
+SMOKE=${SMOKE:-./build/smoke_view}
+RENDER_DOC=docs/03-renderer-audio.md
+if [ -x "$SMOKE" ]; then
+  smoke=$("$SMOKE" --out=/tmp --frames=8 --duration=600 2>&1)
+  if printf '%s\n' "$smoke" | grep -q 'no usable GPU'; then
+    echo "  - no Vulkan device, skipping the fire and smoke figures"
+  else
+    for h in "at **834 K**" "peaks at **531 K**" "reaches 511" \
+             "84.1% of the engine"; do
+      hint "$h" "$RENDER_DOC"
+    done
+    # Each reader anchored to its own line, for the reason the damage figures are:
+    # `531` also appears in the table two rows above the one being read.
+    last_frame() { printf '%s\n' "$1" | grep 'smoke_07.png' | awk '{ print $'"$2"' }'; }
+    glow=$(printf '%s\n' "$smoke" | sed -n 's/.*one byte of red on the screen at \([0-9]*\) K.*/\1/p')
+    peak=$(printf '%s\n' "$smoke" | sed -n 's/.*this one peaked at \([0-9]*\) K.*/\1/p')
+    check "the glow threshold (K)" 834 1 "$glow" "at **834 K**" "$RENDER_DOC"
+    check "the ferry fire's peak layer temperature (K)" 531 2 "$peak" \
+          "peaks at **531 K**" "$RENDER_DOC"
+    checks=$((checks + 1))
+    if [ -n "$glow" ] && [ -n "$peak" ] && [ "$peak" -lt "$glow" ]; then
+      printf '  %s✓%s and the finding still holds: %s K of gas against a %s K threshold,'\
+' so there is no glow to draw\n' "$green" "$off" "$peak" "$glow"
+    else
+      printf '  %s✗%s the ferry fire now reaches the glow threshold (%s K vs %s K)\n' \
+             "$red" "$off" "$peak" "$glow"
+      printf '      %s%s says "This fire has no fire in it"%s\n' "$dim" "$RENDER_DOC" "$off"
+      fails=$((fails + 1))
+    fi
+    check "optical depth across the room at t = 600 s" 511 3 "$(last_frame "$smoke" 7)" \
+          "reaches 511" "$RENDER_DOC"
+    check "the layer's extinction at t = 600 s (1/m)" 19.90 0.1 "$(last_frame "$smoke" 6)" \
+          "| 19.90 | 511" "$RENDER_DOC"
+    plan=$(printf '%s\n' "$smoke" | sed -n 's/.*\([0-9][0-9]\.[0-9][0-9]\)% of the bounding box.*/\1/p')
+    check "the drawn prism, % of the bounding box in plan" 84.11 0.05 "$plan" \
+          "84.1% of the engine" "$RENDER_DOC"
+  fi
+else
+  echo "  - smoke_view not built, skipping the fire and smoke figures"
+fi
+
 if [ "$fails" -eq 0 ]; then
   echo "ok — $checks published figures still match the tool"
   exit 0

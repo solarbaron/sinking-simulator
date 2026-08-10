@@ -971,6 +971,179 @@ representation (NanoVDB-style) so only the burning compartments cost anything.
 Smoke layer descent in the multi-zone model renders as a genuine stratified layer,
 which is both correct and much cheaper than a full volume.
 
+### Fire and smoke — what exists
+
+`engine/gpu/smoke.{hpp,cpp}`, `engine/gpu/smoke_gpu.cpp`,
+`engine/gpu/shaders/smoke.{vert,frag}`, `tests/test_smoke.cpp`,
+`tests/test_smoke_render.cpp`, `tools/smoke_view`.
+
+**The last sentence of the plan above turned out to be the whole of it, and the
+first sentence turned out not to apply.** `engine/sim/fire.hpp` is a *two-zone*
+model: per compartment it carries a hot upper layer over a cool lower one — two
+masses, two internal energies, two species loadings and an interface height. There
+are no density or temperature *fields* to raymarch against, so there is no
+raymarch. The medium is exactly uniform inside each layer, which makes the
+transfer integral closed form:
+
+    L = B (1 − e^(−k d)) + e^(−k d) L_bg
+
+per layer, composed in the order the ray meets them. Along a straight ray through
+a horizontally stratified medium that order is unambiguous even where the geometry
+chops the path into pieces, because z is monotone in the ray parameter — so two
+path lengths and a sign are the whole of it, and the analytic ray–prism
+intersection replaces the march entirely. Extinction and emissivity are the same
+exponential (Kirchhoff), so **a transparent gas does not glow at any temperature**
+and a compartment holding nothing but ambient air composites to the background bit
+for bit.
+
+**What the model cannot support, and is therefore not drawn.** Stated here because
+a renderer that invents structure the simulation does not have is a lie that will
+be believed:
+
+- **No plume.** Heskestad's correlation appears in `fire.hpp` as an entrainment
+  *rate* — one scalar, kg/s — and as a mean flame height. The shape that produced
+  the correlation was integrated away when it was fitted and is not recoverable.
+- **No flame.** `DesignFire` carries a heat release, a base height and a pan
+  diameter; there is no flame temperature anywhere in the model. A glowing cylinder
+  of Heskestad's mean height would be a scalar wearing a shape.
+- **No ceiling jet and no horizontal structure at all.** A zone is well mixed by
+  definition.
+- **No vertical structure inside a layer**, and the interface is drawn sharp,
+  because `fire.hpp` says it is a plane. Softening it would be drawing a mixing
+  layer the model does not have — and it would cost the assertion that the
+  interface lands where `sim::clipToPixel` puts it.
+- **No scattering.** Smoke scatters about as much as it absorbs; treating
+  extinction as pure absorption makes a lit layer too dark and stops it glowing
+  when a torch is shone into it. In-scattering needs a light list, which is a
+  renderer this one is not yet.
+
+**The prism is the model's, not the compartment's.** `Model::attach` sets
+`floorArea = gasVolume / height` and says why in as many words: a bounding box
+"would over-state the floor area by the turn of the bilge and the interface would
+descend too slowly by exactly that ratio". So the drawn volume is that prism —
+the compartment's plan aspect ratio scaled to the model's own floor area — and the
+drawn gas volume equals `gasVolume`, the drawn hot-layer volume equals
+`upperVolume()`, both to machine precision. Measured on the ferry, how box-like
+each compartment is (mesh volume as a fraction of its bounding box):
+
+| engine rooms | holds | vehicle deck | accommodation | forepeak | fwd wing tanks |
+|---|---|---|---|---|---|
+| 99.0% | 96.7–98.7% | 93.4% | 98.8% | 57.8% | 58.0% |
+
+A machinery-space fire is therefore drawn on essentially the right box; a forepeak
+fire is drawn on the box the *model* used, which is smaller than the space, and
+that is the model's approximation showing rather than the renderer's. The drawn
+prism is smaller again by the compartment's permeability — 84.1% of the engine
+room's bounding box in plan — because `gasVolume` is the volume of gas and the
+machinery displaces the rest.
+
+**Optics from the state, with one knob and one display mapping.** Extinction is a
+mass extinction coefficient times a concentration the model states:
+`k = K_m · products / V_layer`, with `K_m = 8700 m²/kg` (the SFPE Handbook's
+recommended value for the smoke of flaming combustion). `fire.hpp`'s tracer is a
+0.05 kg/kg yield, which is a soot-like yield rather than a total-products one, so
+that is the right coefficient to apply to it; `SmokeShading::massExtinction` is
+the one knob if a ship's fuel says otherwise. Emission is Planck's law integrated
+over three contiguous 100 nm bands (R 600–700, G 500–600, B 400–500 nm) — a
+spectral binning, not a colourimetric transform, because there is no CIE data in
+this repository to do one with. The whole-spectrum integral recovers
+Stefan–Boltzmann to 1e-9 and the peak sits on Wien's wavelength to 1e-6, both
+asserted.
+
+The single display mapping is `SmokeShading::referenceTemperature`, the gas
+temperature whose brightest band reads 1.0. It has to exist because the lit pass's
+radiance scale is arbitrary, and it has to be a *temperature* rather than a gain
+because the exponential is brutal: **the visible-band radiance of a grey body
+rises by a factor of about 400 between 900 K and 1200 K**, so no linear mapping
+shows both.
+
+**What a two-zone fire actually looks like, measured.** `smoke_view` on the ferry,
+4 MW fast-growth machinery fire in `engine_room_s` (1150 m³, both engine rooms
+tracked, watertight door open to port):
+
+| t (s) | Q (MW) | T_upper (K) | interface z (m) | k (1/m) | τ across the room | visibility 3/k (m) |
+|---|---|---|---|---|---|---|
+| 0   | 0.00 | 288 | 7.00 | 0.00  | 0    | clear |
+| 171 | 1.38 | 343 | 3.43 | 2.34  | 60   | 1.28  |
+| 343 | 4.00 | 523 | 3.05 | 11.22 | 288  | 0.267 |
+| 600 | 4.00 | 531 | 3.13 | 19.90 | 511  | 0.151 |
+
+Three findings, none of them expected:
+
+- **This fire has no fire in it.** A grey layer first puts one byte of red on the
+  screen at **834 K**; this one peaks at **531 K** and emits 9.6e-10 of full scale.
+  What a 4 MW machinery fire in an engine room looks like, through a two-zone
+  model, is *smoke*. The glow is a result and not a setting, and `smoke_view`
+  asserts its absence rather than tuning it into view. Raising the design fire to
+  10 MW reaches 862 K and the layer does then glow.
+- **The layer goes optically black within about a minute and stays there.** τ
+  across the room passes 10 before t = 100 s and reaches 511. So the only visible
+  information a two-zone model carries is the **interface height** — there is no
+  gradient to see, because there is no gradient in the model.
+- **The layer does not descend monotonically.** It reaches 2.96 m at about t = 300
+  s as the fire stops growing, then *recovers* to 3.13 m as the room settles into
+  its vented steady state and the hot layer loses mass through the door. The first
+  version of the test asserted a monotone descent and was wrong about the physics,
+  not about the code.
+
+**Cost on the target card** (GTX 1070 Ti, 960 × 540, two compartments):
+**0.007 ms** for the volumetric pass against 0.056 ms for the lit solid it sits
+on. There is nothing to optimise: an analytic two-slab integral is one `exp` per
+layer per pixel and the geometry is 36 generated vertices per compartment. Two
+passes in one command buffer — the lit solid through `HullRenderer`'s own SPIR-V,
+then the medium composited over it with premultiplied alpha, so `exp(−k d)` is the
+blender's destination factor rather than a second copy of Beer–Lambert in the
+shader.
+
+**How it is checked.** Closed forms on pixels, all agreeing to **one
+least-significant bit** — which is the whole budget an 8-bit store allows:
+
+- a uniform slab of known `k` and known thickness transmits `exp(−k t/|dir.x|)`,
+  predicted in one line with no geometry code behind it;
+- doubling the thickness squares that;
+- the medium stops at whatever is solid, at the path length in front of it;
+- every pixel against `engine/gpu/smoke.cpp`, which states the same transfer
+  integral in double from the formula rather than from the shader — the same
+  arrangement `material.hpp` has with `hull.frag`;
+- the interface is bracketed by the projections of the interface on the prism's
+  near and far faces (2 px apart at 70 m), is exactly the clear colour below the
+  first and opaque above the second, and is monotone between them;
+- **zero smoke is the unsmoked image, bit for bit** — against `HullRenderer`'s own
+  output, which also proves the lit pass here is that pass and not a copy that
+  drifted, and with a *drawn* volume of zero extinction as the stronger case.
+
+**One defect this suite would not have found on its own.** The pass first shipped
+culling the wrong face. From outside a volume both senses give exactly one fragment
+per pixel and exactly the same colour, so every closed-form check passed at 1 LSB;
+they differ only with the camera *inside* the medium, where keeping the near faces
+draws nothing at all, and that test was off by 152.
+
+**And four more the suite did not find, which mutation testing did.**
+`tools/smoke_view/mutate.py` runs 39 single-edit mutants from a copy of the tree
+outside the repository, with a per-mutant timeout, a negative control on clean
+source and four deliberate equivalent-or-unreachable edits that must survive. The
+first pass killed 31 of 35 real mutants with all four controls behaving, and each
+of the four survivors was a question no test asked:
+
+- **the layer order.** Every camera in the render suite happened to produce
+  ascending rays once the ship's heel was taken out of the body frame, so forcing
+  the composite order left the whole suite green. The per-pixel sweep now runs two
+  cameras and counts rays of both orders.
+- **`expm1` against `exp(x) − 1`.** The comment justifying `expm1` said the
+  whole-spectrum integral would fail without it, and that was false — the two
+  differ by 1e-16 there, because the region that cancels carries almost none of the
+  power. What does see it is the Rayleigh–Jeans *limit*, now asserted as a
+  convergence rate rather than at a point. Nothing tests a comment.
+- **the prism's aspect ratio.** A square footprint of the same plan area satisfies
+  the gas volume, the layer split and the interface height, and draws a 24 m engine
+  room as a 15 m square.
+- **the cool layer's own volume.** The ferry's lower layer never carries any
+  tracer, so sizing its concentration by the whole gas space produces the same
+  zero. That question now gets asked on a state set by hand.
+
+After those four checks were added, the survivors and the controls were re-run and
+every survivor was killed.
+
 ## VR
 
 Supported, and it constrains the above:
