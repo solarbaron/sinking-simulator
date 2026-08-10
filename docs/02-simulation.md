@@ -5977,6 +5977,21 @@ checked against a primary source in this worktree** — the turning-circle and
 drift-angle agreement above is evidence the set is at least self-consistent, but
 treat any individual number as unverified until someone opens the paper.
 
+**This was attempted and it failed, which is worth recording so nobody repeats
+the search.** The EN 1993-1-2 transcription above *was* closed this way — a
+scanned copy of the standard turned up and all 39 values checked out — but the
+MMG equivalent did not. Yasukawa & Yoshimura (2015) is the primary source and it
+is behind Springer; the promising secondary reproductions (an MDPI paper on
+KVLCC2 wave drift, several ScienceDirect and ResearchGate items) either return
+403 or exceed what can be fetched here. So the caveat above stands unchanged.
+
+What *did* get checked is the dimensionalisation, which is a different failure
+mode from a bad transcription and the one more likely to bite: the two levers are
+stored in metres, and against `length = 320.0` they give `x_H′ = −148.5/320 =
+−0.4641` and `l_R′ = −227.2/320 = −0.7100`. Those are the published
+non-dimensional values, so whatever the derivatives turn out to be, the code is
+not silently mixing a normalised coefficient with a dimensional one.
+
 **Calibration, not measurement.** Every free constant of the blade-section
 model: `pitchEffectiveness` 0.853, `sectionLiftSlope` 4.0,
 `sectionNormalForceMax` 1.4, `sectionDragCoeff` 0.018, `solidity` 0.194,
