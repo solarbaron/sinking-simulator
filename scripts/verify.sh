@@ -221,6 +221,24 @@ fi
 # was cut — and the unit suite can only afford two stations. This sweeps 47, with the
 # `halo = false` control alongside so that "every station agreed" cannot be reported
 # by a mesher that was never fixed.
+# The Phase 4 milestone as one act: a two-zone fire against the ferry's own engine
+# room bulkhead, an implicit conduction solve on that bulkhead, EN 1993-1-2 steel
+# under restrained expansion *and* the head of water behind it, and the panels that
+# go handed to `breach` and on into the flooding network. Every piece is unit-tested
+# alone; this is the only thing that runs the chain on a real ship.
+#
+# **And it is the only thing that runs the milestone's own sentence as an acceptance
+# test.** "Fails under the head of water behind it" is a claim that neither cause is
+# sufficient, so the tool runs the case three times -- fire with a dry hold, water
+# with no fire, both -- and refuses `ok` unless the two controls survive and the pair
+# does not. A fourth pass runs the pair with the damage evaluated but not applied,
+# because the failure relieves what caused it and a window measured off a relieved
+# run comes back equal to whatever restraint that run was given. ~45 s.
+if [ -x ./build/bulkhead_probe ]; then
+  expect_ok "bulkhead_probe" '^ok$' ./build/bulkhead_probe --quiet
+else
+  skip "bulkhead_probe not built"
+fi
 if [ -x ./build/section_probe ]; then
   expect_ok "section_probe reach"      '^ok$' ./build/section_probe --scan=2
   expect_ok "section_probe invariance" '^ok$' ./build/section_probe --invariance=2

@@ -4,13 +4,19 @@
 // network -- `docs/06-roadmap.md` Phase 4's "multi-zone compartment fire, species
 // transport through the opening network".
 //
-// This is deliberately *only* the gas. There is no combustion chemistry here (the
-// heat release rate is an input, a design fire), no soot particle model, no
-// radiation view factors, and no coupling into `thermal.hpp`'s conduction solve
-// or `scantlings.hpp`'s strength. Each of those is its own roadmap item. What
-// this file answers is: given a fire of a known power in a known space, how hot
-// does the gas get, how far down does the smoke layer come, and what crosses the
-// doors and vents.
+// This is very nearly *only* the gas. There is no combustion chemistry here (the
+// heat release rate is an input, a design fire), no soot particle model and no
+// radiation view factors. What this file answers is: given a fire of a known power
+// in a known space, how hot does the gas get, how far down does the smoke layer
+// come, and what crosses the doors and vents.
+//
+// **The one thing it does reach outside itself for is the boundary**, and that is
+// the Phase 4 milestone: `wallExchange` at the bottom of this file turns a
+// two-zone gas into the `thermal::Film`s a conduction solve wants, and takes the
+// steel's own surface temperature back. It is a handful of lines and it needed no
+// new mechanism on this side at all -- see the note there. Strength stays out:
+// what a hot bulkhead then carries is `thermal::HeatedMember`'s business and this
+// file does not know what a bulkhead is.
 //
 // --- Why this belongs next to the flooding network -----------------------------
 //
@@ -111,6 +117,7 @@
 #pragma once
 
 #include "ship.hpp"
+#include "thermal.hpp"   // Film, BoundaryFace: the boundary the structure sees
 
 #include <string>
 #include <vector>
@@ -551,6 +558,151 @@ struct Scupper {
 // port does once the ship has settled far enough to put it under. One formula for
 // all three, so there is no regime boundary to get wrong.
 double scupperFlow(double insideHead, double outsideHead);
+
+// ---------------------------------------------------------------------------
+// The boundary the structure sees
+// ---------------------------------------------------------------------------
+//
+// `docs/06-roadmap.md`'s Phase 4 milestone -- "an engine room fire that heats a
+// bulkhead until it fails under the head of water behind it" -- and the one link
+// of it that belongs in this file: what boundary condition a two-zone gas imposes
+// on a `thermal::Problem`.
+//
+// **The fire already had the loss term. What it did not have was a wall.**
+// `GasCompartment::wallConductance` and `wallTemperature` have been here since the
+// suppression work, and `step()` relaxes each layer towards `wallTemperature` over
+// its own wetted area exactly. But `wallConductance` was MQH's lumped `h_k` --
+// `sqrt(k rho c / t)`, a *wall* conductance standing in for the whole path -- and
+// `wallTemperature` was a constant, pinned at ambient for as long as the fire ran.
+// A compartment could burn for an hour against a boundary that never got warm.
+//
+// With a conduction solve on the other side, both halves change and neither needs
+// a new mechanism:
+//
+//   * `wallTemperature` becomes the steel's own surface temperature, which the
+//     solve produces;
+//   * `wallConductance` becomes the **gas-side film**, because the wall's own
+//     resistance is no longer being lumped into it -- it is being solved.
+//
+// So the same `expm1` relaxation that was standing in for a boundary now *is* the
+// boundary, and the energy it takes out of the gas is the energy the film puts
+// into the steel. `wallExchange` below produces both ends of that from one set of
+// temperatures, which is what stops them from being two answers.
+//
+// **Radiation is here and it is not an approximation.** `thermal.hpp` says plainly
+// that radiation is not in the conduction solve, because it is nonlinear in a way
+// conduction is not. It does not have to be:
+//
+//     sigma (T_g^4 - T_s^4) = sigma (T_g^2 + T_s^2)(T_g + T_s) (T_g - T_s)
+//
+// is an **identity**, so a film coefficient of `eps sigma (T_g^2+T_s^2)(T_g+T_s)`
+// delivers the Stefan-Boltzmann flux exactly at the two temperatures it was formed
+// at. Re-formed every coupling step, it is exact at every one of them; what it is
+// not is exact *within* a step, and the size of that is a measurement rather than
+// an argument -- `WallExchange::linearisationError` reports it. This is the same
+// arrangement `thermal.hpp` already describes in prose at `gaussTemperature`,
+// where a 900 C compartment is quoted through "an effective film of 200 W/(m^2 K),
+// which is EN's 25 for convection plus about 175 for the radiation this file does
+// not carry".
+
+// Convection and the emissivity of the gas-to-steel exchange. Defaults are
+// EN 1991-1-2 §3.1: 25 W/(m^2 K) on the fire-exposed side of a standard-fire
+// boundary, and a resultant emissivity of 0.7 (the code's 0.8 surface emissivity
+// against a near-black flame is 0.7 after the configuration factor a compartment
+// enclosed by its own hot layer carries).
+struct BoundaryFilm {
+    double convective = 25.0;   // W/(m^2 K)
+    double emissivity = 0.7;    // dimensionless, resultant
+};
+
+// Stefan-Boltzmann.
+inline constexpr double kStefanBoltzmann = 5.670374419e-8;   // W/(m^2 K^4)
+
+// `h_c + eps sigma (T_g^2 + T_s^2)(T_g + T_s)`, W/(m^2 K). Multiplying it by
+// `T_g - T_s` reproduces `h_c (T_g - T_s) + eps sigma (T_g^4 - T_s^4)`.
+//
+// **Algebraically exactly, and numerically better than the thing it reproduces.**
+// The two agree to 1.0e-13 relative over 280-1400 K wherever the two temperatures
+// differ by a kelvin or more, and where they differ by less it is `T_g^4 - T_s^4`
+// that is losing the digits, to the cancellation the factored form has none of.
+// That is not a curiosity: a coupled solve spends its time *near* equilibrium, which
+// is exactly where the difference form is worst, and at `T_g == T_s` this returns a
+// flux of exactly zero rather than a rounding of one -- which is what the
+// zero-heat-release control rests on.
+double filmCoefficient(double gasKelvin, double surfaceKelvin,
+                       const BoundaryFilm& params = {});
+
+// The two-zone boundary condition, as a `thermal::Problem` wants it, plus the two
+// numbers the gas wants back.
+//
+// **The split is by height, and that is the reason the model has two zones at all.**
+// A bulkhead standing in a compartment with a smoke layer over it has hot gas on its
+// upper part and cool air on its lower, and a single film at a mean temperature
+// would heat the whole bulkhead evenly -- which is precisely the thing the head of
+// water behind it is not doing, and the milestone turns on the two profiles being
+// different shapes. Faces are assigned by their own centroid height against
+// `GasCompartment::interfaceZ()`, in the **body** frame, which is where the
+// interface is defined.
+//
+// **`bandHeight` exists because one coefficient over a whole layer is not good
+// enough, and the size of that was measured rather than assumed.** A `Film` carries
+// one coefficient for its whole face set, so a layer treated as one film has its
+// radiative coefficient formed at the layer's *mean* surface temperature -- and the
+// radiative coefficient goes as `T_s^2`, so on a bulkhead whose upper part is at
+// 500 K and whose foot is held near ambient by the water behind it, the two ends of
+// one layer want coefficients differing by half. Measured on the ferry's own
+// bulkhead: 8.8 kW of a 110 kW exchange, 8%, at the worst step. Banding by height
+// fixes it for nothing, because surface temperature on a bulkhead varies with height
+// and almost not at all across it.
+//
+// Positive `bandHeight` therefore cuts the faces into horizontal bands of that
+// height and gives each its own film. **The band index is a pure function of the
+// face's own centroid**, so a caller that hands in the same face set every step gets
+// the same films in the same order every step -- which is what makes
+// `thermal::Solver::setFilm` usable at all, and what stops a coupled run from having
+// to re-prepare (and so reset its own energy account) every time the smoke layer
+// moves. Zero or negative gives exactly two films, split at the interface.
+struct WallExchange {
+    // Ready for `Problem::film`, in band order: with `bandHeight` positive, band 0
+    // is the lowest. Empty bands are kept, so the indexing does not depend on which
+    // heights happened to have faces at them.
+    std::vector<thermal::Film> film;
+    std::vector<double> area;      // m^2 per film
+    std::vector<double> surface;   // K, the area mean each film's coefficient was formed at
+
+    // What the gas should now carry, for the caller to write onto the
+    // `GasCompartment`. Area-weighted over every face handed in.
+    //
+    // **This extrapolates**, and it is the honest weakness of the coupling: the
+    // fire charges its boundary loss over the compartment's whole wetted enclosure,
+    // and the faces handed in are one bulkhead of it. Writing these says "the rest
+    // of the enclosure behaves like the part that is meshed". It is still a strict
+    // improvement on a constant `h_k` against a boundary pinned at ambient, and it
+    // is named rather than hidden.
+    double wallTemperature = 0;    // K
+    double wallConductance = 0;    // W/(m^2 K)
+    double totalArea = 0;          // m^2
+
+    // W into the solid at the temperatures handed in, by the films as built.
+    double heat = 0;
+    // The same, face by face, with each face's own surface temperature and the
+    // exact `sigma (T_g^4 - T_s^4)`. `heat - exactHeat` is zero when every face in a
+    // band is at the same temperature, which is what makes it a measure of the
+    // *spread within a band* rather than of the linearisation, and what makes it
+    // fall as `bandHeight` does.
+    double linearisationError = 0;   // W
+    double exactHeat = 0;            // W
+};
+
+// Build it. `surfaceKelvin` is one temperature per entry of `face`, which is what
+// a caller gets by averaging `thermal::Solver::temperature()` over each face's four
+// nodes. A mismatched or empty pair is refused: the result is empty, which
+// `Problem` will treat as no boundary at all, rather than a film at a silently
+// invented temperature.
+WallExchange wallExchange(const GasCompartment& gas,
+                          const std::vector<thermal::BoundaryFace>& face,
+                          const std::vector<double>& surfaceKelvin,
+                          const BoundaryFilm& params = {}, double bandHeight = 0.0);
 
 // ---------------------------------------------------------------------------
 // The account

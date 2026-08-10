@@ -100,6 +100,15 @@ target_compile_options(zone_probe PRIVATE -Wall -Wextra)
 # The Tier-1 section mesher at ship scale: eleven frame bays of the ferry cut out,
 # meshed, compared against the hull girder, refined, and reduced. Every figure
 # `docs/02-simulation.md` section 3 publishes about it comes out of here.
+# The Phase 4 milestone as one act: a two-zone fire, an implicit conduction solve on
+# the bulkhead it stands against, EN 1993-1-2 steel under restraint and a head of
+# water, and the panels that go handed to `breach`. No GPU. Each piece is unit-tested
+# alone; this is the only thing that runs the chain on a real ship, and the only
+# thing that runs the milestone's own sentence as an acceptance test.
+add_executable(bulkhead_probe tools/bulkhead_probe/main.cpp game/prototype/ferry.cpp)
+target_link_libraries(bulkhead_probe PRIVATE shipsim_engine)
+target_compile_options(bulkhead_probe PRIVATE -Wall -Wextra)
+
 add_executable(section_probe tools/section_probe/main.cpp game/prototype/ferry.cpp)
 target_link_libraries(section_probe PRIVATE shipsim_engine)
 target_compile_options(section_probe PRIVATE -Wall -Wextra)

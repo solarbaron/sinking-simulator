@@ -440,6 +440,104 @@ double scupperFlow(double insideHead, double outsideHead) {
 }
 
 // ---------------------------------------------------------------------------
+// The boundary the structure sees
+// ---------------------------------------------------------------------------
+
+double filmCoefficient(double gasKelvin, double surfaceKelvin, const BoundaryFilm& params) {
+    const double g = gasKelvin, s = surfaceKelvin;
+    // Factored, not `(g^4 - s^4)/(g - s)`: the quotient form is 0/0 when the gas and
+    // the surface are at the same temperature, which is the state every coupled run
+    // starts in and the state the exact control has to survive.
+    return params.convective +
+           params.emissivity * kStefanBoltzmann * (g * g + s * s) * (g + s);
+}
+
+WallExchange wallExchange(const GasCompartment& gas,
+                          const std::vector<thermal::BoundaryFace>& face,
+                          const std::vector<double>& surfaceKelvin, const BoundaryFilm& params,
+                          double bandHeight) {
+    WallExchange out;
+    if (face.size() != surfaceKelvin.size() || face.empty()) return out;
+
+    const double zi = gas.interfaceZ();
+    const double tUpper = gas.upper.temperature(), tLower = gas.lower.temperature();
+
+    // The band a face belongs to, as a pure function of its own centroid, so that the
+    // same face set always produces the same films in the same order. `zBase` is the
+    // lowest face centroid rather than the compartment floor: a caller who meshes
+    // part of a bulkhead should get bands over the part it meshed.
+    double zBase = face[0].centroid.z;
+    for (const thermal::BoundaryFace& f : face)
+        if (f.area > 0) zBase = std::min(zBase, f.centroid.z);
+    const bool banded = bandHeight > 0;
+    std::size_t bands = 2;
+    if (banded) {
+        double zTop = zBase;
+        for (const thermal::BoundaryFace& f : face)
+            if (f.area > 0) zTop = std::max(zTop, f.centroid.z);
+        bands = static_cast<std::size_t>((zTop - zBase) / bandHeight) + 1;
+    }
+    const auto bandOf = [&](const thermal::BoundaryFace& f) -> std::size_t {
+        if (!banded) return f.centroid.z >= zi ? 0u : 1u;
+        const auto b = static_cast<std::size_t>((f.centroid.z - zBase) / bandHeight);
+        return std::min(b, bands - 1);
+    };
+
+    out.film.assign(bands, thermal::Film{});
+    out.area.assign(bands, 0.0);
+    out.surface.assign(bands, 0.0);
+
+    // Two passes: the first sorts the faces and takes each band's area-weighted mean
+    // surface temperature, the second forms the coefficient at that mean. A single
+    // pass cannot, because the coefficient is a function of the mean and the mean is
+    // not known until every face in the band has been seen.
+    for (std::size_t i = 0; i < face.size(); ++i) {
+        const thermal::BoundaryFace& f = face[i];
+        if (!(f.area > 0)) continue;
+        const std::size_t b = bandOf(f);
+        out.area[b] += f.area;
+        out.surface[b] += f.area * surfaceKelvin[i];
+        out.film[b].face.push_back(f);
+    }
+    for (std::size_t b = 0; b < bands; ++b) {
+        if (out.area[b] <= 0) continue;
+        out.surface[b] /= out.area[b];
+        // A band's own gas temperature: the layer its faces sit in on average. With
+        // no banding this is exact, because the split *is* the interface; with bands
+        // it quantises the interface to the band height, which is the price of a
+        // film membership that does not move.
+        double meanZ = 0;
+        for (const thermal::BoundaryFace& f : out.film[b].face) meanZ += f.area * f.centroid.z;
+        meanZ /= out.area[b];
+        out.film[b].ambient = (banded ? meanZ >= zi : b == 0) ? tUpper : tLower;
+        out.film[b].coefficient = filmCoefficient(out.film[b].ambient, out.surface[b], params);
+    }
+
+    for (std::size_t i = 0; i < face.size(); ++i) {
+        const thermal::BoundaryFace& f = face[i];
+        if (!(f.area > 0)) continue;
+        const std::size_t b = bandOf(f);
+        const double tg = out.film[b].ambient, ts = surfaceKelvin[i];
+        out.heat += f.area * out.film[b].coefficient * (tg - ts);
+        out.exactHeat += f.area * (params.convective * (tg - ts) +
+                                   params.emissivity * kStefanBoltzmann *
+                                       (tg * tg * tg * tg - ts * ts * ts * ts));
+    }
+    out.linearisationError = out.heat - out.exactHeat;
+
+    for (std::size_t b = 0; b < bands; ++b) {
+        out.totalArea += out.area[b];
+        out.wallTemperature += out.area[b] * out.surface[b];
+        out.wallConductance += out.area[b] * out.film[b].coefficient;
+    }
+    if (out.totalArea > 0) {
+        out.wallTemperature /= out.totalArea;
+        out.wallConductance /= out.totalArea;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Model internals
 // ---------------------------------------------------------------------------
 

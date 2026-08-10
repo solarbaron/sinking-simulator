@@ -8,6 +8,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <map>
 
 namespace sim::thermal {
@@ -343,6 +344,98 @@ double restrainedBucklingTemperature(double elasticStress, const StructuralMater
                    johnsonOstenfeld(r.youngsModulus * elasticStress,
                                     r.effectiveYield * material.yieldStrength);
         },
+        referenceKelvin);
+}
+
+double twoStripStress(const StructuralMaterial& material, double kelvin, double hotFraction,
+                      double referenceKelvin) {
+    const double f = std::clamp(hotFraction, 0.0, 1.0);
+    if (f >= 1.0) return 0.0;   // nothing cold left to hold it: free expansion
+    // `-k_E E eps / (1 + (f/(1-f)) k_E)`, and not the reciprocal-sum form the header
+    // quotes it in, so that f = 0 divides by a literal 1.0 and returns
+    // `restrainedStress` bit for bit.
+    return restrainedStress(material, kelvin, referenceKelvin) /
+           (1.0 + (f / (1.0 - f)) * carbonSteelModulusFactor(kelvin));
+}
+
+double temperatureForElongation(double elongation) {
+    const double lo = kCelsius + 20.0, hi = kCelsius + 1200.0;
+    if (!(elongation > 0.0)) return lo;
+    if (elongation >= carbonSteelElongation(hi)) return hi;
+    // The curve is monotone non-decreasing, so a bisection on "has it got there yet"
+    // converges on the *lowest* temperature that has -- which is the bottom of the
+    // 750-860 C plateau for any elongation the plateau holds, and the exact answer
+    // everywhere else. 200 halvings is past what a double distinguishes over 1180 K,
+    // the same count and the same reasoning as `firstCrossing`.
+    double a = lo, b = hi;
+    for (int i = 0; i < 200; ++i) {
+        const double m = 0.5 * (a + b);
+        if (carbonSteelElongation(m) >= elongation) b = m;
+        else a = m;
+    }
+    return 0.5 * (a + b);
+}
+
+double beamColumnMagnifier(double axialOverEuler) {
+    if (!(axialOverEuler > 0.0)) return 1.0;
+    if (axialOverEuler >= 1.0) return std::numeric_limits<double>::infinity();
+    // `2 (sec u - 1) / u^2` is 0/0 at the origin and loses most of its digits to
+    // cancellation anywhere near it. The identities `sec u - 1 = (1 - cos u)/cos u`
+    // and `1 - cos u = 2 sin^2(u/2)` turn it into
+    //
+    //     Psi = (sin(u/2) / (u/2))^2 / cos u
+    //
+    // which is the same number exactly and has no subtraction in it at all: the
+    // sinc factor is 1.0 to the bit for small u, so the limit is approached rather
+    // than computed. No series expansion and therefore no truncation term to size.
+    const double u = 0.5 * kPi * std::sqrt(axialOverEuler);
+    const double sinc = std::sin(0.5 * u) / (0.5 * u);
+    return sinc * sinc / std::cos(u);
+}
+
+MemberState memberState(const HeatedMember& member, const StructuralMaterial& material,
+                        double kelvin, double referenceKelvin) {
+    const SteelReduction r = carbonSteelReduction(kelvin);
+    const double restraint = std::max(member.restraint, 0.0);
+
+    MemberState s;
+    s.axialStress = std::abs(restraint * restrainedStress(material, kelvin, referenceKelvin));
+    s.eulerStress = r.youngsModulus * std::max(member.eulerStress, 0.0);
+    s.yieldCapacity = r.effectiveYield * material.yieldStrength;
+    s.columnCapacity = johnsonOstenfeld(s.eulerStress, s.yieldCapacity);
+
+    // A member with no stiffness left has already gone, whatever it is carrying: at
+    // 1200 C EN 1993-1-2 takes both factors to exactly zero, which is the case
+    // `restrainedBucklingTemperature` records as always finding a crossing.
+    const double infinite = std::numeric_limits<double>::infinity();
+    s.axialOverEuler = s.eulerStress > 0.0 ? s.axialStress / s.eulerStress
+                                           : (s.axialStress > 0.0 ? infinite : 0.0);
+    s.magnifier = beamColumnMagnifier(s.axialOverEuler);
+
+    // First-order bending stress. Guarded against `0 * infinity`: a member carrying
+    // no lateral load at all carries none however far past its Euler load it is,
+    // and that case is the one the axial identity below rests on.
+    const double first = member.modulus > 0.0 ? std::abs(member.lateralMoment) / member.modulus
+                                              : (member.lateralMoment != 0.0 ? infinite : 0.0);
+    s.bendingStress = first > 0.0 ? first * s.magnifier : 0.0;
+
+    const double axialTerm = s.columnCapacity > 0.0
+                                 ? s.axialStress / s.columnCapacity
+                                 : (s.axialStress > 0.0 ? infinite : 0.0);
+    const auto bend = [&](double stress) {
+        return s.yieldCapacity > 0.0 ? stress / s.yieldCapacity : (stress > 0.0 ? infinite : 0.0);
+    };
+    s.utilisation = axialTerm + bend(s.bendingStress);
+    s.additiveUtilisation = axialTerm + bend(first);
+    if (s.utilisation >= 1.0)
+        s.limit = axialTerm >= 1.0 ? MemberLimit::Column : MemberLimit::Interaction;
+    return s;
+}
+
+double memberFailureTemperature(const HeatedMember& member, const StructuralMaterial& material,
+                               double referenceKelvin) {
+    return firstCrossing(
+        [&](double k) { return memberState(member, material, k, referenceKelvin).utilisation - 1.0; },
         referenceKelvin);
 }
 
@@ -1188,6 +1281,19 @@ bool Solver::step(double timestep, std::string* why) {
             *why = "Picard did not converge in " + std::to_string(picardLimit_) + " iterations";
         return false;
     }
+    return true;
+}
+
+bool Solver::setFilm(std::size_t index, double flux, double coefficient, double ambient) {
+    if (index >= problem_.film.size()) return false;
+    Film& film = problem_.film[index];
+    film.flux = flux;
+    film.coefficient = coefficient;
+    film.ambient = ambient;
+    // `coefficient` is in the matrix and `coefficient * ambient` is in the load, so
+    // both have to be rebuilt. Neither the forms nor the numbering depend on either.
+    factored_ = false;
+    propertiesFresh_ = false;
     return true;
 }
 

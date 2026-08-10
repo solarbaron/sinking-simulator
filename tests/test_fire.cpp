@@ -2882,6 +2882,338 @@ void testValidateCatchesBadSuppressionDefinitions() {
 
 }  // namespace
 
+// --- The boundary the structure sees -----------------------------------------
+//
+// A plate standing on its edge, so that the two large faces look along +/-x and
+// their centroids run up z -- which is a bulkhead, and is what `wallExchange`
+// bands by.
+solidshell::HexMesh standingPlate(double width, double height, double thickness, int nx, int ny,
+                                  double baseZ = 0.0) {
+    solidshell::HexMesh mesh = solidshell::makePlateMesh(width, height, thickness, nx, ny, 1);
+    for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+        double* p = &mesh.position[n * 3];
+        const double a = p[0], b = p[1], c = p[2];
+        p[0] = c;   // thickness along x: the two large faces now look fore and aft
+        p[1] = a;
+        p[2] = baseZ + b;
+    }
+    return mesh;
+}
+
+// A gas compartment with both layers set by hand, so that the interface height is
+// an input rather than something a fire has to be run to produce.
+fire::GasCompartment twoLayerBox(double interfaceZ, double upperKelvin, double lowerKelvin) {
+    fire::GasCompartment g;
+    g.floorZ = 0.0;
+    g.ceilingZ = 4.0;
+    g.floorArea = 10.0;
+    g.perimeter = 13.0;
+    g.gasVolume = g.floorArea * (g.ceilingZ - g.floorZ);
+    // `interfaceZ()` is the ceiling less the upper layer's share of the volume, and
+    // the share is the internal-energy split -- so the two energies are what set it.
+    const double upperVolume = (g.ceilingZ - interfaceZ) * g.floorArea;
+    const double lowerVolume = g.gasVolume - upperVolume;
+    g.upper.mass = kPatm * upperVolume / (kRAir * upperKelvin);
+    g.lower.mass = kPatm * lowerVolume / (kRAir * lowerKelvin);
+    g.upper.energy = g.upper.mass * fire::kCvAir * upperKelvin;
+    g.lower.energy = g.lower.mass * fire::kCvAir * lowerKelvin;
+    return g;
+}
+
+void testTheFilmCoefficientCarriesRadiationExactly() {
+    fire::BoundaryFilm p;
+
+    // The whole claim: `h (T_g - T_s)` is the convective flux plus
+    // `eps sigma (T_g^4 - T_s^4)`, because `(a^2+b^2)(a+b)(a-b) = a^4 - b^4` is an
+    // identity. Swept over the range a compartment fire actually spans.
+    double worst = 0, worstAt = 0;
+    for (double tg = 280.0; tg < 1400.0; tg += 3.7)
+        for (double ts = 280.0; ts < 1400.0; ts += 5.3) {
+            if (std::abs(tg - ts) < 1.0) continue;
+            const double lhs = fire::filmCoefficient(tg, ts, p) * (tg - ts);
+            const double rhs = p.convective * (tg - ts) +
+                               p.emissivity * fire::kStefanBoltzmann *
+                                   (tg * tg * tg * tg - ts * ts * ts * ts);
+            const double relative = std::abs(lhs - rhs) / std::abs(rhs);
+            if (relative > worst) { worst = relative; worstAt = tg; }
+        }
+    expectTrue("the film coefficient reproduces Stefan-Boltzmann to 1e-13", worst < 1e-13);
+
+    // **Where they disagree, the film coefficient is the one that is right.** Near
+    // equilibrium `T_g^4 - T_s^4` is a cancellation and the factored form is not, so
+    // the "exact" expression is the one losing digits -- and near equilibrium is
+    // where a coupled solve spends its time.
+    const auto disagreement = [&](double gap) {
+        const double tg = 500.0, ts = 500.0 + gap;
+        const double factored = fire::filmCoefficient(tg, ts, p) * (tg - ts);
+        const double naive = p.convective * (tg - ts) +
+                             p.emissivity * fire::kStefanBoltzmann *
+                                 (tg * tg * tg * tg - ts * ts * ts * ts);
+        return std::abs(factored - naive) / std::abs(factored);
+    };
+    // The loss goes as `eps T / (4 dT)`, so it climbs by eight orders of magnitude
+    // over eight orders of the gap -- and it is the difference form doing the
+    // losing, because the factored one has no subtraction of nearly equal
+    // quantities anywhere in it.
+    expectTrue("a kelvin apart the two forms are indistinguishable", disagreement(1.0) < 1e-13);
+    expectTrue("a millikelvin apart they still are", disagreement(1e-3) < 1e-11);
+    expectTrue("a nanokelvin apart the difference form has lost six digits",
+               disagreement(1e-9) > 1e-7);
+    expectTrue("and it is monotone in the gap, which is what says it is cancellation",
+               disagreement(1e-9) > disagreement(1e-7) && disagreement(1e-7) > disagreement(1e-3));
+
+    // Exactly zero flux at equal temperatures -- not a rounding of zero. This is
+    // what the cold control rests on: a chain attached to a ship that is not on fire
+    // must add nothing at all.
+    expectTrue("equal temperatures give exactly zero flux",
+               fire::filmCoefficient(700.0, 700.0, p) * (700.0 - 700.0) == 0.0);
+    // And with no emissivity it is the convective coefficient, exactly.
+    fire::BoundaryFilm bare{25.0, 0.0};
+    expectTrue("with no emissivity it is the convective coefficient, to the bit",
+               fire::filmCoefficient(900.0, 300.0, bare) == 25.0);
+    expectTrue("radiation dominates convection in a real compartment fire",
+               fire::filmCoefficient(1073.15, 500.0, p) > 4.0 * p.convective);
+
+    std::printf("     film: %.1f W/(m2 K) at 800 C gas against 227 C steel, of which %.1f is"
+                " radiation; identity holds to %.1e (worst at T_g = %.0f K)\n",
+                fire::filmCoefficient(1073.15, 500.0, p),
+                fire::filmCoefficient(1073.15, 500.0, p) - p.convective, worst, worstAt);
+}
+
+void testTheWallExchangeSplitsAtTheLayerInterface() {
+    const solidshell::HexMesh mesh = standingPlate(4.0, 4.0, 0.0095, 4, 8);
+    std::vector<thermal::BoundaryFace> face;
+    for (const thermal::BoundaryFace& f : thermal::boundaryFaces(mesh))
+        if (f.normal.x > 0.5) face.push_back(f);
+    expectEqual("the plate has one film face per element on its fore side",
+                static_cast<long long>(face.size()), 32);
+
+    // A surface that is hot at the top and cold at the foot, which is what a
+    // bulkhead standing in a smoke layer with water behind it looks like.
+    std::vector<double> surface(face.size());
+    for (std::size_t i = 0; i < face.size(); ++i)
+        surface[i] = kTAmbient + 220.0 * face[i].centroid.z / 4.0;
+
+    const fire::GasCompartment gas = twoLayerBox(2.5, 800.0, 300.0);
+    expectNear("the fixture's interface is where it was asked for", gas.interfaceZ(), 2.5, 1e-12);
+
+    const fire::WallExchange two = fire::wallExchange(gas, face, surface);
+    expectEqual("with no banding there are exactly two films",
+                static_cast<long long>(two.film.size()), 2);
+    expectNear("and they cover the whole plate between them", two.totalArea, 16.0, 1e-9);
+    expectTrue("the upper film is the hot layer's temperature and the lower the cool one's",
+               two.film[0].ambient == gas.upper.temperature() &&
+                   two.film[1].ambient == gas.lower.temperature());
+    // Split at 2.5 m on a plate whose element rows are 0.5 m tall: the three rows
+    // centred at 2.75, 3.25 and 3.75 are above it and the other five are below, so
+    // 12 faces of 0.5 m2 against 20. Not the middle, which is what a single film at
+    // a mean temperature would have made of it.
+    expectNear("the split is at the interface and not at the middle", two.area[0], 6.0, 1e-9);
+    expectNear("and the rest is below it", two.area[1], 10.0, 1e-9);
+    for (const thermal::BoundaryFace& f : two.film[0].face)
+        expectTrue("every face in the upper film is above the interface", f.centroid.z >= 2.5);
+    for (const thermal::BoundaryFace& f : two.film[1].face)
+        expectTrue("and every face in the lower one is below it", f.centroid.z < 2.5);
+
+    // The back-reaction the gas takes: area means, so a caller writing them onto a
+    // `GasCompartment` is writing what the meshed part of its boundary is doing.
+    double meanSurface = 0;
+    for (std::size_t i = 0; i < face.size(); ++i) meanSurface += face[i].area * surface[i];
+    meanSurface /= 16.0;
+    expectNear("the wall temperature handed back is the area mean of the surface",
+               two.wallTemperature, meanSurface, 1e-9);
+
+    // Refusals: a mismatched or empty pair produces nothing, rather than a film at
+    // an invented temperature.
+    expectTrue("a mismatched surface field is refused",
+               fire::wallExchange(gas, face, {1.0}).film.empty());
+    expectTrue("and so is an empty one", fire::wallExchange(gas, {}, {}).film.empty());
+}
+
+void testBandingTheFilmRemovesTheSpreadError() {
+    const solidshell::HexMesh mesh = standingPlate(4.0, 4.0, 0.0095, 4, 8);
+    std::vector<thermal::BoundaryFace> face;
+    for (const thermal::BoundaryFace& f : thermal::boundaryFaces(mesh))
+        if (f.normal.x > 0.5) face.push_back(f);
+    std::vector<double> surface(face.size());
+    for (std::size_t i = 0; i < face.size(); ++i)
+        surface[i] = kTAmbient + 220.0 * face[i].centroid.z / 4.0;
+    const fire::GasCompartment gas = twoLayerBox(2.5, 800.0, 300.0);
+
+    // **The radiative coefficient goes as `T_s^2`, so one coefficient over a whole
+    // layer is wrong wherever the surface has a gradient.** The error is exactly the
+    // spread *within* a film, so banding by height -- which is the direction a
+    // bulkhead's surface temperature varies in -- drives it down.
+    const fire::WallExchange unbanded = fire::wallExchange(gas, face, surface);
+    const fire::WallExchange banded = fire::wallExchange(gas, face, surface, {}, 0.5);
+    expectEqual("banding at the element height gives one film per row",
+                static_cast<long long>(banded.film.size()), 8);
+    expectNear("and it still covers the whole plate", banded.totalArea, unbanded.totalArea, 1e-12);
+    expectNear("and books the same exact heat, because that does not depend on the films",
+               banded.exactHeat, unbanded.exactHeat, 1e-9);
+    expectTrue("the unbanded error is a real fraction of the exchange",
+               std::abs(unbanded.linearisationError) > 0.004 * std::abs(unbanded.exactHeat));
+    expectTrue("banding removes at least nine tenths of it",
+               std::abs(banded.linearisationError) < 0.1 * std::abs(unbanded.linearisationError));
+
+    // **The band index is a pure function of the face's own centroid**, which is the
+    // property `thermal::Solver::setFilm` depends on: the same faces must give the
+    // same films in the same order however hot anything is, or a coupled run would
+    // be writing one band's coefficient onto another's faces.
+    const fire::GasCompartment colder = twoLayerBox(3.5, 400.0, 290.0);
+    const fire::WallExchange moved = fire::wallExchange(colder, face, surface, {}, 0.5);
+    expectEqual("a different fire gives the same number of bands",
+                static_cast<long long>(moved.film.size()),
+                static_cast<long long>(banded.film.size()));
+    bool sameFaces = true;
+    for (std::size_t b = 0; b < banded.film.size(); ++b) {
+        if (banded.film[b].face.size() != moved.film[b].face.size()) { sameFaces = false; break; }
+        for (std::size_t i = 0; i < banded.film[b].face.size(); ++i)
+            if (banded.film[b].face[i].element != moved.film[b].face[i].element ||
+                banded.film[b].face[i].face != moved.film[b].face[i].face)
+                sameFaces = false;
+    }
+    expectTrue("and exactly the same faces in exactly the same bands", sameFaces);
+    expectTrue("while the layer the bands sit in did move",
+               moved.film[5].ambient != banded.film[5].ambient);
+    // Ordering: band 0 is the lowest, which is what a caller indexing by height
+    // needs and is not something to leave to the face table's own order.
+    for (std::size_t b = 1; b < banded.film.size(); ++b)
+        expectTrue("bands run upward from the foot of the plate",
+                   banded.film[b].face.front().centroid.z >
+                       banded.film[b - 1].face.front().centroid.z);
+
+    // **The bands are measured from the lowest face and not from the origin**, and a
+    // plate sitting on the origin cannot tell the difference -- 0.25 m is half a
+    // band, so both readings land on the same integers. Mutation testing found that:
+    // dropping `- zBase` survived the whole suite. A bulkhead does not start at the
+    // baseline, so the fixture that matters is the offset one.
+    const solidshell::HexMesh raised = standingPlate(4.0, 4.0, 0.0095, 4, 8, 1.4);
+    std::vector<thermal::BoundaryFace> high;
+    for (const thermal::BoundaryFace& f : thermal::boundaryFaces(raised))
+        if (f.normal.x > 0.5) high.push_back(f);
+    std::vector<double> highSurface(high.size());
+    for (std::size_t i = 0; i < high.size(); ++i)
+        highSurface[i] = kTAmbient + 220.0 * (high[i].centroid.z - 1.4) / 4.0;
+    const fire::WallExchange offset =
+        fire::wallExchange(twoLayerBox(2.5, 800.0, 300.0), high, highSurface, {}, 0.5);
+    expectEqual("a plate raised off the origin still bands into one film per row",
+                static_cast<long long>(offset.film.size()), 8);
+    for (std::size_t b = 0; b < offset.film.size(); ++b) {
+        expectEqual("every band holds exactly one row of faces",
+                    static_cast<long long>(offset.film[b].face.size()), 4);
+        expectNear("and band 0 is the row at the foot, not wherever the origin fell",
+                   offset.film[b].face.front().centroid.z,
+                   1.4 + 0.25 + 0.5 * static_cast<double>(b), 1e-9);
+    }
+
+    std::printf("     wall exchange: %.3f kW into the steel; one film per layer misbooks"
+                " %.1f%% of it, one film per %.2f m row misbooks %.3f%%\n",
+                banded.exactHeat / 1e3,
+                100.0 * std::abs(unbanded.linearisationError / unbanded.exactHeat), 0.5,
+                100.0 * std::abs(banded.linearisationError / banded.exactHeat));
+}
+
+// The exact control for the whole chain, not only for the gas: a ship carrying a
+// fire model, a conduction solve on one of her bulkheads and the boundary exchange
+// between them, with nothing burning, must be bit-identical to the same ship
+// carrying none of it.
+//
+// It is a different assertion from `testZeroHeatReleaseLeavesTheShipBitIdentical`
+// above, because the coupling adds two write paths that test does not exercise:
+// `wallExchange` writes `wallConductance` and `wallTemperature` onto every tracked
+// compartment, and a film that was a rounding away from zero would heat the steel,
+// which would move the wall temperature, which would move the gas.
+void testAColdChainLeavesTheShipAndTheSteelBitIdentical() {
+    Sea sea{0.0};
+    Ship bare = game::buildFerry();
+    bare.initialise(sea);
+
+    Ship coupled = game::buildFerry();
+    coupled.initialise(sea);
+    fire::Model model;
+    model.attach(coupled, {coupled.findCompartment("engine_room_s"),
+                           coupled.findCompartment("engine_room_p")});
+    fire::DesignFire d;
+    d.name = "unlit";
+    d.compartment = 0;
+    d.baseZ = 2.5;
+    d.diameter = 2.5;
+    d.peakHeatRelease = 0.0;
+    model.fires.push_back(d);
+
+    const solidshell::HexMesh mesh = standingPlate(4.0, 4.0, 0.0095, 4, 8);
+    std::vector<thermal::BoundaryFace> face;
+    for (const thermal::BoundaryFace& f : thermal::boundaryFaces(mesh))
+        if (f.normal.x > 0.5) face.push_back(f);
+    std::vector<double> surface(face.size(), kTAmbient);
+
+    thermal::Problem problem;
+    problem.mesh = &mesh;
+    problem.material = ah36Steel();
+    problem.temperatureDependent = true;
+    const fire::WallExchange seed = fire::wallExchange(model.gas[0], face, surface, {}, 0.5);
+    problem.film = seed.film;
+    thermal::Solver solver;
+    std::string why;
+    expectTrue("the conduction problem prepares", solver.prepare(problem, kTAmbient, &why));
+
+    for (int i = 0; i < 400; ++i) {
+        bare.step(0.05, sea);
+        coupled.step(0.05, sea);
+        model.step(0.05, coupled, sea);
+        const std::vector<double>& nodal = solver.temperature();
+        for (std::size_t k = 0; k < face.size(); ++k) {
+            double t = 0;
+            for (int c = 0; c < 4; ++c) t += nodal[face[k].node[c]];
+            surface[k] = 0.25 * t;
+        }
+        const fire::WallExchange x = fire::wallExchange(model.gas[0], face, surface, {}, 0.5);
+        for (std::size_t b = 0; b < x.film.size(); ++b)
+            solver.setFilm(b, 0.0, x.film[b].coefficient, x.film[b].ambient);
+        model.gas[0].wallTemperature = x.wallTemperature;
+        model.gas[0].wallConductance = x.wallConductance;
+        // Not exactly zero, and the reason is worth being exact about: the banded
+        // solve returns a uniform field to *its* rounding and not to the bit, so the
+        // steel sits nanokelvins off ambient and the film books nanowatts against a
+        // 100 kW exchange. What has to be exact is the ship, and it is.
+        expectTrue("a boundary at the temperature of the gas against it books nothing",
+                   std::abs(x.heat) < 1e-6 && std::abs(x.exactHeat) < 1e-6);
+        solver.step(0.05, &why);
+        model.applyTo(coupled);
+    }
+
+    double drift = 0;
+    for (double t : solver.temperature()) drift = std::max(drift, std::abs(t - kTAmbient));
+    expectTrue("the steel is still at ambient to 1e-8 K after 400 steps", drift < 1e-8);
+
+    const std::vector<double> a = shipFingerprint(bare);
+    const std::vector<double> b = shipFingerprint(coupled);
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i)
+        if (std::memcmp(&a[i], &b[i], sizeof(double)) != 0) ++differing;
+    expectEqual("a cold chain leaves the ship bit-identical, in every state double",
+                static_cast<long long>(differing), 0);
+
+    // Vacuity, in both directions: the ship has to have been doing something, the
+    // gas model has to have stepped, and the coupling has to have actually written.
+    expectTrue("and the ship really was flooding through the run",
+               bare.totalFloodwaterMass() > 1.0e5);
+    expectTrue("the gas model really did step", model.time > 19.0);
+    expectTrue("and the wall coupling really did write a conductance",
+               model.gas[0].wallConductance > 25.0);
+    // **Which is the gas-side film and not the lumped `h_k` it replaced.** 28.80 at
+    // ambient -- EN's 25 of convection plus 3.80 of radiation between two bodies
+    // both at 15 C -- against the 30.0 `GasCompartment` defaults to, which was MQH's
+    // wall conductance standing in for a wall that is now solved.
+    expectNear("which is the gas-side film, not the MQH wall conductance it replaced",
+               model.gas[0].wallConductance, fire::filmCoefficient(kTAmbient, kTAmbient, {}),
+               1e-9);
+    expectTrue("and the two are genuinely different numbers",
+               std::abs(model.gas[0].wallConductance - fire::GasCompartment{}.wallConductance) >
+                   1.0);
+}
+
 void runFireTests() {
     std::printf("\n--- compartment fire ---\n");
     testCaloricConstantsAreExactlyConsistent();
@@ -2942,4 +3274,10 @@ void runFireTests() {
     testTheFerrysLollTracksTheDrencherAndTheFreeingPortsDecideIt();
     testSuppressionOffLeavesTheShipAndTheGasBitIdentical();
     testValidateCatchesBadSuppressionDefinitions();
+
+    std::printf("\n--- the boundary the structure sees ---\n");
+    testTheFilmCoefficientCarriesRadiationExactly();
+    testTheWallExchangeSplitsAtTheLayerInterface();
+    testBandingTheFilmRemovesTheSpreadError();
+    testAColdChainLeavesTheShipAndTheSteelBitIdentical();
 }
