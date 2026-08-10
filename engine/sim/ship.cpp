@@ -1046,9 +1046,93 @@ Diagnostics Ship::diagnostics(const Sea& sea) const {
     double heelRad = 0, trimRad = 0;
     heelTrimFromRotation(R, heelRad, trimRad);
     d.gzRighting = rightingArmAtHeel(heelRad, sea);
-    const double eps = 0.03;
-    d.gmTransverse = (rightingArmAtHeel(eps, sea) - rightingArmAtHeel(-eps, sea))
-                     / (2 * eps);
+
+    // GM is the slope of the righting arm at the origin, and a finite difference
+    // only delivers that while the arm is linear across the angle it is taken at.
+    //
+    // **A shallow layer stops being linear almost immediately.** Tilt a compartment
+    // holding a layer of mean depth h across a breadth b, and the surface stays a
+    // full-breadth plane only while tan(heel) <= 2h/b; past that the water has
+    // pulled off the high side, the surface is narrower than the compartment and
+    // the free-surface moment collapses as `3/tau - 2/tau^1.5` in
+    // `tau = tan(heel) b / 2h`. That closed form is exact for a box compartment and
+    // holds on the ferry's own tapered vehicle deck to about 1%.
+    //
+    // 0.03 rad -- what this line used to be, unconditionally -- is ten times the
+    // pocketing angle of a 2.9 cm layer on that deck, and it delivers 24% of the
+    // free-surface effect. **The ship then reads +0.59 m where her initial GM is
+    // -3.77 m**, which is the unsafe direction on the one number every stability
+    // judgement here keys off.
+    //
+    // So the angle is measured rather than assumed: halve it until the slope stops
+    // moving. The secant slope is monotone in the sampling angle and constant below
+    // the pocketing angle, so "it stopped moving" is exactly "we are inside the
+    // linear region" and the angle it settles at is a lower bound on where that
+    // region ends. This is the only route that does not need a free-surface
+    // *correction* term, a compartment idealised as a box, or a count of how many
+    // compartments are wet -- none of which this model has anywhere else.
+    //
+    // Conditioning is not the trade it looks like. `rightingArmAtHeel` is
+    // deterministic and its round-off cancels almost exactly across the difference:
+    // measured, the ferry's GZ(0) is 6e-18 m intact and 5e-12 m with a free
+    // surface, and GZ(eps) - GZ(-eps) carries about 5e-16 m of noise on the ferry
+    // and on a box barge alike. The slope error is then ~5e-16/(2 eps) -- 2.7e-10 m
+    // at the floor below, under three thousandths of the tolerance. There is no
+    // sampling angle here that is wrong in both directions at once.
+    const auto slopeAt = [&](double e) {
+        return (rightingArmAtHeel(e, sea) - rightingArmAtHeel(-e, sea)) / (2 * e);
+    };
+
+    // 0.03 rad and no refinement at all when nothing is wet, on the same test
+    // rightingArmAtHeel() itself uses to decide a compartment contributes. **That
+    // is deliberate and it is a guarantee, not an optimisation**: an intact ship
+    // has no free surface to pocket, so every figure this repository publishes
+    // about one comes out bit-identical. What the intact ship is left with is the
+    // hull's own O(eps^2) truncation -- +0.13% on the ferry, +0.34% on the box
+    // barge -- which is a different and much smaller error, and moving it would
+    // move every gated figure taken on an intact ship for no gain.
+    bool anyFreeSurface = false;
+    for (const Compartment& c : compartments)
+        if (c.waterVolume * seaDensity > 0) { anyFreeSurface = true; break; }
+
+    double eps = 0.03;
+    double gm = slopeAt(eps);
+    if (anyFreeSurface) {
+        // **The bound is the round-off limit, not a policy about what is worth
+        // reporting**, and getting that wrong is the one thing mutation testing
+        // caught here. It was 15 halvings -- 9.2e-7 rad -- on the reasoning that
+        // anything finer is a safety rail nothing reaches. That reasoning was
+        // false: a *control* that raised the bound was killed, and the sweep
+        // behind it shows why. Between 10 and 100 kg of water on the ferry's
+        // vehicle deck the answer is perfectly well posed and 15 halvings could
+        // not reach it -- 100 kg came out right and was flagged unreliable, and
+        // 10 kg came out at -3.25 m against a true -3.78.
+        //
+        // 24 halvings bottom out at 1.79e-9 rad, where the noise above costs
+        // 5e-16/(2 eps) = 1.4e-7 m of slope: seven times under the tolerance
+        // floor, and the last power of two that stays there. Deeper starts
+        // chasing round-off.
+        //
+        // The tolerance is what the slope has to stop moving by: a micrometre of
+        // GM, or 1e-4 of it, whichever is larger.
+        d.gmSlopeConverged = false;
+        for (int i = 0; i < 24; ++i) {
+            const double halved = 0.5 * eps;
+            const double gmHalved = slopeAt(halved);
+            if (std::abs(gmHalved - gm) <= std::max(1e-6, 1e-4 * std::abs(gm))) {
+                // Report the finer value with the coarser angle: the two agree, so
+                // linearity is established out to `eps`, and `gmHalved` is the
+                // better-converged of the two numbers that establish it.
+                gm = gmHalved;
+                d.gmSlopeConverged = true;
+                break;
+            }
+            eps = halved;
+            gm = gmHalved;
+        }
+    }
+    d.gmTransverse = gm;
+    d.gmSampledAtRad = eps;
 
     // Lowest point of the weather deck edge relative to the sea.
     double minFreeboard = kInf;

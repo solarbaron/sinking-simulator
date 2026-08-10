@@ -178,6 +178,33 @@ struct Diagnostics {
     double freeboardMin = 0;       // m, lowest point of the weather deck edge above sea
     double waterplaneArea = 0;     // m^2
     double gmTransverse = 0;       // m, effective (includes free-surface effect)
+
+    // The half-angle `gmTransverse` was central-differenced over. A metacentric
+    // height is the slope of the righting arm *at the origin*, so this is the
+    // statement that makes the number one: the arm was measured to be linear
+    // across +/- this heel, and nothing is claimed beyond it.
+    //
+    // It is 0.03 rad on a ship with no free surface and shrinks -- by a factor of
+    // sixteen on the ferry with fifty tonnes on her vehicle deck -- when a shallow
+    // layer pockets. See Ship::diagnostics().
+    double gmSampledAtRad = 0;
+
+    // False when that refinement ran out of room: the free surface pockets at an
+    // angle the righting arm cannot be resolved across, so `gmTransverse` is the
+    // best slope available rather than a metacentric height, and a consumer that
+    // keys a stability judgement off GM needs to tell "negative" from
+    // "unanswerable".
+    //
+    // A free-surface moment does not depend on how much water there is, only on
+    // the shape of its surface -- while the angle that surface survives to does.
+    // So the initial GM is *discontinuous* in the amount of loose water, and the
+    // ferry's vehicle deck straddles that discontinuity within a factor of two:
+    // half a litre reports her own **+2.00 m** over +/-3.8e-3 rad, because a layer
+    // that thin is not there at any angle anything can measure; one litre reports
+    // no usable window at all and sets this false. Both are honest and the flag is
+    // what tells them apart.
+    bool gmSlopeConverged = true;
+
     double gzRighting = 0;         // m, righting arm at the current heel
     Vec3   centreOfGravity{};      // body frame
     Vec3   centreOfBuoyancy{};     // body frame

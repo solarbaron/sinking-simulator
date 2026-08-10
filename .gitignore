@@ -26,6 +26,12 @@ compile_commands.json
 .cache/
 *.csv
 
+# Three mutation harnesses live in this tree and each is a Python module as well as
+# a program. Running one is harmless; *importing* one -- which is how you check its
+# substitution patterns still apply without spending an hour finding out -- drops a
+# `__pycache__` next to it. That is the same class of debris as the 176 files above.
+__pycache__/
+
 # Agent worktrees and transient session state only -- .claude/settings.json is
 # project configuration and is tracked deliberately.
 .claude/worktrees/
