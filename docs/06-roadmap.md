@@ -993,9 +993,120 @@ should be honest about that.
   passed at 1 LSB anyway** — from outside a volume both senses give one fragment
   per pixel and the same colour. Only a camera *inside* the medium can tell them
   apart, and that check was off by 152.
-- **Milestone:** an engine room fire that heats a bulkhead until it fails under
+- ✅ **Milestone:** an engine room fire that heats a bulkhead until it fails under
   the head of water behind it, and the flooding spreads. Three subsystems, none
   of which know about each other, producing one consequence.
+  `fire::wallExchange`, `fire::filmCoefficient`, `thermal::HeatedMember`,
+  `thermal::beamColumnMagnifier`, `thermal::twoStripStress`,
+  `thermal::temperatureForElongation`, `thermal::Solver::setFilm`, and
+  `tools/bulkhead_probe`, which runs the whole chain on the reference ferry.
+
+  **Every piece existed and nothing joined them.** Before this, no file outside
+  `thermal.{hpp,cpp}` and its own test named `thermal::` at all. The four links,
+  and what each needed:
+
+  1. *Fire → steel.* **The fire already had the loss term; what it did not have
+     was a wall.** `GasCompartment::wallConductance` and `wallTemperature` have
+     relaxed each layer over its own wetted area since the suppression work — but
+     the conductance was MQH's lumped `h_k`, standing in for the whole path, and
+     the temperature was pinned at ambient for as long as the fire ran.
+     `wallExchange` replaces both: the conductance becomes the **gas-side film**,
+     because the wall's own resistance is now solved rather than lumped, and the
+     temperature becomes the steel's own surface. The same `expm1` relaxation
+     that was standing in for a boundary now *is* one.
+  2. *Steel → load.* `thermal::HeatedMember`: restrained expansion as an axial
+     compression, the head as a lateral moment integrated off the ship's own free
+     surface, joined by the exact beam-column magnifier.
+  3. *Failure → hole.* `breachesFromFailedPanels`, unchanged.
+  4. *Hole → flooding.* `Ship::step`, with nothing added.
+
+  **Radiation is in the coupling and it is not an approximation.** `thermal.hpp`
+  leaves radiation out because it is nonlinear where conduction is not. It does
+  not have to be: `σ(T_g⁴ − T_s⁴) = σ(T_g²+T_s²)(T_g+T_s)(T_g−T_s)` is an
+  *identity*, so a film coefficient of `εσ(T_g²+T_s²)(T_g+T_s)` delivers the
+  Stefan–Boltzmann flux exactly — 112.5 W/(m²·K) for 800 °C gas against 227 °C
+  steel, of which 87.5 is radiation, and the two forms agree to **1.0e-13** over
+  280–1400 K. Where they *disagree* the factored form is the right one: near
+  equilibrium `T_g⁴ − T_s⁴` is a cancellation and the factored form has none, so
+  a nanokelvin apart the difference form has lost six digits. At `T_g == T_s` the
+  flux is exactly zero, which is what the cold control rests on.
+
+  **The result, on the ferry's own x = −8 bulkhead** — 9.5 mm plating on 180 × 10
+  flat bars at 700 mm, spanning the tank top to the bulkhead deck, 4 MW machinery
+  fire in the port engine room, both aft holds 45% flooded:
+
+  | | fire alone | head alone | both |
+  |---|---|---|---|
+  | member peak | 252.2 °C | 20 °C | 174.8 °C |
+  | worst utilisation | 0.934 | 0.274 | **1.001** |
+  | failed | no | no | **at 1935 s** |
+
+  It fails at a member temperature of **151.6 °C**, where `k_y` is exactly 1 and
+  the steel has lost none of its strength. At that state, each cause alone:
+  restrained expansion **0.513** of the member's capacity, the head **0.234**
+  unmagnified and **0.488** magnified — the axial load is what magnifies it, by
+  **2.086**. **A purely additive check reads 0.747 and has not failed**, which is
+  the whole of what the coupling buys and is what two subsystems that do not know
+  about each other would have produced. One panel goes, 0.490 m², and 307.7 m³
+  reaches the machinery spaces through it; four compartments end wet and she
+  stays afloat at 6.2° of heel.
+
+  **The milestone's sentence reproduces, and the honest answer is that it does so
+  over a band.** The restraint on a heated member is set by the stiffness of the
+  structure at its ends — a bulkhead deck and a tank top — and that is in *none*
+  of the three subsystems, so it is an input the model cannot derive. The tool
+  measures the band rather than asserting a value: the sentence is true for
+  **0.2194 ≤ r < 0.2505**, a factor of 1.142. Below it nothing fells the bulkhead;
+  at or above it the fire alone does and the head is not what fails it.
+
+  **Why the band is that narrow is itself the finding: the water that loads the
+  bulkhead also cools it.** A dry hold behind leaves the member **77.4 K hotter**
+  (252.2 °C against 174.8 °C), so the two controls are not one change apart. The
+  same-state decomposition above is the sharper statement for exactly that reason.
+
+  **Two controls had to be repaired before either was a control at all.**
+  *The fire has to end.* Steel asymptotes to the gas temperature it stands in and
+  the restrained-buckling limit is a fixed temperature, so a fire that burns
+  indefinitely fells the bulkhead on its own — measured at 2760 s — and the
+  sentence would have been true only over a window in *time* the tool itself had
+  chosen. A design fire that grows, burns and decays gives the steel a peak.
+  *And the ship has a second leak path.* The ferry carries an unsealed 0.04 m²
+  cable transit through this very bulkhead; left open it floods the machinery
+  spaces, downfloods the vehicle deck and lolls her, which fells the bulkhead in
+  the **water-only control at 3645 s with nothing burning anywhere**. Real, and a
+  different experiment, so the milestone run seals it and `--cable-transit`
+  reopens it.
+
+  **What the plating does, and it is not a hole.** Under the horizontal
+  compression the hot band of the bulkhead takes from the cold band below it —
+  `twoStripStress` at the hot fraction the fire's own interface height gives —
+  the 0.70 × 0.70 m panels between the stiffeners buckle at t = 1360 s. A buckled
+  panel goes out of plane, sheds its in-plane load and stays watertight. It is
+  reported and it is deliberately not fed to `breach`.
+
+  **Three defects the chain found in its own first version**, each of which
+  produced a plausible number: filling a hold *after* `Ship::initialise` leaves
+  the air mass from when it was empty, so the trapped gas reads 184 kPa — 8.3 m
+  of head that is not water — and the bulkhead failed in the first step of every
+  run, controls included. One film per gas layer misbooks **8%** of the exchange,
+  because the radiative coefficient goes as `T_s²` and the foot of a bulkhead is
+  held near ambient by the water behind while its head is at 500 K; banding the
+  films by element row takes that to **0.102%** of a 261.7 kW peak exchange on
+  the ferry, and to 0.000% on the unit fixture — and it needs no re-preparing,
+  which is what lets the steel's energy account span the run and close to
+  **7e-13** of the 0.1534 GJ it moved. And a
+  restraint window measured off a run that *applied* its own damage comes back
+  equal to whatever restraint that run was given, because the failure floods the
+  compartment and relieves the head — so the bound is measured on a fourth pass
+  that evaluates the failure and does not open it.
+
+  Not here, and named rather than hidden: no redistribution, so a member that has
+  gone hands nothing to its neighbours; first yield of the extreme fibre rather
+  than a plastic mechanism, so the check is conservative by the shape factor;
+  pin-ended, so real end fixity fails later; and the axial restraint is uniform
+  along the member where the temperature is not — the member is reduced to one
+  *equivalent uniform temperature*, the inverse of the elongation curve at the
+  mean of its own elongations, which is the right integral but still one number.
 
 ## Phase 5 — Fluids — *~9 em*
 

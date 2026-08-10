@@ -3158,14 +3158,16 @@ void testWhatRestraintMeansOnAShip() {
     // answer is the f -> 0 limit, and the question this settles is how fast the
     // limit is approached -- because if it needed f = 0.001 the 164.6 C figure would
     // be a laboratory result and not a ship one.
+    //
+    // **This is now `th::twoStripStress` and it used to be written out here.** The
+    // formula existed in two places -- this test and nowhere else -- so the moment a
+    // caller wanted it, it would have been written a third time. It is one function
+    // now, and the three published temperatures below are what test it.
     const auto yieldsAt = [&](double fraction) {
         double lo = 20.0 + kC, hi = 1200.0 + kC;
         const auto margin = [&](double k) {
-            const double eHot = th::carbonSteelModulusFactor(k) * steel.youngsModulus;
-            const double ratio = fraction / (1.0 - fraction);
-            const double sigma =
-                th::thermalStrain(k) / (1.0 / eHot + ratio / steel.youngsModulus);
-            return sigma - th::carbonSteelYieldFactor(k) * steel.yieldStrength;
+            return std::abs(th::twoStripStress(steel, k, fraction)) -
+                   th::carbonSteelYieldFactor(k) * steel.yieldStrength;
         };
         if (margin(hi) < 0.0) return 0.0;
         for (int i = 0; i < 200; ++i) {
@@ -3198,15 +3200,366 @@ void testWhatRestraintMeansOnAShip() {
 
     // At 400 C, where `k_y` is still exactly 1 and the strength model reports
     // nothing at all, the half-restrained strip is already 24% past yield.
-    const double eHot = th::carbonSteelModulusFactor(400.0 + kC) * steel.youngsModulus;
-    const double half = th::thermalStrain(400.0 + kC) / (1.0 / eHot + 1.0 / steel.youngsModulus);
+    const double half = std::abs(th::twoStripStress(steel, 400.0 + kC, 0.5));
     expectNear("half-restrained at 400 C is 440.9 MPa", half * 1e-6, 440.94, 0.05);
     expectTrue("which is past yield, where k_y says the steel has lost nothing",
                half > steel.yieldStrength && th::carbonSteelYieldFactor(400.0 + kC) == 1.0);
 
+    // The two ends of the function, and the first is why it is written as
+    // `-k_E E eps / (1 + (f/(1-f)) k_E)` rather than as the reciprocal sum the
+    // formula is published in: **`f = 0` has to return `restrainedStress` to the
+    // bit**, or the fully restrained anchor this whole file is built on would have
+    // two values depending on which door a caller came in by.
+    for (double kelvin : {50.0 + kC, 164.63 + kC, 400.0 + kC, 900.0 + kC})
+        expectTrue("f = 0 is the fully restrained stress, bit for bit",
+                   th::twoStripStress(steel, kelvin, 0.0) == th::restrainedStress(steel, kelvin));
+    expectTrue("f = 1 is a body with nothing cold left to hold it: exactly zero",
+               th::twoStripStress(steel, 600.0 + kC, 1.0) == 0.0);
+    expectTrue("and it is clamped rather than extrapolated outside [0, 1]",
+               th::twoStripStress(steel, 600.0 + kC, -1.0) ==
+                       th::restrainedStress(steel, 600.0 + kC) &&
+                   th::twoStripStress(steel, 600.0 + kC, 2.0) == 0.0);
+    // Monotone in the hot fraction, which is the physical statement: the more of the
+    // section is hot, the less of it is left to hold the rest.
+    double previous = 0;
+    for (double f = 0.0; f < 0.999; f += 0.01) {
+        const double s = std::abs(th::twoStripStress(steel, 300.0 + kC, f));
+        expectTrue("more of the section hot is always less stress in it",
+                   f == 0.0 || s < previous);
+        previous = s;
+    }
+
     std::printf("     restraint: yields at %.1f C fully, %.1f C with a tenth of the section"
                 " hot, %.1f C with half\n",
                 full, at10, at50);
+}
+
+// The inverse of the elongation curve, and the plateau that makes it interesting.
+void testElongationInverts() {
+    // Below 750 C the curve is strictly increasing, so the round trip is exact to a
+    // rounding of the temperature itself. Asserted at 1e-9 K over the whole branch,
+    // which is 6e-13 of the range and is what a 200-step bisection delivers.
+    for (double t = 20.0; t < 750.0; t += 3.7) {
+        const double e = th::carbonSteelElongation(t + kC);
+        expectNear("the elongation curve inverts below the phase change",
+                   th::temperatureForElongation(e) - kC, t, 1e-9);
+    }
+    for (double t = 861.0; t <= 1200.0; t += 7.3) {
+        const double e = th::carbonSteelElongation(t + kC);
+        expectNear("and above it", th::temperatureForElongation(e) - kC, t, 1e-9);
+    }
+
+    // **The plateau, and the number that is not 750.** EN 1993-1-2's curve steps
+    // *down* by 8.4e-6 on entering the phase change, so the polynomial branch has
+    // already reached 1.1e-2 before the boundary -- and the lowest temperature with
+    // that elongation is therefore 749.53 C and not 750. Solve
+    // `1.2e-5 t + 0.4e-8 t^2 - 2.416e-4 = 1.1e-2` for the closed form.
+    const double a = 0.4e-8, b = 1.2e-5, c = -2.416e-4 - 1.1e-2;
+    const double exact = (-b + std::sqrt(b * b - 4.0 * a * c)) / (2.0 * a);
+    expectNear("the plateau inverts to where the polynomial first reached it", exact, 749.5333,
+               1e-3);
+    for (double t : {750.0, 760.0, 800.0, 855.0})
+        expectNear("every temperature on the plateau inverts to that one point",
+                   th::temperatureForElongation(th::carbonSteelElongation(t + kC)) - kC, exact,
+                   1e-9);
+    // 860 C is the exception, and for the reason the header records: the round trip
+    // through `k - 273.15` lands a hair over the branch boundary, so the elongation
+    // there is 2.3e-15 *above* the plateau and inverts to itself.
+    expectTrue("860 C is a hair over the plateau and so inverts to itself",
+               th::carbonSteelElongation(860.0 + kC) > 1.1e-2);
+    expectNear("which the inverse reports rather than hides",
+               th::temperatureForElongation(th::carbonSteelElongation(860.0 + kC)) - kC, 860.0,
+               1e-9);
+
+    expectTrue("zero and negative elongation clamp to the reference temperature",
+               th::temperatureForElongation(0.0) == 20.0 + kC &&
+                   th::temperatureForElongation(-1.0) == 20.0 + kC);
+    expectTrue("and anything past the top of the curve clamps to 1200 C",
+               th::temperatureForElongation(1.0) == 1200.0 + kC);
+
+    // What it is *for*: a member's restraint is set by the length it wanted to grow,
+    // which is an integral of the elongation and not the elongation at the mean
+    // temperature. The two differ because the curve is quadratic, and the size of
+    // that is worth a number rather than an assertion that it exists.
+    const double hot = 400.0 + kC, cold = 20.0 + kC;
+    const double meanElongation =
+        0.5 * (th::carbonSteelElongation(hot) + th::carbonSteelElongation(cold));
+    const double equivalent = th::temperatureForElongation(meanElongation);
+    const double atMean = 0.5 * (hot + cold);
+    expectTrue("the equivalent uniform temperature is above the mean temperature",
+               equivalent > atMean);
+    std::printf("     a member half at 400 C and half at 20 C elongates like one at %.2f C,"
+                " not like one at %.2f C -- %.2f K apart\n",
+                equivalent - kC, atMean - kC, equivalent - atMean);
+}
+
+// The beam-column magnifier, which is the whole of what makes the milestone's two
+// causes more than a sum.
+// `Solver::setFilm`, which is what makes a coupled run one `prepare` instead of one
+// per coupling step -- and therefore what makes its energy account span the run.
+//
+// **The whole test is under constant properties, and that is the point.** With
+// `temperatureDependent` set, Picard re-forms and re-factors on every iteration, so
+// a `setFilm` that forgot to drop the factorisation would still work and the defect
+// would be invisible. Mutation testing established that: removing both invalidations
+// survived the entire suite until this existed.
+void testSetFilmMovesTheBoundaryWithoutRepreparing() {
+    const ss::HexMesh mesh = makeBar(0.10, 0.01, 8);
+    th::Problem problem;
+    problem.mesh = &mesh;
+    problem.material = roundSteel();
+    problem.temperatureDependent = false;   // constant properties: one factorisation
+    th::Film film;
+    for (const th::BoundaryFace& f : th::boundaryFaces(mesh))
+        if (f.normal.x < -0.5) film.face.push_back(f);
+    expectTrue("the bar has an end face to heat through", !film.face.empty());
+    film.coefficient = 200.0;
+    film.ambient = kC + 20.0;
+    problem.film = {film};
+
+    th::Solver solver;
+    std::string why;
+    expectTrue("it prepares", solver.prepare(problem, kC + 20.0, &why));
+    for (int i = 0; i < 5; ++i) expectTrue("and steps", solver.step(1.0, &why));
+    expectEqual("a constant-property solve factors once and then reuses it",
+                solver.factorisations(), 1);
+    double before = 0;
+    for (double t : solver.temperature()) before = std::max(before, t);
+    expectTrue("nothing has happened yet, because the film is at the bar's temperature",
+               std::abs(before - (kC + 20.0)) < 1e-9);
+
+    // Move the ambient only. The face list has not changed, so the surface integrals
+    // stay cached -- but `h * ambient` is in the load and the load has to be rebuilt.
+    expectTrue("setting a film in range succeeds", solver.setFilm(0, 0.0, 200.0, kC + 800.0));
+    expectTrue("and it steps", solver.step(1.0, &why));
+    double after = 0;
+    for (double t : solver.temperature()) after = std::max(after, t);
+    expectNear("the bar is now being heated, by 7.644 K in the first second", after - before,
+               7.644, 0.01);
+    expectEqual("and the system was re-factored, because the load and the matrix moved",
+                solver.factorisations(), 2);
+
+    // Move the coefficient only, which is in the *matrix* rather than in the load.
+    // Same ambient, ten times the film: the bar has to heat faster.
+    th::Solver slow, fast;
+    expectTrue("two identical solvers prepare", slow.prepare(problem, kC + 20.0, &why) &&
+                                                    fast.prepare(problem, kC + 20.0, &why));
+    slow.setFilm(0, 0.0, 20.0, kC + 800.0);
+    fast.setFilm(0, 0.0, 2000.0, kC + 800.0);
+    for (int i = 0; i < 5; ++i) {
+        slow.step(1.0, &why);
+        fast.step(1.0, &why);
+    }
+    double slowest = 0, fastest = 0;
+    for (double t : slow.temperature()) slowest = std::max(slowest, t);
+    for (double t : fast.temperature()) fastest = std::max(fastest, t);
+    expectTrue("a hundredfold film coefficient heats the bar measurably faster",
+               fastest > slowest + 100.0);
+
+    // And the refusal. An index one past the end must not report success: the write
+    // that followed would be out of bounds, and a caller who mis-indexed would
+    // otherwise see silence.
+    expectTrue("an index one past the end is refused",
+               !solver.setFilm(problem.film.size(), 0.0, 1.0, kC));
+    expectTrue("and so is anything beyond that",
+               !solver.setFilm(problem.film.size() + 7, 0.0, 1.0, kC));
+    expectTrue("while the last valid index is accepted",
+               solver.setFilm(problem.film.size() - 1, 0.0, 200.0, kC + 800.0));
+}
+
+void testBeamColumnMagnification() {
+    // Exactly 1 with no axial load, and 1 for a member in tension -- this formula is
+    // not the one for that case and returning it would be a plausible wrong number.
+    expectTrue("no axial load magnifies nothing, exactly",
+               th::beamColumnMagnifier(0.0) == 1.0 && th::beamColumnMagnifier(-0.5) == 1.0);
+    expectTrue("at the Euler load and past it, unbounded",
+               std::isinf(th::beamColumnMagnifier(1.0)) && std::isinf(th::beamColumnMagnifier(4.0)));
+
+    // Against the published closed form, `2 (sec u - 1) / u^2`, evaluated directly.
+    // The implementation uses `4 sin^2(u/2) / (u^2 cos u)`, which is the same number
+    // by two trigonometric identities and has no subtraction in it -- so the two
+    // agree wherever the direct form has any digits left, and the direct form is the
+    // one that runs out.
+    double worst = 0;
+    for (double x = 0.001; x < 1.0; x += 0.001) {
+        const double u = 0.5 * sim::kPi * std::sqrt(x);
+        const double direct = 2.0 * (1.0 / std::cos(u) - 1.0) / (u * u);
+        worst = std::max(worst, std::abs(th::beamColumnMagnifier(x) - direct) / direct);
+    }
+    expectTrue("it is Timoshenko's magnifier to 1e-12 over the whole elastic range",
+               worst < 1e-12);
+
+    // Where the direct form gives up: `sec u - 1` is a cancellation, and by
+    // `x = 1e-12` it has no digits left at all. The series is `1 + 5u^2/12 + ...`,
+    // so the answer there is 1 + 5(pi/2)^2 x/12 = 1 + 1.0281e-12 x/1e-12, and the
+    // implementation reproduces it while the direct form has already gone to zero or
+    // to noise.
+    const double tiny = 1e-12;
+    const double series = 1.0 + 5.0 * 0.25 * sim::kPi * sim::kPi * tiny / 12.0;
+    expectNear("and it holds its accuracy where the published form has none left",
+               th::beamColumnMagnifier(tiny), series, 1e-15);
+
+    // Monotone, which is what makes the failure search a bisection.
+    double previous = 1.0;
+    for (double x = 0.0; x < 0.999; x += 0.001) {
+        const double m = th::beamColumnMagnifier(x);
+        expectTrue("more axial load is always more magnification", m >= previous);
+        previous = m;
+    }
+}
+
+// The interaction: a member that is both heated and bent.
+void testHeatedMemberUnderALateralLoad() {
+    const StructuralMaterial steel = ah36Steel();
+    // The ferry's own bulkhead stiffener: 180 x 10 flat bar on 9.5 mm plating at
+    // 700 mm, spanning the tank top at 1.8 m to the bulkhead deck at 7.0 m.
+    const sim::StiffenedSection section =
+        sim::stiffenedSection(sim::flatBar(0.180, 0.010), 0.0095, 0.70);
+    const sim::BucklingCheck column = sim::columnBuckling(section, 5.20, 1.0, steel);
+    expectNear("the ferry's bulkhead stiffener buckles elastically at 156.85 MPa",
+               column.elasticStress / 1e6, 156.852, 0.01);
+
+    th::HeatedMember member;
+    member.modulus = section.modulusStiffener;
+    member.eulerStress = column.elasticStress;
+
+    // **With no lateral load the interaction *is* the axial check.** Not to a
+    // tolerance: the two searches bisect the same crossing on differently rounded
+    // margins and could disagree about a probe that lands between them, so it is
+    // swept rather than spot-checked.
+    int identical = 0, cases = 0;
+    for (double elastic = 5.0e6; elastic < 2.0e9; elastic *= 1.13) {
+        th::HeatedMember bare = member;
+        bare.eulerStress = elastic;
+        ++cases;
+        if (th::memberFailureTemperature(bare, steel) ==
+            th::restrainedBucklingTemperature(elastic, steel))
+            ++identical;
+    }
+    expectEqual("with no moment it is restrainedBucklingTemperature, on every one of 50 members",
+                identical, cases);
+    expectTrue("and that is not a vacuous sweep", cases == 50);
+
+    // **`k_E` cancels, and so does the grade** -- on the elastic branch, which is
+    // where the ferry's own stiffener sits. The restraint stress is `k_E E eps_th`
+    // and the Euler stress is `k_E` times the cold one, so their ratio, and
+    // therefore the magnifier, is a function of the elongation curve and the
+    // geometry alone. Halve E and scale the member's Euler stress with it: the same
+    // temperature, to the bit.
+    th::HeatedMember loaded = member;
+    loaded.lateralMoment = 8.9e3;
+    loaded.restraint = 0.234;
+    StructuralMaterial soft = steel;
+    soft.youngsModulus = 0.5 * steel.youngsModulus;
+    th::HeatedMember softMember = loaded;
+    softMember.eulerStress = 0.5 * column.elasticStress;
+    expectTrue("halving E and the Euler stress with it moves nothing, to the bit",
+               th::memberFailureTemperature(loaded, steel) ==
+                   th::memberFailureTemperature(softMember, soft));
+
+    // The interaction is strictly worse than the sum whenever there is any axial
+    // load at all, and equal to it when there is none.
+    const double failure = th::memberFailureTemperature(loaded, steel);
+    expectTrue("the ferry's bulkhead member fails at a real temperature",
+               failure > 20.0 + kC && failure < 1200.0 + kC);
+    const th::MemberState at = th::memberState(loaded, steel, failure);
+    expectNear("and it fails at utilisation 1", at.utilisation, 1.0, 1e-9);
+    expectTrue("the interaction is worse than the sum", at.utilisation > at.additiveUtilisation);
+    expectTrue("because the axial load magnified the bending", at.magnifier > 1.0);
+    expectTrue("and the limit is the interaction, not the column alone",
+               at.limit == th::MemberLimit::Interaction);
+    th::HeatedMember unstressed = loaded;
+    unstressed.restraint = 0.0;
+    const th::MemberState free = th::memberState(unstressed, steel, failure);
+    expectTrue("with no restraint there is no magnification and no difference",
+               free.magnifier == 1.0 && free.utilisation == free.additiveUtilisation);
+
+    // **Neither cause alone is above half at the state where the pair fells it**, on
+    // this member with this moment. That is the milestone's own sentence as a
+    // number, and it is what `tools/bulkhead_probe` reproduces on the ship.
+    const double axialTerm = at.axialStress / at.columnCapacity;
+    expectTrue("restrained expansion alone is under 0.6 of the member's capacity",
+               axialTerm > 0.4 && axialTerm < 0.6);
+    expectTrue("and the head alone, unmagnified, is under a third",
+               at.additiveUtilisation - axialTerm < 0.34);
+
+    // **A member that is only bent does fail -- at 698.3 C, by losing its strength,
+    // and that is a closed form rather than a measurement.** With no axial load
+    // there is no magnification, so the utilisation is `M / (Z k_y(T) f_y)` and it
+    // reaches 1 exactly where `k_y` falls to the cold utilisation. Table 3.1 puts
+    // `k_y` at 0.47 at 600 C and 0.23 at 700 C with linear interpolation between,
+    // so the crossing is available in one line -- and it is the number that says why
+    // the head alone never fells this bulkhead in `tools/bulkhead_probe`: a 4 MW
+    // machinery fire takes the steel to 252 C.
+    th::HeatedMember bent = loaded;
+    bent.restraint = 0.0;
+    const double cold = std::abs(bent.lateralMoment) / bent.modulus / steel.yieldStrength;
+    const double closed = 600.0 + 100.0 * (0.47 - cold) / (0.47 - 0.23);
+    expectNear("a bent member with no restraint fails where k_y falls to its own utilisation",
+               th::memberFailureTemperature(bent, steel) - kC, closed, 1e-6);
+    expectNear("which is 698.3 C for this moment", th::memberFailureTemperature(bent, steel) - kC,
+               698.311, 1e-3);
+    expectTrue("and nothing magnified it on the way, because there was no axial load",
+               th::memberState(bent, steel, closed + kC).magnifier == 1.0);
+    // Sweeping the way up is the honest check that the search did not simply find
+    // the degenerate 1200 C where `k_y` is exactly zero.
+    double worstBent = 0;
+    for (double t = 20.0; t <= closed - 1.0; t += 0.5)
+        worstBent = std::max(worstBent, th::memberState(bent, steel, t + kC).utilisation);
+    expectTrue("and it climbed to it rather than jumping at the end of the table",
+               worstBent > 0.95 && worstBent < 1.0);
+
+    std::printf("     bulkhead member at r = 0.234 under 8.90 kN m: fails at %.2f C, axial"
+                " %.4f of capacity, bending %.4f magnified by %.3f; the same member with no"
+                " restraint at all needs %.1f C\n",
+                failure - kC, axialTerm, at.utilisation - axialTerm, at.magnifier, closed);
+
+    // **The magnifier's argument is `N/N_E` and not `N` over the capacity**, and on
+    // the ferry's own stiffener nothing can tell the two apart: it is slender enough
+    // that Johnson-Ostenfeld never bites, so the capacity *is* the Euler stress and
+    // a model that divided by the wrong one would agree exactly. Mutation testing
+    // found that -- the substitution survived the whole suite. A **stocky** member
+    // separates them, because there the cap is most of the answer.
+    const sim::BucklingCheck stockyColumn = sim::columnBuckling(section, 2.00, 1.0, steel);
+    expectTrue("a 2 m span is stocky enough for the plasticity cap to bite",
+               stockyColumn.elasticStress > 0.5 * steel.yieldStrength);
+    th::HeatedMember stocky = loaded;
+    stocky.eulerStress = stockyColumn.elasticStress;
+    const th::MemberState hot = th::memberState(stocky, steel, 300.0 + kC);
+    expectTrue("so its capacity is well below its Euler stress",
+               hot.columnCapacity < 0.5 * hot.eulerStress);
+    expectTrue("and the magnifier is taken against the Euler stress, exactly",
+               hot.axialOverEuler == hot.axialStress / hot.eulerStress &&
+                   hot.magnifier == th::beamColumnMagnifier(hot.axialStress / hot.eulerStress));
+    expectTrue("which is a different number from the capped one, by more than a factor of two",
+               hot.axialStress / hot.columnCapacity > 2.0 * hot.axialOverEuler);
+    expectTrue("and using the capped one would have magnified it measurably more",
+               th::beamColumnMagnifier(hot.axialStress / hot.columnCapacity) >
+                   1.05 * hot.magnifier);
+
+    // A negative restraint is nonsense input and reads as *no* restraint, not as its
+    // own magnitude -- `std::abs` further down would otherwise turn a caller's sign
+    // error into a compression of exactly the wrong size. Also found by mutation
+    // testing, which is the only reason the clamp is now exercised.
+    th::HeatedMember reversed = loaded;
+    reversed.restraint = -loaded.restraint;
+    expectTrue("a negative restraint is no restraint, not the same restraint",
+               th::memberState(reversed, steel, 400.0 + kC).axialStress == 0.0);
+
+    // Refusals, on the same terms as the rest of this file: a degenerate member is
+    // loud rather than plausible. **`eulerStress` zero is a member with no buckling
+    // capacity, not a member that cannot buckle**, so it goes the moment it carries
+    // anything -- which is the conservative direction and is what a caller who
+    // forgot to fill the field should see.
+    th::HeatedMember nothing;
+    expectNear("a default member has no capacity and goes the moment it is heated at all",
+               th::memberFailureTemperature(nothing, steel) - kC, 20.0, 1e-9);
+    expectTrue("but at exactly its reference temperature it is carrying nothing and is fine",
+               th::memberState(nothing, steel, 20.0 + kC).utilisation == 0.0);
+    th::HeatedMember noEuler = loaded;
+    noEuler.eulerStress = 0.0;
+    expectTrue("and so does a real member whose buckling capacity is taken away",
+               std::isinf(th::memberState(noEuler, steel, 400.0 + kC).utilisation));
 }
 
 void testBucklingArrivesBeforeYield() {
@@ -3801,10 +4154,16 @@ void runThermalTests() {
     testThermalElongationCurve();
     testRestrainedMemberYieldsOnExpansionAlone();
     testWhatRestraintMeansOnAShip();
+    testElongationInverts();
     testBucklingArrivesBeforeYield();
     testExpansionRefusals();
     testThermalLoadRefusals();
     testTheFerryLosesPanelsAtEightyKelvin();
+
+    std::printf("\n=== heated and bent: the Phase 4 milestone's own interaction ===\n");
+    testSetFilmMovesTheBoundaryWithoutRepreparing();
+    testBeamColumnMagnification();
+    testHeatedMemberUnderALateralLoad();
 
     testElementTemperatureField();
     testGradientThroughPlating();

@@ -5662,13 +5662,25 @@ out the top, cool air in the bottom, with a neutral plane in between).
   next 200 — because a fixed step is factored once and every later step is two
   triangular solves.
 - Radiation between hot surfaces and to flame volumes (view factors precomputed
-  per compartment).
-- Convection to gas layers.
+  per compartment). **Convection to the gas layers is built** — `fire::wallExchange`
+  — and it carries radiation with it, because `σ(T_g⁴ − T_s⁴)` factors exactly into
+  `h(T_g − T_s)` with `h = h_c + εσ(T_g²+T_s²)(T_g+T_s)`. What is still missing is
+  surface-to-*surface* exchange, which is the part that needs view factors.
 
 The coupling that makes this worth the effort: **a fire in a machinery space heats
 a bulkhead, the bulkhead loses strength, the bulkhead fails under hydrostatic
 load from the flooded space next door, and the flooding spreads.** Every step of
 that is modelled by a different subsystem and none of them know about the others.
+
+**Built, and it reproduces — with one correction to the sentence above.** The
+bulkhead does *not* fail by losing strength: it fails at a member temperature of
+151.6 °C where `k_y` is exactly 1 and the steel has lost none of it, because what
+a fire does to structure is **use it up** rather than weaken it. Restrained
+expansion puts the member into compression, the head of water bends it, and the
+axial load magnifies the bending by 2.086 — a purely additive check of the same
+two causes reads 0.747 and has not failed. `tools/bulkhead_probe` runs the chain
+end to end on the ferry with both controls beside it, and
+`docs/06-roadmap.md`'s Phase 4 milestone carries every figure.
 
 ### Suppression
 

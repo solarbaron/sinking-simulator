@@ -98,7 +98,17 @@
 //  1. **Everything Tier-0 cannot see.** No torsion, no shear lag, no racking, no
 //     transverse strength, no local pressure. A load that does not change `M(x)`
 //     and is not handed in as a contact patch is invisible here, which includes
-//     slamming, sloshing, a dropped weight, and a fire softening a bulkhead.
+//     slamming, sloshing, a dropped weight, and a fire against a bulkhead.
+//
+//     **And "softening" was the wrong word for the last of those**, which the
+//     Phase 4 milestone settled: the ferry's engine room bulkhead fails at a
+//     member temperature of 151.6 C, where `k_y` is *exactly 1* and the steel has
+//     lost none of its strength. What a fire does to a restrained member is put it
+//     into compression -- `thermal::HeatedMember` -- and what fells it is that
+//     compression magnifying the bending the head of water behind it is already
+//     applying, by 2.086. So a promotion criterion that looked for lost strength
+//     would find nothing to promote right up to the moment the bulkhead went. The
+//     trigger this file would need is a *temperature field*, not a knock-down.
 //  2. **It is one-dimensional.** A station says *where along the ship*, never
 //     where around the girth. The site is taken as the panel nearest the extreme
 //     fibre on the centreline, and a panel that is locally the weakest somewhere

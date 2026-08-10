@@ -31,6 +31,7 @@ case "$LEVEL" in
   *) echo "usage: $0 [quick|full|sanitize|all]" >&2; exit 2 ;;
 esac
 
+readonly dim=$'\033[2m' off=$'\033[0m'
 readonly BOLD=$'\033[1m' RED=$'\033[0;31m' GREEN=$'\033[0;32m' YELLOW=$'\033[0;33m' OFF=$'\033[0m'
 FAILURES=0
 STARTED=$SECONDS
@@ -48,9 +49,22 @@ build_into() {
     fail "cmake configure failed for $dir"
     tail -20 "$log"; rm -f "$log"; return 1
   fi
-  if ! ninja -C "$dir" >"$log" 2>&1; then
+  ninja -C "$dir" >"$log" 2>&1
+  local status=$?
+  if [ "$status" -ne 0 ]; then
     fail "build failed in $dir"
-    grep -E 'error:' "$log" | head -10; rm -f "$log"; return 1
+    # **Show the tail as well as the errors.** Grepping `error:` alone reports
+    # *nothing* when a build dies without saying that word -- a compiler killed
+    # under memory pressure, a ninja subcommand stopped, a missing generated file.
+    # A clean rebuild failed here once during a concurrent gate and printed a blank
+    # diagnosis, which is the same hole `expect_ok` had one function below: a
+    # failure path that only reports the failures it already expected.
+    printf '      ninja exited %d%s\n' "$status" \
+           "$([ "$status" -ge 128 ] && echo " (signal $((status - 128)))")"
+    grep -E 'error:|Killed|No space|cannot open|fatal' "$log" | head -10
+    printf '      %s--- last lines ---%s\n' "$dim" "$off"
+    tail -8 "$log"
+    rm -f "$log"; return 1
   fi
   local warnings; warnings="$(grep -cE 'warning:' "$log" || true)"
   if [ "$warnings" -ne 0 ]; then
@@ -221,6 +235,24 @@ fi
 # was cut — and the unit suite can only afford two stations. This sweeps 47, with the
 # `halo = false` control alongside so that "every station agreed" cannot be reported
 # by a mesher that was never fixed.
+# The Phase 4 milestone as one act: a two-zone fire against the ferry's own engine
+# room bulkhead, an implicit conduction solve on that bulkhead, EN 1993-1-2 steel
+# under restrained expansion *and* the head of water behind it, and the panels that
+# go handed to `breach` and on into the flooding network. Every piece is unit-tested
+# alone; this is the only thing that runs the chain on a real ship.
+#
+# **And it is the only thing that runs the milestone's own sentence as an acceptance
+# test.** "Fails under the head of water behind it" is a claim that neither cause is
+# sufficient, so the tool runs the case three times -- fire with a dry hold, water
+# with no fire, both -- and refuses `ok` unless the two controls survive and the pair
+# does not. A fourth pass runs the pair with the damage evaluated but not applied,
+# because the failure relieves what caused it and a window measured off a relieved
+# run comes back equal to whatever restraint that run was given. ~45 s.
+if [ -x ./build/bulkhead_probe ]; then
+  expect_ok "bulkhead_probe" '^ok$' ./build/bulkhead_probe --quiet
+else
+  skip "bulkhead_probe not built"
+fi
 if [ -x ./build/section_probe ]; then
   expect_ok "section_probe reach"      '^ok$' ./build/section_probe --scan=2
   expect_ok "section_probe invariance" '^ok$' ./build/section_probe --invariance=2

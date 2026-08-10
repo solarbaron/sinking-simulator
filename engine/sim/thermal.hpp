@@ -4,14 +4,18 @@
 // `docs/06-roadmap.md` Phase 4 that everything else in that phase needs.
 //
 // The milestone Phase 4 is aimed at is "an engine room fire that heats a
-// bulkhead until it fails under load". Three things stand between here and
-// there: a compartment fire that says what the gas does, a conduction solve that
-// says what the steel does, and a strength model that says what the steel then
-// carries. This file is the middle one, and it is deliberately *only* the middle
-// one -- there is no combustion here, no species transport, no radiation view
-// factors and no coupling back into `solid_shell.hpp`'s constitutive law. Each of
-// those is a separate roadmap item with its own validation, and one conduction
-// solve that is right is worth more than three that are sketched.
+// bulkhead until it fails under the head of water behind it". Three things stand
+// between here and there: a compartment fire that says what the gas does, a
+// conduction solve that says what the steel does, and a strength model that says
+// what the steel then carries. This file is the middle one **and, since the
+// milestone landed, the third as well** -- `carbonSteelReduction`,
+// `carbonSteelElongation` and `HeatedMember` below are what a heated member
+// carries, and `fire::wallExchange` is what hands the boundary across. There is
+// still no combustion here, no species transport and no radiation view factors:
+// radiation crosses the boundary as a film coefficient formed on the *fire* side,
+// where the exchange `sigma (T_g^4 - T_s^4)` factors exactly into
+// `h (T_g - T_s)`, so the conduction operator stays linear and nothing here has
+// to know about it.
 //
 // --- Why implicit, and a correction to the usual argument ----------------------
 //
@@ -425,6 +429,172 @@ double restrainedYieldTemperature(const StructuralMaterial& material,
 double restrainedBucklingTemperature(double elasticStress, const StructuralMaterial& material,
                                      double referenceKelvin = kCelsius + 20.0);
 
+// --- Restraint that is not total, and a temperature that is not uniform ----------
+//
+// Two closed forms that turn the paragraphs above into functions, because the
+// milestone this file exists for -- a bulkhead heated on one side and loaded on the
+// other -- has neither a fully restrained member nor a uniform one.
+//
+// **The two-strip stress.** `hotFraction` is `f` in the header note above: two
+// parallel strips tied at both ends and free overall, the hot one carrying
+//
+//     sigma = -eps_th / (1/E_hot + (f / (1 - f)) / E_cold)
+//
+// written here as `-k_E E eps_th / (1 + (f/(1-f)) k_E)` so that `f = 0` returns
+// `restrainedStress` **bit for bit** rather than to a rounding -- the two
+// expressions are algebraically the same and `1/(1/E)` is not `E` in binary. `f = 1`
+// is a body with nothing cold left to hold it and returns exactly zero.
+//
+// The ratio to the fully restrained answer is `1 / (1 + (f/(1-f)) k_E(T))`, which is
+// the *only* place the modulus survives: it is a stiffness ratio, and the hot strip
+// is the softer of the two.
+double twoStripStress(const StructuralMaterial& material, double kelvin, double hotFraction,
+                      double referenceKelvin = kCelsius + 20.0);
+
+// **The equivalent uniform temperature.** A member's restraint force is set by the
+// elongation it is prevented from making, which is the *integral* of `eps_th` along
+// it and not `eps_th` at its mean temperature -- the elongation curve is quadratic,
+// so those differ. `temperatureForElongation` inverts `carbonSteelElongation`, so a
+// caller averages the elongations of its own temperature field and asks what one
+// temperature would have produced it. Everything downstream is then uniform, which
+// is what keeps the `k_E` cancellation below exact.
+//
+// The **lowest** such temperature, and the plateau makes that a real distinction
+// rather than a formality. EN 1993-1-2's curve is flat at 1.1e-2 over 750-860 C, so
+// every temperature in that band inverts to one number -- and that number is
+// **749.533 C, not 750**, because the curve *steps down* by 8.4e-6 on entering the
+// plateau (see the note above) and the polynomial branch therefore reaches 1.1e-2 a
+// little before the branch boundary. 860 C is the exception and for the reason
+// recorded above: `carbonSteelElongation(860 C)` lands 2.3e-15 *over* the plateau
+// value, so it inverts to itself. Below 750 C, which is where a member that still
+// carries anything lives, the curve is strictly increasing and the round trip closes
+// to a rounding of the temperature itself.
+//
+// Clamped to 20 C below zero elongation and to 1200 C above the curve's top, on the
+// same terms as `carbonSteelElongation` itself.
+double temperatureForElongation(double elongation);
+
+// --- A heated member that is also carrying a load --------------------------------
+//
+// The Phase 4 milestone in one function: "an engine room fire that heats a bulkhead
+// until it fails **under the head of water behind it**". The header above establishes
+// what heat alone does to a restrained member -- compression, and buckling before
+// yield. This is what happens when that member is *also* being bent, which is the
+// only case in which the milestone's own sentence can be true.
+//
+// --- Why it is not a sum -----------------------------------------------------------
+//
+// A member under axial compression `N` and a lateral load deflects, and the axial
+// load then acts through that deflection. For a pin-ended beam-column under a uniform
+// lateral load the mid-span moment is **exactly**
+//
+//     M = M_0 * 2 (sec u - 1) / u^2,     u = (pi/2) sqrt(N / N_E)
+//
+// (Timoshenko, *Theory of Elastic Stability* §1.11), with `M_0` the first-order
+// moment and `N_E` the Euler load. It is 1 at `u = 0` -- exactly, and the series
+// `1 + 5u^2/12 + ...` is what the implementation uses near zero, because
+// `(sec u - 1)/u^2` is 0/0 there and evaluating it as written loses every digit.
+// It diverges at `N = N_E`. **That divergence is the whole mechanism**: the fire
+// supplies `N`, the head of water supplies `M_0`, and neither on its own is what
+// fells the member.
+//
+// --- `k_E` cancels here too --------------------------------------------------------
+//
+// `u` depends on `N/N_E`, and both are proportional to the reduced modulus: the
+// restraint stress is `k_E E eps_th` and the Euler stress is `k_E` times the cold
+// one. So **the magnification is a function of the elongation curve and the member's
+// geometry alone** -- independent of `k_E`, of `E` and of the steel grade -- exactly
+// as the restrained buckling temperature is. Asserted by changing all three.
+//
+// --- The check ----------------------------------------------------------------------
+//
+// EN 1993-1-2 §4.2.3.5's shape, with this repo's own pieces rather than the
+// standard's tabulated interaction factors -- a table reproduced from memory is a
+// plausible wrong number, and the exact magnifier above is a better object than a
+// code fit anyway:
+//
+//     utilisation = |sigma_N| / sigma_column(T)  +  Psi(u) |sigma_M| / (k_y(T) f_y)
+//
+// with `sigma_column(T) = johnsonOstenfeld(k_E(T) sigma_E, k_y(T) f_y)`, which is the
+// same capacity `restrainedBucklingTemperature` uses and reduces to it exactly when
+// there is no lateral load at all.
+//
+// **What it is not.** First yield of the extreme fibre, not a plastic mechanism, so
+// it is conservative by the shape factor -- 1.5 for a rectangle, less for a stiffener
+// with its plating. Pin-ended, so a member with real end fixity fails later. Elastic
+// magnification, so it says nothing about what happens after the first hinge. And no
+// redistribution: a member that has gone hands its load to its neighbours, and
+// nothing here notices.
+struct HeatedMember {
+    // Section modulus to the fibre the lateral load puts in compression, m^3.
+    double modulus = 0;
+    // First-order moment from the lateral load, N m. The caller integrates its own
+    // pressure distribution: a bulkhead's is hydrostatic over part of its span and
+    // zero above, which is not `q L^2 / 8`.
+    double lateralMoment = 0;
+    // Elastic column buckling stress at 20 C, Pa -- `BucklingCheck::elasticStress`
+    // out of `columnBuckling` on the unheated material, exactly as
+    // `restrainedBucklingTemperature` takes it.
+    //
+    // **Zero is a member with no buckling capacity, not one that cannot buckle**, so
+    // a default-constructed `HeatedMember` fails the instant it is heated above its
+    // reference temperature. That is deliberate and it is the conservative
+    // direction: the alternative reading -- an unfilled field meaning "infinitely
+    // stiff" -- would let a caller who forgot it get a member that never buckles at
+    // all, which is the failure this repo keeps finding under the name "fails open".
+    double eulerStress = 0;
+    // The share of the fully restrained stress the member actually carries, 1 for a
+    // laboratory bar. **The model cannot derive this**: it is set by the stiffness of
+    // the structure at the member's ends, which is a bulkhead deck and a tank top and
+    // is in neither the fire model nor the conduction one. `twoStripStress` gives it
+    // for the one case that *is* derivable -- a hot strip held by a cold one beside
+    // it, in the same plane.
+    double restraint = 1.0;
+};
+
+// Which term reached one first.
+enum class MemberLimit { None, Column, Interaction };
+
+struct MemberState {
+    double axialStress = 0;       // Pa, magnitude, compression
+    double eulerStress = 0;       // Pa, at temperature: k_E times the cold value
+    double axialOverEuler = 0;    // the magnifier's argument
+    double magnifier = 1;         // Psi(u)
+    double bendingStress = 0;     // Pa, magnified
+    double columnCapacity = 0;    // Pa, Johnson-Ostenfeld at temperature
+    double yieldCapacity = 0;     // Pa, k_y f_y
+    double utilisation = 0;       // the interaction; >= 1 has failed
+    // The same sum with the magnifier forced to 1. Published because the difference
+    // between the two **is** the coupling: a purely additive check is what two
+    // subsystems that do not know about each other would produce, and the gap is the
+    // measure of what the third one buys.
+    double additiveUtilisation = 0;
+    MemberLimit limit = MemberLimit::None;
+};
+
+// `2 (sec u - 1) / u^2` at `u = (pi/2) sqrt(x)`, `x = N / N_E`. Exactly 1 at x = 0,
+// infinite at x >= 1, and refused (returning 1) for x < 0 -- a member in tension is
+// stiffened by its axial load and this formula is not the one for that.
+double beamColumnMagnifier(double axialOverEuler);
+
+MemberState memberState(const HeatedMember& member, const StructuralMaterial& material,
+                        double kelvin, double referenceKelvin = kCelsius + 20.0);
+
+// The temperature at which `memberState(...).utilisation` first reaches 1, by the
+// same scan-and-bisect `restrainedYieldTemperature` uses and over the same range.
+// Zero when it never does.
+//
+// With `lateralMoment` zero this is `restrainedBucklingTemperature` on the same
+// member, **to the bit**: the identity that says the interaction was not bolted on
+// beside the axial check but contains it. It is not obvious that it should be --
+// the two searches bisect the same crossing on differently rounded margins,
+// `sigma/sigma_c - 1` against `sigma - sigma_c`, which are free to disagree about
+// the sign of a probe that lands between them -- so it is measured over a sweep of
+// fifty elastic stresses from 5 MPa to 2 GPa rather than assumed, and every one of
+// the fifty agrees exactly.
+double memberFailureTemperature(const HeatedMember& member, const StructuralMaterial& material,
+                                double referenceKelvin = kCelsius + 20.0);
+
 // --- Materials at temperature ----------------------------------------------------
 //
 // The coupling itself, and it is deliberately two free functions returning
@@ -806,6 +976,23 @@ public:
     // Drop the capacity and solve `K T = f` directly. Singular, and refused, when
     // nothing holds the temperature -- no prescribed node and no convective film.
     bool solveSteady(std::string* why = nullptr);
+
+    // Move one film's scalars without re-preparing. `index` is into
+    // `Problem::film` as it was handed to `prepare`; the face list, and therefore
+    // every surface integral cached from it, is untouched.
+    //
+    // **This is what a coupled fire needs and nothing else here provides.** A gas
+    // temperature moves every coupling step while the bulkhead it stands against
+    // does not, so re-preparing would rebuild the forms, renumber the mesh and
+    // reset the account -- and an account that restarts every step cannot say
+    // whether the run conserved anything. False on an index that is not there,
+    // rather than growing the vector: a film with no faces heats nothing, so a
+    // caller who mis-indexed would otherwise see silence.
+    //
+    // The factorisation is dropped, because `h` is in the matrix and `h * ambient`
+    // is in the load. That costs nothing under `temperatureDependent`, where Picard
+    // refactors every iteration anyway.
+    bool setFilm(std::size_t index, double flux, double coefficient, double ambient);
 
     const std::vector<double>& temperature() const { return temperature_; }
     const Account& account() const { return account_; }

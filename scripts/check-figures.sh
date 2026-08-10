@@ -173,6 +173,81 @@ else
   echo "  - zone_gpu_probe not built, skipping the §8 torn counts"
 fi
 
+# --- the Phase 4 milestone -------------------------------------------------------
+#
+# `docs/06-roadmap.md`'s Phase 4 milestone publishes a table and a restraint window,
+# and both come out of `bulkhead_probe`. **The window is the figure most worth
+# gating**: it is the band of a parameter the model cannot derive over which the
+# milestone's own sentence is true at all, and a change anywhere in the fire, the
+# conduction solve or the strength model moves it without moving anything that fails
+# a test. `verify.sh` already runs the tool for its `ok` contract; this is the other
+# half, and it is the same failure the smoke and section figures above were added
+# for -- a number nobody re-ran.
+#
+# ~45 s, and it is a second full run rather than a parse of the first because
+# `expect_ok` throws its log away. The alternative -- one run feeding both -- would
+# make the acceptance test and the figures the same invocation, and the acceptance
+# test is the one that must be able to fail on its own.
+MILESTONE=${MILESTONE:-./build/bulkhead_probe}
+if [ -x "$MILESTONE" ]; then
+  bulk=$("$MILESTONE" --quiet 2>&1)
+  for h in "member peak | 252.2 °C" "**0.2194 ≤ r < 0.2505**" "**77.4 K hotter**" \
+           "**2.086**" "0.747 and has not failed"; do
+    hint "$h"
+  done
+  # Each reader anchored to its own line and the **label stripped before any field
+  # is counted**, because two of the three labels are two words and one is one word,
+  # so `$2` is "alone" on two rows and "yes" on the third. Counting back from the end
+  # would work here and is the thing that picked the wrong column in the §8 block
+  # above, so the label goes instead and the fields are counted forward: 1 failed,
+  # 2 at, 3 steel C, 4 member C, 5 worst u, 6 members, 7 hole, 8 into ER, 9 wet.
+  row() { printf '%s\n' "$bulk" | grep "^$1  *" | sed "s/^$1  *//"; }
+  window_lo=$(printf '%s\n' "$bulk" | sed -n 's/^restraint window: .* true for \([0-9.]*\) <= r.*/\1/p')
+  window_hi=$(printf '%s\n' "$bulk" | sed -n 's/^restraint window: .*<= r < \([0-9.]*\),.*/\1/p')
+  check "the restraint window's lower bound" 0.2194 0.0005 "$window_lo" \
+        "**0.2194 ≤ r < 0.2505**"
+  check "the restraint window's upper bound" 0.2505 0.0005 "$window_hi" \
+        "**0.2194 ≤ r < 0.2505**"
+  check "the fire-alone control's peak member temperature (C)" 252.2 0.2 \
+        "$(row 'fire alone' | awk '{ print $4 }')" "member peak | 252.2 °C"
+  check "the fire-alone control's worst utilisation" 0.934 0.002 \
+        "$(row 'fire alone' | awk '{ print $5 }')" "| 0.934 |"
+  check "the head-alone control's worst utilisation" 0.274 0.002 \
+        "$(row 'head alone' | awk '{ print $5 }')" "| 0.274 |"
+  check "the coupled case's worst utilisation" 1.001 0.002 \
+        "$(row 'both' | awk '{ print $5 }')" "| **1.001** |"
+  check "the failure time (s)" 1935 5 "$(row 'both' | awk '{ print $2 }')" "at 1935 s"
+  check "water into the machinery spaces (m3)" 307.7 1.0 \
+        "$(row 'both' | awk '{ print $8 }')" "307.7 m³"
+  check "the hole the failure opened (m2)" 0.490 0.001 \
+        "$(row 'both' | awk '{ print $7 }')" "0.490 m²"
+  magnifier=$(printf '%s\n' "$bulk" | sed -n 's/.*magnified    [0-9.]*   (x\([0-9.]*\),.*/\1/p')
+  additive=$(printf '%s\n' "$bulk" | sed -n 's/^  utilisation [0-9.]*, .* additive check reads \([0-9.]*\) and.*/\1/p')
+  check "the beam-column magnification at failure" 2.086 0.005 "$magnifier" "**2.086**"
+  check "what a purely additive check would have read" 0.747 0.002 "$additive" \
+        "0.747 and has not failed"
+  cooler=$(printf '%s\n' "$bulk" | sed -n 's/.*leaves the member \([0-9.]*\) K hotter.*/\1/p')
+  check "how much hotter a dry hold leaves the member (K)" 77.4 0.3 "$cooler" \
+        "**77.4 K hotter**"
+  # **And the finding itself, not only its numbers.** Each figure above could match
+  # while the milestone's own sentence had stopped reproducing, so the relation is
+  # asserted as a relation.
+  checks=$((checks + 1))
+  if printf '%s\n' "$bulk" | grep -q '^ok$' &&
+     [ "$(row 'fire alone' | awk '{ print $1 }')" = "no" ] &&
+     [ "$(row 'head alone' | awk '{ print $1 }')" = "no" ] &&
+     [ "$(row 'both' | awk '{ print $1 }')" = "yes" ]; then
+    printf '  %s✓%s and the milestone still reproduces its own sentence: neither cause alone,'\
+' both together\n' "$green" "$off"
+  else
+    printf '  %s✗%s the milestone no longer reproduces its own sentence\n' "$red" "$off"
+    printf '      %s%s publishes the three-run table%s\n' "$dim" "$DOC" "$off"
+    fails=$((fails + 1))
+  fi
+else
+  echo "  - bulkhead_probe not built, skipping the Phase 4 milestone figures"
+fi
+
 if [ ! -x "$RAM" ]; then
   echo "  - ram_view not built, skipping published-figure check"
   exit 0
