@@ -34,6 +34,7 @@ int main() {
     runOffscreenTests();
     runOceanTests();
     runHullRenderTests();
+    runSmokeRenderTests();
     runZoneGpuTests();
 #elif defined(SHIPSIM_HAS_VULKAN)
     std::printf("\n--- vulkan device ---\n     skipped under ThreadSanitizer"
@@ -51,6 +52,7 @@ int main() {
     runPlasticityTests();
     runSerialiseTests();
     runShipFileTests();
+    runSmokeTests();
     runWorldIoTests();
     runWaveTests();
     runBucklingTests();

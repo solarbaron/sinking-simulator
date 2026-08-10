@@ -801,7 +801,53 @@ should be honest about that.
   done and this is the larger term for any restrained member — see above.
 - Suppression systems, and their effect on stability
 - LES promotion for the local compartment
-- Volumetric fire and smoke rendering
+- ✅ Volumetric fire and smoke rendering — `engine/gpu/smoke.{hpp,cpp}`,
+  `engine/gpu/smoke_gpu.cpp`, `engine/gpu/shaders/smoke.{vert,frag}`,
+  `tools/smoke_view`. Two homogeneous emitting, absorbing slabs per compartment on
+  the prism the zone model solves on, composited over the lit solid with
+  premultiplied alpha. Full detail and every figure in
+  `03-renderer-audio.md`'s "Fire and smoke — what exists".
+
+  **There is no raymarch, and that is the physics rather than an optimisation.**
+  The plan for this item said "volumetric raymarching against the gas solver's
+  density and temperature fields". A two-zone model has no fields: it has two
+  masses, two internal energies, two species loadings and an interface height per
+  compartment. Each layer is exactly uniform, so the transfer integral is closed
+  form — `B(1 − e^(−kd)) + e^(−kd) L_bg` per layer — and the path lengths come
+  from an analytic segment-against-half-space intersection. Extinction and
+  emissivity are the same exponential, so a clear compartment composites to the
+  background *bit for bit*, which is asserted against `HullRenderer`'s own frame.
+
+  **What was refused.** No plume, because the model carries an entrainment *rate*
+  and not a shape; no flame, because it carries a mean height and no flame
+  temperature; no ceiling jet, no horizontal structure and no gradient inside a
+  layer, because a zone is well mixed by definition; and the interface is drawn
+  sharp because the model says it is a plane. Each of those would have been
+  structure the simulation does not have.
+
+  **Three results that were not the expected ones.** *This fire has no fire in
+  it*: a grey layer first puts one byte of red on the screen at 834 K and the
+  ferry's 4 MW machinery fire peaks at 531 K, so what a two-zone fire looks like at
+  that power is smoke — the glow is a result, and `smoke_view` asserts its absence
+  rather than tuning it into view. *The layer goes optically black in about a
+  minute* — optical depth across the engine room passes 10 before t = 100 s and
+  reaches 511 — so the only visible information a two-zone model has is the
+  interface height. And *the layer does not descend monotonically*: it reaches
+  2.96 m at t ≈ 300 s and recovers to 3.13 m as the room reaches its vented steady
+  state, which the first version of the test asserted away.
+
+  Closed forms on pixels, all agreeing to **one least-significant bit**:
+  Beer–Lambert on a slab of known thickness, its square when the thickness
+  doubles, the medium stopping at whatever is solid, every pixel against an
+  independent statement of the same integral in double, and the interface
+  bracketed by two `sim::clipToPixel` projections 2 px apart. **0.007 ms** for the
+  volumetric pass at 960 × 540 on the GTX 1070 Ti, against 0.056 ms for the lit
+  solid under it.
+
+  The pass first shipped culling the wrong face, and **every closed-form check
+  passed at 1 LSB anyway** — from outside a volume both senses give one fragment
+  per pixel and the same colour. Only a camera *inside* the medium can tell them
+  apart, and that check was off by 152.
 - **Milestone:** an engine room fire that heats a bulkhead until it fails under
   the head of water behind it, and the flooding spreads. Three subsystems, none
   of which know about each other, producing one consequence.

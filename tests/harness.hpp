@@ -52,6 +52,8 @@ void runSolidShellTests();
 void runThermalTests();
 void runSerialiseTests();
 void runShipFileTests();
+void runSmokeTests();
+void runSmokeRenderTests();
 void runWorldIoTests();
 void runWaveTests();
 void runBucklingTests();
