@@ -54,9 +54,11 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <map>
 #include <numbers>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace sim;
@@ -824,6 +826,571 @@ void testPressureLoadResultant() {
     for (int c = 0; c < 4; ++c) cornerAverage += mesh.position[face[c] * 3] / 4.0;
     expectTrue("the face is skewed enough for the distinction to exist",
                std::abs(cornerAverage - firstMoment[0] / area) > 1e-3);
+}
+
+// --- 1b. Eigenstrain ------------------------------------------------------------
+//
+// A strain that is not a stress. Everything here is an identity, because every one
+// of these has an exact answer and a tolerance on any of them would hide the one
+// defect the whole mechanism is exposed to: a subtraction that went the wrong way,
+// or that happened in one of the two places it has to happen and not the other.
+
+// A mesh whose elements are all distorted **in plane** -- the distortion a hull
+// panel actually meshes to -- with every element still of constant thickness. That
+// last part is load-bearing: a solid-shell whose thickness varies *within* the
+// element cannot represent a free dilatation exactly, and
+// `testTaperedElementCannotExpandFreely` below is where that is measured rather
+// than tripped over.
+//
+// Interior nodes only, so the block stays a block and its boundary stays planar;
+// the test needs a distorted *element*, not a distorted *body*.
+HexMesh distortedBlock(int nx, int ny, int nz, double lx, double ly, double lz) {
+    HexMesh mesh = makePlateMesh(lx, ly, lz, nx, ny, nz);
+    std::mt19937 rng(20260809u);
+    std::uniform_real_distribution<double> jitter(-0.22, 0.22);
+    const double h[2] = {lx / nx, ly / ny};
+    const double extent[2] = {lx, ly};
+    // The in-plane position of a node, keyed by the (x, y) it started at, so that
+    // every node in a through-thickness stack moves together and the columns stay
+    // straight. Otherwise the elements taper and the test measures the element's
+    // ANS sampling instead of the eigenstrain.
+    std::map<std::pair<long long, long long>, std::pair<double, double>> moved;
+    for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+        const double x0 = mesh.position[n * 3], y0 = mesh.position[n * 3 + 1];
+        const std::pair<long long, long long> key{std::llround(x0 * 1e9),
+                                                  std::llround(y0 * 1e9)};
+        auto it = moved.find(key);
+        if (it == moved.end()) {
+            double x = x0, y = y0;
+            if (x0 > 1e-12 && x0 < extent[0] - 1e-12) x += jitter(rng) * h[0];
+            if (y0 > 1e-12 && y0 < extent[1] - 1e-12) y += jitter(rng) * h[1];
+            it = moved.emplace(key, std::pair<double, double>{x, y}).first;
+        }
+        mesh.position[n * 3] = it->second.first;
+        mesh.position[n * 3 + 1] = it->second.second;
+    }
+    return mesh;
+}
+
+// The largest |sigma| over every Gauss point of every element.
+double worstStress(const HexMesh& mesh, const StructuralMaterial& material, Formulation form,
+                   const std::vector<double>& displacement, const double* eigenstrain) {
+    double worst = 0;
+    for (std::size_t e = 0; e < mesh.elementCount(); ++e) {
+        double nodes[kDof], u[kDof], stress[kGauss * 6];
+        for (int a = 0; a < kNodes; ++a) {
+            const std::size_t n = mesh.index[e * kNodes + static_cast<std::size_t>(a)];
+            for (int i = 0; i < 3; ++i) {
+                nodes[a * 3 + i] = mesh.position[n * 3 + static_cast<std::size_t>(i)];
+                u[a * 3 + i] = displacement[n * 3 + static_cast<std::size_t>(i)];
+            }
+        }
+        elementStress(nodes, u, material, form, stress, eigenstrain);
+        for (int i = 0; i < kGauss * 6; ++i) worst = std::max(worst, std::abs(stress[i]));
+    }
+    return worst;
+}
+
+// Free expansion: the three constraints that remove rigid body motion and nothing
+// else. Node at the origin fully, one along +x in y and z, one along +y in z --
+// statically determinate, so the body is free to grow in every direction.
+void supportFreely(HexMesh& mesh) {
+    std::size_t origin = 0, alongX = 0, alongY = 0;
+    double bestX = -1e30, bestY = -1e30, best = 1e30;
+    for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+        const double x = mesh.position[n * 3], y = mesh.position[n * 3 + 1],
+                     z = mesh.position[n * 3 + 2];
+        if (x + y + z < best) { best = x + y + z; origin = n; }
+    }
+    const double oy = mesh.position[origin * 3 + 1], oz = mesh.position[origin * 3 + 2];
+    for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+        const double x = mesh.position[n * 3], y = mesh.position[n * 3 + 1],
+                     z = mesh.position[n * 3 + 2];
+        if (std::abs(y - oy) < 1e-12 && std::abs(z - oz) < 1e-12 && x > bestX) {
+            bestX = x;
+            alongX = n;
+        }
+        if (std::abs(x - mesh.position[origin * 3]) < 1e-12 && std::abs(z - oz) < 1e-12 &&
+            y > bestY) {
+            bestY = y;
+            alongY = n;
+        }
+    }
+    mesh.pin(origin, 0);
+    mesh.pin(origin, 1);
+    mesh.pin(origin, 2);
+    mesh.pin(alongX, 1);
+    mesh.pin(alongX, 2);
+    mesh.pin(alongY, 2);
+}
+
+void testFreeExpansionCarriesNoStress() {
+    const StructuralMaterial steel = steelMaterial();
+    const double e = 5.1984e-3;  // the EN elongation at 400 C, so the scale is a real one
+    const double eigen[6] = {e, e, e, 0, 0, 0};
+
+    // What the stress would be if the eigenstrain were simply *not* subtracted --
+    // the whole point of asserting zero rather than something small.
+    const double nu = steel.poissonRatio, ee = steel.youngsModulus;
+    const double bulkStress = ee / (1.0 - 2.0 * nu) * e;  // (3 lambda + 2 mu) e
+
+    for (int distorted = 0; distorted < 2; ++distorted) {
+        HexMesh mesh = distorted ? distortedBlock(3, 2, 2, 0.9, 0.6, 0.048)
+                                 : makePlateMesh(0.9, 0.6, 0.048, 3, 2, 2);
+        supportFreely(mesh);
+        const std::string tag = distorted ? " (distorted)" : " (rectangular)";
+
+        std::vector<double> eigenstrain(mesh.elementCount() * 6);
+        for (std::size_t el = 0; el < mesh.elementCount(); ++el)
+            for (int i = 0; i < 6; ++i) eigenstrain[el * 6 + i] = eigen[i];
+
+        const std::vector<double> load =
+            thermalLoad(mesh, steel, Formulation::SolidShell, eigenstrain);
+        expectEqual("the thermal load has one value per degree of freedom" + tag,
+                    static_cast<long long>(load.size()),
+                    static_cast<long long>(mesh.nodeCount() * 3));
+
+        // The load is in equilibrium with itself: heating a free body applies no
+        // net force and no net moment to it.
+        double force[3] = {0, 0, 0}, moment[3] = {0, 0, 0}, biggest = 0;
+        for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+            const double* f = &load[n * 3];
+            const double* p = &mesh.position[n * 3];
+            for (int i = 0; i < 3; ++i) {
+                force[i] += f[i];
+                biggest = std::max(biggest, std::abs(f[i]));
+            }
+            moment[0] += p[1] * f[2] - p[2] * f[1];
+            moment[1] += p[2] * f[0] - p[0] * f[2];
+            moment[2] += p[0] * f[1] - p[1] * f[0];
+        }
+        expectTrue("the thermal load is not itself trivial" + tag, biggest > 1e5);
+        for (int i = 0; i < 3; ++i) {
+            expectNear("the thermal load carries no net force, axis " + std::to_string(i) + tag,
+                       force[i], 0.0, 1e-9 * biggest);
+            expectNear("nor any net moment, axis " + std::to_string(i) + tag, moment[i], 0.0,
+                       1e-9 * biggest * 0.9);
+        }
+
+        std::vector<double> displacement;
+        std::string problem;
+        expectTrue("the free-expansion solve succeeds" + tag,
+                   solveStatic(mesh, steel, Formulation::SolidShell, load, displacement,
+                               &problem));
+
+        // The exact solution is a uniform dilatation about the pinned origin,
+        // u = e (x - x0), and it is in the trilinear space, so the discrete answer
+        // is that field to rounding.
+        std::size_t origin = 0;
+        double best = 1e30;
+        for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+            const double s = mesh.position[n * 3] + mesh.position[n * 3 + 1] +
+                             mesh.position[n * 3 + 2];
+            if (s < best) { best = s; origin = n; }
+        }
+        double worstDisplacement = 0, span = 0;
+        for (std::size_t n = 0; n < mesh.nodeCount(); ++n)
+            for (int i = 0; i < 3; ++i) {
+                const double want =
+                    e * (mesh.position[n * 3 + static_cast<std::size_t>(i)] -
+                         mesh.position[origin * 3 + static_cast<std::size_t>(i)]);
+                worstDisplacement = std::max(
+                    worstDisplacement,
+                    std::abs(displacement[n * 3 + static_cast<std::size_t>(i)] - want));
+                span = std::max(span, std::abs(want));
+            }
+        expectTrue("the body actually expanded" + tag, span > 1e-6);
+        expectNear("free expansion is exactly the uniform dilatation" + tag, worstDisplacement,
+                   0.0, 1e-11 * span);
+
+        // **The assertion this whole mechanism exists for.**
+        const double zero = worstStress(mesh, steel, Formulation::SolidShell, displacement,
+                                        eigen);
+        expectNear("a freely expanding body carries no stress at all" + tag, zero, 0.0,
+                   1e-9 * bulkStress);
+
+        // Non-vacuous, twice over. Reading the same displacement *without* the
+        // eigenstrain gives the full bulk stress -- so the test fails if the
+        // subtraction in `elementStress` is dropped -- and solving without the
+        // thermal load gives no displacement at all, so it fails if the load is.
+        const double ignored =
+            worstStress(mesh, steel, Formulation::SolidShell, displacement, nullptr);
+        expectNear("and it is 2.68 GPa if the eigenstrain is not subtracted" + tag, ignored,
+                   bulkStress, 1e-6 * bulkStress);
+
+        std::vector<double> none(mesh.nodeCount() * 3, 0.0), unloaded;
+        expectTrue("the unloaded solve succeeds" + tag,
+                   solveStatic(mesh, steel, Formulation::SolidShell, none, unloaded, &problem));
+        const double withoutLoad =
+            worstStress(mesh, steel, Formulation::SolidShell, unloaded, eigen);
+        expectNear("and it is the same magnitude, negated, if the load is dropped" + tag,
+                   withoutLoad, bulkStress, 1e-6 * bulkStress);
+    }
+}
+
+// Six element geometries: what the mesher makes, and two that it does not.
+struct NamedElement {
+    const char* name;
+    double node[kDof];
+};
+
+const NamedElement kGeometries[] = {
+    {"rectangular",
+     {0, 0, 0, 0.60, 0, 0, 0.60, 0.45, 0, 0, 0.45, 0, 0, 0, 0.012, 0.60, 0, 0.012, 0.60, 0.45,
+      0.012, 0, 0.45, 0.012}},
+    {"in-plane trapezoid",
+     {0, 0, 0, 0.62, 0.03, 0, 0.55, 0.48, 0, 0.04, 0.44, 0, 0, 0, 0.012, 0.62, 0.03, 0.012, 0.55,
+      0.48, 0.012, 0.04, 0.44, 0.012}},
+    {"warped mid-surface, 1 mm in 12",
+     {0, 0, 0.000, 0.60, 0, 0.001, 0.60, 0.45, 0.000, 0, 0.45, 0.001, 0, 0, 0.012, 0.60, 0, 0.013,
+      0.60, 0.45, 0.012, 0, 0.45, 0.013}},
+    {"uniform director tilt",
+     {0, 0, 0, 0.60, 0, 0, 0.60, 0.45, 0, 0, 0.45, 0, 0.004, 0.003, 0.012, 0.604, 0.003, 0.012,
+      0.604, 0.453, 0.012, 0.004, 0.453, 0.012}},
+};
+
+void testEigenstrainAndTheEnhancedModes() {
+    // **`int G^T C eps* dV` is identically zero for a constant eigenstrain, on every
+    // geometry**, because `int G^T dV = 0` is the Simo-Rifai condition that makes
+    // EAS pass the patch test. That was not the expectation when the term was
+    // written, so it is asserted rather than argued -- and asserted on the integral
+    // itself, so that an enhanced basis which stopped satisfying it is caught here
+    // and not in a caller.
+    const StructuralMaterial steel = steelMaterial();
+    const double e = 5.1984e-3;  // the EN elongation at 400 C
+    const double eigen[6] = {e, e, e, 0, 0, 0};
+    const double bulkStress = steel.youngsModulus / (1.0 - 2.0 * steel.poissonRatio) * e;
+
+    for (const NamedElement& g : kGeometries) {
+        const std::string tag = std::string(" -- ") + g.name;
+
+        // `int G^T dV = 0`, read out of the element's own forms rather than
+        // re-derived, one component at a time.
+        RestForms forms;
+        expectTrue("the forms build" + tag,
+                   computeRestForms(g.node, Formulation::SolidShell, forms));
+        double volume = 0;
+        for (int gp = 0; gp < kGauss; ++gp) volume += forms.weight[gp];
+        double worstIntegral = 0, worstMode = 0;
+        for (int k = 0; k < forms.easCount; ++k)
+            for (int i = 0; i < 6; ++i) {
+                double integral = 0, magnitude = 0;
+                for (int gp = 0; gp < kGauss; ++gp) {
+                    integral += forms.weight[gp] * forms.g[gp][i][k];
+                    magnitude += forms.weight[gp] * std::abs(forms.g[gp][i][k]);
+                }
+                worstIntegral = std::max(worstIntegral, std::abs(integral));
+                worstMode = std::max(worstMode, magnitude);
+            }
+        expectTrue("the enhanced modes are not themselves zero" + tag, worstMode > 1e-6);
+        expectNear("int G dV vanishes, which is why the enhanced thermal term does" + tag,
+                   worstIntegral, 0.0, 1e-14 * worstMode);
+        expectTrue("and the element has a volume to integrate over" + tag, volume > 1e-6);
+
+        // Free expansion, exactly. The displacement is the closed-form dilatation,
+        // so no solve stands between the element and the assertion.
+        double u[kDof], stress[kGauss * 6];
+        for (int i = 0; i < kDof; ++i) u[i] = e * g.node[i];
+        elementStress(g.node, u, steel, Formulation::SolidShell, stress, eigen);
+        double worst = 0;
+        for (int i = 0; i < kGauss * 6; ++i) worst = std::max(worst, std::abs(stress[i]));
+        expectNear("free expansion is exactly stress free" + tag, worst, 0.0,
+                   1e-13 * bulkStress);
+    }
+}
+
+void testTaperedElementCannotExpandFreely() {
+    // **The one geometry that is not exact, and the eigenstrain is not why.** A
+    // solid-shell whose thickness varies within the element samples
+    // `E_zeta,zeta` at four in-plane corners and interpolates it bilinearly, which
+    // is exact only while `|g_zeta|` is constant. The plain patch test -- a linear
+    // displacement field, no eigenstrain anywhere -- already fails on it, and by
+    // more than the free-expansion case does. Both are measured so the day the
+    // mesher produces one, the size is written down rather than discovered.
+    //
+    // Nothing reaches it today: `zone.cpp` extrudes one patch at one thickness by
+    // construction and warns when a thickness seam is crossed.
+    const StructuralMaterial steel = steelMaterial();
+    const double e = 5.1984e-3;
+    const double eigen[6] = {e, e, e, 0, 0, 0};
+    const double bulkStress = steel.youngsModulus / (1.0 - 2.0 * steel.poissonRatio) * e;
+    // 10 mm at one corner to 15 mm at another: a +-20% taper, far past anything a
+    // hull mesh would carry.
+    const double tapered[kDof] = {0,    0,    0,     0.60, 0,    0,     0.60, 0.45,
+                                  0,    0,    0.45,  0,    0,    0,     0.014, 0.60,
+                                  0,    0.010, 0.60, 0.45, 0.015, 0,    0.45,  0.011};
+
+    double u[kDof], stress[kGauss * 6];
+    for (int i = 0; i < kDof; ++i) u[i] = e * tapered[i];
+    elementStress(tapered, u, steel, Formulation::SolidShell, stress, eigen);
+    double worst = 0;
+    for (int i = 0; i < kGauss * 6; ++i) worst = std::max(worst, std::abs(stress[i]));
+    expectNear("a +-20% tapered element leaves 1.75% of the bulk stress under free expansion",
+               worst / bulkStress, 0.01748, 5e-4);
+
+    // The same element, no eigenstrain at all, under a general linear displacement:
+    // the stress ought to be constant over the eight points and is not.
+    const double gradient[3][3] = {{1.1e-3, 3.0e-4, -2.0e-4},
+                                   {5.0e-4, -7.0e-4, 1.0e-4},
+                                   {2.0e-4, -4.0e-4, 9.0e-4}};
+    double linear[kDof], plain[kGauss * 6];
+    for (int a = 0; a < kNodes; ++a)
+        for (int i = 0; i < 3; ++i)
+            linear[a * 3 + i] = gradient[i][0] * tapered[a * 3] +
+                                gradient[i][1] * tapered[a * 3 + 1] +
+                                gradient[i][2] * tapered[a * 3 + 2];
+    elementStress(tapered, linear, steel, Formulation::SolidShell, plain, nullptr);
+    double spread = 0, magnitude = 0;
+    for (int i = 0; i < 6; ++i) {
+        double lo = plain[i], hi = plain[i];
+        for (int gp = 1; gp < kGauss; ++gp) {
+            lo = std::min(lo, plain[gp * 6 + i]);
+            hi = std::max(hi, plain[gp * 6 + i]);
+        }
+        spread = std::max(spread, hi - lo);
+        magnitude = std::max(magnitude, std::abs(hi));
+    }
+    expectNear("and the plain patch test spreads by 1.09% on the same element, with no"
+               " eigenstrain in sight",
+               spread / magnitude, 0.01089, 5e-4);
+
+    // Non-vacuous: the same two checks on a constant-thickness element are at the
+    // rounding floor, so the taper is what is being measured.
+    const double even[kDof] = {0,    0,    0,     0.60, 0,    0,     0.60, 0.45,
+                               0,    0,    0.45,  0,    0,    0,     0.012, 0.60,
+                               0,    0.012, 0.60, 0.45, 0.012, 0,    0.45,  0.012};
+    double ue[kDof], se[kGauss * 6];
+    for (int i = 0; i < kDof; ++i) ue[i] = e * even[i];
+    elementStress(even, ue, steel, Formulation::SolidShell, se, eigen);
+    double evenWorst = 0;
+    for (int i = 0; i < kGauss * 6; ++i) evenWorst = std::max(evenWorst, std::abs(se[i]));
+    expectNear("the same element at constant thickness is exact", evenWorst / bulkStress, 0.0,
+               1e-13);
+}
+
+void testRestraintAndNotTemperatureIsWhatGeneratesStress() {
+    // A bar heated uniformly and held at both ends to a *prescribed* extension. The
+    // degree of restraint R = 1 - delta / (eps* L) sweeps the whole spectrum from
+    // free to fully restrained, and the closed form is exact at every point:
+    //
+    //     sigma_xx = -R E eps*
+    //
+    // -- because eps_xx = (1 - R) eps*, the lateral faces are free so sigma_yy and
+    // sigma_zz vanish, and for that state the uniaxial modulus is exactly E. This
+    // is the statement that a temperature on its own carries no stress and that
+    // the whole of the effect is the boundary condition.
+    const StructuralMaterial steel = steelMaterial();
+    const double lx = 2.40, ly = 0.20, lz = 0.012;
+    const double e = 1.842374e-3;  // the EN elongation at the 164.63 C anchor
+    const double eigen[6] = {e, e, e, 0, 0, 0};
+
+    for (double restraint : {1.0, 0.75, 0.5, 0.25, 0.0}) {
+        HexMesh mesh = makePlateMesh(lx, ly, lz, 4, 2, 1);
+        const double delta = (1.0 - restraint) * e * lx;
+        // Both x faces held: the -x face at zero, the +x face at `delta`. Free in y
+        // and z apart from three pins that remove the remaining rigid motions --
+        // and the third of them is not optional. Pinning only the corner in y and z
+        // leaves the bar free to **spin about its own axis**, which the x-face pins
+        // do not touch, and `solveStatic` refuses the singular system rather than
+        // returning a plausible answer. That refusal is what caught it.
+        std::size_t corner = mesh.nodeCount(), offAxis = mesh.nodeCount();
+        for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+            const double x = mesh.position[n * 3], y = mesh.position[n * 3 + 1],
+                         z = mesh.position[n * 3 + 2];
+            if (x < 1e-12) mesh.pin(n, 0, 0.0);
+            if (x > lx - 1e-12) mesh.pin(n, 0, delta);
+            if (x < 1e-12 && y < 1e-12 && z < 1e-12) corner = n;
+            if (x < 1e-12 && y > ly - 1e-12 && z < 1e-12) offAxis = n;
+        }
+        expectTrue("both support nodes were found",
+                   corner < mesh.nodeCount() && offAxis < mesh.nodeCount());
+        mesh.pin(corner, 1, 0.0);
+        mesh.pin(corner, 2, 0.0);
+        mesh.pin(offAxis, 2, 0.0);  // kills rotation about x; both nodes sit at z = 0,
+                                    // where the exact solution has u_z = 0 anyway
+
+        std::vector<double> eigenstrain(mesh.elementCount() * 6);
+        for (std::size_t el = 0; el < mesh.elementCount(); ++el)
+            for (int i = 0; i < 6; ++i) eigenstrain[el * 6 + i] = eigen[i];
+        const std::vector<double> load =
+            thermalLoad(mesh, steel, Formulation::SolidShell, eigenstrain);
+
+        std::vector<double> displacement;
+        std::string problem;
+        expectTrue("the restrained-bar solve succeeds",
+                   solveStatic(mesh, steel, Formulation::SolidShell, load, displacement,
+                               &problem));
+
+        const double want = -restraint * steel.youngsModulus * e;
+        double worstAxial = 0, worstLateral = 0;
+        for (std::size_t el = 0; el < mesh.elementCount(); ++el) {
+            double nodes[kDof], u[kDof], stress[kGauss * 6];
+            for (int a = 0; a < kNodes; ++a) {
+                const std::size_t n = mesh.index[el * kNodes + static_cast<std::size_t>(a)];
+                for (int i = 0; i < 3; ++i) {
+                    nodes[a * 3 + i] = mesh.position[n * 3 + static_cast<std::size_t>(i)];
+                    u[a * 3 + i] = displacement[n * 3 + static_cast<std::size_t>(i)];
+                }
+            }
+            elementStress(nodes, u, steel, Formulation::SolidShell, stress, eigen);
+            for (int gp = 0; gp < kGauss; ++gp) {
+                worstAxial = std::max(worstAxial, std::abs(stress[gp * 6] - want));
+                for (int i = 1; i < 6; ++i)
+                    worstLateral = std::max(worstLateral, std::abs(stress[gp * 6 + i]));
+            }
+        }
+        const double scale = steel.youngsModulus * e;
+        expectNear("a bar restrained to R = " + std::to_string(restraint) +
+                       " carries exactly -R E eps*",
+                   worstAxial, 0.0, 1e-9 * scale);
+        expectNear("and nothing at all on the free faces, R = " + std::to_string(restraint),
+                   worstLateral, 0.0, 1e-9 * scale);
+    }
+
+    // Non-vacuous: full restraint is 379 MPa of compression and free is zero, so
+    // the sweep is not measuring the same thing five times.
+    expectNear("full restraint at this eigenstrain is 379.5 MPa", steel.youngsModulus * e * 1e-6,
+               379.53, 0.05);
+}
+
+void testNullEigenstrainIsTheSameArithmetic() {
+    // The exact control. A zero eigenstrain and no eigenstrain must be **bit**
+    // identical, on every output of both entry points, or an unheated ship is not
+    // the ship master computes.
+    const StructuralMaterial steel = steelMaterial();
+    const double zeroEigen[6] = {0, 0, 0, 0, 0, 0};
+    // Deliberately the *awkward* geometry here -- warped, tapered and sheared. Bit
+    // identity has to hold on an element the arithmetic is hardest on, and this one
+    // is not required to expand freely.
+    const double nodes[kDof] = {0.00, 0.00, 0.000, 0.62, 0.03, 0.001, 0.55, 0.48, -0.002,
+                                0.04, 0.44, 0.003, 0.02, 0.05, 0.014, 0.60, 0.01, 0.013,
+                                0.58, 0.46, 0.015, 0.01, 0.41, 0.012};
+    // A displacement with bending, shear and stretch in it, so every row of B and
+    // every enhanced mode is exercised.
+    double current[kDof];
+    std::mt19937 rng(770213u);
+    std::uniform_real_distribution<double> jitter(-2.0e-4, 2.0e-4);
+    for (int i = 0; i < kDof; ++i) current[i] = nodes[i] + jitter(rng);
+
+    double u[kDof];
+    for (int i = 0; i < kDof; ++i) u[i] = current[i] - nodes[i];
+    double withNull[kGauss * 6], withZero[kGauss * 6];
+    elementStress(nodes, u, steel, Formulation::SolidShell, withNull, nullptr);
+    elementStress(nodes, u, steel, Formulation::SolidShell, withZero, zeroEigen);
+    bool identical = true, moved = false;
+    for (int i = 0; i < kGauss * 6; ++i) {
+        identical = identical && withNull[i] == withZero[i];
+        moved = moved || std::abs(withNull[i]) > 1.0;
+    }
+    expectTrue("elementStress at zero eigenstrain is bit-identical to no eigenstrain",
+               identical);
+    expectTrue("and the element was carrying stress, so that is not vacuous", moved);
+
+    const plasticity::Material flow = plasticity::shipSteel();
+    ElementPlasticState stateNull, stateZero;
+    initialisePlasticState(nodes, flow, stateNull);
+    initialisePlasticState(nodes, flow, stateZero);
+    double forceNull[kDof], forceZero[kDof], stressNull[kGauss * 6], stressZero[kGauss * 6];
+    const PlasticUpdate a = elementPlasticUpdate(nodes, current, flow, Formulation::SolidShell,
+                                                 stateNull, forceNull, stressNull, nullptr);
+    const PlasticUpdate b = elementPlasticUpdate(nodes, current, flow, Formulation::SolidShell,
+                                                 stateZero, forceZero, stressZero, zeroEigen);
+    bool same = a.iterations == b.iterations && a.yieldedPoints == b.yieldedPoints &&
+                a.dissipation == b.dissipation && a.enhancedWork == b.enhancedWork;
+    for (int i = 0; i < kDof; ++i) same = same && forceNull[i] == forceZero[i];
+    for (int i = 0; i < kGauss * 6; ++i) same = same && stressNull[i] == stressZero[i];
+    for (int gp = 0; gp < kGauss; ++gp) {
+        same = same && stateNull.point[gp].equivalentPlasticStrain ==
+                           stateZero.point[gp].equivalentPlasticStrain;
+        for (int i = 0; i < plasticity::kVoigt; ++i)
+            same = same && stateNull.point[gp].plasticStrain[i] ==
+                               stateZero.point[gp].plasticStrain[i];
+    }
+    for (int k = 0; k < kEas; ++k) same = same && stateNull.enhanced[k] == stateZero.enhanced[k];
+    expectTrue("elementPlasticUpdate is bit-identical too, history included", same);
+    expectTrue("and it did some work, so that is not vacuous either",
+               a.enhancedWork > 0.0 || a.yieldedPoints > 0);
+}
+
+void testEigenstrainThroughThePlasticUpdate() {
+    // The eigenstrain has to reach the *nonlinear* path as well, and there the
+    // enhanced parameters are found by Newton on `r(alpha) = 0` rather than by a
+    // closed form -- so if the subtraction is in the right place the enhanced modes
+    // need no term of their own. Two checks, both exact.
+    const plasticity::Material flow = plasticity::shipSteel();
+    const StructuralMaterial steel = steelMaterial();
+    // In-plane trapezoid at constant thickness: what a hull panel meshes to, and
+    // the geometry on which free expansion is exact.
+    const double nodes[kDof] = {0.00, 0.00, 0.000, 0.62, 0.03, 0.000, 0.55, 0.48, 0.000,
+                                0.04, 0.44, 0.000, 0.00, 0.00, 0.012, 0.62, 0.03, 0.012,
+                                0.55, 0.48, 0.012, 0.04, 0.44, 0.012};
+
+    // (a) An element held at its rest position and given an eigenstrain is the same
+    //     element displaced by -eps* x with no eigenstrain: the constitutive law
+    //     sees the same mechanical strain either way, so it must answer the same.
+    const double e = 4.0e-4;  // elastic, so the comparison is not about the return map
+    const double eigen[6] = {e, e, e, 0, 0, 0};
+    double shrunk[kDof];
+    for (int i = 0; i < kDof; ++i) shrunk[i] = nodes[i] * (1.0 - e);
+
+    ElementPlasticState heated, pulled;
+    initialisePlasticState(nodes, flow, heated);
+    initialisePlasticState(nodes, flow, pulled);
+    double fHeated[kDof], fPulled[kDof], sHeated[kGauss * 6], sPulled[kGauss * 6];
+    elementPlasticUpdate(nodes, nodes, flow, Formulation::SolidShell, heated, fHeated, sHeated,
+                         eigen);
+    elementPlasticUpdate(nodes, shrunk, flow, Formulation::SolidShell, pulled, fPulled, sPulled,
+                         nullptr);
+    double worst = 0, scale = 0;
+    for (int i = 0; i < kGauss * 6; ++i) {
+        worst = std::max(worst, std::abs(sHeated[i] - sPulled[i]));
+        scale = std::max(scale, std::abs(sHeated[i]));
+    }
+    expectTrue("the heated element is actually stressed", scale > 1e8);
+    // Not bit-identical: the two reach the same mechanical strain by different
+    // arithmetic -- one subtracts a constant from B u, the other scales the
+    // geometry -- and the co-rotation of a shrunk element is not exactly the
+    // identity. Nine digits is what that costs and it is measured, not chosen.
+    expectNear("heating an element is contracting it, to nine digits", worst, 0.0,
+               2e-9 * scale);
+
+    // (b) The stress of an element under free expansion, through the plastic path,
+    //     is exactly zero -- the same identity as the elastic one, and the check
+    //     that the Newton found alpha = 0 rather than something that happened to
+    //     be small.
+    //
+    //     Both bounds are taken against the **same element fully restrained**,
+    //     which is `heated` above: it is the only reference that gets the units and
+    //     the magnitude right for a force as well as for a stress, and it makes the
+    //     assertion "the free element is 1e-11 of the restrained one" rather than
+    //     "small against a constant somebody chose". Measured: 3.1e-13 in both,
+    //     which is the rounding of a 24-term dot product against a 206 MPa stress
+    //     and 13.5 MN of force, so 1e-11 is thirty times the floor and not more.
+    double grown[kDof];
+    for (int i = 0; i < kDof; ++i) grown[i] = nodes[i] * (1.0 + e);
+    ElementPlasticState free;
+    initialisePlasticState(nodes, flow, free);
+    double fFree[kDof], sFree[kGauss * 6];
+    elementPlasticUpdate(nodes, grown, flow, Formulation::SolidShell, free, fFree, sFree,
+                         eigen);
+    double freeStress = 0, freeForce = 0, heldStress = 0, heldForce = 0;
+    for (int i = 0; i < kGauss * 6; ++i) {
+        freeStress = std::max(freeStress, std::abs(sFree[i]));
+        heldStress = std::max(heldStress, std::abs(sHeated[i]));
+    }
+    for (int i = 0; i < kDof; ++i) {
+        freeForce = std::max(freeForce, std::abs(fFree[i]));
+        heldForce = std::max(heldForce, std::abs(fHeated[i]));
+    }
+    expectTrue("the restrained reference carries a real stress and a real force",
+               heldStress > 1e8 && heldForce > 1e6);
+    expectNear("free expansion through the plastic path carries no stress",
+               freeStress / heldStress, 0.0, 1e-11);
+    expectNear("and therefore no internal force", freeForce / heldForce, 0.0, 1e-11);
+    // The same element is the reference for both, so a units slip in one would show
+    // as a ratio that is not a pure number.
+    expectNear("the two residuals are the same rounding, not two different ones",
+               freeForce / heldForce, freeStress / heldStress, 1e-12);
 }
 
 // --- 2. Rigid body motion under the co-rotational formulation ------------------
@@ -2613,6 +3180,12 @@ void runSolidShellTests() {
     testElementShapeSamplesTheQuadratureAndNotOnlyTheCorners();
     testCollapsedElementSolvesAndPassesThePatchTest();
     testPressureLoadResultant();
+    testFreeExpansionCarriesNoStress();
+    testEigenstrainAndTheEnhancedModes();
+    testTaperedElementCannotExpandFreely();
+    testRestraintAndNotTemperatureIsWhatGeneratesStress();
+    testNullEigenstrainIsTheSameArithmetic();
+    testEigenstrainThroughThePlasticUpdate();
     testFiniteRotationCarriesNoForce();
     testFrameIndifference();
     testInternalForceSignAndEquilibrium();

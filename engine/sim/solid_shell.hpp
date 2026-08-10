@@ -202,13 +202,127 @@ bool computeRestForms(const double rest[kDof], Formulation form, RestForms& out)
 void elementStiffness(const double nodes[kDof], const StructuralMaterial& material,
                       Formulation form, double out[kDof * kDof]);
 
+// --- Eigenstrain: a strain that is not a stress ---------------------------------
+//
+// A thermal expansion, a weld shrinkage, a swelling -- all of them are strain the
+// material carries **for free**, and the constitutive law must not be shown it.
+// The whole of the model is one subtraction:
+//
+//     sigma = C (eps_total - eps_star)
+//
+// with `eps_star` the eigenstrain, six Voigt components in this file's order and
+// in the same **engineering shear** convention as `RestForms::b`. For an isotropic
+// thermal expansion it is `{e, e, e, 0, 0, 0}` and `thermal::thermalEigenstrain`
+// builds it; nothing here assumes it is isotropic, and nothing here assumes it is
+// thermal.
+//
+// **Where it belongs is settled, and the answer is "the constitutive law", not
+// "the load vector".** Both `elementStress` and `elementPlasticUpdate` form a
+// strain from the displacement and hand it to a material; that strain is the
+// *total* one and the subtraction goes there, immediately before the material sees
+// it. The equivalent nodal force below is a **consequence** of that choice and not
+// an alternative to it -- it is what the same statement looks like moved to the
+// other side of the weak form,
+//
+//     int B^T C (B u - eps_star) dV = f_ext   <=>   K u = f_ext + int B^T C eps_star dV
+//
+// -- and it is needed only where the constitutive law has been linearised away.
+// `solveStatic` assembles `elementStiffness`, which is `int B^T C B dV` and knows
+// nothing about any strain, so a static solve has to be handed `thermalLoad`. An
+// explicit solve does not: `elementPlasticUpdate` returns `-int B^T sigma dV` with
+// the real `sigma`, so the force is already right and there is nothing to add.
+//
+// **Doing only one of the two is wrong in a way that looks like physics.** Put the
+// eigenstrain only in the load vector and `elementStress` reports `C B u`, so a
+// bar free to expand comes back carrying `C eps_star` -- **2.68 GPa** at 400 C, from a
+// bar under no load at all. Put it only in the constitutive law and a static solve
+// has nothing driving it, `u` stays zero, and the same free bar reports
+// `-C eps_star`: the same fiction with the sign flipped. `thermalLoad` and the
+// subtraction are therefore built from the same six numbers by construction, and
+// the free-bar test in `tests/test_solid_shell.cpp` asserts **exactly** zero.
+//
+// **The enhanced parameters see it too, and the term is exactly zero -- which was
+// not the expectation and is worth being precise about.** `alpha` is whatever makes
+// the enhanced modes carry no stress, `r(alpha) = int G^T sigma dV = 0`, and with an
+// eigenstrain that reads `Kaa alpha = int G^T C eps_star dV - Kua^T u` rather than
+// `Kaa alpha = -Kua^T u`. The new term was expected to vanish on a parallelepiped
+// and to matter on a distorted element. **It vanishes on every element.** For a
+// *constant* eigenstrain it is `C eps_star` times `int G^T dV`, and `int G^T dV = 0`
+// identically on any geometry -- that is precisely the Simo-Rifai condition, the
+// `det(J0)/det(J)` scaling plus modes odd in a natural coordinate, that makes EAS
+// pass the patch test in the first place. Measured across six geometries including
+// a warped mid-surface and a tilted director: the enhanced contribution to the
+// thermal load is **0 to the last bit**, and 2.5e-18 of the load in the one case
+// where the arithmetic reorders.
+//
+// It is kept, for the reason `thermal.cpp`'s tabulated-station branch is kept: the
+// identity is a property of *these* enhanced modes and not of the method, and it
+// stops holding the moment an eigenstrain varies within an element -- which is the
+// per-Gauss-point refinement `thermal.hpp` already names. So the term stays and
+// `tests/test_solid_shell.cpp` asserts `int G^T dV = 0` directly, rather than the
+// code carrying a branch whose justification nothing checks.
+//
+// **Mutation testing puts it more sharply than any of this.** Eleven mutants land
+// in the `fa` quadrature and the condensation that consumes it, and none is a gap
+// in the tests. Seven survive the suite outright -- running the loop backwards,
+// turning its `+=` into `-=`, skipping the condensation entirely -- because every
+// one of them changes a quantity that is exactly zero. The other four run off the
+// end of an array and ASan catches all four, which is a different instrument
+// finding a different thing about the same lines. That is what an equivalent
+// mutant looks like when the equivalence is a theorem rather than an accident, and
+// it is the evidence for the paragraph above rather than a footnote to it.
+//
+// `elementPlasticUpdate` needs no such term at all: its Newton is on `r(alpha)`
+// itself and finds the right `alpha` the moment `sigma` is right.
+//
+// **The one geometry that is not exact, and it is not this file's doing.** A
+// solid-shell whose **thickness varies within the element** cannot represent free
+// thermal expansion exactly: Betsch-Stein samples `E_zeta,zeta` at the four
+// in-plane corners and interpolates bilinearly, and `g_zeta . eps . g_zeta` is
+// biquadratic once `|g_zeta|` varies, so the interpolation is no longer exact.
+// Measured on a 10-to-15 mm taper across one element: 1.75% of the bulk stress.
+// It is a property of the **element** and not of the eigenstrain -- the plain patch
+// test, a linear displacement field and no eigenstrain anywhere, spreads the stress
+// by 1.09% on the same geometry -- and the note at `ElementShape` above, which says
+// curvature-thickness locking "costs nothing on a flat element", is true of a flat
+// element of *constant* thickness and silent about this one. Nothing reaches it
+// today: `zone.cpp` extrudes one patch at one thickness by construction, and warns
+// when a thickness seam is crossed. `tests/test_solid_shell.cpp` measures it so
+// that the day something does, the number is already written down.
+
 // Cartesian stress at the eight Gauss points, six Voigt components each in the
 // order [xx, yy, zz, xy, yz, zx]. The enhanced parameters are recovered from the
 // displacement first, so this is the stress the element actually carries -- which
 // is what a patch test has to look at.
+//
+// `eigenstrain`, when given, is subtracted from the total strain before the
+// elasticity matrix sees it, and is carried into the enhanced-parameter recovery
+// as above. A null pointer is **bit-identical** to the call without it -- the
+// subtraction is branched around rather than done against zeros, so that an
+// unheated ship is not merely close to master but the same arithmetic.
 void elementStress(const double nodes[kDof], const double displacement[kDof],
                    const StructuralMaterial& material, Formulation form,
-                   double out[kGauss * 6]);
+                   double out[kGauss * 6], const double eigenstrain[6] = nullptr);
+
+// The equivalent nodal force of an eigenstrain: `int B^T C eps_star dV`, with the
+// enhanced parameters condensed out the same way `elementStiffness` condenses
+// them, so that the pair (this, `elementStiffness`) reproduces the same
+// displacement the unlinearised element would settle at.
+//
+// The condensation is what makes it exact rather than nearly right:
+//
+//     f = int B^T C eps_star dV  -  Kua Kaa^-1 int G^T C eps_star dV
+//
+// and the second term is the one that vanishes on a parallelepiped and does not
+// on a ship.
+//
+// Sign: this is a force **applied to the element's nodes by the expansion**, to be
+// added to the external load vector -- the opposite convention to `internalForce`,
+// and the same one as `uniformPressureLoad`, because it goes to the same place.
+void elementThermalLoad(const double nodes[kDof], const StructuralMaterial& material,
+                        Formulation form, const double eigenstrain[6], double out[kDof]);
+void elementThermalLoad(const RestForms& forms, const StructuralMaterial& material,
+                        const double eigenstrain[6], double out[kDof]);
 
 // Row-sum lumped nodal mass: integral of N_a over the element, times density. Row
 // sum rather than volume/8 because a distorted hex does not divide evenly and the
@@ -381,10 +495,23 @@ struct PlasticUpdate {
 // The history is committed even when the Newton did not converge, because a caller
 // that has to keep stepping is better served by a slightly wrong state it is told
 // about than by a state that silently stopped advancing. Check `converged`.
+//
+// `eigenstrain` is subtracted from the total strain at every integration point
+// before `plasticity::update` sees it, which is the same place and the same
+// subtraction `elementStress` makes. A J2 yield surface is pressure-independent
+// and a thermal expansion is pure dilatation, so the eigenstrain does not move the
+// surface at all -- it changes what strain the point is *at*, and nothing about
+// what it may carry there. It is read in the **co-rotated** frame, along with
+// everything else in this routine; for the isotropic case that is a distinction
+// without a difference, and for an anisotropic one the caller has to mean the
+// material frame.
+//
+// Null is bit-identical to the call without it, as `elementStress`.
 PlasticUpdate elementPlasticUpdate(const double rest[kDof], const double current[kDof],
                                   const plasticity::Material& material, Formulation form,
                                   ElementPlasticState& state, double force[kDof],
-                                  double stress[kGauss * 6] = nullptr);
+                                  double stress[kGauss * 6] = nullptr,
+                                  const double eigenstrain[6] = nullptr);
 
 // The same update off a pre-computed `RestForms`, which is what an explicit solver
 // wants: the forms are 97% of the cost above and none of it depends on `current`.
@@ -396,7 +523,8 @@ PlasticUpdate elementPlasticUpdate(const RestForms& forms, const double rest[kDo
                                   const double current[kDof],
                                   const plasticity::Material& material,
                                   ElementPlasticState& state, double force[kDof],
-                                  double stress[kGauss * 6] = nullptr);
+                                  double stress[kGauss * 6] = nullptr,
+                                  const double eigenstrain[6] = nullptr);
 
 // --- Meshes -------------------------------------------------------------------
 
@@ -589,5 +717,22 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
 // lies on the boundary of the mesh -- the top surface of a plate. Positive
 // pressure pushes *into* the element, so a plate loaded from above deflects in -z.
 std::vector<double> uniformPressureLoad(const HexMesh& mesh, double pressure);
+
+// The equivalent nodal load of a per-element eigenstrain, six Voigt components per
+// element in element order. This is what a *static* solve needs in order to expand
+// at all; see the note at `elementStress`. Add it to whatever else loads the mesh
+// and pass the sum to `solveStatic`, exactly as with `uniformPressureLoad`.
+//
+// **A uniform eigenstrain over an unrestrained mesh produces a load vector that is
+// in equilibrium with itself**: it sums to zero force and zero moment, node by
+// node cancelling across every interior face, and what is left is a self-balancing
+// ring around the boundary. That is not decoration -- it is the statement that
+// heating a free body applies no net force to it, and it is what makes the
+// free-expansion solve well posed against nothing but the three constraints that
+// remove rigid body motion.
+//
+// Empty, and no load, if `eigenstrain` is not six values per element.
+std::vector<double> thermalLoad(const HexMesh& mesh, const StructuralMaterial& material,
+                                Formulation form, const std::vector<double>& eigenstrain);
 
 }  // namespace sim::solidshell

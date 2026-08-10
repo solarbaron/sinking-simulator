@@ -183,19 +183,11 @@ double carbonSteelEnthalpy(double kelvin);  // J/kg
 //     12 mm plating keeps 0.323. At **400 C**, where `k_y` is still exactly 1, the
 //     section has already lost 17.6% -- all of it through `k_E`.
 //
-// **What is not here, and what it costs.** Two things, and the first is much the
-// larger.
-//
-// **Thermal elongation, §3.4.1.1, is absent and it dominates.** The standard's own
-// expression, `1.2e-5 theta + 0.4e-8 theta^2 - 2.416e-4`, gives **7.08e-3** of free
-// strain at 520 C -- a 500 K rise -- against a yield strain of
-// `355e6 / 206e9 = 1.72e-3`. That is a factor of **4.1**. A *fully restrained*
-// member therefore reaches yield on expansion alone at **164.6 C**, a 145 K rise,
-// solved where `k_E E (dl/l) = k_y f_y` -- and at that temperature `k_y` is still
-// exactly 1 and `k_E` is 0.94, so the whole of the effect is expansion and none of
-// it is the reduction factors above. For restrained structure the missing term
-// arrives first and is four times the size. It is the next roadmap item and not a
-// refinement of this one.
+// **What is not here, and what it costs.** Thermal elongation used to be the first
+// item on this list and is now `carbonSteelElongation` below, where the estimate
+// made here -- yield on expansion alone at 164.6 C -- is reproduced to 164.630 C
+// against the element rather than against a hand solve. What that estimate got
+// wrong is not the number but the failure mode; see there.
 //
 // **Creep, §3.2.4, is absent and it does not matter here -- with a number.**
 // EN 1993-1-2 §3.2.1 states that the curves above already carry creep implicitly,
@@ -259,6 +251,179 @@ double carbonSteelModulusFactor(double kelvin);
 // hot member is the interesting direction.
 double carbonSteelStress(double strain, double kelvin, double yieldStrength = 355.0e6,
                          double youngsModulus = 210.0e9);
+
+// --- Thermal elongation, EN 1993-1-2:2005 §3.4.1.1 --------------------------------
+//
+// **The largest single thing a fire does to structure, and it is not a weakening.**
+// The relative elongation from 20 C, `dl/l`, in three branches:
+//
+//     20 <= theta <  750   1.2e-5 theta + 0.4e-8 theta^2 - 2.416e-4
+//     750 <= theta <= 860   1.1e-2                       (the phase change)
+//     860 <  theta <= 1200  2e-5 theta - 6.2e-3
+//
+// The plateau is the ferrite-to-austenite transition: face-centred cubic packs
+// more densely than body-centred cubic, and over that 110 K the lattice
+// contraction cancels the thermal expansion exactly. It is the same transition the
+// 735 C spike in `carbonSteelSpecificHeat` is -- one physical event appearing in
+// two of the standard's clauses, and a model that carried one without the other
+// would be describing half a phase change.
+//
+// **The standard's own curve is discontinuous at 750 C, by 8.4e-6, and it is
+// asserted rather than smoothed.** The polynomial reaches 1.100840e-2 at 750 and
+// the plateau is 1.1e-2 flat, so the elongation steps *down* on entering the phase
+// change. At 860 the two branches agree to the last bit -- `2e-5 * 860 - 6.2e-3` is
+// exactly 1.1e-2 in binary as well as in decimal. So the curve is continuous at one
+// end of the plateau and not at the other, which is a fact about EN 1993-1-2 and
+// not about this file. It is 0.076% of the elongation there and 1.73 MPa of
+// restrained stress; interpolating it away would be inventing a curve the standard
+// does not publish, and `tests/test_thermal.cpp` asserts the jump's exact size so
+// that a later smoothing has to argue with a test.
+//
+// **`carbonSteelElongation(860 C + kCelsius)` still does not return 1.1e-2**, and
+// the reason is the one this file already records at `carbonSteelReduction`: no
+// double satisfies `k - 273.15 == 860`. The round trip lands 1.1e-13 K high, over
+// the branch boundary, so the linear expression is evaluated a hair past 860 and
+// the answer is 2.3e-15 out. That is 1e-13 K of *representation* against the 21 K
+// it would take to matter, and it is asserted rather than hidden behind a
+// tolerance, because a caller who compares against 1.1e-2 with `==` should find
+// the property written down.
+//
+// --- What it is: an eigenstrain -------------------------------------------------
+//
+// A thermal strain is not a stress and it is not a load. It is strain the material
+// carries for free, subtracted from the total before the constitutive law is
+// shown anything:
+//
+//     sigma = C (eps_total - eps_th)
+//
+// `solid_shell.hpp` says where that subtraction goes and why the equivalent nodal
+// force is a consequence of it rather than an alternative to it. What belongs here
+// is the consequence: **heating a body generates no stress. Preventing it from
+// expanding does.**
+//
+//   * A free bar, uniformly heated, carries **exactly zero** stress at any
+//     temperature. Asserted at zero and not at a tolerance, because that is the
+//     assertion that says the eigenstrain was subtracted and not added.
+//   * A bar restrained against expanding carries `sigma = -k_E(T) E eps_th(T)`,
+//     compression, and reaches `k_y(T) f_y` at **164.630 C** for this repo's
+//     `ah36Steel()` -- a 144.6 K rise, `k_E` = 0.9354, `k_y` exactly 1. The whole
+//     of the effect is expansion and none of it is strength loss, which is the
+//     figure `restrainedYieldTemperature` returns and the element reproduces.
+//   * **164.6 C is right for E = 206 GPa and only for E = 206 GPa.** At the
+//     210 GPa that `carbonSteelStress` takes as its default it is 161.546 C. These
+//     take the modulus from the material rather than from a constant for that
+//     reason.
+//
+// --- What "restrained" means on a ship, which is the part that decides ------------
+//
+// A fully restrained bar is a laboratory object. A bulkhead stiffener is held by
+// structure that is itself hot and itself expanding, and **a uniformly heated
+// region expands freely and generates no stress at all** -- so the question is
+// never "how hot" on its own.
+//
+// It is also not answered by a length: an axially heated *chain* of members with
+// free ends is statically determinate and carries **zero** stress however the
+// temperature varies along it. The bar just gets longer. What generates stress is
+// a **transverse** gradient -- a hot strake beside a cold one, sharing a seam, the
+// hot one wanting to grow along the ship and the cold one holding it -- which is
+// exactly the shape of a fire in one compartment of many.
+//
+// For two parallel strips tied at both ends and free overall, hot fraction `f` of
+// the area, the hot strip carries
+//
+//     sigma = -eps_th / (1/E_hot + (f / (1 - f)) / E_cold)
+//
+// and the fully restrained answer is its `f -> 0` limit. **The limit is approached
+// fast, and that is why this is not a laboratory result**: with a tenth of the
+// section hot the hot strip yields at 181.5 C against the fully restrained 164.6,
+// and with a fiftieth at 167.7. Half the section hot is the case that is genuinely
+// different -- 313.6 C -- and half a ship's midship section is not what one
+// compartment burns.
+//
+// --- And buckling arrives first ---------------------------------------------------
+//
+// **A restrained member that cannot expand goes into compression, and compression
+// is not a yield problem.** Against `buckling.hpp`'s own checks on this ferry's own
+// scantlings, with the restraint stress as the applied compression:
+//
+//   * the 8 mm plating of the vehicle deck head, in its 0.70 x 2.40 m bay, buckles
+//     at **59.0 C -- a 39 K rise**. A hot shower would do it, if the deck were
+//     truly restrained.
+//   * the 12 mm side plating, same bay, at **103.1 C**;
+//   * the 14.5 mm bottom plating at 121.1 C;
+//   * the side longitudinal with its attached plating, as an Euler column over the
+//     2.40 m frame bay, at 149.8 C -- only 9% earlier than yield, because it is a
+//     stocky column and Johnson-Ostenfeld caps it near `f_y`.
+//
+// So the ordering is plating, then stiffener, then yield, and the plating goes at
+// **a third of the temperature rise** the yield figure quotes. 164.6 C is the right
+// answer to the wrong question.
+//
+// **Two closed forms make that more than a table.** In the elastic branch the
+// modulus reduction factor **cancels exactly**: the restraint stress is
+// `k_E E eps_th` and the elastic buckling stress is `k_E E` times a pure geometry,
+// so the temperature at which they meet is a function of geometry and the
+// elongation curve **alone** -- independent of E, of `k_E`, and of the steel grade.
+// For an Euler column that reads `eps_th(T) = pi^2 / lambda^2` with `lambda` the
+// slenderness, and equating it to the 164.630 C yield strain gives a **critical
+// slenderness of 73.19**: above it a fully restrained column buckles first, below
+// it it would yield first were it not for the plasticity cap. The ferry's
+// longitudinals sit at lambda = 34 to 45, which is why they pre-empt yield only
+// narrowly and the plating pre-empts it by a mile.
+//
+// Limits, inherited from `buckling.hpp` and worth naming because they all point the
+// same way: these are ideal flat panels under *uniaxial* compression. Real
+// restrained heating is biaxial, real panels carry initial distortion and welding
+// residual stress, and every one of those makes the real temperature **lower**.
+
+// Relative elongation `dl/l` from 20 C, dimensionless. Clamped outside 20..1200 C,
+// matching `carbonSteelConductivity` and for the same reason.
+double carbonSteelElongation(double kelvin);
+
+// The eigenstrain between two temperatures: `elongation(kelvin) -
+// elongation(reference)`. This -- not `carbonSteelElongation` -- is what an element
+// subtracts, because a structure is stress-free at the temperature it was built
+// at and that need not be 20 C.
+double thermalStrain(double kelvin, double referenceKelvin = kCelsius + 20.0);
+
+// The same as the six Voigt components `solid_shell.hpp` wants: `{e, e, e, 0, 0, 0}`.
+// A thermal expansion of an isotropic material is pure dilatation and carries no
+// shear at all, which is why a J2 yield surface never sees it.
+void thermalEigenstrain(double kelvin, double referenceKelvin, double out[6]);
+
+// Stress in a member held to exactly its reference length: `-k_E(T) E eps_th`,
+// **negative in compression**, the same sign convention as `elementStress`.
+//
+// `material` is the material at 20 C -- the reduction factor is applied here, so
+// handing this the output of `atTemperature` would apply `k_E` twice.
+double restrainedStress(const StructuralMaterial& material, double kelvin,
+                        double referenceKelvin = kCelsius + 20.0);
+
+// The temperature at which `|restrainedStress|` first reaches `k_y(T) f_y`: the
+// 164.630 C anchor for `ah36Steel()` from 20 C. Kelvin.
+//
+// Zero -- not a temperature -- when the reference is already at or above 1200 C,
+// because there is nothing above it to search.
+//
+// **1200 C is the answer for a degenerate material, and that is not "never".**
+// EN 1993-1-2 takes both `k_y` and `k_E` to *exactly* zero there, so a member at
+// the top of the range has no strength left and is at its limit whatever stress it
+// is carrying -- a material with no stiffness at all comes back 1200 C rather than
+// zero. Both of these searches therefore always find a crossing, which mutation
+// testing established rather than the other way round, and
+// `tests/test_thermal.cpp` asserts the two factors that make it so.
+double restrainedYieldTemperature(const StructuralMaterial& material,
+                                  double referenceKelvin = kCelsius + 20.0);
+
+// The temperature at which `|restrainedStress|` first reaches the member's own
+// buckling capacity, `johnsonOstenfeld(k_E(T) elasticStress, k_y(T) f_y)`.
+//
+// `elasticStress` is the member's **elastic** buckling stress at 20 C -- exactly
+// `BucklingCheck::elasticStress` out of `plateBuckling` or `columnBuckling` on the
+// unheated material -- so one routine serves a plate and a column and there is no
+// second place for the reduction to be applied. Zero if it never does.
+double restrainedBucklingTemperature(double elasticStress, const StructuralMaterial& material,
+                                     double referenceKelvin = kCelsius + 20.0);
 
 // --- Materials at temperature ----------------------------------------------------
 //

@@ -62,6 +62,7 @@
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
+#include <numbers>
 #include <numeric>
 #include <tuple>
 #include <random>
@@ -2901,6 +2902,632 @@ void testHotStructureIsWeaker() {
     }
 }
 
+// --- 6b. Thermal elongation, EN 1993-1-2 §3.4.1.1 --------------------------------
+
+// An independent transcription of the standard's own expression, so that the test
+// and the code are two readings of the published text and not one reading twice.
+double publishedElongation(double celsius) {
+    if (celsius < 750.0) return 1.2e-5 * celsius + 0.4e-8 * celsius * celsius - 2.416e-4;
+    if (celsius <= 860.0) return 1.1e-2;
+    return 2.0e-5 * celsius - 6.2e-3;
+}
+
+void testThermalElongationCurve() {
+    // (a) The closed form, over the whole published range and at every branch.
+    for (double c = 20.0; c <= 1200.0; c += 0.25) {
+        const double got = th::carbonSteelElongation(c + kC);
+        const double want = publishedElongation(c);
+        if (std::abs(got - want) > 1e-15) {
+            expectNear("the elongation is the standard's own expression at " +
+                           std::to_string(c) + " C",
+                       got, want, 1e-15);
+            break;
+        }
+    }
+    expectTrue("the elongation curve reproduces the standard everywhere on [20, 1200]", true);
+
+    // (b) 20 C is exactly zero -- the -2.416e-4 constant exists to make it so, and
+    // it does not quite: the polynomial at 20 C is 2.4e-4 + 1.6e-6 - 2.416e-4,
+    // which is zero to the last bit in decimal and 3.5e-20 in binary. The clamp is
+    // what makes it exactly zero, and that is worth knowing rather than assuming.
+    expectTrue("the elongation at 20 C is exactly zero",
+               th::carbonSteelElongation(20.0 + kC) == 0.0);
+    expectTrue("and the polynomial there is not quite, which is why the clamp is <= 20",
+               std::abs(publishedElongation(20.0)) < 1e-18);
+
+    // (c) The header's own figure, and the ratio that makes this the dominant term.
+    const double at520 = th::carbonSteelElongation(520.0 + kC);
+    expectNear("7.08e-3 of free strain at 520 C, a 500 K rise", at520, 7.08e-3, 5e-9);
+    const StructuralMaterial steel = ah36Steel();
+    const double yieldStrain = steel.yieldStrength / steel.youngsModulus;
+    expectNear("against a yield strain of 1.723e-3", yieldStrain, 1.7233e-3, 1e-7);
+    expectNear("a factor of 4.1", at520 / yieldStrain, 4.109, 5e-3);
+
+    // (d) **The phase change, and "continuous at both ends of it" is not true.**
+    //     The plateau meets the linear branch exactly at 860 C and does *not* meet
+    //     the polynomial at 750: the standard's own curve steps down by 8.4e-6
+    //     there. Asserted as an exact quantity, so that a later smoothing has to
+    //     argue with a test rather than with a comment.
+    const double below750 = 1.2e-5 * 750.0 + 0.4e-8 * 750.0 * 750.0 - 2.416e-4;
+    const double plateau = th::carbonSteelElongation(750.0 + kC);
+    expectNear("the polynomial reaches 1.100840e-2 at 750 C", below750, 1.100840e-2, 1e-12);
+    expectTrue("and the plateau is exactly 1.1e-2", plateau == 1.1e-2);
+    expectNear("so the standard's curve steps DOWN by exactly 8.4e-6 at 750 C",
+               below750 - plateau, 8.4e-6, 1e-12);
+    // In stress terms, on a fully restrained member: small, but not nothing.
+    expectNear("which is 1.73 MPa of restrained stress",
+               steel.youngsModulus * (below750 - plateau) * 1e-6, 1.730, 5e-3);
+
+    // At 860 the two branches agree **to the last bit** -- the standard's continuity
+    // there is exact in binary as well as in decimal, which is not something a
+    // decimal coincidence guarantees.
+    expectTrue("the plateau and the linear branch are bit-identical at 860 C",
+               2.0e-5 * 860.0 - 6.2e-3 == 1.1e-2);
+
+    // **And the function still does not return exactly 1.1e-2 at 860 C, for a
+    // reason this file has already recorded once.** No double satisfies
+    // `k - 273.15 == 860`: the round trip lands 1.1e-13 K high, which is over the
+    // branch boundary, so the linear expression is evaluated a hair past 860. The
+    // gap that leaves is 2.3e-15 of an 1.1e-2 elongation -- 21 K of *representation*
+    // would be needed to matter and there is 1e-13 of it. The property is asserted
+    // rather than hidden behind a tolerance, exactly as `testReductionTable` does
+    // for the same cause at 800 C.
+    expectTrue("the Kelvin round trip at 860 C is not exact, which is why",
+               (860.0 + kC) - kC != 860.0);
+    expectNear("so the function lands within 1e-14 of the plateau at 860 C",
+               th::carbonSteelElongation(860.0 + kC), 1.1e-2, 1e-14);
+
+    // The plateau is flat: the lattice contraction cancels the expansion exactly
+    // over 110 K, so nothing moves at all across it. Sampled up to 859.5, because
+    // 860 itself is the boundary the round trip above steps over.
+    int notFlat = 0;
+    for (double c = 750.0; c <= 859.5; c += 0.5)
+        if (th::carbonSteelElongation(c + kC) != 1.1e-2) ++notFlat;
+    expectEqual("the plateau is exactly flat across the whole phase change", notFlat, 0);
+    expectTrue("and that is 220 samples of it, not two",
+               th::carbonSteelElongation(750.0 + kC) == th::carbonSteelElongation(859.5 + kC));
+
+    // (e) Monotone everywhere except the one step, and the step is the only one.
+    int falls = 0;
+    double worstFall = 0, fallAt = 0;
+    for (double c = 20.0; c < 1200.0; c += 0.05) {
+        const double d = th::carbonSteelElongation(c + 0.05 + kC) - th::carbonSteelElongation(c + kC);
+        if (d < -1e-18) {
+            ++falls;
+            if (-d > worstFall) { worstFall = -d; fallAt = c; }
+        }
+    }
+    expectEqual("the elongation falls in exactly one place", falls, 1);
+    expectNear("and that place is 750 C", fallAt, 749.95, 0.06);
+    expectNear("by the 8.4e-6 of the phase change", worstFall, 8.4e-6, 1e-9);
+
+    // (f) Clamped outside the published range, both ends.
+    expectTrue("below 20 C it clamps to zero rather than contracting",
+               th::carbonSteelElongation(-40.0 + kC) == 0.0 &&
+                   th::carbonSteelElongation(0.0 + kC) == 0.0);
+    expectTrue("above 1200 C it clamps to the end value",
+               th::carbonSteelElongation(2000.0 + kC) == th::carbonSteelElongation(1200.0 + kC));
+    // Just past the end as well as far past it: mutation testing found the clamp
+    // tested only at 2000 C, which a bound moved to 1260 would have survived.
+    expectTrue("and clamps immediately above 1200, not merely far above it",
+               th::carbonSteelElongation(1250.0 + kC) ==
+                       th::carbonSteelElongation(1200.0 + kC) &&
+                   th::carbonSteelElongation(1201.0 + kC) ==
+                       th::carbonSteelElongation(1200.0 + kC));
+    expectNear("which is 1.78e-2", th::carbonSteelElongation(1200.0 + kC), 1.78e-2, 1e-12);
+
+    // (g) The eigenstrain is the *difference*, and it is pure dilatation.
+    double eigen[6];
+    th::thermalEigenstrain(400.0 + kC, 20.0 + kC, eigen);
+    for (int i = 0; i < 3; ++i)
+        expectTrue("the eigenstrain is the elongation on all three normal components",
+                   eigen[i] == th::carbonSteelElongation(400.0 + kC));
+    for (int i = 3; i < 6; ++i)
+        expectTrue("and exactly zero shear -- which is why a J2 surface never sees it",
+                   eigen[i] == 0.0);
+    expectNear("a reference temperature other than 20 C shifts it exactly",
+               th::thermalStrain(400.0 + kC, 200.0 + kC),
+               th::carbonSteelElongation(400.0 + kC) - th::carbonSteelElongation(200.0 + kC),
+               0.0);
+    expectTrue("and a member at its own reference temperature carries none",
+               th::thermalStrain(637.0 + kC, 637.0 + kC) == 0.0);
+}
+
+void testRestrainedMemberYieldsOnExpansionAlone() {
+    const StructuralMaterial steel = ah36Steel();
+
+    // (a) The closed form. sigma = -k_E E eps_th, negative in compression.
+    for (double c : {100.0, 164.63, 400.0, 600.0}) {
+        const double want = -th::carbonSteelModulusFactor(c + kC) * steel.youngsModulus *
+                            th::carbonSteelElongation(c + kC);
+        expectNear("the restrained stress is -k_E E eps_th at " + std::to_string(c) + " C",
+                   th::restrainedStress(steel, c + kC), want, 0.0);
+        expectTrue("and it is compression", th::restrainedStress(steel, c + kC) < 0.0);
+    }
+
+    // (b) **The anchor.** 164.6 C, quoted in this header from a hand solve, is
+    //     reproduced: 164.630 C, where k_y is exactly 1 and k_E is 0.9354, so the
+    //     whole of the effect is expansion and none of it is strength loss.
+    const double yieldK = th::restrainedYieldTemperature(steel);
+    expectNear("a fully restrained member yields on expansion alone at 164.630 C",
+               yieldK - kC, 164.6301, 5e-4);
+    expectNear("a rise of 144.63 K", yieldK - kC - 20.0, 144.6301, 5e-4);
+    expectTrue("where the yield factor is still exactly 1",
+               th::carbonSteelYieldFactor(yieldK) == 1.0);
+    expectNear("and the modulus factor is 0.9354", th::carbonSteelModulusFactor(yieldK), 0.93537,
+               1e-5);
+    expectNear("the stress there is exactly the yield strength",
+               std::abs(th::restrainedStress(steel, yieldK)), steel.yieldStrength,
+               1e-6 * steel.yieldStrength);
+
+    // **164.6 C is right for 206 GPa and only for 206 GPa.** `carbonSteelStress`
+    // defaults to 210, which is a different number, and the two are not
+    // interchangeable in this calculation.
+    StructuralMaterial stiffer = steel;
+    stiffer.youngsModulus = 210.0e9;
+    expectNear("at 210 GPa the same member yields at 161.546 C instead",
+               th::restrainedYieldTemperature(stiffer) - kC, 161.5461, 5e-4);
+
+    // Mild steel is *later*, not earlier: less yield to reach at the same stiffness.
+    const double mild = th::restrainedYieldTemperature(sim::mildSteel());
+    expectTrue("235 MPa mild steel yields sooner, at a lower temperature",
+               mild < yieldK - 5.0);
+    expectNear("112.175 C", mild - kC, 112.1753, 5e-4);
+
+    // A member built hot and cooled is a different problem, and the reference
+    // temperature is what says so.
+    expectTrue("a member stress-free at 200 C reaches yield later",
+               th::restrainedYieldTemperature(steel, 200.0 + kC) > yieldK + 100.0);
+
+    // (c) **The element reproduces it.** A fully restrained bar, solved through
+    //     `solveStatic` with the reduced material and the EN eigenstrain, carries
+    //     exactly the closed form -- so the anchor is the FEM's number and not only
+    //     the algebra's.
+    const double lx = 2.40, ly = 0.20, lz = 0.012;
+    for (double c : {100.0, 164.6301, 400.0}) {
+        ss::HexMesh mesh = ss::makePlateMesh(lx, ly, lz, 4, 2, 1);
+        std::size_t corner = mesh.nodeCount(), offAxis = mesh.nodeCount();
+        for (std::size_t n = 0; n < mesh.nodeCount(); ++n) {
+            const double x = mesh.position[n * 3], y = mesh.position[n * 3 + 1],
+                         z = mesh.position[n * 3 + 2];
+            if (x < 1e-12 || x > lx - 1e-12) mesh.pin(n, 0, 0.0);
+            if (x < 1e-12 && y < 1e-12 && z < 1e-12) corner = n;
+            if (x < 1e-12 && y > ly - 1e-12 && z < 1e-12) offAxis = n;
+        }
+        mesh.pin(corner, 1, 0.0);
+        mesh.pin(corner, 2, 0.0);
+        mesh.pin(offAxis, 2, 0.0);
+
+        const StructuralMaterial hot = th::atTemperature(steel, c + kC);
+        double eigen[6];
+        th::thermalEigenstrain(c + kC, 20.0 + kC, eigen);
+        std::vector<double> eigenstrain(mesh.elementCount() * 6);
+        for (std::size_t e = 0; e < mesh.elementCount(); ++e)
+            for (int i = 0; i < 6; ++i) eigenstrain[e * 6 + i] = eigen[i];
+
+        const std::vector<double> load =
+            ss::thermalLoad(mesh, hot, ss::Formulation::SolidShell, eigenstrain);
+        std::vector<double> displacement;
+        std::string problem;
+        expectTrue("the hot restrained bar solves at " + std::to_string(c) + " C",
+                   ss::solveStatic(mesh, hot, ss::Formulation::SolidShell, load, displacement,
+                                   &problem));
+
+        const double want = th::restrainedStress(steel, c + kC);
+        double worst = 0;
+        for (std::size_t e = 0; e < mesh.elementCount(); ++e) {
+            double nodes[ss::kDof], u[ss::kDof], stress[ss::kGauss * 6];
+            for (int a = 0; a < ss::kNodes; ++a) {
+                const std::size_t n = mesh.index[e * ss::kNodes + static_cast<std::size_t>(a)];
+                for (int i = 0; i < 3; ++i) {
+                    nodes[a * 3 + i] = mesh.position[n * 3 + static_cast<std::size_t>(i)];
+                    u[a * 3 + i] = displacement[n * 3 + static_cast<std::size_t>(i)];
+                }
+            }
+            ss::elementStress(nodes, u, hot, ss::Formulation::SolidShell, stress, eigen);
+            for (int gp = 0; gp < ss::kGauss; ++gp)
+                worst = std::max(worst, std::abs(stress[gp * 6] - want));
+        }
+        expectNear("and carries exactly -k_E E eps_th at " + std::to_string(c) + " C", worst,
+                   0.0, 1e-9 * std::abs(want));
+        expectTrue("which is not a small number", std::abs(want) > 1e8);
+    }
+
+    // The vacuity guard the whole section rests on: the restraint has to restrain.
+    // At the anchor the *free* bar would have grown 4.4 mm over 2.4 m, and the
+    // restrained one grew nothing.
+    expectNear("the free bar would have grown 4.42 mm over the 2.4 m frame bay",
+               th::carbonSteelElongation(164.6301 + kC) * lx * 1e3, 4.4217, 5e-4);
+
+    std::printf("     fully restrained: yields at %.3f C (rise %.3f K), k_y = %.3f, k_E = %.4f"
+                " -- all expansion, no weakening\n",
+                yieldK - kC, yieldK - kC - 20.0, th::carbonSteelYieldFactor(yieldK),
+                th::carbonSteelModulusFactor(yieldK));
+}
+
+void testWhatRestraintMeansOnAShip() {
+    const StructuralMaterial steel = ah36Steel();
+
+    // **A uniformly heated free body carries nothing**, which is the statement the
+    // whole model has to make first. Asserted through the element in
+    // `tests/test_solid_shell.cpp`; here it is the *ship* statement that follows
+    // from it, in closed form.
+    //
+    // Two parallel strips tied at both ends and free overall, hot fraction f of the
+    // area: sigma_hot = -eps_th / (1/E_hot + (f/(1-f))/E_cold). The fully restrained
+    // answer is the f -> 0 limit, and the question this settles is how fast the
+    // limit is approached -- because if it needed f = 0.001 the 164.6 C figure would
+    // be a laboratory result and not a ship one.
+    const auto yieldsAt = [&](double fraction) {
+        double lo = 20.0 + kC, hi = 1200.0 + kC;
+        const auto margin = [&](double k) {
+            const double eHot = th::carbonSteelModulusFactor(k) * steel.youngsModulus;
+            const double ratio = fraction / (1.0 - fraction);
+            const double sigma =
+                th::thermalStrain(k) / (1.0 / eHot + ratio / steel.youngsModulus);
+            return sigma - th::carbonSteelYieldFactor(k) * steel.yieldStrength;
+        };
+        if (margin(hi) < 0.0) return 0.0;
+        for (int i = 0; i < 200; ++i) {
+            const double m = 0.5 * (lo + hi);
+            if (margin(m) >= 0.0) hi = m;
+            else lo = m;
+        }
+        return 0.5 * (lo + hi) - kC;
+    };
+
+    const double full = th::restrainedYieldTemperature(steel) - kC;
+    const double at2 = yieldsAt(0.02), at10 = yieldsAt(0.10), at50 = yieldsAt(0.50);
+    expectNear("a fiftieth of the section hot yields at 167.7 C", at2, 167.73, 0.05);
+    expectNear("a tenth of it at 181.5 C", at10, 181.46, 0.05);
+    expectNear("and half of it at 313.6 C", at50, 313.57, 0.05);
+    expectTrue("every one of them is above the fully restrained figure",
+               at2 > full && at10 > at2 && at50 > at10);
+    expectNear("the fully restrained figure is the f -> 0 limit", yieldsAt(1e-9), full, 1e-3);
+
+    // **So it is not a laboratory result.** A tenth of the section hot is within
+    // 17 K of the fully restrained answer, and one compartment of a ferry is nearer
+    // a tenth than a half.
+    expectTrue("a tenth of the section hot is within 17 K of full restraint",
+               at10 - full < 17.0);
+
+    // And the case that genuinely differs is the one a fire does not produce: half
+    // the section hot nearly doubles the temperature it takes.
+    expectTrue("half the section hot takes nearly twice the rise",
+               (at50 - 20.0) / (full - 20.0) > 1.9);
+
+    // At 400 C, where `k_y` is still exactly 1 and the strength model reports
+    // nothing at all, the half-restrained strip is already 24% past yield.
+    const double eHot = th::carbonSteelModulusFactor(400.0 + kC) * steel.youngsModulus;
+    const double half = th::thermalStrain(400.0 + kC) / (1.0 / eHot + 1.0 / steel.youngsModulus);
+    expectNear("half-restrained at 400 C is 440.9 MPa", half * 1e-6, 440.94, 0.05);
+    expectTrue("which is past yield, where k_y says the steel has lost nothing",
+               half > steel.yieldStrength && th::carbonSteelYieldFactor(400.0 + kC) == 1.0);
+
+    std::printf("     restraint: yields at %.1f C fully, %.1f C with a tenth of the section"
+                " hot, %.1f C with half\n",
+                full, at10, at50);
+}
+
+void testBucklingArrivesBeforeYield() {
+    const StructuralMaterial steel = ah36Steel();
+    const sim::Scantlings scantlings = sim::ferryScantlings();
+    const double bay = scantlings.frameSpacing;         // 2.40 m
+    const double spacing = scantlings.longitudinalSpacing;  // 0.70 m
+    const double yieldK = th::restrainedYieldTemperature(steel);
+
+    // (a) **A restrained plate panel, against `buckling.hpp`'s own check.** The
+    //     applied compression is the restraint stress; the capacity is the panel's,
+    //     reduced by `k_E` and `k_y` the way the strength model already reduces it.
+    struct Panel { const char* name; double thickness; double at; };
+    const Panel panels[] = {{"vehicle deck head, 8 mm", 0.0080, 59.027},
+                            {"side shell, 12 mm", 0.0120, 103.082},
+                            {"bottom shell, 14.5 mm", 0.0145, 121.060}};
+    double earliest = 1e30;
+    for (const Panel& p : panels) {
+        const sim::BucklingCheck cold =
+            sim::plateBuckling(p.thickness, bay, spacing, 0.0, steel);
+        const double at = th::restrainedBucklingTemperature(cold.elasticStress, steel);
+        expectNear(std::string("the restrained ") + p.name + " buckles at the hand value",
+                   at - kC, p.at, 0.01);
+        expectTrue(std::string("and that is before it yields -- ") + p.name, at < yieldK);
+        earliest = std::min(earliest, at);
+
+        // The check is a real one: at that temperature the restraint stress and the
+        // reduced capacity are equal, computed the long way round.
+        const sim::StructuralMaterial hot = th::atTemperature(steel, at);
+        const sim::BucklingCheck now =
+            sim::plateBuckling(p.thickness, bay, spacing, std::abs(th::restrainedStress(steel, at)),
+                               hot);
+        expectNear(std::string("utilisation is exactly 1 there -- ") + p.name, now.utilisation,
+                   1.0, 1e-6);
+    }
+    expectNear("the thinnest plating goes at 59.0 C -- a 39 K rise", earliest - kC, 59.027, 0.01);
+    expectTrue("which is under half the rise the yield figure quotes",
+               (earliest - kC - 20.0) < 0.5 * (yieldK - kC - 20.0));
+
+    // (b) **The 8 mm panel is on the elastic branch, and there `k_E` cancels
+    //     exactly.** The restraint stress is `k_E E eps_th` and the elastic
+    //     buckling stress is `k_E E` times a pure geometry, so the temperature is a
+    //     function of the geometry and the elongation curve alone -- independent of
+    //     E, of the steel grade, and of the reduction factor. Asserted by changing
+    //     all three and getting the same temperature back.
+    const sim::BucklingCheck thin = sim::plateBuckling(0.0080, bay, spacing, 0.0, steel);
+    expectTrue("the 8 mm panel is elastic-buckling-governed at 20 C",
+               thin.elasticStress <= 0.5 * steel.yieldStrength);
+    StructuralMaterial other = steel;
+    other.youngsModulus = 150.0e9;
+    const sim::BucklingCheck thinOther = sim::plateBuckling(0.0080, bay, spacing, 0.0, other);
+    expectNear("a different modulus gives the same buckling temperature",
+               th::restrainedBucklingTemperature(thinOther.elasticStress, other) - kC,
+               th::restrainedBucklingTemperature(thin.elasticStress, steel) - kC, 1e-6);
+    expectTrue("even though the two elastic stresses differ by a third",
+               std::abs(thinOther.elasticStress / thin.elasticStress - 1.0) > 0.25);
+
+    // (c) **A restrained stiffener as an Euler column**, over the same frame bay.
+    //     These are stocky, and Johnson-Ostenfeld is what makes them pre-empt yield
+    //     at all -- by 9%, not by the factor the plating manages.
+    const sim::StiffenedSection side =
+        sim::stiffenedSection(sim::angle(0.160, 0.009, 0.070, 0.011), 0.0120, spacing);
+    const sim::BucklingCheck column = sim::columnBuckling(side, bay, 0.0, steel);
+    const double columnAt = th::restrainedBucklingTemperature(column.elasticStress, steel);
+    expectNear("the side longitudinal buckles at 149.8 C", columnAt - kC, 149.787, 0.01);
+    expectTrue("still before yield, but only just", columnAt < yieldK && columnAt > 0.9 * yieldK);
+
+    const double slenderness = bay / std::sqrt(side.secondMoment / side.area);
+    expectNear("its slenderness is 44.9", slenderness, 44.91, 0.05);
+
+    // The bottom longitudinal is stockier still, so "34 to 45" covers the ferry's
+    // longitudinals rather than being an eyeballed range.
+    const sim::StiffenedSection bottom =
+        sim::stiffenedSection(sim::tee(0.200, 0.010, 0.090, 0.012), 0.0145, spacing);
+    const double bottomSlenderness = bay / std::sqrt(bottom.secondMoment / bottom.area);
+    expectNear("and the bottom longitudinal's is 34.5", bottomSlenderness, 34.50, 0.05);
+    expectNear("which buckles at 155.8 C",
+               th::restrainedBucklingTemperature(
+                   sim::columnBuckling(bottom, bay, 0.0, steel).elasticStress, steel) - kC,
+               155.766, 0.01);
+
+    // **The critical slenderness, in closed form.** In the elastic branch the two
+    // meet where `eps_th = pi^2 / lambda^2`; equating that to the yield strain of
+    // the restrained bar gives lambda = pi / sqrt(eps_th(164.63 C)) = 73.19. Above
+    // it a restrained column buckles first on the elastic branch; the ferry's
+    // longitudinals are well below it, which is exactly why they pre-empt yield
+    // only through the plasticity cap.
+    const double critical = std::numbers::pi / std::sqrt(th::carbonSteelElongation(yieldK));
+    expectNear("the critical slenderness is 73.19", critical, 73.192, 5e-3);
+    expectTrue("and the ferry's longitudinals are well inside it", slenderness < 0.7 * critical);
+
+    // Non-vacuous: an actually slender column does buckle far earlier, and there
+    // the temperature is the geometry-only closed form **exactly** -- no E, no
+    // grade, no reduction factor. Slenderness 130 rather than 100, because at 100
+    // the elastic stress is 203 MPa against a `f_y/2` of 177.5 and Johnson-Ostenfeld
+    // is still in play; the closed form belongs to the elastic branch and the
+    // branch has to actually be the elastic one.
+    const double lambda = 130.0;
+    sim::StiffenedSection slender = side;
+    slender.secondMoment = side.area * (bay / lambda) * (bay / lambda);
+    const sim::BucklingCheck slim = sim::columnBuckling(slender, bay, 0.0, steel);
+    expectTrue("and that column really is on the elastic branch",
+               slim.elasticStress <= 0.5 * steel.yieldStrength);
+    const double slimAt = th::restrainedBucklingTemperature(slim.elasticStress, steel);
+    double lo = 20.0, hi = 1200.0;
+    const double target = std::numbers::pi * std::numbers::pi / (lambda * lambda);
+    for (int i = 0; i < 200; ++i) {
+        const double m = 0.5 * (lo + hi);
+        if (th::carbonSteelElongation(m + kC) >= target) hi = m;
+        else lo = m;
+    }
+    expectNear("a lambda = 130 column buckles where eps_th = pi^2 / lambda^2, exactly",
+               slimAt - kC, 0.5 * (lo + hi), 1e-9);
+    expectNear("which is 67.29 C", slimAt - kC, 67.2907, 5e-4);
+    // At lambda = 100 the same identity is out by 1.24 K, and that is the plasticity
+    // cap rather than an error -- which is why the elastic branch is stated as a
+    // condition and not as an approximation.
+    sim::StiffenedSection stocky = side;
+    stocky.secondMoment = side.area * (bay / 100.0) * (bay / 100.0);
+    const sim::BucklingCheck stockyCheck = sim::columnBuckling(stocky, bay, 0.0, steel);
+    expectTrue("lambda = 100 is NOT on the elastic branch for 355 MPa steel",
+               stockyCheck.elasticStress > 0.5 * steel.yieldStrength);
+    expectNear("and there the geometry-only form is out by 1.24 K",
+               99.1060 - (th::restrainedBucklingTemperature(stockyCheck.elasticStress, steel) - kC),
+               1.244, 5e-3);
+
+    std::printf("     restrained, ferry scantlings: 8 mm deck buckles at %.1f C, 12 mm side at"
+                " %.1f C, side longitudinal at %.1f C -- against yield at %.1f C\n",
+                th::restrainedBucklingTemperature(thin.elasticStress, steel) - kC,
+                th::restrainedBucklingTemperature(
+                    sim::plateBuckling(0.0120, bay, spacing, 0.0, steel).elasticStress, steel) - kC,
+                columnAt - kC, yieldK - kC);
+}
+
+void testExpansionRefusals() {
+    // Every path out of the two temperature solvers that is not a temperature.
+    // All six of these were mutation-test survivors before they were written --
+    // the routines were exercised only on their happy paths, which is the shape of
+    // "two functions on the caller's own path shipped with no test at all" in
+    // `CLAUDE.md`.
+    const StructuralMaterial steel = ah36Steel();
+
+    // (a) A reference temperature at or past the top of the published range. There
+    //     is nothing above it to search, so there is no answer rather than a
+    //     clamped one.
+    expectTrue("a reference at 1200 C has nowhere left to go",
+               th::restrainedYieldTemperature(steel, 1200.0 + kC) == 0.0);
+    expectTrue("and one above it likewise",
+               th::restrainedYieldTemperature(steel, 1300.0 + kC) == 0.0);
+    expectTrue("while one just below it still answers",
+               th::restrainedYieldTemperature(steel, 1199.0 + kC) > 0.0);
+
+    // (b) A material with no yield strength is already at its limit at the
+    //     reference, and the answer is the reference itself rather than a search.
+    StructuralMaterial noYield = steel;
+    noYield.yieldStrength = 0.0;
+    expectTrue("a material with no yield is at its limit where it starts",
+               th::restrainedYieldTemperature(noYield) == 20.0 + kC);
+
+    // (c) A material with no stiffness never generates a restraint stress -- and
+    //     the answer is **1200 C, not "never"**, which is worth pinning down
+    //     because it is not what it looks like. EN 1993-1-2 takes `k_y` and `k_E`
+    //     to *exactly* zero at 1200 C, so at the top of the range a member has no
+    //     strength left and is at its limit by definition, whatever stress it is
+    //     or is not carrying. That is also why `firstCrossing`'s "no crossing at
+    //     all" return is unreachable from either of these two solvers: both
+    //     margins are exactly zero at the top of the search. The reason is
+    //     asserted here rather than left as a comment nothing tests.
+    StructuralMaterial noStiffness = steel;
+    noStiffness.youngsModulus = 0.0;
+    expectTrue("a material with no stiffness carries no restraint stress",
+               th::restrainedStress(noStiffness, 600.0 + kC) == 0.0);
+    expectTrue("both reduction factors are exactly zero at 1200 C",
+               th::carbonSteelYieldFactor(1200.0 + kC) == 0.0 &&
+                   th::carbonSteelModulusFactor(1200.0 + kC) == 0.0);
+    expectNear("so a member with no stiffness reaches its (zero) limit at 1200 C",
+               th::restrainedYieldTemperature(noStiffness) - kC, 1200.0, 1e-9);
+    expectNear("and so does its buckling check",
+               th::restrainedBucklingTemperature(1.0e8, noStiffness) - kC, 1200.0, 1e-9);
+
+    // (d) A member with no elastic buckling stress is not a member.
+    expectTrue("a zero buckling stress is refused",
+               th::restrainedBucklingTemperature(0.0, steel) == 0.0);
+    expectTrue("and a negative one",
+               th::restrainedBucklingTemperature(-1.0e8, steel) == 0.0);
+    expectTrue("while a positive one answers",
+               th::restrainedBucklingTemperature(1.0e8, steel) > 0.0);
+
+    // (e) An enormously strong member never buckles at all within the range: its
+    //     capacity is capped at `k_y f_y`, which the restraint does reach, so this
+    //     is the case that must *not* return zero -- the two solvers agree there.
+    const double huge = th::restrainedBucklingTemperature(1.0e15, steel);
+    expectNear("a member too stocky to buckle falls back to its squash load",
+               huge, th::restrainedYieldTemperature(steel), 0.01);
+}
+
+void testThermalLoadRefusals() {
+    // The same for the element side. `elementThermalLoad` has two ways of
+    // declining, and both used to leave `out` untouched as far as any test knew.
+    const StructuralMaterial steel = ah36Steel();
+    const double nodes[ss::kDof] = {0, 0, 0, 0.60, 0, 0, 0.60, 0.45, 0, 0, 0.45, 0,
+                                    0, 0, 0.012, 0.60, 0, 0.012, 0.60, 0.45, 0.012,
+                                    0, 0.45, 0.012};
+    double eigen[6];
+    th::thermalEigenstrain(400.0 + kC, 20.0 + kC, eigen);
+
+    const auto allZero = [](const double f[ss::kDof]) {
+        for (int i = 0; i < ss::kDof; ++i)
+            if (f[i] != 0.0) return false;
+        return true;
+    };
+
+    // Poisoned beforehand, so "left untouched" and "written to zero" are different
+    // outcomes -- which is the whole point, since a caller accumulates into a load
+    // vector from this.
+    double out[ss::kDof];
+    for (int i = 0; i < ss::kDof; ++i) out[i] = 1.0e9;
+    ss::elementThermalLoad(nodes, steel, ss::Formulation::SolidShell, nullptr, out);
+    expectTrue("a null eigenstrain gives a zeroed load, not a stale one", allZero(out));
+
+    // An inverted element: the same node list with two corners swapped, which folds
+    // it. `computeForms` refuses it and the load must come back zero rather than
+    // holding whatever the caller had.
+    double folded[ss::kDof];
+    std::copy(std::begin(nodes), std::end(nodes), std::begin(folded));
+    for (int i = 0; i < 3; ++i) std::swap(folded[i], folded[12 + i]);
+    for (int i = 0; i < ss::kDof; ++i) out[i] = 1.0e9;
+    ss::elementThermalLoad(folded, steel, ss::Formulation::SolidShell, eigen, out);
+    expectTrue("an inverted element gives a zeroed load too", allZero(out));
+
+    // Non-vacuous: the sound element with a real eigenstrain does not.
+    ss::elementThermalLoad(nodes, steel, ss::Formulation::SolidShell, eigen, out);
+    expectTrue("while the sound element carries a real load", !allZero(out));
+
+    // And the mesh-level entry point refuses a mis-sized eigenstrain rather than
+    // reading past it.
+    ss::HexMesh mesh = ss::makePlateMesh(0.6, 0.45, 0.012, 2, 2, 1);
+    expectTrue("a short eigenstrain vector is refused",
+               ss::thermalLoad(mesh, steel, ss::Formulation::SolidShell,
+                               std::vector<double>(mesh.elementCount() * 6 - 1, 0.0))
+                   .empty());
+    expectTrue("and a long one",
+               ss::thermalLoad(mesh, steel, ss::Formulation::SolidShell,
+                               std::vector<double>(mesh.elementCount() * 6 + 1, 0.0))
+                   .empty());
+    expectEqual("while a correctly sized one gives one value per degree of freedom",
+                static_cast<long long>(
+                    ss::thermalLoad(mesh, steel, ss::Formulation::SolidShell,
+                                    std::vector<double>(mesh.elementCount() * 6, 1e-3))
+                        .size()),
+                static_cast<long long>(mesh.nodeCount() * 3));
+}
+
+void testTheFerryLosesPanelsAtEightyKelvin() {
+    // **The ship-scale consequence, against the section the repo already builds.**
+    // No wave, no cargo, no bending moment at all -- only a compartment that got
+    // hot while the structure around it did not. `collapseElementsAt` gives every
+    // element of the midship section the compressive capacity its own plating and
+    // spacing imply, and `atTemperature` reduces it; the question is when the
+    // restraint stress catches the weakest one.
+    const sim::StructuralMesh mesh =
+        sim::makeStructuralMesh(game::buildFerry().hull, sim::ferryScantlings());
+    const sim::Scantlings scantlings = sim::ferryScantlings();
+    expectTrue("the reference section was built", !mesh.panels.empty());
+    const StructuralMaterial steel = ah36Steel();
+
+    // The weakest element's compressive capacity at a temperature, through the
+    // existing chain and with nothing added to it.
+    const auto weakestCapacity = [&](double kelvin) {
+        sim::StructuralMesh hot = mesh;
+        for (StructuralMaterial& m : hot.materials) m = th::atTemperature(m, kelvin);
+        const std::vector<sim::CollapseElement> elements =
+            sim::collapseElementsAt(hot, scantlings, 0.0);
+        double worst = 1e30;
+        for (const sim::CollapseElement& e : elements)
+            worst = std::min(worst, e.curve.compressiveCapacity());
+        return worst;
+    };
+
+    const double cold = weakestCapacity(20.0 + kC);
+    expectTrue("the section has a weakest panel and it is not degenerate",
+               cold > 1e6 && cold < steel.yieldStrength);
+
+    double lo = 20.0 + kC, hi = 1200.0 + kC;
+    for (int i = 0; i < 120; ++i) {
+        const double m = 0.5 * (lo + hi);
+        if (std::abs(th::restrainedStress(steel, m)) >= weakestCapacity(m)) hi = m;
+        else lo = m;
+    }
+    const double lost = 0.5 * (lo + hi);
+    expectNear("the ferry loses her first panel to restrained expansion alone at 59.0 C",
+               lost - kC, 59.027, 0.02);
+    expectTrue("a 39 K rise, well before the fully restrained yield temperature of 164.6 C",
+               lost < th::restrainedYieldTemperature(steel));
+
+    // **And the whole section agrees with the hand calculation on one panel.** The
+    // weakest element of 8 900 panels is the 8 mm vehicle deck head in its
+    // 0.70 x 2.40 m bay, and the temperature the section arrives at is the one
+    // `plateBuckling` gives for that panel alone -- two paths, one number.
+    const double byHand = th::restrainedBucklingTemperature(
+        sim::plateBuckling(0.0080, scantlings.frameSpacing, scantlings.longitudinalSpacing, 0.0,
+                           steel)
+            .elasticStress,
+        steel);
+    expectNear("which is exactly the 8 mm deck panel's own figure", lost - kC, byHand - kC, 0.02);
+
+    // Non-vacuous, and the part that makes this a *thermal expansion* result rather
+    // than a strength one: at that temperature the yield factor is exactly 1 and
+    // the modulus factor has barely moved, so the strength model on its own would
+    // report the ship as very nearly undamaged.
+    expectTrue("where k_y is still exactly 1", th::carbonSteelYieldFactor(lost) == 1.0);
+    expectTrue("and k_E has fallen by under 5%", th::carbonSteelModulusFactor(lost) > 0.95);
+    expectTrue("so the weakest panel has lost under 5% of its own capacity to heat",
+               weakestCapacity(lost) > 0.95 * cold);
+
+    std::printf("     ferry midship: the first panel goes at %.1f C on restrained expansion"
+                " alone, where k_y = %.2f and the panel has lost %.1f%% of its capacity\n",
+                lost - kC, th::carbonSteelYieldFactor(lost),
+                100.0 * (1.0 - weakestCapacity(lost) / cold));
+}
+
 // --- 7. From a nodal field to an element's temperature ---------------------------
 
 void testElementTemperatureField() {
@@ -3169,6 +3796,16 @@ void runThermalTests() {
     testReturnMapUnderAMovingYieldSurface();
     testFibresSoften();
     testHotStructureIsWeaker();
+
+    std::printf("\n=== thermal elongation: EN 1993-1-2 §3.4.1.1, and what restraint does with it ===\n");
+    testThermalElongationCurve();
+    testRestrainedMemberYieldsOnExpansionAlone();
+    testWhatRestraintMeansOnAShip();
+    testBucklingArrivesBeforeYield();
+    testExpansionRefusals();
+    testThermalLoadRefusals();
+    testTheFerryLosesPanelsAtEightyKelvin();
+
     testElementTemperatureField();
     testGradientThroughPlating();
 }

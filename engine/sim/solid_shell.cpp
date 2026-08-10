@@ -525,9 +525,50 @@ void elementStiffness(const double nodes[kDof], const StructuralMaterial& materi
         }
 }
 
+namespace {
+
+// `int B^T C eps_star dV` and `int G^T C eps_star dV` -- the two halves of an
+// eigenstrain's equivalent force, before condensation. One place, so that
+// `elementStress`'s enhanced recovery and `elementThermalLoad`'s nodal force
+// cannot be built from two different quadratures of the same integral.
+//
+// `fa` is **identically zero for an eigenstrain constant over the element**, on any
+// geometry, because `int G^T dV = 0` is the condition that makes EAS pass the patch
+// test -- see the note at `elementStress` in the header, and the test that asserts
+// the integral rather than assuming it. It is computed rather than skipped because
+// an eigenstrain that varies within the element is the next refinement and would
+// make it real, and because a loop that is provably zero costs nothing next to the
+// Cholesky it feeds.
+void eigenLoads(const RestForms& f, const double c[6][6], const double eigen[6],
+                double fu[kDof], double fa[kEas]) {
+    std::fill(fu, fu + kDof, 0.0);
+    std::fill(fa, fa + kEas, 0.0);
+    double ce[6];
+    for (int i = 0; i < 6; ++i) {
+        double s = 0.0;
+        for (int k = 0; k < 6; ++k) s += c[i][k] * eigen[k];
+        ce[i] = s;
+    }
+    for (int gp = 0; gp < kGauss; ++gp) {
+        const double w = f.weight[gp];
+        for (int j = 0; j < kDof; ++j) {
+            double s = 0.0;
+            for (int i = 0; i < 6; ++i) s += f.b[gp][i][j] * ce[i];
+            fu[j] += w * s;
+        }
+        for (int k = 0; k < f.easCount; ++k) {
+            double s = 0.0;
+            for (int i = 0; i < 6; ++i) s += f.g[gp][i][k] * ce[i];
+            fa[k] += w * s;
+        }
+    }
+}
+
+}  // namespace
+
 void elementStress(const double nodes[kDof], const double displacement[kDof],
                    const StructuralMaterial& material, Formulation form,
-                   double out[kGauss * 6]) {
+                   double out[kGauss * 6], const double eigenstrain[6]) {
     std::fill(out, out + kGauss * 6, 0.0);
     RestForms forms;
     computeForms(nodes, form, forms);
@@ -539,15 +580,23 @@ void elementStress(const double nodes[kDof], const double displacement[kDof],
     computeBlocks(forms, c, blocks);
 
     // Recover the enhanced parameters the element would have settled on:
-    // alpha = -Kaa^-1 Kua^T u. For a linear displacement field this is exactly
-    // zero, which is what makes the patch test a statement about the element and
-    // not about the condensation.
+    // alpha = Kaa^-1 (int G^T C eps_star dV - Kua^T u). Without an eigenstrain that
+    // is -Kaa^-1 Kua^T u, and for a linear displacement field it is exactly zero,
+    // which is what makes the patch test a statement about the element and not
+    // about the condensation.
+    //
+    // The `-s` is written out rather than reached through `0.0 - s` so that a null
+    // eigenstrain is the same arithmetic as before this parameter existed, signed
+    // zeros included.
+    double fu[kDof], fa[kEas];
+    if (eigenstrain != nullptr) eigenLoads(forms, c, eigenstrain, fu, fa);
     double alpha[kEas] = {};
     if (blocks.easCount > 0) {
         for (int i = 0; i < blocks.easCount; ++i) {
             double s = 0.0;
             for (int j = 0; j < kDof; ++j) s += blocks.kua[j * kEas + i] * displacement[j];
             alpha[i] = -s;
+            if (eigenstrain != nullptr) alpha[i] += fa[i];
         }
         if (!solveSmall(blocks.kaa, blocks.easCount, alpha, 1))
             std::fill(std::begin(alpha), std::end(alpha), 0.0);
@@ -559,7 +608,7 @@ void elementStress(const double nodes[kDof], const double displacement[kDof],
             double s = 0.0;
             for (int j = 0; j < kDof; ++j) s += forms.b[gp][i][j] * displacement[j];
             for (int k = 0; k < blocks.easCount; ++k) s += forms.g[gp][i][k] * alpha[k];
-            strain[i] = s;
+            strain[i] = eigenstrain != nullptr ? s - eigenstrain[i] : s;
         }
         for (int i = 0; i < 6; ++i) {
             double s = 0.0;
@@ -567,6 +616,40 @@ void elementStress(const double nodes[kDof], const double displacement[kDof],
             out[gp * 6 + i] = s;
         }
     }
+}
+
+void elementThermalLoad(const RestForms& forms, const StructuralMaterial& material,
+                        const double eigenstrain[6], double out[kDof]) {
+    std::fill(out, out + kDof, 0.0);
+    if (!forms.ok || eigenstrain == nullptr) return;
+
+    double c[6][6];
+    isotropic(material, c);
+    double fu[kDof], fa[kEas];
+    eigenLoads(forms, c, eigenstrain, fu, fa);
+    std::memcpy(out, fu, sizeof(double) * kDof);
+    if (forms.easCount == 0) return;
+
+    // Condense: f = fu - Kua Kaa^-1 fa, the same elimination `elementStiffness`
+    // performs on the stiffness and necessarily the same Kaa, or the pair would
+    // not solve the system it claims to.
+    Blocks blocks;
+    computeBlocks(forms, c, blocks);
+    double x[kEas];
+    for (int k = 0; k < blocks.easCount; ++k) x[k] = fa[k];
+    if (!solveSmall(blocks.kaa, blocks.easCount, x, 1)) return;
+    for (int j = 0; j < kDof; ++j) {
+        double s = 0.0;
+        for (int k = 0; k < blocks.easCount; ++k) s += blocks.kua[j * kEas + k] * x[k];
+        out[j] -= s;
+    }
+}
+
+void elementThermalLoad(const double nodes[kDof], const StructuralMaterial& material,
+                        Formulation form, const double eigenstrain[6], double out[kDof]) {
+    RestForms forms;
+    computeForms(nodes, form, forms);
+    elementThermalLoad(forms, material, eigenstrain, out);
 }
 
 void elementMass(const double nodes[kDof], double density, double out[kNodes]) {
@@ -734,17 +817,17 @@ void initialisePlasticState(const double nodes[kDof], const plasticity::Material
 PlasticUpdate elementPlasticUpdate(const double rest[kDof], const double current[kDof],
                                    const plasticity::Material& material, Formulation form,
                                    ElementPlasticState& state, double force[kDof],
-                                   double stress[kGauss * 6]) {
+                                   double stress[kGauss * 6], const double eigenstrain[6]) {
     RestForms forms;
     computeForms(rest, form, forms);
-    return elementPlasticUpdate(forms, rest, current, material, state, force, stress);
+    return elementPlasticUpdate(forms, rest, current, material, state, force, stress, eigenstrain);
 }
 
 PlasticUpdate elementPlasticUpdate(const RestForms& forms, const double rest[kDof],
                                    const double current[kDof],
                                    const plasticity::Material& material,
                                    ElementPlasticState& state, double force[kDof],
-                                   double stress[kGauss * 6]) {
+                                   double stress[kGauss * 6], const double eigenstrain[6]) {
     PlasticUpdate result;
     std::fill(force, force + kDof, 0.0);
     if (stress != nullptr) std::fill(stress, stress + kGauss * 6, 0.0);
@@ -823,7 +906,13 @@ PlasticUpdate elementPlasticUpdate(const RestForms& forms, const double rest[kDo
                     double s = 0.0;
                     for (int j = 0; j < kDof; ++j) s += forms.b[gp][i][j] * u[j];
                     for (int k = 0; k < easCount; ++k) s += forms.g[gp][i][k] * alpha[k];
-                    strain[i] = s;
+                    // The one subtraction. `plasticity::update` integrates the law
+                    // from the stored history to the strain it is given, so what it
+                    // must be given is the *mechanical* strain -- and the enhanced
+                    // Newton below then converges on the alpha that makes the real
+                    // stress orthogonal to G, with no separate eigenstrain term of
+                    // its own.
+                    strain[i] = eigenstrain != nullptr ? s - eigenstrain[i] : s;
                 }
                 trial[gp] = start[gp];
                 increments[gp] = plasticity::update(material, state.failureStrain, strain, trial[gp],
@@ -1468,6 +1557,29 @@ std::vector<double> uniformPressureLoad(const HexMesh& mesh, double pressure) {
                         load[n[c] * 3 + static_cast<std::size_t>(i)] -=
                             pressure * shape[c] * area[i];
             }
+    }
+    return load;
+}
+
+std::vector<double> thermalLoad(const HexMesh& mesh, const StructuralMaterial& material,
+                                Formulation form, const std::vector<double>& eigenstrain) {
+    std::vector<double> load;
+    if (eigenstrain.size() != mesh.elementCount() * 6) return load;
+    load.assign(mesh.nodeCount() * 3, 0.0);
+    for (std::size_t e = 0; e < mesh.elementCount(); ++e) {
+        double nodes[kDof];
+        for (int a = 0; a < kNodes; ++a) {
+            const std::size_t n = mesh.index[e * kNodes + static_cast<std::size_t>(a)];
+            for (int i = 0; i < 3; ++i)
+                nodes[a * 3 + i] = mesh.position[n * 3 + static_cast<std::size_t>(i)];
+        }
+        double f[kDof];
+        elementThermalLoad(nodes, material, form, &eigenstrain[e * 6], f);
+        for (int a = 0; a < kNodes; ++a) {
+            const std::size_t n = mesh.index[e * kNodes + static_cast<std::size_t>(a)];
+            for (int i = 0; i < 3; ++i)
+                load[n * 3 + static_cast<std::size_t>(i)] += f[a * 3 + i];
+        }
     }
     return load;
 }

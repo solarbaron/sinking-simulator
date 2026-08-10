@@ -5579,9 +5579,28 @@ loses strength faster than the yield factor says: the ferry's midship section
 sheds 17.6% of its ultimate sagging moment at 400 °C, at which temperature `k_y`
 is still exactly 1.
 
+**Thermal expansion, §3.4.1.1, is now there and it is the larger term.**
+`thermal::carbonSteelElongation` gives 7.08e-3 of free strain at a 500 K rise
+against a 1.723e-3 yield strain, and it enters the element as an *eigenstrain* —
+subtracted from the total strain before the constitutive law sees it, in
+`elementStress` and `elementPlasticUpdate` alike, with `solidshell::thermalLoad`
+supplying the equivalent nodal force that a *linear* static solve needs and an
+explicit one does not. A freely expanding body carries exactly zero stress; a
+fully restrained one carries `−k_E·E·ε*` and reaches yield at **164.630 °C**,
+where `k_y` is still exactly 1.
+
+**And that is the wrong failure mode.** A restrained member is in compression, and
+on this ferry's scantlings the plating buckles first: the 8 mm vehicle deck head
+at **59.0 °C**, the 12 mm side shell at 103.1 °C, the side longitudinal as a
+column at 149.8 °C. On the elastic branch `k_E` cancels out of the comparison
+exactly, so the buckling temperature depends on geometry and the elongation curve
+alone — independent of `E`, of the grade, and of the reduction factor — and the
+critical slenderness at which buckling and yield coincide is 73.19 against the
+ferry's longitudinals at 34–45. The whole midship section, through
+`collapseElementsAt`, loses its first panel at 59.0 °C under no load at all.
+
 Still per material, and still to come: ultimate strength, Johnson–Cook rate and
-thermal coefficients, **thermal expansion** (§3.4.1.1, and for a restrained member
-it is four times the size of the strength effect), melting point. Coverage: mild
+thermal coefficients, melting point. Coverage: mild
 steel, higher-tensile grades AH/DH/EH 32/36/40, stainless,
 aluminium 5083/5383/6082 (which loses strength at *200* °C — the reason aluminium
 superstructures are a fire problem), GRP and sandwich laminates, timber, ferro-
