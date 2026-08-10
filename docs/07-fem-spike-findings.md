@@ -69,6 +69,13 @@ explicit scheme has no accuracy at all. Sweeping the GPU step count from 198 to
 202 does not reduce the difference, ruling out a step offset. Use integral or
 low-frequency quantities to compare solvers, never the max norm on velocity.)*
 
+> **The paragraph above is the only thing in §1 or §2 that `fem_spike` cannot be
+> asked to produce.** Every other cell of both tables comes back on
+> `./build/fem_spike` exactly as printed, to every digit. The peak-velocity
+> comparison and the 198–202 step sweep were scaffolding and were never checked in,
+> so "over 200%" and "~4 steps" rest on the authority of the session that ran them
+> and cannot be re-derived from this tree.
+
 ## 3. Throughput
 
 Steel plate, varying mesh density, 2000 steps per measurement, GPU timestamps:
@@ -89,6 +96,20 @@ For scale, the same kernel on one CPU core manages **4.5–6.7 M element-updates
 The GPU is worth about 100 cores — or, put less flatteringly, about **4× the whole
 24-thread CPU**. Useful, but not a silver bullet, and a well-threaded CPU fallback
 is a viable degradation path rather than a joke.
+
+> **The two count columns re-derive; the three clock columns never have, and an
+> attempt was refused by the box.** `./build/fem_spike` returns 960/315,
+> 11 520/2 745, 46 080/10 285, 230 400/45 225 and 491 520/95 337 exactly, so the
+> mesh sizes §4 works forward from are sound. The timings were re-run with an
+> unrelated desktop application holding the device at 74–100% for the whole session:
+> the 960-tet row came back within 1% (0.0082 ms/step, 116.9 M) and the two largest
+> read **4.5× slow**. That is the signature of a busy GPU rather than of a moved
+> figure — a competing consumer costs a long kernel far more than a launch-bound
+> one, which is the mechanism §8 measures directly — so **nothing in this table is
+> treated as re-measured**, and nothing here is gated: `scripts/check-figures.sh`
+> reaches §8 and no other section of this file. The single-core 4.5–6.7 M range is
+> worse off still: `fem_spike` benchmarks one mesh size on the CPU, so even an idle
+> box would return one point of a range that has two.
 
 The last column is the one that matters. It is dominated not by element count but
 by the CFL limit: halving element size doubles the element count in each of three
@@ -138,14 +159,26 @@ Tier 2 should not be uniformly tetrahedral. It should be:
   > its through-thickness stretch degree of freedom — deliberately, because a crush
   > zone needs the plate to be able to thin — so its highest frequency is the
   > thickness dilatational mode and the stable step is `t / c_p` **however large
-  > the element is in plane**. Measured: `dt·c_p/t = 0.999` at in-plane sizes from
-  > 5t to 50t, i.e. flat. The step is *not* set by the in-plane size. The 5–10×
+  > the element is in plane**. Measured: `dt·c_p/t` runs 0.992 at 5t to 0.9999 at
+  > 50t, i.e. flat. The step is *not* set by the in-plane size. The 5–10×
   > figure survives by accident, because it is the right comparison against a tet
   > mesh with 8 elements through the thickness (measured 6.7×), but anyone sizing
   > elements from the stated mechanism would over-predict the affordable step by
-  > the in-plane aspect ratio, which is 25× at 50 mm elements on 20 mm plate. A
+  > the in-plane aspect ratio, which is 2.5× at 50 mm elements on 20 mm plate. A
   > timestep governed by in-plane size needs a classical shell element with no
   > thickness stretch, or selective mass scaling on the thickness mode.
+  >
+  > > **Both numbers in the sentence above were wrong, and one by a factor of ten.**
+  > > It read `dt·c_p/t = 0.999` "from 5t to 50t" and an aspect ratio of "25× at
+  > > 50 mm elements on 20 mm plate". 50 mm on 20 mm plate is an aspect ratio of
+  > > **2.5**, not 25, and the over-prediction is the same 2.5: the stability sweep
+  > > in `tests/test_solid_shell.cpp` reports `dt·c_p/h = 0.3867` at t = 20 mm,
+  > > h = 50 mm, so believing the in-plane size sets the step over-predicts it by
+  > > 1/0.3867 = **2.6×**. The flatness figure was quoted from the wide end of its
+  > > own sweep: `dt·c_p/t` is 0.9924 at 5t and only reaches 0.999 at 10t. Re-derived
+  > > by running `./build/shipsim_tests` and reading the *explicit stability limit*
+  > > table under `--- solid-shell elements ---`, which is where the 6.7× beside it
+  > > comes from and always did.
 - **Tetrahedra retained where the geometry is genuinely three-dimensional** —
   castings, engine seats, thick brackets, and the crush zone itself once plating
   has folded and is no longer thin.
@@ -220,13 +253,33 @@ a deflection test cannot see.
 
 ### Cost, one core, measured
 
+All five rows come off the *measured cost, one core* block `./build/shipsim_tests`
+prints under `--- solid-shell elements ---`, and each is the **minimum over five
+passes** rather than one reading, because contention can only add time:
+
 | | |
 |---|---|
-| Element stiffness formation | **21.1 µs** — once, when a zone is promoted |
-| The same for a plain hex | 13.4 µs, so the assumed strains cost **1.57×** |
-| Internal force per step | **267 ns** |
-| `fem.cpp` linear tet internal force per step | 129 ns, so one solid-shell = **2.1 tets** |
+| Element stiffness formation | **21.9 µs** — once, when a zone is promoted |
+| The same for a plain hex | 13.5 µs, so the assumed strains cost **1.62×** |
+| Internal force per step | **293 ns** |
+| `fem.cpp` linear tet internal force per step | 129 ns, so one solid-shell = **2.3 tets** |
 | Explicit step, 20 mm plate | 3.25 µs (`t / c_p`, in-plane size irrelevant) |
+
+> **Two of those had drifted, and the tet row is what says so rather than the box
+> being busy.** The table read 21.1 µs, 13.4 µs, **267 ns**, 129 ns and 1.57× /
+> 2.1 tets. The solid-shell's own two figures are 4% and 10% above what was
+> published; the plain hex is within 1% and **the tet is exactly 129 ns**. All four
+> are timed in the same loop, in the same run, on the same box, so a load that
+> inflated the solid-shell would have inflated the tet beside it — and across five
+> passes the tet's minimum lands on 129 while the internal force never once came
+> near 267 (293, 295, 303, 307, 309). That is a **control**, not an argument: the
+> re-measurement was taken while the box was 22–38% busy with sibling agents, and
+> the tet row is the only reason the two moved rows can be read as the element
+> changing rather than the machine. *Why* the element got 10% slower was **not
+> chased and is not explained here**: `internalForce` is a polar decomposition and
+> a 24 × 24 matvec on a stiffness formed outside the timed loop, so it touches
+> neither the enhanced-mode normalisation nor the constraint path that arrived
+> after these figures were taken.
 
 Per element the solid-shell is twice a tet. That is not the comparison that
 matters. Per **square metre of 20 mm plating per simulated second**, single core:
@@ -234,36 +287,46 @@ matters. Per **square metre of 20 mm plating per simulated second**, single core
 | | elements/m² | steps/s | cost |
 |---|---|---|---|
 | Linear tets at 2.5 mm (8 through the thickness, the spike's 11%-error mesh) | 7.7 M | 4.1 M | **4.1 × 10⁶ s** |
-| Solid-shell at 50 mm, one through the thickness | 400 | 3.3 × 10⁵ | **37 s** |
+| Solid-shell at 50 mm, one through the thickness | 400 | 3.4 × 10⁵ | **40 s** |
 
-**A factor of 1.1 × 10⁵.** A 20 m × 10 m collision zone is 200 m² of shell, so one
-simulated second costs **~8 × 10⁸ core-seconds as tets and ~7 400 core-seconds as
-solid-shells** — about 5 minutes of wall time per simulated second on the
-24-thread CPU, or well under a minute on the GPU at the throughput §3 measured.
+**A factor of 1.0 × 10⁵.** A 20 m × 10 m collision zone is 200 m² of shell, so one
+simulated second costs **~8 × 10⁸ core-seconds as tets and ~8 000 core-seconds as
+solid-shells** — about five and a half minutes of wall time per simulated second on
+the 24-thread CPU, or well under a minute on the GPU at the throughput §3 measured.
 That is inside the time dilation the engine already plans for, and it is what
 makes the 20 m damage zone affordable rather than theoretical.
 
 > **Correction.** That sentence previously read "~2 core-hours as tets and
-> ~2 core-minutes as solid-shells", and **both figures were wrong** — 200 × 37 s is
-> 7 400 core-seconds, which is two core-*hours*, and 200 × 4.1 × 10⁶ s is 26
+> ~2 core-minutes as solid-shells", and **both figures were wrong** — 200 × 40 s is
+> 8 000 core-seconds, which is two core-*hours*, and 200 × 4.1 × 10⁶ s is 26
 > core-*years*, not two core-hours. The wall-time figure beside them was right all
-> along (7 400 / 24 = 5.1 minutes), which is why the error survived: the number
+> along (8 000 / 24 = 5.6 minutes), which is why the error survived: the number
 > anyone would sanity-check was correct and the two feeding it were not. Found while
 > costing the elastoplastic path against it.
+>
+> > The tet column and the two derived from it are unchanged on re-measurement
+> > (4.07 × 10⁶ s, minimum of five). The solid-shell column moved with the 267 → 293 ns
+> > above it: 37 → 40 s, 1.1 × 10⁵ → 1.0 × 10⁵, 7 400 → 8 000 core-seconds. The
+> > `steps/s` column was independently wrong: the test forms it from
+> > `criticalTimestep(..., 0.9)`, i.e. 1/(0.9 × 3.25 µs) = **3.4 × 10⁵**, and 3.3 × 10⁵
+> > never reproduced the 37 s printed beside it.
 
-Stiffness formation at 21 µs means promoting a 10⁵-element zone costs ~2 s on one
+Stiffness formation at 22 µs means promoting a 10⁵-element zone costs ~2 s on one
 core, ~0.1 s threaded. That is a hitch at promotion, not a per-frame cost, and it
 is the number to watch if zones are promoted during play rather than at impact.
 
 ### What it was checked against
 
-Closed forms throughout, not eyeballed output. 207 assertions:
+Closed forms throughout, not eyeballed output. **428 assertions** — counted by
+running `runSolidShellTests()` on its own against `testing::checkCount()`. It was
+207 when the mutation pass below finished and has roughly doubled since; the number
+here had never been re-counted:
 
-- **The patch test**, exactly, on a distorted patch: displacement to 1.1 × 10⁻¹⁵
-  and constant stress to 2 × 10⁻¹³. Distortion in-plane is arbitrary.
+- **The patch test**, exactly, on a distorted patch: displacement to 1.0 × 10⁻¹⁵
+  and constant stress to 1.7 × 10⁻¹³. Distortion in-plane is arbitrary.
 - **Rigid body motion** carries no force, including finite rotations to 3 rad; and
   the stronger statement, **frame indifference** — a 25% stretch rotated 1.7 rad
-  gives the rotated force to 8 × 10⁻¹³ of it.
+  gives the rotated force to 4.7 × 10⁻¹³ of it.
 - **Cylindrical bending** against `PL³/3Db`, converging at **order 2.1–2.4** and
   reaching the closed form to 1 × 10⁻⁵.
 - **Plates**: the Navier double series (summed, not quoted) to 0.04%; the clamped
@@ -548,8 +611,8 @@ profiling found on the way in.
 
 **Amdahl's law decides an accelerator, and the kernel's peak throughput does
 not.** So before any Vulkan, `zone::Solver` was instrumented per phase and run on
-the ferry's own side patch — 192 elements, 450 nodes, a 2 m punch driven 0.048 m
-in 6 608 steps, `tools/zone_probe --radius=2.5`:
+the ferry's own side patch — 192 elements, 450 nodes, a 2 m punch driven 0.060 m
+in 6 608 steps, `tools/zone_probe --radius=2.5 --depth=0.06 --forms-cache=never`:
 
 | phase | one worker | 23 workers |
 |---|---|---|
@@ -557,6 +620,21 @@ in 6 608 steps, `tools/zone_probe --radius=2.5`:
 | CSR nodal gather | 0.3% | 1.4% |
 | integration | 0.2% | 0.8% |
 | energy accounting | 1.0% | 3.9% |
+
+> **The command above used to read `tools/zone_probe --radius=2.5`, and that is a
+> different experiment.** `--depth` defaults to **0.45 m**, which is 42 396 steps
+> and half the patch torn, and it profiles 92.1 / 1.8 / 1.2 / 4.9 on 23 workers —
+> neither column of this table. Two parameters were missing beside the number:
+> the depth, and `--forms-cache=never`. The second matters because **this is the
+> pre-hoist profile** — it is the thing the next paragraph is about — and the
+> switch that turns the hoist off did not exist when it was taken. Supplied both,
+> the one-worker column comes back exactly: **98.5–98.6 / 0.3 / 0.2 / 0.9** on
+> three passes, and the 23-worker column comes back 93.3–93.8 / 1.1 / 0.8 /
+> 4.3–4.7 on a box 31–36% busy, where the serial energy phase is the one a
+> competing load inflates. The travel was also wrong: 0.048 m is the last *history
+> sample* the run prints, and the punch is driven 0.060 m. This is the same fault
+> as *The correction to the correction* below — a parameter of the experiment not
+> written next to the number — in the section that records it.
 
 So the tet pattern does apply: this is an element-dominated explicit loop and not
 a direct solve. **But half of that 98.5% was work that did not have to happen at
@@ -573,6 +651,20 @@ Gauss weights and its rest Jacobian — every step, for every element, from the
 | 192 elements, 1 worker | 5.48 s | **2.73 s** | 2.01× |
 | 192 elements, 23 workers | 1.48 s | **0.90 s** | 1.64× |
 | 17 800 elements, 23 workers | 21.12 s | **13.03 s** | 1.62× |
+
+> **What re-measures here is the ratio, and only the one-worker one.** On the
+> commands above with `--forms-cache=never` against the default, the one-worker
+> pair is 6.57 s / 3.29 s = **2.00×** against the published 2.01× — the absolute
+> times are 20% high on a box 27–36% busy, and the ratio is untouched by that
+> because both halves are one thread. The 23-worker pair comes out 2.43 s / 1.36 s
+> = 1.79× against 1.64×, which is a 23-way split on a box with a third of its
+> cores in other hands and is not evidence of anything. **The third row cannot be
+> re-run at all**: nothing records its step count, no `--radius`/`--sub` is given,
+> and the configuration that produces exactly 17 800 elements had to be searched
+> for — it is `zone_probe --force --radius=11 --sub=10`. At the depth the other two
+> rows use that is 7 001 steps and 106 s / 154 s, and the published 13.03 s implies
+> a run roughly eight times shorter. The row is retained as taken and flagged as
+> unreproducible, not corrected, because there is nothing to correct it *to*.
 
 **The two answers are bit-identical** — same arithmetic, same order, on the same
 numbers — asserted on every reported quantity and on every node position rather
@@ -759,6 +851,19 @@ are within 2%.
 > The one figure to distrust is unchanged and for the reason previously given: at
 > 192 elements six workgroups is a handful of warps, so it is latency-bound and
 > anything else on the device shows in it directly.
+>
+> > **A later audit could not repeat this table, and the way it failed is the
+> > callout's own mechanism observed again.** With a desktop application holding the
+> > device at 74–100% for an entire session, single runs of the same commands gave
+> > 0.79× / 1.32× / 1.02× / 1.02× / 1.22× on the workgroup mapping against the
+> > 1.56 / 1.27 / 1.34 / 2.23 / 2.44 above — while the **invocation** mapping at
+> > 3 072, the longest kernel in the sweep, came back at **0.62× against its
+> > published 0.64×**. The one measurement that survived the contention is the one
+> > made of the most work, which is what *the contended session understated the
+> > cost* says below, and it is why none of the rest was written into the table.
+> > Every **deterministic** cell of §8 — every torn count, dissipation, alpha and
+> > register count — was re-derived in that session and holds; nothing on a clock
+> > was.
 
 **The degradation past 3 000 elements is gone**, and that is the load-bearing part.
 The old curve improved to 3 072 and then fell off a cliff — 0.64× to 0.24× to 0.22×
@@ -1044,12 +1149,22 @@ two on the CPU's 1e-16 land on 204–205, whatever their arithmetic: the gate is
 **42 elements** and everything fp64 does inside a gate is worth **four**. At 768 the
 gate is worth nothing at all and fp64 is worth four, in the wrong direction.
 
-**And `tight` and `newton` now agree to one element at both sizes** — 40/44 and
-205/204. That is the section's own central claim about this ladder, *"the whole of the
-fp64 block's effect on this kernel is the tolerance it was bundled with"*, and the
-derived-step table it was drawn from actually contradicted it at 3 072 (205 against
-241). Fixing the step count did not weaken the finding; it is the first version of this
-table that supports it.
+**And `tight` and `newton` agree to one element at 3 072** — 205 against 204 — where the
+derived-step table this was drawn from had them 36 apart (205 against 241). That is the
+section's own central claim about this ladder, *"the whole of the fp64 block's effect on
+this kernel is the tolerance it was bundled with"*, and fixing the step count is what
+made it hold at the size where tearing is busiest.
+
+> **It does not hold at 768, and a previous revision of this paragraph said it did.**
+> The sentence read "`tight` and `newton` now agree to one element **at both sizes** —
+> 40/44 and 205/204", quoting as agreement a pair four elements apart in the table
+> immediately above it, one paragraph after that same four had been called out as
+> "everything fp64 does inside a gate". Both figures re-measure exactly —
+> `zone_gpu_probe --radius=2.5 --sub=8 --steps=5505 --mapping=workgroup --eas=tight`
+> gives 40 and `--eas=newton` gives 44 — so this was never a drifted number, it was a
+> claim that contradicted its own evidence on the page. The honest statement of the
+> finding is the one the table already makes: what the numbers sort by is the stopping
+> rule, and inside a stopping rule fp64 is worth about four elements either way.
 
 **Read the spread, not any one row.** Five kernels that differ only in the precision of
 the enhanced block land between 40 and 44 at 768 and between 204 and 247 at 3 072, while
@@ -1109,17 +1224,31 @@ Three things fall out of that table and each is a separate finding.
 - **fp64 in the solve and in the condensation changes nothing whatsoever** — they return
   the identical bit-zero, because the correction they compute to sixteen digits is
   discarded at the same gate the float kernel discards it at.
-- **`tight` and `newton` are indistinguishable.** Every digit printed agrees, at every
-  step count tried. The whole of the fp64 block's effect on this kernel is the tolerance
-  it was bundled with.
+- **`tight` and `newton` are indistinguishable *on alpha*.** Every digit of the two rows
+  above agrees. They are not indistinguishable on the torn count — 40 against 44 at 768,
+  205 against 204 at 3 072 — so the fp64 arithmetic is worth about four elements and the
+  tolerance is worth the rest. The whole of the fp64 block's *large* effect on this
+  kernel is the tolerance it was bundled with.
 - **The tolerance is worth something on its own.** In float, with the CPU's rule, alpha
   goes from wrong by 100% of the reference (it is zero) to wrong by 20%, and the peak
   lands within 5.5%. It is also the only variant that moves the torn count meaningfully:
-  248 → 205 at 3 072, which takes it from 53% over the reference to 27%. It is not
-  reproduced at 768 (41 → 40, 28% over to 25%), it costs 3.5× on the kernel, and 27%
-  over is still not an answer — so the shipped gate stays at 1e-9 and this is recorded
-  rather than adopted. It is the one thing on this page that a future attempt should
-  start from, and it is not a precision question at all.
+  **247 → 205 at 3 072**, which takes it from 52% over the reference to 27%. It does
+  **nothing at 768** (40 → 40, 25% over and still 25% over), it costs **4.5×** on the
+  kernel, and 27% over is still not an answer — so the shipped gate stays at 1e-9 and
+  this is recorded rather than adopted. It is the one thing on this page that a future
+  attempt should start from, and it is not a precision question at all.
+
+  > **Three of those numbers were wrong, and all three the same way.** The bullet read
+  > "248 → 205 … 53% over the reference to 27% … not reproduced at 768 (41 → 40, 28%
+  > over to 25%) … costs 3.5×". 248 and 41 are the **derived**-step float counts (5 545
+  > and 5 513 steps); 205 and 40 are the **fixed** 5 505-step `tight` counts, which is
+  > what every table in this subsection is taken at. Comparing across the two is the
+  > exact defect the *correction to the correction* above is about, in the prose of the
+  > section that documents it. At a fixed 5 505 the shipped float kernel tears 247 and
+  > 40, so the tight rule is worth 42 elements at 3 072 and **nothing at all** at 768 —
+  > which is what the ladder table two screens up already said. The 3.5× is the
+  > figure the cost table below carries in its *"as first published, under
+  > contention"* column; the current one, in its left-hand column, is 4.5×.
 
 **A caution on comparing alpha's *value* across item 2.** Normalising the enhanced modes
 rescales alpha by construction — column *j* of G by *s* and α*ⱼ* by 1/*s*, which is what

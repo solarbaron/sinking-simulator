@@ -70,8 +70,8 @@
 // divergence in the quantities that mean anything.
 //
 // **It is not enough, and the remap did not change that by so much as a digit.**
-// Where it fails is the torn set: at 768 and 3 072 elements this kernel tears 41 and
-// 248 elements where the double reference tears 32 and 162, while the negative
+// Where it fails is the torn set: at 768 and 3 072 elements this kernel tears 40 and
+// 247 elements where the double reference tears 32 and 162, while the negative
 // control -- the same double solver on a mesh jittered by the size of float's own
 // representation error -- tears exactly 32 and 162. That is the whole argument, and
 // it is why the CPU is still the path a zone's answer comes from.
@@ -79,12 +79,23 @@
 // **Keeping `alpha` in double was the last thing left to try, and it does not work
 // either.** `EasPrecision` below compiles the enhanced block in fp64 at three depths,
 // all from `solidshell_forces_wg.comp` so that nothing but the precision differs. The
-// five resulting kernels tear between 40 and 49 elements at 768 and between 205 and 268
-// at 3 072 -- a spread the size of the gap they were meant to close, and not monotone in
-// precision. Holding the stopping rule fixed, the whole block in fp64 moves alpha by
-// 1/810 of the amount float is already wrong by, because Kaa's inputs are a float
-// tangent and a float stress and widening what consumes them recovers nothing they never
-// had. It costs 5-10x on the kernel. `docs/07-fem-spike-findings.md` §8 has the tables.
+// five resulting kernels tear 40-44 elements at 768 and 204-247 at 3 072 -- a spread half
+// the size of the gap they were meant to close (8 and 85), and not monotone in precision:
+// at 3 072 it runs 247, 205, 243, 243, 204 as the fp64 depth increases. Holding the
+// stopping rule fixed, the whole block in fp64 moves alpha by 1/810 of the amount float is
+// already wrong by, because Kaa's inputs are a float tangent and a float stress and
+// widening what consumes them recovers nothing they never had.
+//
+// **Every count above is at a FIXED `--steps=5505`, and that is load-bearing.** The probe
+// derives its step count from the punch depth, so the same experiment run without the flag
+// is a *different* one -- 5 513 at 768 and 5 545 at 3 072, which tear 41 and 248. Those two
+// numbers stood in this comment for months and were compared against fixed-step ones
+// beside them. `docs/07-fem-spike-findings.md` §8 records the same mistake being made in
+// the prose of the section written to document it.
+//
+// The fp64 kernels cost several times the float one; the figure is a wall clock, it has
+// already moved twice, and this comment deliberately does not carry it. §8's cost table is
+// the only place it belongs. §8 also has the torn and alpha tables.
 //
 // It inherits §2's reproducibility bound: an explicit scheme at the CFL limit
 // amplifies float rounding in the modes at its stability boundary, so this is not

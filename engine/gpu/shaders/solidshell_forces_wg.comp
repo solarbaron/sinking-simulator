@@ -253,9 +253,15 @@ const float kRoot23 = 0.816496580927726f;
 // and discard it at the same gate. Float at the CPU's 1e-16 does *not* stall; it runs
 // more iterations and recovers alpha to about 20%.
 //
-// It is left at 1e-9 because the CPU's rule costs 3.5x on this kernel and does not fix
-// what the kernel is actually wrong about -- see `07-fem-spike-findings.md` §8, "Alpha
-// in double". `SHIPSIM_EAS_TIGHT` builds the variant that uses it. The residual gate is
+// It is left at 1e-9 because the CPU's rule costs several times as much on this kernel and
+// does not fix what the kernel is actually wrong about -- see `07-fem-spike-findings.md`
+// §8, "Alpha in double", which carries the cost table. The multiple was written here as
+// 3.5x and has since been re-measured higher; a wall clock does not belong in a comment
+// that nothing re-runs, and on a shared box it cannot be re-measured honestly anyway.
+// What *is* stable and worth keeping here: the tight rule tears 40 at 768 against float's
+// 40 and the CPU's 32, and 205 at 3 072 against 247 and 162 -- it moves the answer at the
+// larger size and not at the smaller, which is the shape of the argument.
+// `SHIPSIM_EAS_TIGHT` builds the variant that uses it. The residual gate is
 // *already* the CPU's 1e-12, so only the work gate and the iteration cap move.
 #if SHIPSIM_EAS_TIGHT
 const easreal kEnhancedWorkTol = easreal(1.0e-16);
