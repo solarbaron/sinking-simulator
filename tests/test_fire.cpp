@@ -1700,6 +1700,1186 @@ void testDesignFireFollowsItsCurve() {
                fire::DesignFire{}.productYield * 20.0e6, 0.05, 1e-15);
 }
 
+// ==============================================================================
+// Suppression, and its effect on stability
+// ==============================================================================
+//
+// The roadmap item is "suppression systems, **and their effect on stability**",
+// and on a ship those are one question: water put into a compartment to fight a
+// fire is water in a compartment.
+//
+// The independent answers this half leans on:
+//
+//   * **The free-surface moment of a rectangular tank**, `rho mu b^3 l / 12`.
+//     Asserted against a *box* barge, where the second moment is arithmetic, and
+//     then again against the ferry's vehicle deck, where it is measured off the
+//     compartment's own mesh by a slicing integration that shares no code with
+//     the model. What the model computes instead is a water body re-levelled
+//     against gravity; the two have nothing in common but the answer.
+//   * **The classical weir**, `(2/3) Cd b sqrt(2g) h^(3/2)`, and the equilibrium
+//     depth it holds a deck at under a steady inflow.
+//   * **The caloric arithmetic of the split**: `cp dT + e L` per kilogram, which
+//     is the whole cooling mechanism and is an identity, not a correlation.
+//   * **An exact control**: suppression switched off must leave both the ship and
+//     the gas bit-identical to a run with no suppression objects at all.
+//   * **Convergence**, because the sink is stiff and a stiff term that does not
+//     converge under refinement is a term whose answer is the step size.
+//
+// **Two of these tests exist because a mutant survived the first version.** A
+// mutant that handed the deck the whole delivered flow instead of the part that
+// did not evaporate lived through the entire suite, because every fixture that
+// wrote water was *cold* and `evaporated` was therefore zero -- the two
+// quantities were the same number everywhere it was looked at. And a mutant that
+// discarded the water that would not fit in a full compartment lived because
+// nothing ever filled one. `testTheWaterAccountClosesAgainstWhatTheShipReceived`
+// now carries a 30 MW fire so that a third of the flow leaves as steam, and
+// `testWaterThatWillNotFitStaysOwedRatherThanBeingDropped` starts a compartment
+// at 99.9% full.
+
+// --- A box barge, so the free surface second moment is arithmetic --------------
+
+constexpr double kBargeL = 60.0, kBargeB = 16.0, kBargeDepth = 10.0;
+constexpr double kDeckL = 50.0, kDeckB = 12.0, kDeckZ = 4.0, kDeckTop = 8.0;
+
+// The deck's free-surface second moment about its own centreline. A box, so this
+// is the textbook `b^3 l / 12` with nothing measured.
+constexpr double kDeckI = kDeckB * kDeckB * kDeckB * kDeckL / 12.0;
+
+struct Barge {
+    Ship ship;
+    Sea sea{0.0};
+    fire::Model model;
+};
+
+// A rectangular barge with one undivided deck compartment. `draft` is where she
+// floats: 3 m leaves the deck a metre clear of the sea, 4.5 m puts it half a
+// metre under, which is the difference between a freeing port that drains and one
+// that admits.
+Barge makeBarge(double draft) {
+    Barge b;
+    b.ship.hull = makeBox({-kBargeL / 2, -kBargeB / 2, 0.0},
+                          {kBargeL / 2, kBargeB / 2, kBargeDepth});
+    b.ship.deckEdgeZ = kDeckZ;
+    Compartment d;
+    d.name = "deck";
+    d.mesh = makeBox({-kDeckL / 2, -kDeckB / 2, kDeckZ}, {kDeckL / 2, kDeckB / 2, kDeckTop});
+    // Unity, so that the free-surface arithmetic below is the box's own and not
+    // the box's times a factor. The ferry case carries a real 0.90 and checks
+    // that the factor is there.
+    d.permeability = 1.0;
+    d.ventedToAtmosphere = true;
+    b.ship.compartments.push_back(d);
+    b.ship.lightshipMass = kBargeL * kBargeB * draft * kRhoSeawater;
+    b.ship.lightshipCog = {0.0, 0.0, 5.0};
+    b.ship.gyradii = {6.0, 15.0, 16.0};
+    b.ship.initialise(b.sea);
+    b.model.attach(b.ship, {0});
+    return b;
+}
+
+// GM by central difference on the ship's own righting arm. `Diagnostics` takes
+// this at eps = 0.03 rad, which is the right question for a ship at a finite
+// angle and the wrong one for the initial metacentric height of a shallow layer
+// -- see `testPocketingLimitsFreeSurfaceExactlyWhereGeometrySays`.
+double gmAt(const Ship& s, const Sea& sea, double eps) {
+    return (s.rightingArmAtHeel(eps, sea) - s.rightingArmAtHeel(-eps, sea)) / (2 * eps);
+}
+
+// The smallest positive heel at which GZ comes back to zero: where a ship with no
+// initial stability actually sits. Coarse scan then bisect, because 0.1 degree of
+// resolution over 45 degrees is 450 plane sweeps and this is called in a loop.
+double lollDeg(const Ship& s, const Sea& sea) {
+    // Stability is asked of GM, not of GZ at zero heel. `rightingArmAtHeel(0)` is
+    // zero by symmetry on any hull whose loading is symmetric, to within the sign
+    // of the last bit -- and an early-out on that sign reported "upright" or
+    // "lolling" for the same ship depending on round-off. It did: two ferry runs
+    // differing only in whether a freeing port was blocked reported 0.00 and 1.50
+    // degrees for that reason and not for any other.
+    if (gmAt(s, sea, 0.002) >= 0) return 0.0;
+    for (int i = 1; i <= 180; ++i) {
+        const double a = i * 0.25;
+        if (s.rightingArmAtHeel(a * kDegToRad, sea) >= 0) {
+            double lo = (i - 1) * 0.25, hi = a;
+            for (int k = 0; k < 20; ++k) {
+                const double mid = 0.5 * (lo + hi);
+                if (s.rightingArmAtHeel(mid * kDegToRad, sea) < 0) lo = mid; else hi = mid;
+            }
+            return 0.5 * (lo + hi);
+        }
+    }
+    return 180.0;
+}
+
+// The second moment of a compartment's waterplane about the centreline, measured
+// off the mesh and nothing else: slice into strips, take each strip's breadth
+// from its own volume, integrate `b^3/12`. Deliberately a *different* route to
+// the answer than anything in `fire.cpp` or `ship.cpp`, which is the only reason
+// it is worth asserting against. Converged to 1e-5 relative at dx = 0.125 on the
+// ferry's deck: 56300.23 at dx = 2 m, 56307.67 at dx = 0.125 m.
+double waterplaneSecondMoment(const TriMesh& mesh, const Vec3& lo, const Vec3& hi, double z,
+                              double dx) {
+    // One-sided upward, so a surface sitting on the compartment floor is not
+    // measured through a slab that is half outside the space. Getting that wrong
+    // reads as a factor of two in the answer, because the breadth is cubed.
+    const double slab = 0.05;
+    double iyy = 0;
+    for (double x = lo.x; x < hi.x - 1e-12; x += dx) {
+        const double x1 = std::min(x + dx, hi.x);
+        const TriMesh strip =
+            clipToBox(mesh, Vec3{x, lo.y - 1.0, z}, Vec3{x1, hi.y + 1.0, z + slab});
+        const double vol = integrate(strip).volume;
+        if (vol <= 0) continue;
+        const double b = vol / ((x1 - x) * slab);
+        iyy += b * b * b / 12.0 * (x1 - x);
+    }
+    return iyy;
+}
+
+// --- The arithmetic of the split ----------------------------------------------
+
+// The rule unit, converted once. Every suppression standard is written in litres
+// per minute per square metre and every equation here is in kilograms per second,
+// so a factor of sixty and a factor of a thousand both live in this one line.
+void testSprayMassFlowConvertsTheRuleUnitExactly() {
+    const double area = 373.6;
+    const double got = fire::sprayMassFlow(area, 5.0);
+    // SOLAS II-2 Reg. 20 for a ro-ro space: 5 L/(min m^2).
+    expectNear("5 L/(min m2) over 373.6 m2 is the litres it says it is",
+               got * 60.0 / kRhoFresh * 1e3, area * 5.0, 1e-9);
+    expectNear("and that is 31.077 kg/s", got, area * 5.0 * 1e-3 * kRhoFresh / 60.0, 1e-12);
+    // The two mistakes this function exists to prevent, named so that a future
+    // edit that makes either has to delete an assertion rather than pass.
+    expectTrue("which is neither the litres per minute", std::abs(got - area * 5.0) > 1.0);
+    expectTrue("nor sixty times the answer", std::abs(got - area * 5.0 * 1e-3 * kRhoFresh) > 1.0);
+    expectNear("no area is no flow", fire::sprayMassFlow(0.0, 5.0), 0.0, 0.0);
+    expectNear("and no spray density is no flow", fire::sprayMassFlow(area, 0.0), 0.0, 0.0);
+}
+
+// The freeing port's discharge law, against the classical weir it has to reduce
+// to, the submerged orifice it has to reduce to at the other end, and the
+// antisymmetry that makes "the sea comes in instead" the same formula.
+void testScupperIntegralIsTheClassicalWeirAndItsDrownedLimit() {
+    const double root2g = std::sqrt(2.0 * kGravity);
+    for (double h : {0.005, 0.02, 0.1, 0.5, 2.0}) {
+        expectNear("a dry outside gives the free weir exactly",
+                   fire::scupperFlow(h, 0.0), (2.0 / 3.0) * root2g * h * std::sqrt(h), 1e-14);
+    }
+    expectNear("equal levels move nothing at all", fire::scupperFlow(0.4, 0.4), 0.0, 0.0);
+    expectNear("and neither does a dry port", fire::scupperFlow(0.0, 0.0), 0.0, 0.0);
+
+    // Water below the sill cannot reach it, so a negative head is the same as no
+    // head. Asserted directly because the model's own caller already clamps
+    // before it gets here -- which means nothing else in this file can see
+    // whether the function does -- and this one is public.
+    expectNear("water below the sill is the same as a dry deck",
+               fire::scupperFlow(-1.0, 0.5), fire::scupperFlow(0.0, 0.5), 0.0);
+    expectNear("in both arguments", fire::scupperFlow(0.5, -1.0),
+               fire::scupperFlow(0.5, 0.0), 0.0);
+
+    // Antisymmetric to the bit: a port with the sea standing over it is the same
+    // port run backwards, and that is one formula rather than two branches that
+    // have to be kept in step.
+    for (double a : {0.05, 0.3, 1.2})
+        for (double c : {0.0, 0.1, 0.9})
+            expectNear("swapping the two heads flips the sign and nothing else",
+                       fire::scupperFlow(a, c), -fire::scupperFlow(c, a), 0.0);
+
+    expectTrue("the sea above the sill drives water inward", fire::scupperFlow(0.1, 1.0) < 0);
+
+    // Deeply drowned, the free band is negligible against the drowned one and the
+    // law becomes Torricelli through the wetted area. Checked as a limit rather
+    // than at a point: the ratio has to *approach* one.
+    double previous = 0;
+    for (double lo : {1.0, 10.0, 100.0, 1000.0}) {
+        const double drop = 0.01;
+        const double ratio = fire::scupperFlow(lo + drop, lo) / (lo * std::sqrt(2 * kGravity * drop));
+        expectTrue("a deeply drowned port tends to Torricelli through its wetted area",
+                   ratio > 1.0 && ratio < 1.01);
+        expectTrue("and gets closer the deeper it is drowned", previous == 0 || ratio < previous);
+        previous = ratio;
+    }
+}
+
+// The cooling arithmetic, on a fixture where the layer is far above saturation
+// and can supply everything asked of it: per kilogram, sensible heat to
+// saturation plus latent heat on the evaporated share, and nothing else.
+void testDrencherCoolingIsSensibleHeatPlusLatentOnTheEvaporatedShare() {
+    for (double e : {0.0, 0.3, 0.75, 1.0}) {
+        Room r = makeRoom(2.0e6, 30.0);
+        fire::Drencher d;
+        d.name = "head";
+        d.gasCompartment = 0;
+        d.flow = 0.02;                 // small: the layer must be able to supply it
+        d.evaporatedFraction = e;
+        d.on = true;
+        r.model.drenchers.push_back(d);
+        runToSteady(r, 400);
+
+        const fire::Drencher& s = r.model.drenchers[0];
+        expectTrue("the layer is far above saturation, so the whole split is available",
+                   r.model.gas[0].upper.temperature() > fire::kTSaturation + 500.0);
+        const double perKg = fire::kCpWater * (fire::kTSaturation - kTAmbient) +
+                             e * fire::kLatentHeat;
+        const double got = s.lastCooling / (s.flow * perKg);
+        // The sink is applied as an exact relaxation rather than as a rate, so it
+        // sits just *under* the demand by the exponential's own second-order term
+        // -- measured between 2.8e-4 and 2.1e-3 of it across this sweep, growing
+        // with the demand exactly as `-expm1(-x)/x` does. Bounded on both sides,
+        // because a scheme that over-delivered would be removing energy the layer
+        // did not have.
+        expectTrue("cooling is the flow times the heat one kilogram takes out",
+                   got > 0.995 && got <= 1.0);
+        expectNear("the steam leaves in the same proportion as the heat",
+                   s.lastEvaporated, e * s.flow * got, 1e-15);
+        expectNear("and every kilogram either evaporated or landed",
+                   s.lastEvaporated + s.lastToDeck, s.flow, 0.0);
+    }
+
+    // Guard against vacuity in the direction that matters: the water has to
+    // actually cool the fire, not merely be counted.
+    Room dry = makeRoom(2.0e6, 30.0);
+    runToSteady(dry, 400);
+    Room wet = makeRoom(2.0e6, 30.0);
+    fire::Drencher d;
+    d.name = "head";
+    d.gasCompartment = 0;
+    d.flow = 0.4;
+    d.on = true;
+    wet.model.drenchers.push_back(d);
+    runToSteady(wet, 400);
+    expectTrue("and 0.4 kg/s into a 2 MW fire takes 218 K off the layer",
+               wet.model.gas[0].upper.temperature() <
+                   dry.model.gas[0].upper.temperature() - 150.0);
+    expectTrue("by removing a fifth of the fire's whole output",
+               wet.model.account.suppressionCooling > 0.15 * wet.model.account.heatReleased);
+}
+
+// **The coefficient nothing here measures, and how much it matters.**
+//
+// The evaporated fraction is a guess -- the header says so -- so what has to be
+// established is the sensitivity rather than the value. It has two halves, and
+// they point opposite ways.
+void testTheEvaporatedFractionMovesCoolingByFourAndNotByNine() {
+    const double sensible = fire::kCpWater * (fire::kTSaturation - kTAmbient);
+    auto perKg = [&](double e) { return sensible + e * fire::kLatentHeat; };
+
+    expectNear("the sensible floor is 355.8 kJ/kg", sensible, 355.83e3, 20.0);
+    expectNear("cooling at e = 0.1 is 581.5 kJ/kg", perKg(0.1), 581.5e3, 100.0);
+    expectNear("and at e = 0.9 it is 2387.1 kJ/kg", perKg(0.9), 2387.1e3, 100.0);
+    expectNear("so the span over that range is 4.105, not 9", perKg(0.9) / perKg(0.1), 4.105,
+               0.002);
+    expectTrue("which is well short of the 9.0 the latent heats alone would give",
+               perKg(0.9) / perKg(0.1) < 0.6 * 9.0);
+    // The floor is the whole reason, so name it: at the default fraction the
+    // sensible term is still a third of the total.
+    expectTrue("because at the default 0.3 the sensible term is still a third of it",
+               sensible / perKg(0.3) > 0.3 && sensible / perKg(0.3) < 0.36);
+
+    // The same sweep measured through the model rather than asserted from the
+    // arithmetic, because nothing tests a comment.
+    double coolLow = 0, coolHigh = 0, deckLow = 0, deckHigh = 0;
+    for (int i = 0; i < 2; ++i) {
+        Room r = makeRoom(2.0e6, 30.0);
+        fire::Drencher d;
+        d.name = "head";
+        d.gasCompartment = 0;
+        d.flow = 0.02;
+        d.evaporatedFraction = i == 0 ? 0.1 : 0.9;
+        d.on = true;
+        r.model.drenchers.push_back(d);
+        runToSteady(r, 400);
+        (i == 0 ? coolLow : coolHigh) = r.model.drenchers[0].lastCooling;
+        (i == 0 ? deckLow : deckHigh) = r.model.drenchers[0].lastToDeck;
+    }
+    expectNear("the model's own cooling ratio is the same 4.10", coolHigh / coolLow, 4.099,
+               0.02);
+    // **And the water runs the other way, by more.** On the arithmetic alone the
+    // coefficient matters *more* to the stability half of this item than to the
+    // cooling half, which is the opposite of what the latent heat suggests.
+    expectTrue("while the water landing differs by nine, not by four",
+               deckLow / deckHigh > 8.5 && deckLow / deckHigh < 9.0);
+    expectTrue("so the fraction that cools best is the one that wets the deck least",
+               coolHigh > coolLow && deckHigh < deckLow);
+}
+
+// **And on a real ship the coefficient barely matters at all**, because it is a
+// ceiling and not a rate: what actually evaporates is bounded by the power
+// available to boil it. A drencher can deliver far more water than any fire in
+// the space can turn to steam, and the rest lands whatever the fraction says.
+void testWhatEvaporatesIsBoundedByTheFiresPowerAndNotByTheFraction() {
+    double deck[3] = {0, 0, 0};
+    double evaporatedShare[3] = {0, 0, 0};
+    const double e[3] = {0.1, 0.3, 0.9};
+    for (int i = 0; i < 3; ++i) {
+        Room r = makeRoom(2.0e6, 30.0);
+        fire::Drencher d;
+        d.name = "deluge";
+        d.gasCompartment = 0;
+        d.flow = 5.0;              // far more than a 2 MW fire can boil
+        d.evaporatedFraction = e[i];
+        d.on = true;
+        r.model.drenchers.push_back(d);
+        runToSteady(r, 900);
+        deck[i] = r.model.drenchers[0].lastToDeck;
+        evaporatedShare[i] = r.model.drenchers[0].lastEvaporated / d.flow;
+    }
+    // The most it could evaporate is the fire's whole output divided by the heat
+    // of one kilogram, and even that is an over-estimate because the boundary and
+    // the vents take a share.
+    const double ceiling = 2.0e6 / (fire::kCpWater * (fire::kTSaturation - kTAmbient) +
+                                    fire::kLatentHeat);
+    for (int i = 0; i < 3; ++i) {
+        expectTrue("nothing evaporates beyond what the fire can boil",
+                   evaporatedShare[i] * 5.0 <= ceiling);
+        expectTrue("so the nominal fraction is a ceiling that is never reached",
+                   evaporatedShare[i] < 0.5 * e[i]);
+    }
+    expectTrue("and a nine-fold change in the fraction moves the water landing under 2%",
+               std::abs(deck[0] / deck[2] - 1.0) < 0.02);
+    // Vacuity: there has to be water landing, and the three cases have to differ
+    // at all, or "insensitive" would be a statement about a constant.
+    expectTrue("while several kilograms a second really are landing", deck[1] > 4.0);
+    expectTrue("and the three cases are genuinely different runs", deck[0] != deck[2]);
+}
+
+// A drencher may not take a layer below the temperature of its own water: that is
+// energy from nowhere. On this ship that is not a corner case, it is the
+// operating point -- a deck drencher can absorb eight times what the design fire
+// releases -- so it is asserted rather than assumed.
+void testTheDrencherCannotCoolBelowTheTemperatureOfItsOwnWater() {
+    // No fire at all, and a flow that would remove megawatts if it were allowed.
+    Room r = makeRoom(0.0, 30.0);
+    fire::Drencher d;
+    d.name = "flood";
+    d.gasCompartment = 0;
+    d.flow = 50.0;
+    d.on = true;
+    r.model.drenchers.push_back(d);
+    runToSteady(r, 200);
+
+    // Not exactly zero, and it should not be asserted at exactly zero: the vent
+    // solve moves the layer temperature by round-off, and the drencher correctly
+    // removes what that round-off represents. 1.0e-13 J over 200 s of a 5 MJ room
+    // is 2e-20 of it.
+    expectTrue("a drencher in a cold compartment removes nothing measurable",
+               std::abs(r.model.account.suppressionCooling) < 1e-9);
+    expectTrue("and the gas never goes below ambient",
+               r.model.gas[0].upper.temperature() >= kTAmbient - 1e-9 &&
+                   r.model.gas[0].lower.temperature() >= kTAmbient - 1e-9);
+    expectNear("nothing evaporates, exactly, because nothing is near saturation",
+               r.model.account.waterEvaporated, 0.0, 0.0);
+    expectNear("so every kilogram delivered lands", r.model.drenchers[0].lastToDeck, 50.0, 0.0);
+    expectNear("which is what the account says too", r.model.account.waterToShip(),
+               r.model.account.waterDelivered, 0.0);
+
+    // And with a fire the drencher over-powers, the layer settles at a real
+    // equilibrium -- `Q_fire = Q_spray(T)` -- rather than being pinned by a cap.
+    Room hot = makeRoom(2.0e6, 30.0);
+    fire::Drencher big;
+    big.name = "deluge";
+    big.gasCompartment = 0;
+    big.flow = 20.0;
+    big.on = true;
+    hot.model.drenchers.push_back(big);
+    runToSteady(hot, 600);
+    const double demand = big.flow * (fire::kCpWater * (fire::kTSaturation - kTAmbient) +
+                                      0.3 * fire::kLatentHeat);
+    expectTrue("an over-powered drencher applies a tenth of its nominal demand",
+               hot.model.drenchers[0].lastCooling < 0.15 * demand);
+    expectTrue("because it is absorbing the fire rather than its own capacity",
+               hot.model.account.suppressionCooling > 0.9 * hot.model.account.heatReleased &&
+                   hot.model.account.suppressionCooling <= hot.model.account.heatReleased);
+    expectTrue("and the layer sits at a steady 333 K, above the water and below saturation",
+               hot.model.gas[0].upper.temperature() > kTAmbient + 20.0 &&
+                   hot.model.gas[0].upper.temperature() < fire::kTSaturation);
+    expectNear("with nothing evaporating at all out of a layer below boiling",
+               hot.model.drenchers[0].lastEvaporated, 0.0, 0.0);
+}
+
+// The suppression sink is stiff, and a stiff term that does not converge under
+// refinement is a term whose answer is the step size. It converges, first order,
+// and -- the part that matters for this item -- **the water landing on the deck
+// converges an order of magnitude tighter than the layer temperature does**, so
+// the stability answer is not hostage to the thermal one.
+void testTheSuppressionSinkConvergesAndTheWaterLandingConvergesFaster() {
+    std::vector<double> temperature, water;
+    for (double h : {0.4, 0.2, 0.1, 0.05, 0.025}) {
+        Room r = makeRoom(2.0e6, 30.0);
+        fire::Drencher d;
+        d.name = "head";
+        d.gasCompartment = 0;
+        d.flow = 2.0;
+        d.on = true;
+        r.model.drenchers.push_back(d);
+        r.model.maxSubstep = h;
+        runToSteady(r, 600);
+        temperature.push_back(r.model.gas[0].upper.temperature());
+        water.push_back(r.model.account.waterDelivered - r.model.account.waterEvaporated);
+    }
+    // Successive halvings have to shrink, which is what separates convergence
+    // from wandering. Measured 44.0, 5.1, 2.3, 1.1 K.
+    for (std::size_t i = 2; i < temperature.size(); ++i)
+        expectTrue("halving the substep moves the layer temperature less each time",
+                   std::abs(temperature[i] - temperature[i - 1]) <
+                       std::abs(temperature[i - 1] - temperature[i - 2]));
+    expectTrue("and the finest two agree to under half a per cent",
+               std::abs(temperature[4] / temperature[3] - 1.0) < 5e-3);
+    expectTrue("while the water landing agrees to under one per cent across a 16x refinement",
+               std::abs(water.front() / water.back() - 1.0) < 0.01);
+    expectTrue("which is an order of magnitude tighter than the temperature over the same span",
+               std::abs(water.front() / water.back() - 1.0) <
+                   0.15 * std::abs(temperature.front() / temperature.back() - 1.0));
+    expectTrue("with the coarse and fine runs both delivering real tonnages",
+               water.front() > 800.0 && water.back() > 800.0);
+}
+
+// --- Suppression water is floodwater ------------------------------------------
+
+// **The load-bearing claim of the whole item.** `ship.cpp` contains no free
+// surface *correction* -- no `rho i / disp` term anywhere -- because it re-levels
+// the real water body at every attitude it is asked about. So suppression water
+// needs no path of its own, and the proof is that the emergent free-surface loss
+// is the closed form it is supposed to be.
+//
+// Measured by freezing the same mass at the same centroid into the lightship, so
+// that draft, KG, KB and BM are identical between the two ships and the only
+// difference left is that one body of water can re-level and the other cannot.
+void testSuppressionWaterIsFloodwaterAndItsFreeSurfaceIsTheClosedForm() {
+    const double eps = 0.002;
+    for (double tonnes : {100.0, 200.0, 400.0}) {
+        Barge liquid = makeBarge(3.0);
+        liquid.ship.compartments[0].waterVolume = tonnes * 1000.0 / kRhoSeawater;
+        liquid.ship.step(1e-9, liquid.sea);
+
+        Barge solid = makeBarge(3.0);
+        const double m = tonnes * 1000.0, lm = solid.ship.lightshipMass;
+        solid.ship.lightshipCog =
+            (solid.ship.lightshipCog * lm + liquid.ship.compartments[0].waterCentroid * m) /
+            (lm + m);
+        solid.ship.lightshipMass = lm + m;
+        solid.ship.step(1e-9, solid.sea);
+
+        const double disp = liquid.ship.diagnostics(liquid.sea).displacementMass;
+        const double closedForm = kRhoSeawater * 1.0 * kDeckI / disp;
+        const double loss = gmAt(solid.ship, solid.sea, eps) - gmAt(liquid.ship, liquid.sea, eps);
+
+        // Asserted at 5e-6 relative, which is where the *finite difference* sits:
+        // the residual scales as eps^2 and is 1.36e-6 at eps = 0.002, so anything
+        // looser would also pass on a model that had lost the property and merely
+        // converged well. The two GMs are metres apart, so this is a genuine five
+        // significant figures.
+        expectTrue("the free-surface loss is rho mu b^3 l / 12 over the displacement",
+                   std::abs(loss / closedForm - 1.0) < 5e-6);
+        // Guard against vacuity from both ends.
+        expectTrue("and it is metres, not a rounding error", closedForm > 1.5);
+        expectTrue("with the free surface taking most of the barge's stability",
+                   loss > 0.6 * gmAt(solid.ship, solid.sea, eps));
+        expectTrue("so the liquid ship keeps under half the GM the frozen one has",
+                   gmAt(liquid.ship, liquid.sea, eps) <
+                       0.4 * gmAt(solid.ship, solid.sea, eps));
+    }
+
+    // The same identity on a real hull, where the second moment is not arithmetic
+    // and the permeability is not one. Measured off the compartment's own mesh by
+    // a slicing integration that shares no code with either model.
+    Sea sea{0.0};
+    Ship reference = game::buildFerry();
+    reference.initialise(sea);
+    const int vd = reference.findCompartment("vehicle_deck");
+    const Compartment& c0 = reference.compartments[static_cast<std::size_t>(vd)];
+
+    const double tonnes = 500.0;
+    Ship liquid = game::buildFerry();
+    liquid.initialise(sea);
+    liquid.compartments[static_cast<std::size_t>(vd)].waterVolume = tonnes * 1000.0 / kRhoSeawater;
+    liquid.step(1e-9, sea);
+    const Compartment& cl = liquid.compartments[static_cast<std::size_t>(vd)];
+
+    Ship solid = game::buildFerry();
+    solid.initialise(sea);
+    const double m = tonnes * 1000.0, lm = solid.lightshipMass;
+    solid.lightshipCog = (solid.lightshipCog * lm + cl.waterCentroid * m) / (lm + m);
+    solid.lightshipMass = lm + m;
+    solid.step(1e-9, sea);
+
+    const double iyy = waterplaneSecondMoment(c0.mesh, c0.bboxLo, c0.bboxHi, cl.surfaceOffset,
+                                              0.125);
+    const double disp = liquid.diagnostics(sea).displacementMass;
+    const double closedForm = kRhoSeawater * cl.permeability * iyy / disp;
+    const double loss = gmAt(solid, sea, eps) - gmAt(liquid, sea, eps);
+    expectTrue("and on the ferry's own vehicle deck, against its measured second moment",
+               std::abs(loss / closedForm - 1.0) < 3e-4);
+    expectTrue("which is 56308 m4 of waterplane", iyy > 56000.0 && iyy < 56600.0);
+    // **The permeability is in there and it is not optional.** Dropping it would
+    // over-state the loss by 11% on this deck, which is more than the tolerance
+    // above by two orders of magnitude and would still look plausible.
+    expectTrue("with the compartment's permeability genuinely in the answer",
+               std::abs(loss / (closedForm / cl.permeability) - 1.0) > 0.09);
+    expectTrue("and 500 t on an undivided vehicle deck costs this ship metres of GM",
+               closedForm > 5.0);
+}
+
+// The free-surface loss above is the *initial* one, and it only exists while the
+// water still spans the compartment. Tilt far enough and a shallow layer runs off
+// the high side; the surface is then narrower than the deck and the moment
+// collapses. That is real -- it is why a ship with no GM lolls instead of
+// capsizing -- and it is the reason `Diagnostics::gmTransverse`, taken at
+// eps = 0.03 rad, is not the initial GM of a centimetres-deep layer.
+void testPocketingLimitsFreeSurfaceExactlyWhereGeometrySays() {
+    const double tonnes = 100.0;
+    Barge liquid = makeBarge(3.0);
+    liquid.ship.compartments[0].waterVolume = tonnes * 1000.0 / kRhoSeawater;
+    liquid.ship.step(1e-9, liquid.sea);
+    Barge solid = makeBarge(3.0);
+    const double m = tonnes * 1000.0, lm = solid.ship.lightshipMass;
+    solid.ship.lightshipCog =
+        (solid.ship.lightshipCog * lm + liquid.ship.compartments[0].waterCentroid * m) / (lm + m);
+    solid.ship.lightshipMass = lm + m;
+    solid.ship.step(1e-9, solid.sea);
+
+    const double depth = liquid.ship.compartments[0].waterVolume / (kDeckL * kDeckB);
+    // The surface reaches the high side of the deck at exactly this angle.
+    const double limit = std::atan(2.0 * depth / kDeckB);
+    const double closedForm = kRhoSeawater * kDeckI /
+                              liquid.ship.diagnostics(liquid.sea).displacementMass;
+    expectTrue("the layer is 16 cm deep", depth > 0.15 && depth < 0.18);
+    expectTrue("so it spans the deck only out to about 1.55 degrees",
+               limit > 0.026 && limit < 0.028);
+
+    auto ratio = [&](double eps) {
+        return (gmAt(solid.ship, solid.sea, eps) - gmAt(liquid.ship, liquid.sea, eps)) /
+               closedForm;
+    };
+    // Measured 1.000061 at half the limit and 1.000198 at nine tenths of it, so
+    // the tolerances are what was measured rather than a round number: a looser
+    // pair would pass on a model with no pocketing at all.
+    expectTrue("well inside that angle the full free surface is there",
+               std::abs(ratio(0.5 * limit) - 1.0) < 1e-4);
+    expectTrue("and still at nine tenths of it", std::abs(ratio(0.9 * limit) - 1.0) < 3e-4);
+    // Past it the moment falls away, and it has to fall a long way rather than a
+    // little: this is a different regime, not a rounding difference.
+    expectTrue("but at three times it, nearly 40% of the moment is gone",
+               ratio(3.0 * limit) < 0.65);
+    expectTrue("monotonically", ratio(3.0 * limit) < ratio(2.0 * limit) &&
+                                    ratio(2.0 * limit) < ratio(1.2 * limit) &&
+                                    ratio(1.2 * limit) < ratio(0.9 * limit));
+    // Which is exactly why the ship's own published GM is not the initial one for
+    // a layer this shallow: eps = 0.03 rad is 1.1 times the limit here, and the
+    // deviation it reports is a hundred times the one just inside it.
+    expectTrue("so the ship's own eps = 0.03 GM is not the initial GM of this layer",
+               std::abs(ratio(0.03) - 1.0) > 20.0 * std::abs(ratio(0.5 * limit) - 1.0));
+}
+
+// And on the ferry the same effect is not a technicality, it is the difference
+// between a stability report that says she is safe and one that says she is not.
+// **`Diagnostics::gmTransverse` reads +0.59 m with 50 tonnes on the vehicle deck,
+// where the true initial GM is -3.77 m**, because 50 tonnes is a 2.9 cm layer and
+// eps = 0.03 rad is ten times the angle it spans the deck to.
+//
+// Reported rather than repaired: eps = 0.03 is the right question for a ship at a
+// finite angle, it is what the 35 published figures were taken under, and moving
+// it would move all of them.
+void testTheFerrysPublishedGmIsNotTheInitialGmOfAShallowLayer() {
+    Sea sea{0.0};
+    Ship s = game::buildFerry();
+    s.initialise(sea);
+    const int vd = s.findCompartment("vehicle_deck");
+    s.compartments[static_cast<std::size_t>(vd)].waterVolume = 50.0e3 / kRhoSeawater;
+    s.step(1e-9, sea);
+
+    const double published = s.diagnostics(sea).gmTransverse;
+    const double initial = gmAt(s, sea, 0.001);
+    expectTrue("with 50 t on the vehicle deck the published GM still reads positive",
+               published > 0.4 && published < 0.8);
+    expectTrue("while the initial GM is strongly negative", initial < -3.5);
+    expectTrue("a gap of over four metres", published - initial > 4.0);
+
+    // The mechanism, so that this is a statement about pocketing and not about
+    // two numbers: the layer is 2.9 cm deep and spans the deck only to 0.0031 rad.
+    const Compartment& c = s.compartments[static_cast<std::size_t>(vd)];
+    const double depth = c.waterVolume / c.permeability / 1868.4;
+    expectTrue("because the layer is under three centimetres deep",
+               depth > 0.028 && depth < 0.030);
+    expectTrue("and spans the deck only out to a fifth of a degree",
+               std::atan(2.0 * depth / 18.68) < 0.2 * 0.03);
+    // Vacuity: the two GMs have to be measuring the same ship.
+    Ship dryShip = game::buildFerry();
+    dryShip.initialise(sea);
+    expectTrue("and dry, the two agree",
+               std::abs(dryShip.diagnostics(sea).gmTransverse - gmAt(dryShip, sea, 0.001)) <
+                   0.01);
+}
+
+// --- Freeing ports -------------------------------------------------------------
+
+// A drencher into a compartment with a port in its side reaches an equilibrium
+// depth, and that depth is the weir's. This is the design question a freeing port
+// is sized against, and it is a closed form: `h = (q / ((2/3) Cd b sqrt(2g)))^(2/3)`.
+//
+// Deliberately run with **no fire**, so the whole flow lands and the hydraulics
+// are isolated from the thermodynamics.
+void testFreeingPortsHoldTheDeckAtTheWeirsEquilibriumDepth() {
+    const double width = 0.8, cd = 0.6;
+    for (double flow : {10.0, 40.0}) {
+        const double q = flow / kRhoSeawater;   // m^3/s landing, all of it
+        const double expected =
+            std::pow(q / (cd * width * (2.0 / 3.0) * std::sqrt(2.0 * kGravity)), 2.0 / 3.0);
+
+        // **Seeded at the closed form and asked whether it is a fixed point**,
+        // rather than run from dry and asked whether it arrived. The approach is
+        // exponential with a time constant of `(2/3) A h / q` -- 25 minutes at
+        // the lower flow -- so a from-dry run that stopped short would look like
+        // a failed closed form rather than like an unfinished integration. The
+        // from-dry direction is checked below, for what it can actually say.
+        Barge b = makeBarge(3.0);
+        b.ship.compartments[0].waterVolume = expected * kDeckL * kDeckB;
+        b.ship.step(1e-9, b.sea);
+        fire::Drencher d;
+        d.name = "deck_drencher";
+        d.gasCompartment = 0;
+        d.flow = flow;
+        d.on = true;
+        b.model.drenchers.push_back(d);
+        fire::Scupper sc;
+        sc.name = "freeing_port";
+        sc.gasCompartment = 0;
+        sc.sillPos = {0.0, -kDeckB / 2, kDeckZ};
+        sc.width = width;
+        sc.dischargeCoeff = cd;
+        b.model.scuppers.push_back(sc);
+        expectTrue("the definition is sound", b.model.validate().empty());
+
+        for (int i = 0; i < 2000; ++i) {
+            b.ship.step(1.0, b.sea);
+            b.model.step(1.0, b.ship, b.sea);
+            b.model.applyTo(b.ship);
+        }
+
+        const double depth = b.ship.compartments[0].waterVolume / (kDeckL * kDeckB);
+        // Measured to drift 1.5e-4 of the seeded depth over 2000 s, downward, and
+        // that drift is the model's own one-step lag on the ship's water level
+        // rather than a disagreement with the closed form.
+        expectTrue("the weir's equilibrium depth is a fixed point of the model",
+                   std::abs(depth / expected - 1.0) < 1e-3);
+        expectTrue("with the port carrying what is landing to a part in a thousand",
+                   std::abs(b.model.scuppers[0].lastFlow * kRhoSeawater / flow - 1.0) < 1e-3);
+        expectTrue("and the head the port sees is that depth",
+                   std::abs(b.model.scuppers[0].lastInsideHead / expected - 1.0) < 1e-3);
+        expectTrue("the port is discharging freely, not drowned",
+                   b.model.scuppers[0].lastOutsideHead == 0.0);
+        // Vacuity: the equilibrium has to be a *balance* rather than an empty deck
+        // or a full one.
+        expectTrue("the deck is neither dry nor full",
+                   b.ship.compartments[0].waterVolume > 1.0 &&
+                       b.ship.compartments[0].fillFraction() < 0.2);
+
+        // And from dry it climbs towards the same depth without passing it, which
+        // is what says the fixed point is the one the model actually seeks.
+        Barge from = makeBarge(3.0);
+        from.model.drenchers.push_back(d);
+        from.model.scuppers.push_back(sc);
+        double previous = 0;
+        bool monotone = true, overshot = false;
+        for (int i = 0; i < 4000; ++i) {
+            from.ship.step(1.0, from.sea);
+            from.model.step(1.0, from.ship, from.sea);
+            from.model.applyTo(from.ship);
+            // Checked into a flag rather than asserted in the loop: a regression
+            // here would otherwise print four thousand identical failures and
+            // scroll every other diagnostic in the suite off the top.
+            const double now = from.ship.compartments[0].waterVolume;
+            monotone = monotone && now >= previous - 1e-12;
+            overshot = overshot || now > expected * kDeckL * kDeckB * 1.001;
+            previous = now;
+        }
+        expectTrue("the deck fills monotonically towards the equilibrium", monotone);
+        expectTrue("and never overshoots it", !overshot);
+        expectTrue("and gets most of the way there in an hour",
+                   previous / (expected * kDeckL * kDeckB) > 0.88);
+    }
+
+    // Four times the flow is only 2.52 times the depth, because the weir goes as
+    // h^(3/2). That exponent is the reason freeing ports work at all and it is
+    // what a linear drain model would get wrong, so it is asserted directly.
+    expectNear("and the depth goes as the two-thirds power of the flow",
+               std::pow(4.0, 2.0 / 3.0), 2.5198, 1e-4);
+}
+
+// Block the ports and the same drencher fills the deck without bound. This is the
+// contrast the item is about: the water gets in either way, and whether it gets
+// out is what decides the ship.
+void testABlockedFreeingPortLetsTheDeckFillWithoutBound() {
+    double held[2] = {0, 0};
+    for (int blocked = 0; blocked < 2; ++blocked) {
+        Barge b = makeBarge(3.0);
+        fire::Drencher d;
+        d.name = "deck_drencher";
+        d.gasCompartment = 0;
+        d.flow = 40.0;
+        d.on = true;
+        b.model.drenchers.push_back(d);
+        fire::Scupper sc;
+        sc.name = "freeing_port";
+        sc.gasCompartment = 0;
+        sc.sillPos = {0.0, -kDeckB / 2, kDeckZ};
+        // Four metres of port, which is enough to reach equilibrium well inside
+        // the run: with 0.8 m the equilibrium is 56 t and an hour of blocked
+        // accumulation is only 144 t, so the "contrast" would be a factor of two
+        // and would say more about the run length than about the port.
+        sc.width = 4.0;
+        sc.blocked = blocked != 0;
+        b.model.scuppers.push_back(sc);
+        for (int i = 0; i < 3600; ++i) {
+            b.ship.step(1.0, b.sea);
+            b.model.step(1.0, b.ship, b.sea);
+            b.model.applyTo(b.ship);
+        }
+        held[blocked] = b.ship.compartments[0].waterVolume * kRhoSeawater;
+        if (blocked != 0) {
+            expectNear("a blocked port drains nothing at all", b.model.scuppers[0].lastFlow, 0.0,
+                       0.0);
+            expectNear("so every kilogram delivered is still aboard",
+                       held[1], b.model.account.waterDelivered, 1e-6);
+        }
+    }
+    expectTrue("an hour of drencher with the ports blocked is 144 tonnes",
+               held[1] > 143.0e3 && held[1] < 145.0e3);
+    expectTrue("while clear ports hold it to 19 tonnes and stop",
+               held[0] > 18.0e3 && held[0] < 21.0e3);
+    expectTrue("a factor of seven", held[1] > 7.0 * held[0]);
+}
+
+// "...and what happens when they are blocked **or under water**." A ship that has
+// settled far enough to put her freeing ports under does not drain through them;
+// she floods through them, and it is the same formula with the heads the other
+// way round.
+void testAFreeingPortUnderTheSeaAdmitsInsteadOfDraining() {
+    Barge b = makeBarge(4.5);   // deck 4 m up, floating at 4.5: half a metre under
+    fire::Scupper sc;
+    sc.name = "freeing_port";
+    sc.gasCompartment = 0;
+    sc.sillPos = {0.0, -kDeckB / 2, kDeckZ};
+    sc.width = 0.8;
+    b.model.scuppers.push_back(sc);
+
+    b.ship.step(1e-9, b.sea);
+    b.model.step(1.0, b.ship, b.sea);
+    expectTrue("the sea is standing over the sill", b.model.scuppers[0].lastOutsideHead > 0.4);
+    expectNear("with nothing inside to come out", b.model.scuppers[0].lastInsideHead, 0.0, 0.0);
+    expectTrue("so the port runs inward", b.model.scuppers[0].lastFlow < 0);
+
+    for (int i = 0; i < 600; ++i) {
+        b.ship.step(1.0, b.sea);
+        b.model.step(1.0, b.ship, b.sea);
+        b.model.applyTo(b.ship);
+    }
+    expectTrue("and the deck floods through it", b.ship.compartments[0].waterVolume > 10.0);
+    expectTrue("which the account records as negative drainage",
+               b.model.account.waterDrained < -10.0e3);
+    expectNear("with no drencher anywhere near it", b.model.account.waterDelivered, 0.0, 0.0);
+}
+
+// --- The water account ---------------------------------------------------------
+
+// Every kilogram is somewhere. Delivered, less evaporated, less drained, is
+// exactly what has been handed to the flooding solve plus what is still owed --
+// asserted to the bit, because it is a sum of the same doubles rather than an
+// approximation of anything.
+void testTheWaterAccountClosesAgainstWhatTheShipReceived() {
+    Barge b = makeBarge(3.0);
+    // **With a fire in the compartment, and that is not decoration.** The first
+    // version ran this cold, so nothing evaporated, and a mutant that handed the
+    // *whole* delivered flow to the deck instead of the part that did not
+    // evaporate survived the entire suite: with `evaporated == 0` the two are the
+    // same number. A 30 MW fire against 25 kg/s puts 30% of the flow up the
+    // funnel as steam, which is the only condition under which this test can tell
+    // the two apart.
+    fire::DesignFire f;
+    f.name = "deck_fire";
+    f.compartment = 0;
+    f.baseZ = 4.5;
+    f.diameter = 3.0;
+    f.peakHeatRelease = 30.0e6;
+    f.steadyDuration = 1e9;
+    b.model.fires.push_back(f);
+    b.model.gas[0].wallConductance = 25.0;
+
+    fire::Drencher d;
+    d.name = "deck_drencher";
+    d.gasCompartment = 0;
+    d.flow = 25.0;
+    d.on = true;
+    b.model.drenchers.push_back(d);
+    fire::Scupper sc;
+    sc.name = "freeing_port";
+    sc.gasCompartment = 0;
+    sc.sillPos = {0.0, -kDeckB / 2, kDeckZ};
+    sc.width = 0.5;
+    b.model.scuppers.push_back(sc);
+
+    double written = 0;
+    for (int i = 0; i < 1500; ++i) {
+        b.ship.step(1.0, b.sea);
+        b.model.step(1.0, b.ship, b.sea);
+        const double before = b.ship.compartments[0].waterVolume;
+        b.model.applyTo(b.ship);
+        written += b.ship.compartments[0].waterVolume - before;
+    }
+    const fire::Account& a = b.model.account;
+    const double owed = b.model.pendingWater()[0];
+    // Measured at 5.8e-11 kg on 37.5 tonnes moved -- 1.6e-15 relative, which is
+    // the accumulation of 1500 steps of round-off and nothing else. Asserted at
+    // 1e-9 rather than at a fraction, because this is a sum of the same doubles
+    // and any real hole in it would be kilograms.
+    expectTrue("what was written plus what is still owed is what suppression moved",
+               std::abs((written + owed) * kRhoSeawater - a.waterToShip()) < 1e-9);
+    expectNear("and waterToShip is delivered less evaporated less drained",
+               a.waterToShip(), a.waterDelivered - a.waterEvaporated - a.waterDrained, 0.0);
+
+    // Vacuity guards: all three terms have to be real numbers, and in particular
+    // the evaporated one has to be large enough that leaving it out of the write
+    // would show. It is 30% of the flow here.
+    expectTrue("37 tonnes were delivered", a.waterDelivered > 37.0e3);
+    expectTrue("eleven of them left as steam", a.waterEvaporated > 9.0e3);
+    expectTrue("which is a quarter to a third of the flow",
+               a.waterEvaporated > 0.25 * a.waterDelivered &&
+                   a.waterEvaporated < 0.35 * a.waterDelivered);
+    expectTrue("four were drained back over the side", a.waterDrained > 3.0e3);
+    expectTrue("leaving twenty on the deck", written * kRhoSeawater > 18.0e3);
+    // And the three are genuinely different quantities: handing the deck the
+    // whole delivered flow would land here, 11 tonnes out.
+    expectTrue("with the water landing well short of the water delivered",
+               written * kRhoSeawater < a.waterDelivered - a.waterEvaporated + 1.0);
+}
+
+// A compartment can be flooded solid with a drencher still running into it, and
+// what will not fit has to stay **owed** rather than be dropped. Discarding it
+// would put a hole in the water account of exactly the kind the layer clamps put
+// in the energy one -- and both of those paths survived the whole suite until
+// this case existed.
+void testWaterThatWillNotFitStaysOwedRatherThanBeingDropped() {
+    Barge b = makeBarge(3.0);
+    Compartment& c = b.ship.compartments[0];
+    c.waterVolume = 0.999 * c.floodableVolume();
+    b.ship.step(1e-9, b.sea);
+    fire::Drencher d;
+    d.name = "deck_drencher";
+    d.gasCompartment = 0;
+    d.flow = 25.0;
+    d.on = true;
+    b.model.drenchers.push_back(d);
+
+    double written = 0;
+    for (int i = 0; i < 400; ++i) {
+        b.ship.step(1.0, b.sea);
+        b.model.step(1.0, b.ship, b.sea);
+        const double before = b.ship.compartments[0].waterVolume;
+        b.model.applyTo(b.ship);
+        written += b.ship.compartments[0].waterVolume - before;
+    }
+    const fire::Account& a = b.model.account;
+    const double owed = b.model.pendingWater()[0];
+
+    expectTrue("the compartment really did fill solid",
+               b.ship.compartments[0].fillFraction() > 0.9999);
+    expectTrue("it never took more than it holds",
+               b.ship.compartments[0].waterVolume <=
+                   b.ship.compartments[0].floodableVolume() + 1e-9);
+    expectTrue("most of what was delivered would not fit", owed * kRhoSeawater > 6.0e3);
+    expectTrue("and only the headroom was written", written * kRhoSeawater < 3.0e3);
+    // The account is still exact. Measured at 9.1e-9 kg on 10 tonnes moved, which
+    // is 9e-13 relative -- worse than the un-clamped case because `want - got`
+    // cancels two large numbers every step, and still nothing next to a kilogram.
+    expectTrue("and written plus owed is still exactly what suppression moved",
+               std::abs((written + owed) * kRhoSeawater - a.waterToShip()) < 1e-6);
+    expectNear("with nothing evaporated to complicate it", a.waterEvaporated, 0.0, 0.0);
+    expectTrue("ten tonnes were delivered in all", a.waterDelivered > 9.9e3);
+}
+
+// The energy account, with a drencher running, on the ferry. The existing account
+// closes to 1e-14 of scale; adding a megawatt-scale sink that is subtracted from
+// the same total is exactly the sort of change that puts a hole in it.
+void testTheAccountStillClosesWithSuppressionRunning() {
+    FerryFire f = makeFerryFire();
+    fire::Drencher d;
+    d.name = "engine_room_deluge";
+    d.gasCompartment = f.model.findGas("engine_room_s");
+    d.flow = 2.0;
+    d.on = true;
+    f.model.drenchers.push_back(d);
+    expectTrue("the model with suppression on it is still self-consistent",
+               f.model.validate().empty());
+
+    for (int i = 0; i < 1200; ++i) {
+        f.model.step(1.0, f.ship, f.sea);
+        f.model.applyTo(f.ship);
+    }
+    const fire::Account& a = f.model.account;
+    // Measured at 8.9e-15 of scale with a 1.7 GJ sink in the books, which is the
+    // same machine precision the dry account closes to. Asserted at 5e-14 rather
+    // than at the 1e-11 the dry account uses: a looser bound would not notice the
+    // sink being applied twice, or applied to one layer and accounted against the
+    // other.
+    expectTrue("the energy account still closes with a gigajoule-scale sink in it",
+               std::abs(a.energyResidualFraction()) < 5e-14);
+    expectTrue("and the mass account is untouched", std::abs(a.massResidualFraction()) < 1e-13);
+    expectTrue("the drencher really did take gigajoules out", a.suppressionCooling > 1.0e9);
+    expectTrue("but not more than the fire released", a.suppressionCooling < a.heatReleased);
+    expectTrue("and it really did put a tonne and a half of water into the ship",
+               a.waterToShip() > 1.5e3);
+    expectTrue("with the burning compartment measurably cooler for it",
+               f.model.gas[0].upper.temperature() < 400.0);
+
+    // The unfired compartment next door has no drencher, so it must not have
+    // cooled: a sink written to the wrong index would balance the account
+    // perfectly and still be wrong.
+    expectTrue("while the compartment with no drencher in it is untouched by one",
+               f.model.gas[1].upper.temperature() > kTAmbient + 1.0);
+}
+
+// --- The structural consequence ------------------------------------------------
+
+// **The number the roadmap item is about.** A lorry fire on the ferry's undivided
+// vehicle deck, a SOLAS drencher over it, and what four hours of it does to her
+// stability -- with the freeing ports clear and with them blocked.
+//
+// The headline is not the GM. GM collapses within a minute and then stops moving:
+// an undivided 100 x 19 m deck has a free-surface moment so large that ten tonnes
+// of water takes this ship's 2.00 m of GM negative, and everything after that is
+// the same -3.7 m whether there are thirty tonnes on the deck or two thousand.
+// **The angle of loll is what tracks the water**, and it is what the ports decide.
+void testTheFerrysLollTracksTheDrencherAndTheFreeingPortsDecideIt() {
+    struct Outcome { double water = 0, gm = 0, loll = 0, drained = 0; };
+    Outcome result[2];
+
+    for (int blocked = 0; blocked < 2; ++blocked) {
+        Ship ship = game::buildFerry();
+        // No damage: this is about firefighting water and nothing else. The
+        // ferry's authored `downflood_*` openings are shut as well, so that the
+        // drainage measured here is the freeing ports' and not theirs -- they sit
+        // 0.1 m above the deck and do drain it, which is worth knowing and is a
+        // different experiment.
+        for (Opening& o : ship.openings)
+            if (o.name == "breach_er_s" || o.name.rfind("downflood_", 0) == 0) o.open = false;
+        Sea sea{0.0};
+        ship.initialise(sea);
+        const int vd = ship.findCompartment("vehicle_deck");
+
+        fire::Model model;
+        model.attach(ship, {vd});
+        fire::DesignFire d;
+        d.name = "lorry";
+        d.compartment = 0;
+        d.baseZ = 7.5;
+        d.diameter = 4.0;
+        d.growthCoefficient = fire::kGrowthFast;
+        d.peakHeatRelease = 20.0e6;
+        d.steadyDuration = 1e9;
+        model.fires.push_back(d);
+        model.gas[0].wallConductance = 25.0;
+
+        fire::Drencher dr;
+        dr.name = "deck_drencher";
+        dr.gasCompartment = 0;
+        // One 20 m section of the deck at the SOLAS ro-ro rate.
+        dr.flow = fire::sprayMassFlow(20.0 * 18.68, 5.0);
+        dr.on = true;
+        model.drenchers.push_back(dr);
+
+        // Six one-metre freeing ports along both deck edges.
+        for (double x : {-20.0, 0.0, 20.0})
+            for (double y : {-9.5, 9.5}) {
+                fire::Scupper sc;
+                sc.name = "port";
+                sc.gasCompartment = 0;
+                sc.sillPos = {x, y, 7.0};
+                sc.width = 1.0;
+                sc.blocked = blocked != 0;
+                model.scuppers.push_back(sc);
+            }
+        expectTrue("the ferry's suppression definition is sound", model.validate().empty());
+
+        for (int i = 0; i < 14400; ++i) {
+            ship.step(1.0, sea);
+            model.step(1.0, ship, sea);
+            model.applyTo(ship);
+        }
+        const Compartment& c = ship.compartments[static_cast<std::size_t>(vd)];
+        result[blocked] = {c.waterVolume * ship.seaDensity, gmAt(ship, sea, 0.002),
+                           lollDeg(ship, sea), model.account.waterDrained};
+    }
+
+    // Clear ports: the deck reaches a steady 36 tonnes and stays there for the
+    // rest of the fire, at 0.81 degrees of loll. 397 t went over the side to hold
+    // it there, which is the whole point of the port -- eleven times what is
+    // standing on the deck at any moment.
+    expectTrue("with the ports clear the deck holds a steady 36 tonnes",
+               result[0].water > 33.0e3 && result[0].water < 40.0e3);
+    expectTrue("and she lolls under a degree", result[0].loll > 0.5 && result[0].loll < 1.2);
+    expectTrue("having put four hundred tonnes back over the side",
+               result[0].drained > 380.0e3 && result[0].drained > 10.0 * result[0].water);
+
+    // Blocked: everything that lands stays. Four hours of it is 433 tonnes and
+    // 9.7 degrees of loll, on a ship that started with 2.00 m of GM.
+    expectTrue("blocked, four hours puts 433 tonnes on the deck",
+               result[1].water > 400.0e3 && result[1].water < 470.0e3);
+    expectNear("with nothing drained at all", result[1].drained, 0.0, 0.0);
+    expectTrue("and she lolls into double figures of degrees",
+               result[1].loll > 8.0 && result[1].loll < 12.0);
+    expectTrue("which is many times the loll the working ports bought",
+               result[1].loll > 8.0 * result[0].loll);
+
+    // **GM is not the discriminator, and saying so is the finding.** Both cases
+    // sit near -3.7 m; a twelve-fold difference in water on deck moves GM by a
+    // tenth of a metre while it moves the loll by twelve.
+    expectTrue("both cases have lost all their initial stability",
+               result[0].gm < -3.0 && result[1].gm < -3.0);
+    expectTrue("and GM barely distinguishes them", std::abs(result[1].gm - result[0].gm) < 0.2);
+    expectTrue("while the water on deck differs by a factor of ten",
+               result[1].water > 10.0 * result[0].water);
+
+    // Vacuity: the intact ship really did have stability to lose.
+    Ship intact = game::buildFerry();
+    Sea sea{0.0};
+    intact.initialise(sea);
+    expectTrue("the ferry starts with 2.00 m of GM",
+               std::abs(gmAt(intact, sea, 0.002) - 2.0) < 0.02);
+}
+
+// --- The exact control ---------------------------------------------------------
+
+// A byte-for-byte view of the gas, so that "suppression off changed nothing" can
+// be checked on the fire model as well as on the ship.
+std::vector<double> gasFingerprint(const fire::Model& m) {
+    std::vector<double> v;
+    v.push_back(m.time);
+    for (const fire::GasCompartment& g : m.gas) {
+        v.push_back(g.upper.mass);
+        v.push_back(g.upper.energy);
+        v.push_back(g.upper.products);
+        v.push_back(g.lower.mass);
+        v.push_back(g.lower.energy);
+        v.push_back(g.lower.products);
+    }
+    for (const fire::Vent& t : m.vents) {
+        v.push_back(t.massAToB);
+        v.push_back(t.massBToA);
+        v.push_back(t.neutralPlaneZ);
+    }
+    v.push_back(m.account.energy);
+    v.push_back(m.account.mass);
+    v.push_back(m.account.wallLoss);
+    v.push_back(m.account.enthalpyOut);
+    return v;
+}
+
+// **Suppression switched off must be worth exactly nothing.**
+//
+// Not close: identical. The three flooding scenarios and the 35 figures the full
+// gate publishes are validated against their own behaviour, and a drencher that
+// is not running has no business moving any of them. This runs a real fire on the
+// ferry twice -- once with no suppression objects at all, once with a drencher
+// switched off and freeing ports blocked -- and compares every state double, on
+// the ship *and* on the gas, for exact equality.
+void testSuppressionOffLeavesTheShipAndTheGasBitIdentical() {
+    FerryFire bare = makeFerryFire();
+    FerryFire off = makeFerryFire();
+
+    fire::Drencher d;
+    d.name = "idle";
+    d.gasCompartment = 0;
+    d.flow = 40.0;          // a large flow, so "off" is doing the work and not a zero
+    d.on = false;
+    off.model.drenchers.push_back(d);
+    fire::Scupper sc;
+    sc.name = "shut";
+    sc.gasCompartment = 0;
+    sc.sillPos = {6.0, -8.0, 1.8};
+    sc.width = 2.0;
+    sc.blocked = true;
+    off.model.scuppers.push_back(sc);
+
+    const int ticks = 400;
+    for (int i = 0; i < ticks; ++i) {
+        bare.ship.step(1.0, bare.sea);
+        bare.model.step(1.0, bare.ship, bare.sea);
+        bare.model.applyTo(bare.ship);
+        off.ship.step(1.0, off.sea);
+        off.model.step(1.0, off.ship, off.sea);
+        off.model.applyTo(off.ship);
+    }
+
+    auto compare = [](const char* what, const std::vector<double>& a,
+                      const std::vector<double>& b) {
+        expectEqual("the fingerprints are the same shape", static_cast<long long>(a.size()),
+                    static_cast<long long>(b.size()));
+        std::size_t differing = 0;
+        for (std::size_t i = 0; i < a.size() && i < b.size(); ++i)
+            if (std::memcmp(&a[i], &b[i], sizeof(double)) != 0) ++differing;
+        expectEqual(what, static_cast<long long>(differing), 0);
+    };
+    compare("suppression switched off leaves the ship bit-identical, in every state double",
+            shipFingerprint(bare.ship), shipFingerprint(off.ship));
+    compare("and the gas bit-identical too", gasFingerprint(bare.model), gasFingerprint(off.model));
+
+    // And nothing was written, rather than zero being written.
+    expectNear("no water was delivered", off.model.account.waterDelivered, 0.0, 0.0);
+    expectNear("none was drained", off.model.account.waterDrained, 0.0, 0.0);
+    expectNear("no cooling was applied", off.model.account.suppressionCooling, 0.0, 0.0);
+    expectNear("and nothing is owed to the ship", off.model.pendingWater()[0], 0.0, 0.0);
+
+    // Guard against vacuity: the ship and the fire both have to have been doing
+    // something, or two identical inert runs would prove nothing.
+    expectTrue("while the ship really was flooding through the run",
+               bare.ship.totalFloodwaterMass() > 1.0e5);
+    expectTrue("and the fire really was burning",
+               bare.model.gas[0].upper.temperature() > kTAmbient + 100.0);
+}
+
+// A bad suppression definition does not crash; it quietly produces a wrong answer.
+void testValidateCatchesBadSuppressionDefinitions() {
+    fire::Model m;
+    fire::GasCompartment g;
+    g.name = "box";
+    g.shipCompartment = kSea;   // no ship compartment behind it
+    g.floorZ = 0;
+    g.ceilingZ = 3;
+    g.gasVolume = 30;
+    g.floorArea = 10;
+    m.gas.push_back(g);
+
+    fire::Drencher d;
+    d.name = "bad";
+    d.gasCompartment = 4;
+    d.evaporatedFraction = 1.5;
+    d.flow = -1.0;
+    d.waterTemperature = 400.0;
+    m.drenchers.push_back(d);
+    fire::Scupper sc;
+    sc.name = "bad";
+    sc.gasCompartment = 0;
+    sc.width = 0.0;
+    sc.sillPos = {0, 0, -1.0};
+    m.scuppers.push_back(sc);
+
+    const std::vector<std::string> problems = m.validate();
+    auto reported = [&](const char* fragment) {
+        for (const std::string& p : problems)
+            if (p.find(fragment) != std::string::npos) return true;
+        return false;
+    };
+    expectTrue("a drencher in a space that does not exist is reported",
+               reported("drencher 'bad' is in a gas space"));
+    expectTrue("an evaporated fraction outside [0, 1] is reported",
+               reported("evaporated fraction outside"));
+    expectTrue("a negative flow is reported", reported("negative flow"));
+    expectTrue("water supplied at boiling is reported", reported("at or above boiling"));
+    expectTrue("a scupper with nothing behind it is reported",
+               reported("no ship compartment behind it"));
+    expectTrue("a scupper with no width is reported", reported("has no width"));
+    expectTrue("and a sill below its own deck is reported", reported("sill below the deck"));
+}
+
 }  // namespace
 
 void runFireTests() {
@@ -1741,4 +2921,25 @@ void runFireTests() {
     testThePressureSolveConvergesAndDoesNotPressuriseTheRoom();
     testValidateCatchesBadDefinitions();
     testDesignFireFollowsItsCurve();
+
+    std::printf("\n--- suppression, and its effect on stability ---\n");
+    testSprayMassFlowConvertsTheRuleUnitExactly();
+    testScupperIntegralIsTheClassicalWeirAndItsDrownedLimit();
+    testDrencherCoolingIsSensibleHeatPlusLatentOnTheEvaporatedShare();
+    testTheEvaporatedFractionMovesCoolingByFourAndNotByNine();
+    testWhatEvaporatesIsBoundedByTheFiresPowerAndNotByTheFraction();
+    testTheDrencherCannotCoolBelowTheTemperatureOfItsOwnWater();
+    testTheSuppressionSinkConvergesAndTheWaterLandingConvergesFaster();
+    testSuppressionWaterIsFloodwaterAndItsFreeSurfaceIsTheClosedForm();
+    testPocketingLimitsFreeSurfaceExactlyWhereGeometrySays();
+    testTheFerrysPublishedGmIsNotTheInitialGmOfAShallowLayer();
+    testFreeingPortsHoldTheDeckAtTheWeirsEquilibriumDepth();
+    testABlockedFreeingPortLetsTheDeckFillWithoutBound();
+    testAFreeingPortUnderTheSeaAdmitsInsteadOfDraining();
+    testTheWaterAccountClosesAgainstWhatTheShipReceived();
+    testWaterThatWillNotFitStaysOwedRatherThanBeingDropped();
+    testTheAccountStillClosesWithSuppressionRunning();
+    testTheFerrysLollTracksTheDrencherAndTheFreeingPortsDecideIt();
+    testSuppressionOffLeavesTheShipAndTheGasBitIdentical();
+    testValidateCatchesBadSuppressionDefinitions();
 }

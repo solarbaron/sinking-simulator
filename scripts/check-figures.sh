@@ -52,6 +52,17 @@ red=$'\033[0;31m'; green=$'\033[0;32m'; dim=$'\033[2m'; off=$'\033[0m'
 check() {
   local label="$1" expect="$2" tol="$3" actual="$4" quote="$5" where="${6:-$DOC}"
   checks=$((checks + 1))
+  # Validate the pointer on every call, deduplicated. See the note above `hint`.
+  case "$checkedPointers" in
+    *"|$quote|"*) ;;
+    *) checkedPointers="$checkedPointers|$quote|"
+       checks=$((checks + 1))
+       if ! grep -qF -- "$quote" "$where"; then
+         printf '  %s✗%s the pointer %s"%s"%s no longer occurs in %s\n' \
+                "$red" "$off" "$dim" "$quote" "$off" "$where"
+         fails=$((fails + 1))
+       fi ;;
+  esac
   if [ -z "$actual" ]; then
     printf '  %s✗%s %s — could not parse the figure out of the tool output\n' "$red" "$off" "$label"
     fails=$((fails + 1)); return 1
@@ -67,6 +78,16 @@ check() {
   fails=$((fails + 1))
   return 1
 }
+
+# **Every pointer is checked, including the ones only a failure would print.**
+# `hint` below validates the pointers it is given, and that was only half the job:
+# `check`'s fifth argument is a pointer too, and it is *only* read when a figure has
+# already drifted -- so it rots unobserved and misleads exactly when it is needed.
+# One had: `"46 of 49"` occurred nowhere in the document it named, in the script
+# written to prevent that. Found by an agent doing something else. Now every `check`
+# validates its pointer up front, so a rotted one fails on a green run rather than
+# waiting for a red one.
+checkedPointers=""
 
 # A pointer into the doc is itself a claim about the doc, and it rots the same
 # way. The first draft here pointed at "the hole grows from 3.4 to", which never
@@ -249,7 +270,7 @@ if [ -x "$SECTION" ]; then
   reach=$(printf '%s\n' "$scan" | sed -n 's/^ *reach: \([0-9.]*\) m of.*/\1/p')
   check "windows that mesh and solve" 49 0 "$meshed" "49 of 49 two-bay windows" "$SECTION_DOC"
   check "windows in the scan"         49 0 "$windows" "49 of 49 two-bay windows" "$SECTION_DOC"
-  check "windows in one piece"        46 0 "$onepiece" "46 of 49" "$SECTION_DOC"
+  check "windows in one piece"        46 0 "$onepiece" "46 in one piece" "$SECTION_DOC"
   check "reach along the hull (m)"    120.0 0.05 "$reach" "120.0 m of 120.0 m" "$SECTION_DOC"
 
   # --- and what an interior cut plane costs the junctions, which is torsion or nothing

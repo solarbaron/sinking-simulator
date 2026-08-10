@@ -851,7 +851,100 @@ should be honest about that.
   `2e-5·860 − 6.2e-3 == 1.1e-2` to the last bit in binary as well as in decimal —
   and it steps **down by exactly 8.4e-6 at 750 °C**, 0.076% of the elongation and
   1.73 MPa of restrained stress. Asserted rather than smoothed away.
-- Suppression systems, and their effect on stability
+- ✅ Suppression systems, and their effect on stability — `fire::Drencher`,
+  `fire::Scupper`, `fire::scupperFlow`, `fire::sprayMassFlow`. A mass flow of
+  water into a compartment, a share of it evaporating in the hot layer (which is
+  where the cooling comes from) and the rest landing on the deck (which is where
+  the stability cost comes from), plus the freeing ports that are supposed to get
+  it back out — with the blocked case and the submerged case, because those are
+  the two ways a port stops working.
+
+  **Suppression water needed no path of its own, and establishing that was half
+  the item.** `ship.cpp` contains no free-surface *correction* anywhere: it
+  carries floodwater as real mass at the real centroid of the real water body and
+  re-levels it at every attitude it is asked about, so the effect is emergent. A
+  cubic metre added to `Compartment::waterVolume` therefore arrives with its
+  mass, its centroid, its free surface and its cost to GM already right.
+  Measured, on a box barge where the second moment is arithmetic and on the
+  ferry's own vehicle deck where it is not: `GM_solid − GM_liquid = ρ μ I / Δ` to
+  **1.4e-6 relative** on the box, which is the truncation of the finite-difference
+  GM itself, and 2e-4 on the ferry, where `I` is itself a mesh integration.
+  The permeability is in it and is not optional — dropping it overstates
+  the loss by 11% on that deck. `test_core.cpp` already checked this at 15%; the
+  slack there is the two barges not having quite the same KG, not the model.
+
+  **The headline number is not GM, and that is the finding.** The ferry's
+  undivided 100 × 19 m vehicle deck has a free-surface moment of 5.19e7 kg·m, so
+  **ten tonnes of water takes her 2.00 m of GM negative** and everything after
+  that sits at the same −3.7 m whether the deck is holding thirty tonnes or two
+  thousand. GM saturates; the **angle of loll** is what tracks the water. Four
+  hours of a SOLAS ro-ro drencher (5 L/(min·m²)) over one 20 m section:
+
+  | Freeing ports | Water on deck | GM | Loll | Drained |
+  |---|---|---|---|---|
+  | clear, 6 × 1 m | **36 t** (steady) | −3.77 m | **0.8°** | 397 t |
+  | blocked | **433 t** | −3.68 m | **9.7°** | 0 t |
+
+  A twelve-fold difference in water moves GM by 0.09 m and the loll by a factor
+  of twelve. The ports hold the deck at the weir's own equilibrium depth,
+  `h = (q / ((2/3) C_d b √(2g)))^(2/3)`, verified as a fixed point to 1e-3.
+
+  **A caveat on a published quantity.** `Diagnostics::gmTransverse` is
+  finite-differenced at ±0.03 rad, which is the right question for a ship at a
+  finite angle and the wrong one for a shallow layer. With 50 t on the vehicle
+  deck — a 2.9 cm layer, which spans the deck only out to 0.0031 rad — it reads
+  **+0.59 m where the initial GM is −3.77 m**, because the water has pulled off
+  the high side long before ±0.03. The pocketing is real, and it is why she lolls
+  rather than capsizing; the reported number is not wrong so much as answering a
+  different question. Reported rather than repaired: 0.03 is what the 35
+  published figures were taken under.
+
+  **The evaporated fraction, which is the coefficient nothing here measures.**
+  Per kilogram, cooling runs 582 kJ at `e = 0.1` to 2387 kJ at 0.9 — a factor of
+  **4.1**, not the factor of nine the latent heats alone suggest, because the
+  sensible heat to saturation is a floor that no fraction goes below and is a
+  third of the total at 0.3. The water landing runs the other way and by more
+  (9×). **And on a real ship neither matters much**, because the fraction is a
+  ceiling and not a rate: what evaporates is bounded by the power available to
+  boil it, and the ferry's 20 MW fire converts **3.3%** of a 31 kg/s flow, not
+  30%. The stability answer is set by the fire's power and the port area.
+
+  **A correction found by measuring rather than by thinking, twice.** The first
+  scupper compared `Compartment::surfaceOffset` against a sill *height* — but
+  that field is the water plane's offset along the **body** up-vector, not a
+  height, and this ship lolls within a minute of the drencher starting. The ports
+  silently stopped draining at the moment they were needed and the run looked
+  like a system with no freeing ports at all. A sill *position* and
+  `surfaceWorldZ − sillWorldZ` is exact at any attitude and buys the physics the
+  height could not: on a lolled deck only the low-side ports run, and on the
+  ferry — a fifth of a degree of heel and trim apiece under a 2 cm layer —
+  **two of six** carry the whole flow while the other four stand dry. Which is
+  the real argument for distributing freeing ports along a deck edge, and it is
+  emergent rather than assumed.
+
+  The second: the cooling was first a constant per-kilogram sink with the
+  *engaged mass* capped at what the layer could supply, which is the entrainment
+  cap's idiom and is wrong here, because this cap binds at the **steady state**
+  rather than on a transient — a drencher routinely out-absorbs the fire it is
+  aimed at, by ten times on the ISO-room fixture. The applied rate became
+  `available / dt` and the model stopped converging under refinement. It is now
+  an exact relaxation towards the water's own temperature — the boundary loss's
+  `expm1` treatment — which has a real equilibrium `Q_fire = Q_spray(T)` and is
+  the same at any step.
+
+  Not here, and named rather than hidden: the **steam mass** is not added to the
+  gas, because `fire.hpp`'s closure needs one `γ` for both layers and injecting
+  steam as air would be a 60% error in its own contribution to pressure — so the
+  expansion that lets a sprinkler push smoke out of a compartment is missing;
+  the design fire is still an input, so water cools the gas but **does not put
+  the fire out**; a drenched compartment's gas volume is fixed at `attach()`, so
+  the water on the deck does not shrink the gas space; and boundary cooling
+  needed no new mechanism at all — it is `wallConductance` and `wallTemperature`,
+  which `GasCompartment` already carries.
+- Suppression by gas: CO₂ and inert-gas total flooding (oxygen displacement, and
+  the sealing requirement that makes it fail with a door open), high-expansion
+  foam, dry powder. All of them need a second gas species with its own `R` and
+  `γ`, which is the same change the steam mass above wants.
 - LES promotion for the local compartment
 - Volumetric fire and smoke rendering
 - **Milestone:** an engine room fire that heats a bulkhead until it fails under

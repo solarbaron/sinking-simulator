@@ -89,7 +89,11 @@ volume and centroid computed by clipping the compartment mesh with the free
 surface plane, and carried as mass at that centroid. Free surface effect is then
 not modelled at all — it simply happens, because a few hundred tonnes of water
 slides to the low side. The test suite confirms the emergent loss matches the
-classical ρ·i/Δ to within 15%.
+classical ρ·μ·i/Δ to **1.4e-6** on a box barge and 2e-4 on the ferry's own
+vehicle deck, with the frozen and the free ship held at the same displacement and
+the same centre of gravity so that nothing but the water's freedom to move
+differs between them. (An older check quotes 15%; its two barges do not have
+quite the same KG.)
 
 **Air is a real compressible species.** Every compartment tracks air mass and
 pressure. A sealed space stops flooding when its air pressure balances the
