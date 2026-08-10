@@ -5656,6 +5656,31 @@ there: `thermal::carbonSteelConductivity` and `carbonSteelSpecificHeat` carry th
 published curves, and `thermal::Problem::temperatureDependent` uses them.
 Conductivity falls 36% by 600 °C; specific heat spikes elevenfold at 735 °C.
 
+**The EN 1993-1-2 transcription has now been checked against the standard
+itself,** which it had not been — the numbers were carried in from secondary
+sources and this document said so. Read against BS EN 1993-1-2:2005: Table 3.1's
+**39 values are correct to the digit**, all thirteen stations of `k_y,θ`,
+`k_p,θ` and `k_E,θ`; §3.4.1.1's elongation (`1.2e-5·θ + 0.4e-8·θ² − 2.416e-4`,
+the flat `1.1e-2`, then `2.0e-5·θ − 6.2e-3`) is right including its 750/860/1200
+brackets; §3.4.1.2's specific heat is right in all four branches, brackets at
+600/735/900; and §3.4.1.3's conductivity is `54 − 3.33e-2·θ` to 800 °C and a flat
+27.3 above. §3.2's elliptical transition matches the standard's own construction
+term for term — `c = (f_y−f_p)²/[(ε_y−ε_p)E_a − 2(f_y−f_p)]`,
+`a² = (ε_y−ε_p)(ε_y−ε_p+c/E_a)`, `b² = c(ε_y−ε_p)E_a + c²` — with the strain
+landmarks 0.02, 0.15, 0.20.
+
+Two things worth recording from the reading. The OCR of a scanned standard loses
+exponents, and **the fix is arithmetic rather than a better scan**: §3.4.1.3 came
+out as `3.33e-1`, which continuity rejects immediately, since only `3.33e-2`
+meets the flat 27.3 at 800 °C (54 − 26.64 = 27.36, a 0.2% step the standard
+itself carries). And the specific-heat branches at 735 °C meet at *exactly*
+5000 J/(kg·K) from both sides — `666 + 13002/3` and `545 + 17820/4` — which is a
+continuity the standard was built to have and a free check on both coefficients
+at once. **Not every branch of it meets, though**, and that is the standard's
+doing rather than ours: §3.4.1.1 at 750 °C gives 0.01100840 from the quadratic
+and 0.011 flat, a 0.076% step. Anyone re-deriving these will find that jump and
+should not go looking for a transcription error, because there is not one.
+
 **The strength reduction curves are now in**, for carbon steel:
 `thermal::carbonSteelReduction` is EN 1993-1-2 §3.2 Table 3.1 — `k_y,θ` on the
 effective yield, `k_p,θ` on the proportional limit, `k_E,θ` on Young's modulus —
@@ -5667,11 +5692,26 @@ the number fire engineers quote. "Nearly all of it at 800 °C" stands: 0.11.
 
 Two things that table makes plain and a single reduction factor would hide.
 `k_p,θ` falls *far* faster than `k_y,θ` — 0.42 against 1.00 at 400 °C — so the
-elastic limit is gone long before the yield moves. And `k_E,θ` is below `k_y,θ`
-from 500 °C up, so anything that fails by instability rather than by squashing
-loses strength faster than the yield factor says: the ferry's midship section
-sheds 17.6% of its ultimate sagging moment at 400 °C, at which temperature `k_y`
-is still exactly 1.
+elastic limit is gone long before the yield moves. And `k_E,θ` is below `k_y,θ`,
+so anything that fails by instability rather than by squashing loses strength
+faster than the yield factor says: the ferry's midship section sheds 17.6% of its
+ultimate sagging moment at 400 °C, at which temperature `k_y` is still exactly 1.
+
+**That last sentence used to read "from 500 °C up" and it was wrong at both
+ends.** `k_E` leaves 1.0 at 100 °C while `k_y` stays there until 400, so the two
+part company at **100 °C**, not 500 — 0.95 against 1.00 by 150 °C, and the whole
+400 °C result above sits in the band the old sentence excluded. And it does not
+continue "up": the gap closes and **reverses at 872.7 °C**, above which `k_E`
+exceeds `k_y` (0.0675 against 0.060 at 900 °C, 0.0225 against 0.020 at 1100 °C)
+because the modulus row is a fixed **1.125×** the yield row at every one of the
+last three stations where either is nonzero — 900, 1000 and 1100 — against
+0.818× at 800. Measured by scanning both factors at 0.01 °C and reporting every
+sign change: there is exactly one, at 872.73 °C.
+
+The reversal is past anything a ship structure is still standing at, so the
+conclusion is unaffected — but "from 500 °C up" named a floor that is four
+hundred degrees too high and a ceiling that does not exist, and the paragraph
+directly above it is a correction to another figure in this same document.
 
 **Thermal expansion, §3.4.1.1, is now there and it is the larger term.**
 `thermal::carbonSteelElongation` gives 7.08e-3 of free strain at a 500 K rise
