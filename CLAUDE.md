@@ -120,6 +120,8 @@ most useful thing to know about this codebase:
 | A restraint window that came back equal to whatever restraint the run was given, on every run — because the failure floods the compartment and **relieves the head that caused it** | asking the same question at two different inputs and getting the input back both times |
 | The gate's own build step failing and printing **nothing**: it greps the log for `error:`, and a compiler killed by a full disk never says that word | a negative control that fails *without* the word the reporter looks for |
 | 98 gated figures and **not one of them on `README.md`** — the front page, where the verdict a reader sees first had just changed | counting the gate's own coverage by document, rather than by figure |
+| A **mutation left applied** in the source by a sweep that was killed mid-iteration — and it did not fail loudly, it made the suite *hang* | a script that re-derives every injected substitution and greps the source for each, run *before* trusting a green tree |
+| A boundary relaxation using `c_p` where `c_v` belongs, invisible to every existing test because they all stepped short enough that `C(1−e^{−rΔt/C}) → rΔt` **whatever `C` is** | asking the question at a step long enough for the exponential to bend |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct. **Nothing at all tests a comment** — three documents here repeated a
@@ -142,6 +144,18 @@ sequence decide one thing, they need the same notion of "on the boundary".
 **Writing a lesson down does not make it learned.** The rigid-body threshold above
 is the second time that mistake was made in this repo — the first was recorded, in
 this table, by the work that immediately preceded it.
+
+**A mutation run that is interrupted leaves a tree that is green because the
+mutant survived.** This is the one place where a passing suite is actively
+evidence *against* you, and it has happened here: an agent killed mid-sweep by a
+session limit came back to a clean-looking worktree with substitution 43 still in
+`les.cpp`. Never resume a sweep, and never commit from one, without first
+re-deriving every substitution you injected and grepping the source for each.
+Keep that scanner next to the harness rather than in your head — the whole
+premise of mutation testing is that you cannot tell a surviving mutant from
+correct code by looking at test output, and that applies to *your own* leftovers.
+The same run is also why the harness must be able to detect a **hang**: mutant 43
+did not fail, it drove a rejection test into a corner and stopped.
 
 **A failure path that only reports the failures it already anticipated is not a
 failure path.** `verify.sh` had this twice in adjacent functions: `expect_ok` and
