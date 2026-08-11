@@ -768,6 +768,176 @@ StructuralMesh reduce(const StructuralMesh& structure, const SectionReduction& r
     return out;
 }
 
+// --- The gas side ---------------------------------------------------------------
+
+double compartmentReach(double floorArea, double perimeter) {
+    if (!(floorArea > 0)) return 0.0;
+    double lx = 0, ly = 0;
+    les::planRectangle(floorArea, perimeter, &lx, &ly);
+    return 0.5 * std::sqrt(lx * lx + ly * ly);
+}
+
+std::vector<GasCandidate> gasCandidates(const fire::Model& model, const GasCriterion& criterion) {
+    std::vector<GasCandidate> out;
+    for (std::size_t i = 0; i < model.gas.size(); ++i) {
+        const fire::GasCompartment& gas = model.gas[i];
+        if (!(gas.floorArea > 0) || !(gas.ceilingZ > gas.floorZ)) continue;
+
+        // The ceiling height is taken above the compartment **floor** and not above
+        // any fire's base, because the fires are an input that comes and goes and
+        // the geometric trigger is meant to be a property of the compartment. A fire
+        // standing on a flat is closer to the deckhead than this says, which makes
+        // the spread smaller and the criterion less eager -- the safe direction.
+        const double height = gas.ceilingZ - gas.floorZ;
+        const double reach = compartmentReach(gas.floorArea, gas.perimeter);
+        const double spread = les::ceilingJetSpread(reach, height);
+        const double rise = gas.upper.temperature() - gas.lower.temperature();
+
+        if (!(criterion.spreadPromote > 0) || !(criterion.risePromote > 0)) continue;
+        if (spread < criterion.spreadPromote) continue;
+        if (rise < criterion.risePromote) continue;
+
+        GasCandidate c;
+        c.compartment = static_cast<int>(i);
+        c.name = gas.name;
+        c.spread = spread;
+        c.rise = rise;
+        // The weaker of the two, so a score of one is "both have just cleared".
+        c.score = std::min(spread / criterion.spreadPromote, rise / criterion.risePromote);
+        c.cells = les::estimateCells(gas, criterion.grid);
+        c.cost = criterion.coreSecondsPerCell * static_cast<double>(c.cells);
+        c.why = "a ceiling jet " + std::to_string(spread) + "x hotter over the fire than at " +
+                std::to_string(reach) + " m, under a layer standing " + std::to_string(rise) +
+                " K above the cool one";
+        out.push_back(c);
+    }
+    std::sort(out.begin(), out.end(), [](const GasCandidate& a, const GasCandidate& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.compartment < b.compartment;
+    });
+    return out;
+}
+
+GasPromoter::GasPromoter(GasCriterion criterion) : criterion_(criterion) {}
+
+int GasPromoter::activeCells() const {
+    int total = 0;
+    for (const GasActive& a : active_) total += a.cells;
+    return total;
+}
+
+double GasPromoter::activeCost() const {
+    double total = 0;
+    for (const GasActive& a : active_) total += a.cost;
+    return total;
+}
+
+void GasPromoter::clear() {
+    active_.clear();
+    qualifying_.clear();
+}
+
+GasReview GasPromoter::review(const fire::Model& model) {
+    const auto begin = std::chrono::steady_clock::now();
+    GasReview out;
+    ++reviews_;
+    out.considered = gasCandidates(model, criterion_);
+
+    const auto isCandidate = [&](int compartment) {
+        for (const GasCandidate& c : out.considered)
+            if (c.compartment == compartment) return true;
+        return false;
+    };
+
+    // Does an already resolved compartment still deserve to be? The hold
+    // thresholds, which is the hysteresis. The **spread does not move** -- it is a
+    // property of the box -- so in practice this is the fire dying down; the spread
+    // is still tested because a caller may re-attach a model with different
+    // geometry and a compartment that stopped being long should stop being resolved.
+    const auto holds = [&](const GasActive& zone) {
+        if (isCandidate(zone.compartment)) return true;
+        if (zone.compartment < 0 || zone.compartment >= static_cast<int>(model.gas.size()))
+            return false;
+        const fire::GasCompartment& gas = model.gas[static_cast<std::size_t>(zone.compartment)];
+        const double height = gas.ceilingZ - gas.floorZ;
+        const double spread =
+            les::ceilingJetSpread(compartmentReach(gas.floorArea, gas.perimeter), height);
+        const double rise = gas.upper.temperature() - gas.lower.temperature();
+        return spread >= criterion_.spreadHold && rise >= criterion_.riseHold;
+    };
+
+    std::vector<GasActive> kept;
+    for (GasActive& zone : active_) {
+        if (holds(zone)) {
+            zone.idleReviews = 0;
+            kept.push_back(zone);
+            continue;
+        }
+        ++zone.idleReviews;
+        if (zone.idleReviews >= std::max(1, criterion_.hold)) {
+            out.demoted.push_back(zone);
+            ++demotions_;
+        } else {
+            kept.push_back(zone);
+        }
+    }
+    active_ = kept;
+
+    std::vector<std::pair<int, int>> nextQualifying;
+    for (const GasCandidate& c : out.considered) {
+        int previous = 0;
+        for (const auto& entry : qualifying_)
+            if (entry.first == c.compartment) previous = entry.second;
+        nextQualifying.emplace_back(c.compartment, previous + 1);
+    }
+    std::sort(nextQualifying.begin(), nextQualifying.end());
+    qualifying_ = nextQualifying;
+
+    const auto dwellOf = [&](int compartment) {
+        for (const auto& entry : qualifying_)
+            if (entry.first == compartment) return entry.second;
+        return 0;
+    };
+    const auto alreadyActive = [&](int compartment) {
+        for (const GasActive& a : active_)
+            if (a.compartment == compartment) return true;
+        return false;
+    };
+
+    int budgetUsed = activeCells();
+    bool refused = false;
+    for (const GasCandidate& c : out.considered) {
+        if (alreadyActive(c.compartment)) continue;
+        if (dwellOf(c.compartment) < std::max(1, criterion_.dwell)) continue;
+        if (criterion_.cellBudget > 0 && budgetUsed + c.cells > criterion_.cellBudget) {
+            refused = true;
+            continue;
+        }
+        GasActive zone;
+        zone.compartment = c.compartment;
+        zone.name = c.name;
+        zone.spread = c.spread;
+        zone.rise = c.rise;
+        zone.score = c.score;
+        zone.cells = c.cells;
+        zone.cost = c.cost;
+        zone.promotedAtReview = reviews_;
+        active_.push_back(zone);
+        out.promoted.push_back(zone);
+        ++promotions_;
+        budgetUsed += c.cells;
+    }
+    if (refused)
+        out.problems.push_back("the cell budget refused a qualifying compartment; nothing already"
+                               " resolved was demoted for it");
+
+    out.cellsActive = activeCells();
+    out.costActive = activeCost();
+    const auto end = std::chrono::steady_clock::now();
+    out.microseconds = std::chrono::duration<double>(end - begin).count() * 1e6;
+    return out;
+}
+
 double dentedCompressiveCapacity(double yieldStrength, double criticalStress, double deviation,
                                  double thickness) {
     if (!(yieldStrength > 0) || !(criticalStress > 0)) return 0.0;

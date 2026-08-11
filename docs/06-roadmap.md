@@ -29,7 +29,7 @@ Numerical core, flooding, air, damaged stability, validation harness.
 - Mesh boolean (clip, weld, cap by ear clipping) so compartments are carved out
   of the hull form rather than authored as boxes
 - Watertightness checking and load-time ship definition validation
-- 195 086 closed-form validation checks
+- 195 663 closed-form validation checks
 - A 120 m ferry that lolls over or capsizes depending on what you do — and, since
   GM stopped being sampled at a fixed ±0.03 rad, does not survive any of the three
 - Explicit co-rotational tet FEM, CPU reference plus a Vulkan compute back-end,
@@ -975,7 +975,154 @@ should be honest about that.
   the sealing requirement that makes it fail with a door open), high-expansion
   foam, dry powder. All of them need a second gas species with its own `R` and
   `γ`, which is the same change the steam mass above wants.
-- LES promotion for the local compartment
+- ✅ **LES promotion for the local compartment** — `engine/sim/les.{hpp,cpp}`,
+  `promotion::GasPromoter`, `promotion::gasCandidates`, `les::promote` and
+  `les::demote`. One burning compartment's two well-mixed layers replaced by a
+  coarse resolved flow on a regular staggered grid, and handed back as two layers
+  when it is done; every other compartment stays two-zone throughout.
+
+  **The formulation is low-Mach finite volume, and the case for it is that it is
+  the two-zone model's own closure resolved rather than a second model beside it.**
+  At one thermodynamic pressure the internal energy density is uniform, so the
+  total is `p V / (γ−1)` — which is exactly the identity `fire.hpp` calls "the
+  single load-bearing algebraic fact in this file", `V_u/V = U_u/U`. The energy
+  therefore crosses the fidelity boundary as **one scalar with nothing to
+  interpolate**. Mass is the field and temperature is derived (`ρ = m/V_c`,
+  `T = U_c/(m c_v)`), so the equation of state holds identically at every cell at
+  every step instead of drifting, which is what the obvious
+  variable-density-incompressible arrangement does. Heat enters the *velocity*
+  field through the dilatation `div u = (γ−1)(q‴ − Q/V)/(γp)`, whose integral over
+  a sealed box is `dp/dt = (γ−1)Q/V` — `fire.hpp`'s own sealed closed form,
+  recovered rather than imposed, and reproduced to 1e-9 against the design fire's
+  analytic release. The subgrid closure is constant-coefficient Smagorinsky: the
+  cheapest thing that is a closure rather than an absence of one, with one
+  constant, and switching it off is measured — on a 9 × 7 × 5 m box at 1 m cells,
+  150 kW over a 1.4 m pool for 30 s, peak speed 2.63 m/s at `Cs = 0` against
+  2.47 m/s at 0.20, so it damps and it is not decoration. A fully compressible
+  solve was rejected on the step it would demand: `dx/c` is 1.5 ms on a 0.5 m cell
+  for a flow at Mach 0.003.
+
+  **Conservation across the boundary is the acceptance test and it comes out
+  exact.** Promote a 10 × 8 × 5 m compartment at 1 m cells carrying a 1.7 m layer at
+  500 K, and demote it again: the interface returns **bit-exact** (8.9e-16 m at the
+  depths where it is not), the layer masses to **6e-16 relative**, the energy split
+  to 2e-16, and the products to the layer they were in. Through 60 s of a 200 kW
+  pool fire in the same box the mass residual is
+  **1.2e-16** of scale and the energy residual **1.9e-15**, asserted at every step
+  rather than at the end — a model can close its books over a run while breaking
+  them in the middle.
+
+  **Two corrections found by measuring rather than by thinking.**
+
+  *A demotion cannot integrate the cells it promoted.* The obvious reduction sums
+  the cell masses above the interface, and it comes back **9% wrong on a field it
+  has just promoted** — because promotion has to smear the interface across the
+  cell row it falls inside, and no weighted sum of a mixed row pulls the two
+  layers apart again. The equivalent two-layer profile *can*: `ρ_u(H−z_i) +
+  ρ_l(z_i−z_f) = M/A` is one linear equation in `z_i`, closed form, and it reads
+  only the top row, the bottom row and the total — the three things the smear
+  leaves untouched. On that 1.7 m layer at 1 m cells, 9e-2 became 6e-16. The price
+  is named and measured: a layer **thinner than one cell** is not representable,
+  and the reduction faithfully reports the layer the grid does hold — a 0.2 m layer
+  under a 1 m cell comes back 1 m deep at 315 K instead of 500 K, and between one
+  cell and one cell short of the floor the round trip is exact.
+
+  *The arithmetic was the limit before the physics was.* A naive sum over the 400
+  cells of that box carries `√n ε`, and the two-layer reduction divides
+  `M/A − ρ_u H` — a difference of numbers three times its own size — by a density
+  gap. That noise was **larger than the round-trip error it was measuring**:
+  8.6e-14 m on the interface. Compensated summation took it to the last bit. A
+  test cannot be tighter than its own arithmetic.
+
+  **Both directions of the two-zone comparison, because a model that always agrees
+  has bought nothing.** Where the zone model is right — a well-mixed compartment
+  cooling to its boundary — the resolved model reproduces the lumped exponential
+  `exp(−t hA/(Mc_v))` to **1.59% of the 111.9 K the box loses**, worst case, and
+  to 0.002 K after five time constants; the two-zone model reproduces the same
+  closed form to 1e-4, so all three agree. Where it is wrong, 150 kW over a 1.4 m
+  pool for 60 s in a 9 × 7 × 5 m box at 1 m cells puts **45.0 K across the
+  deckhead** the zone model says is one temperature, raises a plume at
+  **+2.21 m/s** over the fire with a return flow of −0.36 m/s in the corner, and a
+  ceiling jet running outboard at ±0.314 m/s on both sides. The control that makes
+  that a statement about the fire being local rather than about the model being
+  noisy: **the same 150 kW for the same 60 s spread over the whole floor** gives
+  8.5 K and no plume (+0.08 m/s), and both fires leave the room at the same mean
+  temperature to 0.7 K.
+
+  **The criterion is Alpert's own ceiling jet, and the heat release cancels out of
+  it.** The two branches of the correlation either side of `r/H = 0.18` have the
+  ratio `(16.9/5.38)(r/H)^(2/3)` — no `Q` in it at all — so the geometric trigger
+  is a property of the compartment and a bigger fire cannot switch it on, which is
+  what makes the second trigger (the layer standing above the cool gas) do
+  independent work. The two branches meet at the crossover to **0.1427%**,
+  derived from the published coefficients rather than remembered, exactly as
+  Heskestad's two entrainment branches meet to 1.78%. The threshold is anchored on
+  the conventional `L/H = 3` limit of a zone model, which for a square room is a
+  spread of 5.16; at `spreadPromote = 5.0` a 6 × 5 × 4 m tank (3.09) and a
+  12 × 10 × 5 m machinery space (4.23) stay two-zone while a 20 × 8 × 5 m hold
+  (5.24) and the ferry's 100 × 19 m vehicle deck (14.75) do not. Hysteresis and
+  dwell are `Promoter`'s, tested against the same negative controls: without the
+  band a fire hovering at the threshold is built and thrown away six times in
+  twelve reviews, with it once.
+
+  **Cost is *not* linear in the resolution, and that is the difference from the
+  structural tier.** A Tier-2 zone is exactly `4.0 × elements` core-seconds per
+  simulated second because its step is fixed. Halving a cell here multiplies the
+  cells by eight *and* halves the advective step *and* lengthens the pressure
+  solve, so the measured cost **per cell per simulated second rises** rather than
+  staying flat: on one core, over 20 simulated seconds of a 300 kW fire in a
+  12 × 10 × 5 m space, 1.6e-6 at 168 cells (1.5 m) against 1.2e-5 at 1456 (0.75 m).
+  `cellBudget` therefore bounds the arithmetic honestly and the wall clock only
+  loosely.
+
+  **Four of the tests interrogate single cells rather than totals**, because the
+  useful defect here is one that cancels when asked globally. The box's wall area
+  is right even when every cell's share of it is wrong, so over one 0.1 ms step in
+  a 9 × 7 × 5 m box at 1 m cells the corner, edge, face and interior cells are
+  asked separately and their losses stand at **3 : 2 : 1 : 0** to 5e-6. One heated
+  cell warms over one 1 ms step by `T(γ−1)q δt/(γpV_c)(1 + (γ−1)/N)` to 1.6e-4,
+  whose large-box limit is `q δt/(m c_p)` — heating at constant pressure, which is
+  what a cell in a low-Mach model is under even though the box as a whole is at
+  constant volume.
+
+  **And a fourth that only mutation testing asked for.** Every one of those is
+  taken at a step so short that the boundary exponential is linear, and a linear
+  boundary term does not care what heat capacity is in it: `C(1 − e^(−r δt/C))`
+  tends to `r δt` whatever `C` is. Swapping `c_p` for `c_v` in it therefore
+  survived the whole suite. The time constant is only visible at a step comparable
+  with it, so the test now takes **one 1 s step at h = 1000 W/(m²·K)**, where a
+  1 m cell's own `m c_p/(hA)` is about a second: 15 616 kJ leaves the box against
+  the constant-pressure closed form's 15 616 kJ, where constant volume would have
+  removed 12 616 kJ — a 19% gap, which is the vacuity guard as much as the
+  measurement.
+
+  And a centred fire in a 10.5 × 9 × 4.5 m box — 11 × 9 × 5 cells, odd on both
+  plan axes and no two spacings equal — leaves a field that is
+  **bit-identical to its own mirror** in both plan axes, with the velocities
+  antisymmetric to the bit: red-black relaxation reads only the other colour
+  within a half sweep, the Laplacian and the flux gather are accumulated axis pair
+  by axis pair, and floating-point addition is commutative — so a reflection maps
+  every sum onto itself term for term. Anything less than exact equality there is
+  an index reading the wrong axis.
+
+  The quiescent control is exact for the same reason: 120 s of a compartment
+  uniformly at **350 K** — not ambient, so a buoyancy referred to a fixed ambient
+  density could not hide — leaves every cell mass bit-identical and every face
+  velocity at exactly 0.0 over 480 substeps, and the same 9 × 7 × 5 m field at 1 m
+  cells against a 288.15 K boundary at 30 W/(m²·K) stratifies by 1.85 K and moves
+  at 0.25 m/s.
+
+  Not here, and named rather than hidden: **vents** — a resolved compartment is
+  sealed for the duration of its promotion, because handing `fire.hpp`'s vent
+  integral a field means deciding what a doorway does with a ceiling jet arriving
+  at an angle, which is a separate question; **kinetic energy**, which is 2.4e-6
+  of the internal energy at 1 m/s and is not booked; **combustion**, still a design
+  fire, though the *entrainment* is now computed rather than correlated;
+  radiation, soot optics and a second species; a **heeled** compartment, on the
+  same terms as the two-zone interface; and the **plan shape**, which
+  `fire::GasCompartment` does not carry at all — the grid is the rectangle its area
+  and perimeter imply, falling back to a square of the same area when no rectangle
+  has both, and saying so.
 - ✅ Volumetric fire and smoke rendering — `engine/gpu/smoke.{hpp,cpp}`,
   `engine/gpu/smoke_gpu.cpp`, `engine/gpu/shaders/smoke.{vert,frag}`,
   `tools/smoke_view`. Two homogeneous emitting, absorbing slabs per compartment on
