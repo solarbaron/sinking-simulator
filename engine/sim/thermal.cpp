@@ -168,6 +168,13 @@ constexpr double kModulusFactor[kReductionStations] = {1.0000, 1.0000, 0.9000, 0
 // the method, and a table row added later has no reason to keep it.
 // `tests/test_thermal.cpp` now asserts the property over every pair directly, so
 // the day it stops holding is caught there rather than in a caller.
+//
+// The bracket test below is unobservable for the same reason and the reverse one:
+// widening `t > station` to `t >= station` kills the early exit *and* steps the
+// search one interval on, where `s` is exactly 0 and `a + (b - a) * 0` is `a` for
+// every finite `a`. Measured bit-identical over two hundred thousand samples from
+// -100 C to 1300 C. Both of these are properties of this table, so both are
+// recorded rather than relied on.
 double interpolate(const double value[kReductionStations], double t) {
     if (t <= kReductionCelsius[0]) return value[0];
     if (t >= kReductionCelsius[kReductionStations - 1]) return value[kReductionStations - 1];
@@ -286,6 +293,13 @@ namespace {
 
 // First temperature above `referenceKelvin` at which `margin` changes sign, by a
 // scan and then a bisection. Kelvin, or zero when it never does.
+//
+// `std::min(t, top)` is a guard and not a behaviour: every curve the margins are
+// built from clamps at 1200 C, so `margin(top + 0.25) == margin(top)` and dropping
+// the clamp is bit-identical over every crossing this file can be asked for --
+// measured, over 1230 reference temperatures and 200 elastic stresses. It stays
+// because the loop's own bound is `top + 0.25` and a reader should not have to
+// prove that the quarter-kelvin overshoot is harmless.
 //
 // A scan is used rather than a root find from one end because the margin is
 // **piecewise** in temperature -- kinked at every hundred-degree station of

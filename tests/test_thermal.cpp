@@ -795,6 +795,25 @@ void testExplicitLimit() {
     expectTrue("12 mm plating is seconds, not milliseconds", ferry > 4.0 && ferry < 5.0);
     expectNear("and four elements through it costs a factor of sixteen", ferry / refined, 16.0,
                1e-9);
+
+    // **Over a mesh it is the *smallest* element's limit, and every fixture above
+    // is uniform** -- so the minimum and the maximum over the elements are the
+    // same number and nothing could have told them apart. A graded bar can: its
+    // elements run from 14 mm to 110 mm, and the thin one is the one an explicit
+    // scheme would have to live with.
+    ss::HexMesh graded = makeBar(0.30, 0.05, 6, 1.5);
+    // Read off the mesh rather than recomputed from the grading, so this is the
+    // bar that was built and not the bar that was meant.
+    const double first = graded.position[4 * 3] - graded.position[0];
+    const double last = graded.position[24 * 3] - graded.position[20 * 3];
+    expectTrue("the graded bar's elements really do differ in size", last > 5.0 * first);
+    expectTrue("and its thinnest direction is along the bar at one end and across it at the other",
+               first < 0.05 && last > 0.05);
+    const double thinnest = th::explicitLimit(graded, steel);
+    expectNear("the mesh's limit is its smallest element's h^2 / 2 alpha", thinnest,
+               first * first / (2.0 * alpha), 1e-12 * (first * first / (2.0 * alpha)));
+    expectTrue("which is an order of magnitude below the largest element's",
+               thinnest < 0.2 * 0.05 * 0.05 / (2.0 * alpha));
 }
 
 // --- 5c. What the lumped capacity is for -------------------------------------------------
@@ -1580,6 +1599,141 @@ void testBoundaryOrientation() {
         // apart, which it cannot if the volume is near zero.
         expectTrue("and 3V is far from -3V", volume > 1e-3);
     }
+
+    // **A warped face's normal is its exact vector area, and that is a closed
+    // form.** For a bilinear patch `x = a + b s + c t + d s t` the surface
+    // integral of the area vector is `4 (b x c)` exactly -- the two terms linear
+    // in `s` and `t` integrate to zero over the parametric square -- so the 2x2
+    // rule reproduces it to the bit whatever the warp is. `boundaryFaces` gets
+    // there by *area-weighting* the four Gauss normals, and on a flat face every
+    // weight is the same and the weighting cannot be seen at all.
+    //
+    // One hexahedron with a single corner lifted, so the warp is not symmetric and
+    // cannot cancel.
+    {
+        ss::HexMesh mesh;
+        const double p[8][3] = {{0, 0, 0},   {1, 0, 0},   {1, 1, 0}, {0, 1, 0},
+                                {0, 0, 1},   {1, 0, 1.4}, {1, 1, 1}, {0, 1, 1}};
+        for (const auto& q : p) {
+            mesh.position.push_back(q[0]);
+            mesh.position.push_back(q[1]);
+            mesh.position.push_back(q[2]);
+        }
+        for (std::uint32_t i = 0; i < 8; ++i) mesh.index.push_back(i);
+
+        // The zeta = +1 face, in the same corner order the face table uses.
+        const Vec3 q0{0, 0, 1}, q1{1, 0, 1.4}, q2{1, 1, 1}, q3{0, 1, 1};
+        const Vec3 b = (q1 + q2 - q0 - q3) * 0.25;
+        const Vec3 c = (q2 + q3 - q0 - q1) * 0.25;
+        const Vec3 d = (q0 + q2 - q1 - q3) * 0.25;
+        const Vec3 vectorArea = cross(b, c) * 4.0;
+        expectTrue("the face really is warped, or there is nothing here to weight",
+                   length(d) > 0.05);
+
+        bool seen = false;
+        for (const th::BoundaryFace& f : th::boundaryFaces(mesh)) {
+            if (f.face != 1) continue;
+            seen = true;
+            const Vec3 want = normalize(vectorArea);
+            expectNear("the warped face's normal is its exact vector area, in x",
+                       f.normal.x, want.x, 1e-14);
+            expectNear("in y", f.normal.y, want.y, 1e-14);
+            expectNear("in z", f.normal.z, want.z, 1e-14);
+            // Cauchy-Schwarz: a warped patch has strictly more area than the
+            // magnitude of its own vector area, which is the projection.
+            expectTrue("and its area exceeds the magnitude of that vector area",
+                       f.area > length(vectorArea) * (1.0 + 1e-9));
+        }
+        expectTrue("the warped face was found", seen);
+
+        // **Vacuity: the unweighted mean of the four Gauss normals is a different
+        // vector**, so a fixture that could not tell them apart would not be
+        // testing the weighting. Computed here from the corners rather than read
+        // out of the code.
+        Vec3 unweighted{};
+        const double g = 1.0 / std::sqrt(3.0);
+        for (int i = 0; i < 4; ++i) {
+            const double s = (i & 1) ? g : -g, t = (i & 2) ? g : -g;
+            unweighted += normalize(cross(b + d * t, c + d * s));
+        }
+        const Vec3 crude = normalize(unweighted);
+        expectTrue("and it differs from the area-weighted one by more than a rounding",
+                   length(crude - normalize(vectorArea)) > 1e-3);
+    }
+}
+
+// The film's own defaults, which every fixture in this file overwrites and
+// nothing therefore pins. `Film::ambient` is EN 1993-1-2's datum -- 20 C, the
+// temperature `carbonSteelEnthalpy` measures above and `carbonSteelReduction`
+// starts at -- and deliberately **not** `kTAmbient`, which is the sea-level 15 C
+// the hydrostatics use. A caller who sets a flux and leaves the ambient alone
+// gets the one this file is written in.
+void testTheFilmDefaultIsTheStandardsDatum() {
+    expectTrue("an unfilled film sits at EN 1993-1-2's 20 C datum",
+               th::Film{}.ambient == kC + 20.0);
+    expectTrue("which is not the 15 C the hydrostatics call ambient",
+               th::Film{}.ambient != sim::kTAmbient);
+    expectNear("and the two are five kelvin apart", th::Film{}.ambient - sim::kTAmbient, 5.0,
+               1e-12);
+    // A default film carries no heat at all, in either channel, so leaving it
+    // unfilled is a surface that does nothing rather than a surface at a
+    // temperature nobody chose.
+    expectTrue("and it neither fluxes nor convects until it is asked to",
+               th::Film{}.flux == 0.0 && th::Film{}.coefficient == 0.0);
+}
+
+// **The secant capacity, on the steps where a tangent looks identical.**
+// `testSpikeAccount` above drives a plate through the 735 C transition in 2 s
+// steps of several kelvin each, where the secant and the tangent are far apart
+// and the account says so. What it cannot see is the *threshold* below which the
+// secant falls back to the tangent: at several kelvin a step the fallback never
+// fires, so widening it from a nanokelvin to a millikelvin changes nothing there.
+//
+// A plate parked a kelvin below its film, next to the 735 C pole where `dc/dT` is
+// eight hundred J/(kg K) per kelvin, moves four microkelvin a step -- inside a
+// millikelvin fallback and far outside a nanokelvin one. The account is what
+// separates them, and by a factor of 180.
+void testTheSecantSurvivesSubMillikelvinSteps() {
+    ss::HexMesh mesh = ss::makePlateMesh(0.05, 0.05, 0.012, 1, 1, 2);
+    th::Problem problem;
+    problem.mesh = &mesh;
+    problem.material = ah36Steel();
+    problem.temperatureDependent = true;
+    th::Film film;
+    for (const th::BoundaryFace& f : th::boundaryFaces(mesh))
+        if (f.normal.z > 0.5) film.face.push_back(f);
+    film.coefficient = 25.0;
+    film.ambient = kC + 734.0;
+    problem.film = {film};
+
+    th::Solver solver;
+    std::string why;
+    expectTrue("the near-spike problem prepares: " + why,
+               solver.prepare(problem, kC + 733.0, &why));
+    double previous = solver.temperature()[0], worstStep = 0.0;
+    for (int i = 0; i < 3000; ++i) {
+        expectTrue("a near-spike step runs: " + why, solver.step(0.05, &why));
+        worstStep = std::max(worstStep, std::abs(solver.temperature()[0] - previous));
+        previous = solver.temperature()[0];
+    }
+    const th::Account& a = solver.account();
+
+    // **Vacuity, and it is the whole design of the fixture.** The steps have to be
+    // sub-millikelvin, or this is `testSpikeAccount` again; the plate has to be
+    // beside the transition, where a tangent and a secant differ; and real heat
+    // has to have moved, or the residual is a ratio of two nothings.
+    expectTrue("every step moves the plate less than a millikelvin", worstStep < 1e-3);
+    expectTrue("and more than a nanokelvin, so the secant is what is being formed",
+               worstStep > 1e-9);
+    expectTrue("the plate sits inside the 735 C transition's shoulder",
+               solver.temperature()[0] > kC + 700.0 && solver.temperature()[0] < kC + 738.0);
+    expectTrue("and real heat crossed the film", std::abs(a.filmHeat) > 1.0);
+    // Measured at 2.0e-9 of the enthalpy moved with the secant and 3.6e-7 with the
+    // tangent -- a factor of 180, so 1e-8 separates them with margin on both
+    // sides.
+    expectTrue("the account still closes on a run made of sub-millikelvin steps",
+               std::abs(a.residual()) < 1e-8 * std::abs(a.enthalpyChange));
+    expectTrue("and the enthalpy really moved", std::abs(a.enthalpyChange) > 1.0);
 }
 
 void testNodeOrdering() {
@@ -4132,8 +4286,10 @@ void runThermalTests() {
     testNewtonCooling();
     testKirchhoffSteady();
     testSpikeAccount();
+    testTheSecantSurvivesSubMillikelvinSteps();
     testRotationInvariance();
     testBoundaryOrientation();
+    testTheFilmDefaultIsTheStandardsDatum();
     testNodeOrdering();
     testVolumetricSourceProfile();
     testFin();

@@ -265,7 +265,7 @@ fi
 #     108 m3 tank that was double-counted inside it. The same drift the header of
 #     this file was written about, one document further out.
 #   - two mutually contradictory counts of the same test suite, `116` and `1309`,
-#     against a measured 195 756.
+#     against a measured 198 869.
 #
 # **The durations are the interesting part and they are now written into the README.**
 # `full` is still flooding when the run ends, so its figures are a function of how
@@ -437,8 +437,8 @@ fi
 # that the failures are zero.
 if [ -x "$TESTS" ]; then
   suite=$("$TESTS" 2>&1 | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  check "closed-form validation checks in the suite" 195756 0 "$suite" \
-        "195756 validation checks" "$FRONT"
+  check "closed-form validation checks in the suite" 198869 0 "$suite" \
+        "198869 validation checks" "$FRONT"
 else
   echo "  - shipsim_tests not built, skipping the README's check count"
 fi
