@@ -27,10 +27,27 @@ namespace {
 #endif
 
 int failures = 0;
+int skippedSections = 0;
 
 void check(const char* what, bool ok, const std::string& detail = {}) {
     std::printf("  [%s] %-52s %s\n", ok ? "PASS" : "FAIL", what, detail.c_str());
     if (!ok) ++failures;
+}
+
+// **`CLAUDE.md`: GPU work must skip, not fail, when there is no Vulkan device.**
+// This tool was the one place that did not -- it counted a missing device as a
+// failed check and exited 1, so on any machine without a card `fem_spike` printed
+// `CHECKS FAILED` for the entirely correct reason that there was nothing to run it
+// on. Every sibling tool already prints `no usable GPU (...)` and carries on.
+//
+// The tradeoff this makes, taken deliberately and in line with those siblings: a
+// genuine driver fault on a machine that *has* a device also reads as a skip here.
+// The gate classifies that from outside -- it knows whether an ICD and a device node
+// exist and calls a skip on a working card a failure -- which is the right place for
+// it, because the tool cannot tell the two apart and the gate can.
+void skipGpuSection(const char* what, const std::string& error) {
+    std::printf("  [SKIP] %-52s no usable GPU (%s)\n", what, error.c_str());
+    ++skippedSections;
 }
 
 // Pin every node at x = 0 to build a cantilever.
@@ -86,7 +103,7 @@ void testCantileverAgainstBeamTheory() {
         std::string error;
         gpu::FemGpuSolver solver;
         if (!solver.initialise(mesh, SHIPSIM_SHADER_DIR, error)) {
-            check("cantilever: GPU solver initialised", false, error);
+            skipGpuSection("cantilever: GPU solver initialised", error);
             return;
         }
 
@@ -145,7 +162,7 @@ void testGpuMatchesCpu() {
     std::string error;
     gpu::FemGpuSolver solver;
     if (!solver.initialise(gpuMesh, SHIPSIM_SHADER_DIR, error)) {
-        check("GPU solver initialised", false, error);
+        skipGpuSection("GPU solver initialised", error);
         return;
     }
     check("GPU solver initialised", true, "on " + solver.deviceName());
@@ -271,6 +288,14 @@ int main() {
     testGpuMatchesCpu();
     benchmarkThroughput();
     benchmarkCpuForComparison();
-    std::printf("\n%s\n", failures == 0 ? "all checks passed" : "CHECKS FAILED");
+    // Name the skips on the result line. A run that skipped half its sections and a
+    // run that checked everything must not print the same sentence -- that is the
+    // hole `check-figures.sh` had, where "ok" and "ok, having run nothing" were the
+    // same line.
+    if (failures != 0) std::printf("\nCHECKS FAILED\n");
+    else if (skippedSections != 0)
+        std::printf("\nall checks passed, but %d GPU section(s) were skipped for want of a"
+                    " device\n", skippedSections);
+    else std::printf("\nall checks passed\n");
     return failures == 0 ? 0 : 1;
 }

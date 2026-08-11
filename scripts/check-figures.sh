@@ -266,6 +266,78 @@ else
   skipped="$skipped zone_gpu_probe"
 fi
 
+# --- §1: the number the whole element choice rests on ----------------------------
+#
+# **`fem_spike` was not run by this gate at all**, which left §1 ungated -- and §1 is
+# where "linear tetrahedra are the wrong element for ship plating" comes from. That
+# conclusion is one number: a two-elements-through-thickness tet mesh gets **63.6%**
+# of the way wrong against a closed form, and the whole solid-shell programme in §4
+# and §6 exists because of it. It was the single most load-bearing figure in the
+# document and nothing re-derived it.
+#
+# ~90 s, nearly all of it GPU wait (6% CPU), which is why it sits behind the same
+# device check as everything else here. The deflections are a CPU closed-form
+# comparison and would run without a device, but the tool has no way to ask for §1
+# alone -- recorded as the reason rather than worked around.
+SPIKE=${SPIKE:-./build/fem_spike}
+if [ -x "$SPIKE" ]; then
+  spike=$("$SPIKE" 2>&1)
+  if printf '%s\n' "$spike" | grep -qiE 'no usable GPU|no Vulkan'; then
+    echo "  - no Vulkan device, skipping §1's deflection table"
+    skipped="$skipped fem_spike"
+  else
+    # Anchored to the row's own tet count, because "0.0801" and "63.6" both appear
+    # in prose elsewhere in the document and a checker that misparses is worse than
+    # no checker.
+    row() { printf '%s\n' "$1" | awk -v t="$2" '$2 == t { print $4 }'; }
+    err() { printf '%s\n' "$1" | awk -v t="$2" '$2 == t { print $5 }' | tr -d '%'; }
+    check "§1 beam theory tip deflection (mm)" 0.2199 0 \
+          "$(printf '%s\n' "$spike" | sed -n 's/.*beam theory: \([0-9.]*\) mm.*/\1/p')" \
+          "Theory: 0.2199 mm." "$FEM_DOC"
+    check "§1 2 elements through thickness, deflection (mm)" 0.0801 0 \
+          "$(row "$spike" 480)"  "| 2 | 480 | 0.0801 mm | 63.6% |" "$FEM_DOC"
+    check "§1 2 through, error vs theory (%)"  63.6 0 \
+          "$(err "$spike" 480)"  "| 2 | 480 | 0.0801 mm | 63.6% |" "$FEM_DOC"
+    check "§1 4 through, error vs theory (%)"  32.2 0 \
+          "$(err "$spike" 3840)" "| 4 | 3 840 | 0.1491 mm | 32.2% |" "$FEM_DOC"
+    check "§1 8 through, error vs theory (%)"  10.8 0 \
+          "$(err "$spike" 30720)" "| 8 | 30 720 | 0.1962 mm | 10.8% |" "$FEM_DOC"
+  fi
+else
+  echo "  - fem_spike not built, skipping §1's deflection table"
+  skipped="$skipped fem_spike"
+fi
+
+# --- §6's locking table, which the suite already computes -------------------------
+#
+# Free: `shipsim_tests` prints this on every run and the gate already runs it. Only
+# the document-side comparison was missing. It is the justification for the element
+# change -- at the slenderness of real plating a plain hex is 1 400x too stiff and a
+# linear tet 3 800x -- and the two stiff columns are quoted in the document to one
+# significant figure, so the expectation is the *published* value at the rounding it
+# was published at, exactly as the front page's Cb is.
+#
+# `TESTS` is set for the README block further down, which is *after* this one, and
+# `set -u` turns reading it early into an abort. Defaulted here rather than moved,
+# because the assignment below must keep working when this block is skipped. The
+# abort was caught the honest way, by running it: the gate exited 1 and printed no
+# success line, which is the behaviour the zero-checks fix above exists to guarantee.
+: "${TESTS:=./build/shipsim_tests}"
+if [ -x "$TESTS" ]; then
+  lock=$("$TESTS" 2>&1 | awk '/locking, demonstrated/,/explicit stability limit/' | awk '$1 == 500')
+  check "§6 locking at L/t=500, solid-shell"   0.996  5e-4 "$(echo "$lock" | awk '{print $2}')" \
+        "| 500 | 0.996 | 0.813 | **0.0007** | **0.0003** |" "$FEM_DOC"
+  check "§6 locking at L/t=500, ANS no EAS"    0.813  5e-4 "$(echo "$lock" | awk '{print $3}')" \
+        "| 500 | 0.996 | 0.813 | **0.0007** | **0.0003** |" "$FEM_DOC"
+  check "§6 locking at L/t=500, plain hex"     0.0007 5e-5 "$(echo "$lock" | awk '{print $4}')" \
+        "a plain hex is 1 400× too stiff" "$FEM_DOC"
+  check "§6 locking at L/t=500, linear tet"    0.0003 5e-5 "$(echo "$lock" | awk '{print $5}')" \
+        "tet 3 800× too stiff" "$FEM_DOC"
+else
+  echo "  - shipsim_tests not built, skipping §6's locking table"
+  skipped="$skipped shipsim_tests-locking"
+fi
+
 # --- the Phase 4 milestone -------------------------------------------------------
 #
 # `docs/06-roadmap.md`'s Phase 4 milestone publishes a table and a restraint window,

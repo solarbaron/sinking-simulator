@@ -9,22 +9,31 @@ of truth.
 ## The one command
 
 ```sh
-./scripts/verify.sh            # quick    build + tests             ~35 s
-./scripts/verify.sh full       # + clean rebuild, GPU, scenarios   ~400 s
-./scripts/verify.sh sanitize   # + ASan and TSan                   ~820 s
+./scripts/verify.sh selftest   # the gate's own negative controls      ~2 s
+./scripts/verify.sh            # quick    build + tests              ~120 s
+./scripts/verify.sh full       # + clean rebuild, GPU, scenarios     ~2300 s
+./scripts/verify.sh sanitize   # + ASan and TSan                     ~3200 s
 ```
+
+**Run `selftest` when you touch the gate.** It drives each reporter with a failure
+it was *not* written for and asserts it goes red — 21 controls in two seconds, at
+the head of every level. It exists because an audit found **fourteen checks in
+this gate that could not go red at all**, including three that accepted
+`0 checks, 0 failures` and two that called a rebuild compiling *nothing*
+"warning-clean".
+
+The figures above were re-measured after that audit; the ones they replace were
+stale by roughly five times, having been written when the suite was a fraction of
+its present size. Re-measure rather than trusting them, and budget generously on
+a shared box — the same gate took 180 s and 358 s at an earlier size depending
+only on what else was running.
 
 Run `quick` constantly and `sanitize` **before every commit** — the extra
 coverage over `full` is about a third more wall time, which is cheap enough that
 there is no reason to reserve it for concurrency or raw-memory work.
 
-Those figures are measured on an **idle** machine and they grow as the suite
-does; re-measure rather than trusting them. Sharing the box with one busy
-benchmark took the same gate from 180 s to 358 s at an earlier size, so budget
-generously before assuming a gate has hung. **Warnings are failures** — the build
-is
-`-Wall -Wextra -Wpedantic` and has been warning-clean since Phase 0, so a single
-warning means the signal is degrading.
+**Warnings are failures** — the build is `-Wall -Wextra -Wpedantic` and has been
+warning-clean since Phase 0, so a single warning means the signal is degrading.
 
 An incremental build cannot see a warning in a file it did not recompile, which
 is why `full` configures a throwaway build directory and compiles everything.
@@ -121,6 +130,10 @@ most useful thing to know about this codebase:
 | The gate's own build step failing and printing **nothing**: it greps the log for `error:`, and a compiler killed by a full disk never says that word | a negative control that fails *without* the word the reporter looks for |
 | 98 gated figures and **not one of them on `README.md`** — the front page, where the verdict a reader sees first had just changed | counting the gate's own coverage by document, rather than by figure |
 | A **mutation left applied** in the source by a sweep that was killed mid-iteration — and it did not fail loudly, it made the suite *hang* | a script that re-derives every injected substitution and greps the source for each, run *before* trusting a green tree |
+| The gate reporting `built warning-clean` off a rebuild that **compiled nothing** | a `ninja` stub that says `no work to do.` — the fix asserts an edge count |
+| `0 checks, 0 failures` satisfying a grep for `checks, 0 failures` in **three** places — unit, ASan and TSan — in the same week as `ok — 0 published figures` | driving each reporter with a *degenerate* run rather than a failing one |
+| A scenario that printed its verdict and then **segfaulted**, and a TSan run that crashed after its summary — both green, because the exit status was never read | asking what the status was, having already parsed the output |
+| A tool reporting `no usable GPU` **with a card present** passing as a skip, on four tools | classifying from outside the tool: an ICD and a device node exist, so a skip is a failure |
 | A boundary relaxation using `c_p` where `c_v` belongs, invisible to every existing test because they all stepped short enough that `C(1−e^{−rΔt/C}) → rΔt` **whatever `C` is** | asking the question at a step long enough for the exponential to bend |
 
 A green functional test is evidence the code does what you thought of, not that
