@@ -243,6 +243,20 @@ The four outermost rings resolve nothing, skip the recurrence entirely and are
 dead flat, which is what makes 60 km of sea nearly free — and is correct as well
 as cheap, since a 20 m wave at 20 km is a thousandth of a pixel.
 
+**Both tables are gated except for their milliseconds**, and the split is the
+point. `scripts/check-figures.sh` re-runs `seaway_view` with every parameter of
+this experiment named on the command line — the ship, Hs, Tp, heading and revs, all
+of them already the defaults — and checks the level count, the cell count, the eye
+height the reach is derived from, the reach itself, the vertex total and every cell
+of the table above. The three time columns are **not** checked and are not
+checkable here: displacement comes back anywhere between 41 and 52 ms on this box
+depending on what else is running, with the mesh bit-identical, so a gate on it
+would be a gate on the machine's mood. The vertex counts are what survive
+contention, and they are what the argument actually rests on. The first two rows of
+the cost table above are ungated for a different reason: no tool builds the uniform
+patch any more, so `55 ms` and `180 625` are history rather than a measurement
+anything can repeat.
+
 **What the cascade did *not* buy.** The near field still costs what it always did:
 level 0 and level 1 carry every component and are 79 000 of the 317 000 vertices
 but most of the 46 ms. Reaching the horizon is now cheap; resolving the water
@@ -793,11 +807,23 @@ Test ship (796 hull triangles) at 512 × 384 on a GTX 1070 Ti, best of six:
 | dented and torn | 13 680 | 2.02 ms | 0.24 ms | 0.23 ms | **0.028 ms** |
 
 and `tools/ram_view` on the ferry at 1280 × 720, with the compartments drawn
-behind the shell: 27 631 triangles, **0.15 ms** of GPU. Her 1 196 hull triangles
+behind the shell: 28 019 triangles, **0.15 ms** of GPU. Her 1 196 hull triangles
 refine to 7 568, of which 3 345 are cut out — 44.8 m² of hole at 4 m/s — in 3.7 ms.
 `--frames=N --out=DIR` writes it; the test suite writes `hull_damaged_ship.png`
 into `testing::scratchDir()` beside the ship-in-a-sea frame, for the same reason
 that one exists.
+
+That scene count read 27 631 until it was re-run. The interior drawn behind the
+shell *is* her compartment set, so authoring the mid wing tanks — the gap that let
+41% of a ram amidships tear open onto nothing — added 388 triangles to this frame
+as well as two compartments to the ship. It is the same drift the front page's
+`16 compartments` was, one document further out, and it survived because nothing
+re-ran the tool. The four counts either side of it are gated now:
+`scripts/check-figures.sh` runs `ram_view --speed=4.0 --duration=1` and reads them
+off the `drawn` line. **The two millisecond figures in this paragraph are not
+gated and cannot be**: they are wall clocks, and this box cannot hold still long
+enough to re-measure one — the 3.7 ms comes back between 3.5 and 3.6 with other
+work on the machine, which is contention and not a change in the mesh.
 
 Three things the table is saying:
 
@@ -1074,8 +1100,22 @@ Three findings, none of them expected:
   screen at **834 K**; this one peaks at **531 K** and emits 9.6e-10 of full scale.
   What a 4 MW machinery fire in an engine room looks like, through a two-zone
   model, is *smoke*. The glow is a result and not a setting, and `smoke_view`
-  asserts its absence rather than tuning it into view. Raising the design fire to
-  10 MW reaches 862 K and the layer does then glow.
+  asserts its absence rather than tuning it into view.
+
+  **And passing the threshold is not the same as being drawn as a light source**,
+  which is the part that had to be re-run to find out. `--power=10e6` reaches
+  **876 K**, past the 834 K one-byte mark, and still draws no glow at all: the
+  layer emits 6.7e-3 of full scale, under two codes of red against a layer that is
+  optically black, and **0** pixels of the frame come back red-dominant. It takes
+  `--power=12e6` — **990 K**, 1.1e-1 of full scale — before the layer is drawn as a
+  light source, and then **16 309** pixels of it are. Two hundred kelvin separate
+  the two, which is Planck's exponent and nothing about the renderer.
+
+  This paragraph published *862 K, and a glow*, until `check-figures.sh` re-ran it.
+  The 4 MW figures beside it were gated and stayed right; the 10 MW counterfactual
+  was not gated and did not — and a counterfactual is exactly where that matters,
+  because it is the control for the negative finding above it. Both powers are
+  gated now.
 - **The layer goes optically black within about a minute and stays there.** τ
   across the room passes 10 before t = 100 s and reaches 511. So the only visible
   information a two-zone model carries is the **interface height** — there is no

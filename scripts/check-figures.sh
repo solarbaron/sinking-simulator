@@ -29,19 +29,68 @@
 # both tonnages looking individually plausible and still have altered what the
 # ship does.
 #
+# **And what it counted about itself.** The count this script prints is not a count
+# of figures. At 155 it was 77 figures and 78 checks of its own pointers -- useful,
+# and not the same thing -- and neither number says *where* the coverage points.
+# Counted by document, which is the only way the README hole was ever going to be
+# visible, and against the crudest honest denominator there is, a line of the
+# document carrying a digit:
+#
+#   document                            lines  with a digit   figures gated
+#   README.md                             321            73        35
+#   docs/01-architecture.md               540            98         0
+#   docs/02-simulation.md                6151          1686         9
+#   docs/03-renderer-audio.md            1179           217         6  ->  56
+#   docs/04-multiplayer.md                130            18         0
+#   docs/05-data-modding-validation.md    423            72         0
+#   docs/06-roadmap.md                   1392           451        22
+#   docs/07-fem-spike-findings.md        1661           585         5
+#
+# 77 figures before, 127 after, inside a printed count that went 155 -> 229. Read
+# the two columns apart: a rising total is not coverage arriving anywhere in
+# particular, which is the whole of what the README hole taught.
+#
+# Two things fall out of reading it. **`06-roadmap.md` is the default sixth argument
+# to `check`, so counting explicit document arguments scores it zero** -- 22 of its
+# figures are gated by calls that name no document at all, and a coverage audit that
+# counts arguments rather than destinations gets the roadmap exactly backwards.
+#
+# And **`03-renderer-audio.md` was the worst covered of the documents that carry
+# tool output at all**: 217 lines with a digit against six figures, and the six were
+# the headline numbers of three findings rather than any of the measurements the
+# findings rest on. That was worth more than the raw ratio suggests, because it is
+# the only document describing a subsystem whose figures cannot be re-derived by
+# reading the source -- they are pixels and vertex counts. Two of them had drifted:
+# `ram_view`'s scene triangle count, and a 10 MW counterfactual that no longer holds
+# either in its temperature or in its conclusion. The three blocks below now cover
+# it, and the tools they run -- `seaway_view` most of all -- had published figures
+# that nothing in the repository re-ran.
+#
+# `01`, `04` and `05` stay at zero on purpose: `01` and `04` are design documents
+# whose digits are dates, section numbers and budgets nothing computes, and `05`'s
+# are the fields of a file format that `test_shipfile.cpp` already parses. A figure
+# is worth gating here when a *tool* produces it.
+#
 # Cost: the damage figures need no flooding at all and run with `--duration=1` in
 # about a second each; three runs pay for the full 900 s. Around 105 s for the
 # `ram_view` half, and another ~230 s for the README block below it -- the front
 # page quotes three 1800 s scenario runs and the size of the test suite, and none of
-# those can be had without running the thing.
+# those can be had without running the thing. The renderer blocks add ~18 s: ~5 s of
+# `seaway_view`, ~12 s of `smoke_view` and ~1 s of a sixth `ram_view` run.
 set -u
 
 RAM=${RAM:-./build/ram_view}
 SECTION=${SECTION:-./build/section_probe}
 SECTION_DOC=docs/02-simulation.md
+RENDER_DOC=docs/03-renderer-audio.md
 DOC=docs/06-roadmap.md
 fails=0
 checks=0
+# **Every block that does not run is named in the summary.** See the note above the
+# summary itself: a gate that skipped everything used to print `ok` and a count of
+# zero, which `verify.sh` accepts, and the count is the only thing that would have
+# said so.
+skipped=""
 
 red=$'\033[0;31m'; green=$'\033[0;32m'; dim=$'\033[2m'; off=$'\033[0m'
 
@@ -55,9 +104,16 @@ check() {
   local label="$1" expect="$2" tol="$3" actual="$4" quote="$5" where="${6:-$DOC}"
   checks=$((checks + 1))
   # Validate the pointer on every call, deduplicated. See the note above `hint`.
+  #
+  # **The key is the document as well as the quote**, and it was the quote alone.
+  # Nothing had collided yet -- all 57 pointers were distinct strings -- but two
+  # documents quoting the same table row is the ordinary case here, not an exotic
+  # one, and the second of them would have been recorded as validated on the
+  # strength of the first. A dedup key that is narrower than the thing it stands
+  # for is a checker that reports coverage it does not have.
   case "$checkedPointers" in
-    *"|$quote|"*) ;;
-    *) checkedPointers="$checkedPointers|$quote|"
+    *"|$where|$quote|"*) ;;
+    *) checkedPointers="$checkedPointers|$where|$quote|"
        checks=$((checks + 1))
        if ! grep -qF -- "$quote" "$where"; then
          printf '  %s✗%s the pointer %s"%s"%s no longer occurs in %s\n' \
@@ -137,6 +193,7 @@ if [ -x "$GPU" ]; then
   gpu768=$("$GPU" --radius=2.5 --sub=8 --steps=5505 --mapping=workgroup --jitter=2e-7 2>&1)
   if printf '%s\n' "$gpu768" | grep -q '^skipped: '; then
     echo "  - no Vulkan device, skipping the §8 torn counts"
+    skipped="$skipped zone_gpu_probe"
   else
     for h in "GPU float, torn (workgroup) | **40**" "CPU dissipation | **1.5194**" \
              "GPU float, torn (invocation) | **44**"; do
@@ -173,6 +230,7 @@ if [ -x "$GPU" ]; then
   fi
 else
   echo "  - zone_gpu_probe not built, skipping the §8 torn counts"
+  skipped="$skipped zone_gpu_probe"
 fi
 
 # --- the Phase 4 milestone -------------------------------------------------------
@@ -248,6 +306,7 @@ if [ -x "$MILESTONE" ]; then
   fi
 else
   echo "  - bulkhead_probe not built, skipping the Phase 4 milestone figures"
+  skipped="$skipped bulkhead_probe"
 fi
 
 # --- the front page ---------------------------------------------------------------
@@ -429,6 +488,7 @@ if [ -x "$SHIPSIM" ]; then
   fi
 else
   echo "  - shipsim not built, skipping the README's scenario figures"
+  skipped="$skipped shipsim-scenarios"
 fi
 
 # The front page's own count of the validation suite, which is the one figure here
@@ -441,6 +501,7 @@ if [ -x "$TESTS" ]; then
         "198869 validation checks" "$FRONT"
 else
   echo "  - shipsim_tests not built, skipping the README's check count"
+  skipped="$skipped shipsim_tests"
 fi
 
 # The three numbers the SURVIVED -> LOST verdict actually rests on. Until `--gm-detail`
@@ -476,6 +537,7 @@ if [ -x "$SHIPSIM" ]; then
         18.684 5e-4 "$(detail layer_breadth_m)" "mean** breadth of 18.684 m" "$FRONT"
 else
   echo "  - shipsim not built, skipping the README's GM-detail figures"
+  skipped="$skipped shipsim-gmdetail"
 fi
 
 # **`ram_view` is a Vulkan target, so a machine with no device never builds it --
@@ -555,8 +617,54 @@ if [ -x "$RAM" ]; then
   qheel=$(outcome_line "$out" | sed -n 's/.*heel \(-\{0,1\}[0-9.]*\) deg.*/\1/p')
   check "floodwater at the quarter (t)" 7323 150 "$qwater" "at the quarter she takes"
   check "heel at the quarter (deg)"    -47.8 1.0 "$qheel" "at the quarter she takes"
+
+  # --- and what the *renderer* makes of that damage, which is 03's figure not 06's
+  #
+  # `docs/03-renderer-audio.md`'s damage-cost paragraph is the only place the
+  # renderer is measured on a real ship, and none of it was gated. It had drifted,
+  # in the one column that cannot move unless the ship does: 27 631 scene triangles
+  # for 28 019. The interior drawn behind the shell *is* her compartment set, so
+  # authoring the mid wing tanks -- the same gap that had 41% of a ram amidships
+  # tearing open onto nothing -- added 388 triangles here, and the front page's
+  # `16 compartments` was the identical drift one document in.
+  #
+  # ~1 s: `--duration=1` runs almost no flooding, and every count below is fixed
+  # before the first step -- the refinement is of the undeformed plating and the
+  # scene is rebuilt identically each frame. Both were checked against
+  # `--duration=120` and against `--frames=3`, and neither moves.
+  #
+  # **The two millisecond figures in that paragraph are deliberately not here.**
+  # `3.7 ms` of rebuild and `0.15 ms` of GPU are wall clocks; on a box with other
+  # work on it the rebuild reads 3.5, which is contention and not a change in the
+  # mesh, and a gate that goes red for that teaches people to ignore it.
+  drawn=$("$RAM" --speed=4.0 --duration=1 --frames=1 --out=/tmp 2>&1)
+  drawn_line() { printf '%s\n' "$drawn" | grep '^drawn'; }
+  src=$(drawn_line | sed -n 's/.*her \([0-9]*\) hull triangles.*/\1/p')
+  refined=$(drawn_line | sed -n 's/.*refine to \([0-9]*\),.*/\1/p')
+  cutout=$(drawn_line | sed -n 's/.*of which \([0-9]*\) are cut out.*/\1/p')
+  holem2=$(drawn_line | sed -n 's/.*cut out (\([0-9.]*\) m2 of hole).*/\1/p')
+  check "the ferry's hull triangles before refinement" 1196 0 "$src" \
+        "Her 1 196 hull triangles" "$RENDER_DOC"
+  check "what they refine to at 4 m/s" 7568 0 "$refined" \
+        "refine to 7 568, of which 3 345 are cut out" "$RENDER_DOC"
+  check "how many of those are cut out" 3345 0 "$cutout" \
+        "refine to 7 568, of which 3 345 are cut out" "$RENDER_DOC"
+  check "the drawn hole at 4 m/s (m2)" 44.8 0.05 "$holem2" \
+        "44.8 m² of hole at 4 m/s" "$RENDER_DOC"
+  # The scene total needs a device, because it is counted off a frame that was
+  # actually submitted. The four counts above do not and are checked either way --
+  # `damage.cpp` contains no Vulkan on purpose, and this keeps that purpose.
+  if printf '%s\n' "$drawn" | grep -q 'no usable GPU'; then
+    echo "  - no Vulkan device, skipping ram_view's drawn scene total"
+    skipped="$skipped ram_view-scene"
+  else
+    scene=$(printf '%s\n' "$drawn" | sed -n 's/^ *[0-9]* vertices, \([0-9]*\) triangles, gpu.*/\1/p')
+    check "triangles in the drawn scene: hull, interior and sea" 28019 0 "$scene" \
+          "28 019 triangles" "$RENDER_DOC"
+  fi
 else
   echo "  - ram_view not built, skipping the collision-milestone figures"
+  skipped="$skipped ram_view"
 fi
 
 # --- the section mesher's reach ---------------------------------------------------
@@ -613,6 +721,86 @@ if [ -x "$SECTION" ]; then
         "$(field "$open" GJrel)" "9.6 m of 134.4 | −3.334%" "$SECTION_DOC"
 else
   echo "  - section_probe not built, skipping the reach figures"
+  skipped="$skipped section_probe"
+fi
+
+# --- the ocean cascade, which is the largest ungated block in 03 -------------------
+#
+# `docs/03-renderer-audio.md` publishes the cascade's shape as a table -- nine
+# levels, what each carries, what each costs in vertices -- and until now not one
+# cell of it was checked. It is the section that most wants checking, because the
+# whole argument is that **reach is exponential in the number of levels while cost
+# is linear in it**, and the evidence for that is a set of integers: the level
+# count, the ring vertex count that is the same at every level, and the component
+# count falling to zero on the rings that resolve nothing.
+#
+# **Every parameter of the experiment is passed explicitly, including the ones that
+# are already the defaults.** That is the §8 lesson kept: a probe that derives part
+# of its own experiment is a probe whose figures cannot be compared against the
+# table they came from. `--hs` sets the shortest component, the shortest component
+# sets the cell size, the cell size sets the cell count -- so a default that moved
+# would move every figure below while the document went on naming Hs 4 m.
+#
+# **The wall clocks in that table are not gated and cannot be.** `46 ms` of
+# displacement comes back between 41 and 52 on this box depending on what else is
+# running -- a 25% spread with the mesh bit-identical -- and `2.5 ms` of upload
+# spreads further. Vertices and reach survive contention; milliseconds do not.
+#
+# ~5 s at `--frames=1`: the counts below are set before the loop and do not depend
+# on it, but the level table and the vertex total are printed from a frame that was
+# actually built, so one frame is the floor. Verified identical at `--frames=2`.
+SEAWAY=${SEAWAY:-./build/seaway_view}
+if [ -x "$SEAWAY" ]; then
+  sea=$("$SEAWAY" --out=/tmp --frames=1 --ship=s175 --hs=4 --tp=9 --heading=180 --revs=4.6 2>&1)
+  casc() { printf '%s\n' "$sea" | grep '^ *ocean cascade:'; }
+  levels=$(casc | sed -n 's/^ *ocean cascade: \([0-9]*\) levels.*/\1/p')
+  cells=$(casc | sed -n 's/^ *ocean cascade: [0-9]* levels, \([0-9]*\) cells.*/\1/p')
+  eyeup=$(casc | sed -n 's/.*for an eye \([0-9]*\) m up.*/\1/p')
+  reachkm=$(casc | sed -n 's/.*reaching \([0-9]*\) km .*/\1/p')
+  # The cascade line is printed before any device is touched, so these four hold on
+  # a machine with no Vulkan as well as on this one -- which is the half of the
+  # section that is pure arithmetic over the camera and the spectrum.
+  check "seaway_view's cascade levels"        9   0 "$levels"  "Nine levels of 212 cells" "$RENDER_DOC"
+  check "seaway_view's cells per level"       212 0 "$cells"   "Nine levels of 212 cells" "$RENDER_DOC"
+  check "the eye height the reach is set by (m)" 69 0.5 "$eyeup" \
+        "camera 69 m up at 1280" "$RENDER_DOC"
+  check "the cascade's reach (km)"            67  0.5 "$reachkm" "| 67 km | 316 729 |" "$RENDER_DOC"
+
+  if printf '%s\n' "$sea" | grep -q 'no usable GPU'; then
+    echo "  - no Vulkan device, skipping the per-level cascade table"
+    skipped="$skipped seaway_view-levels"
+  else
+    # `[cell components vertices]` per level, so the n-th bracket is field 2n when
+    # the line is split on brackets. Counted forward from the level rather than back
+    # from the end, for the reason the §8 columns are: the tail of this line is nine
+    # identical-looking rings and the interesting one is the first.
+    level() { printf '%s\n' "$1" | grep '^ *cascade levels' |
+              awk -F'[][]' -v n="$2" '{ print $(2 * n) }' | awk -v c="$3" '{ print $c }'; }
+    comp_row="| components carried | 128 | 128 | 120 | 96 | 16 | **0** |"
+    vert_row="| vertices | 45 369 | 33 920 | 33 920 | 33 920 | 33 920 | 33 920 each |"
+    # **The components column is the finding and the vertices column is the guard.**
+    # Levels 5 and 6 dropping to 16 and then 0 is what makes 60 km of sea nearly
+    # free; the vertices column is flat by construction, so a ring that quietly
+    # stopped being a ring shows up there and nowhere else.
+    check "level 1: components carried" 128 0 "$(level "$sea" 1 2)" "$comp_row" "$RENDER_DOC"
+    check "level 2: components carried" 128 0 "$(level "$sea" 2 2)" "$comp_row" "$RENDER_DOC"
+    check "level 3: components carried" 120 0 "$(level "$sea" 3 2)" "$comp_row" "$RENDER_DOC"
+    check "level 4: components carried"  96 0 "$(level "$sea" 4 2)" "$comp_row" "$RENDER_DOC"
+    check "level 5: components carried"  16 0 "$(level "$sea" 5 2)" "$comp_row" "$RENDER_DOC"
+    check "level 6: components carried"   0 0 "$(level "$sea" 6 2)" "$comp_row" "$RENDER_DOC"
+    check "level 1: vertices" 45369 0 "$(level "$sea" 1 3)" "$vert_row" "$RENDER_DOC"
+    check "level 2: vertices" 33920 0 "$(level "$sea" 2 3)" "$vert_row" "$RENDER_DOC"
+    check "level 3: vertices" 33920 0 "$(level "$sea" 3 3)" "$vert_row" "$RENDER_DOC"
+    check "level 4: vertices" 33920 0 "$(level "$sea" 4 3)" "$vert_row" "$RENDER_DOC"
+    check "level 5: vertices" 33920 0 "$(level "$sea" 5 3)" "$vert_row" "$RENDER_DOC"
+    check "level 6: vertices" 33920 0 "$(level "$sea" 6 3)" "$vert_row" "$RENDER_DOC"
+    verts=$(printf '%s\n' "$sea" | sed -n 's/^ *best frame: \([0-9]*\) ocean vertices.*/\1/p')
+    check "ocean vertices in the drawn cascade" 316729 0 "$verts" \
+          "| 67 km | 316 729 |" "$RENDER_DOC"
+  fi
+else
+  echo "  - seaway_view not built, skipping the ocean cascade figures"
+  skipped="$skipped seaway_view"
 fi
 
 # --- the volumetric fire and smoke figures ---------------------------------------
@@ -624,22 +812,49 @@ fi
 # reverse. So the glow threshold and the peak layer temperature are checked as a
 # pair, on either side of each other, rather than as two numbers.
 #
-# ~10 s. `smoke_view` asserts these itself and exits non-zero if they move; what
-# this adds is that the *document* still says what the tool says.
+# **The table those findings rest on is now checked cell by cell, and so is the
+# counterfactual beside them.** Six figures of this document were gated when 155
+# were gated in total, against 217 of its lines carrying a digit -- and the six were
+# the findings' headline numbers rather than any of the measurements underneath
+# them. Two things had drifted in that gap, neither of which any test could see:
+# `ram_view`'s scene triangle count below, and this section's own "10 MW reaches
+# 862 K and the layer does then glow", which is 876 K and does not.
+#
+# ~12 s: the 4 MW run is the one `verify.sh` already makes, and the two `--power`
+# runs cost under a second each. **They are read for their output and not for their
+# exit status, deliberately.** Above its design fire `smoke_view` fails checks
+# written for a layer that does not glow -- at 10 MW the red-dominance assertion
+# fires with 0 pixels, at 12 MW the "layer blacked out" one fires because a glowing
+# layer is not black -- so both runs print `CHECKS FAILED` while printing exactly
+# the figures the document publishes. That is a limitation of the tool's acceptance
+# contract at powers it was not written for, recorded here rather than worked
+# around, and it is why the `--power` runs are parsed rather than trusted.
 SMOKE=${SMOKE:-./build/smoke_view}
-RENDER_DOC=docs/03-renderer-audio.md
 if [ -x "$SMOKE" ]; then
   smoke=$("$SMOKE" --out=/tmp --frames=8 --duration=600 2>&1)
   if printf '%s\n' "$smoke" | grep -q 'no usable GPU'; then
     echo "  - no Vulkan device, skipping the fire and smoke figures"
+    skipped="$skipped smoke_view"
   else
+    # The last two are quoted by the *relation* blocks below rather than by any
+    # `check`, and that is exactly the case the header of this file is about: a
+    # pointer only a failure prints is a pointer nobody reads until it is wrong.
+    # `"This fire has no fire in it"` had been printed by the glow relation since it
+    # was written, against nothing.
     for h in "at **834 K**" "peaks at **531 K**" "reaches 511" \
-             "84.1% of the engine"; do
+             "84.1% of the engine" "This fire has no fire in it" \
+             "passes 10 before t = 100 s"; do
       hint "$h" "$RENDER_DOC"
     done
     # Each reader anchored to its own line, for the reason the damage figures are:
     # `531` also appears in the table two rows above the one being read.
-    last_frame() { printf '%s\n' "$1" | grep 'smoke_07.png' | awk '{ print $'"$2"' }'; }
+    #
+    # A cell of the casualty table, addressed by the frame's own file name and by
+    # column number counted forward: 1 frame, 2 t, 3 Q, 4 T_u, 5 z_i, 6 k, 7 tau,
+    # 8 visibility, 9 emission. The file name is what makes a row addressable at
+    # all -- every other field repeats down the table, and `t` is the very thing
+    # being asserted on two of these rows.
+    cell() { printf '%s\n' "$1" | grep "$2" | awk '{ print $'"$3"' }'; }
     glow=$(printf '%s\n' "$smoke" | sed -n 's/.*one byte of red on the screen at \([0-9]*\) K.*/\1/p')
     peak=$(printf '%s\n' "$smoke" | sed -n 's/.*this one peaked at \([0-9]*\) K.*/\1/p')
     check "the glow threshold (K)" 834 1 "$glow" "at **834 K**" "$RENDER_DOC"
@@ -655,21 +870,167 @@ if [ -x "$SMOKE" ]; then
       printf '      %s%s says "This fire has no fire in it"%s\n' "$dim" "$RENDER_DOC" "$off"
       fails=$((fails + 1))
     fi
-    check "optical depth across the room at t = 600 s" 511 3 "$(last_frame "$smoke" 7)" \
+    check "optical depth across the room at t = 600 s" 511 3 "$(cell "$smoke" smoke_07.png 7)" \
           "reaches 511" "$RENDER_DOC"
-    check "the layer's extinction at t = 600 s (1/m)" 19.90 0.1 "$(last_frame "$smoke" 6)" \
+    check "the layer's extinction at t = 600 s (1/m)" 19.90 0.1 "$(cell "$smoke" smoke_07.png 6)" \
           "| 19.90 | 511" "$RENDER_DOC"
     plan=$(printf '%s\n' "$smoke" | sed -n 's/.*\([0-9][0-9]\.[0-9][0-9]\)% of the bounding box.*/\1/p')
     check "the drawn prism, % of the bounding box in plan" 84.11 0.05 "$plan" \
           "84.1% of the engine" "$RENDER_DOC"
+
+    # --- and the casualty table itself, cell by cell --------------------------
+    #
+    # **One pointer per row, and it is the row verbatim**, the arrangement the
+    # README's trapped-air table above uses and for the same reason: `check`
+    # compares the tool against a constant in this file, so a row edited in the
+    # *document* alone is caught by its pointer or it is not caught at all. Every
+    # number in a row is inside that row's pointer, so there is no cell here that a
+    # doc-only edit can move quietly.
+    #
+    # The t column is gated too, on the two interior rows, because it is not
+    # decoration: the sample instants are `duration * frame / (frames - 1)`, and a
+    # figure read at a different instant is the mistake the §8 block above exists
+    # to prevent. Gating 171 and 343 pins the schedule the rest of the row is read
+    # on, in the document, next to the numbers.
+    row0="| 0   | 0.00 | 288 | 7.00 | 0.00  | 0    | clear |"
+    row171="| 171 | 1.38 | 343 | 3.43 | 2.34  | 60   | 1.28  |"
+    row343="| 343 | 4.00 | 523 | 3.05 | 11.22 | 288  | 0.267 |"
+    row600="| 600 | 4.00 | 531 | 3.13 | 19.90 | 511  | 0.151 |"
+    # t = 0 is the ambient control: the room before anything happens, at the
+    # compartment's own height and with no extinction at all. It is the row that
+    # cannot move unless the ship or the atmosphere does.
+    check "t=0: the layer temperature (K)"      288  0.5   "$(cell "$smoke" smoke_00.png 4)" "$row0"   "$RENDER_DOC"
+    check "t=0: the interface height (m)"       7.00 0.005 "$(cell "$smoke" smoke_00.png 5)" "$row0"   "$RENDER_DOC"
+    check "t=171: the sample instant (s)"       171  0.5   "$(cell "$smoke" smoke_02.png 2)" "$row171" "$RENDER_DOC"
+    check "t=171: heat release (MW)"            1.38 0.005 "$(cell "$smoke" smoke_02.png 3)" "$row171" "$RENDER_DOC"
+    check "t=171: the layer temperature (K)"    343  0.5   "$(cell "$smoke" smoke_02.png 4)" "$row171" "$RENDER_DOC"
+    check "t=171: the interface height (m)"     3.43 0.005 "$(cell "$smoke" smoke_02.png 5)" "$row171" "$RENDER_DOC"
+    check "t=171: extinction (1/m)"             2.34 0.005 "$(cell "$smoke" smoke_02.png 6)" "$row171" "$RENDER_DOC"
+    check "t=171: optical depth across the room" 60  0.5   "$(cell "$smoke" smoke_02.png 7)" "$row171" "$RENDER_DOC"
+    check "t=171: visibility 3/k (m)"           1.28 0.005 "$(cell "$smoke" smoke_02.png 8)" "$row171" "$RENDER_DOC"
+    check "t=343: the sample instant (s)"       343  0.5   "$(cell "$smoke" smoke_04.png 2)" "$row343" "$RENDER_DOC"
+    check "t=343: heat release (MW)"            4.00 0.005 "$(cell "$smoke" smoke_04.png 3)" "$row343" "$RENDER_DOC"
+    check "t=343: the layer temperature (K)"    523  0.5   "$(cell "$smoke" smoke_04.png 4)" "$row343" "$RENDER_DOC"
+    check "t=343: the interface height (m)"     3.05 0.005 "$(cell "$smoke" smoke_04.png 5)" "$row343" "$RENDER_DOC"
+    check "t=343: extinction (1/m)"             11.22 0.005 "$(cell "$smoke" smoke_04.png 6)" "$row343" "$RENDER_DOC"
+    check "t=343: optical depth across the room" 288 0.5   "$(cell "$smoke" smoke_04.png 7)" "$row343" "$RENDER_DOC"
+    check "t=343: visibility 3/k (m)"           0.267 0.0005 "$(cell "$smoke" smoke_04.png 8)" "$row343" "$RENDER_DOC"
+    check "t=600: the interface height (m)"     3.13 0.005 "$(cell "$smoke" smoke_07.png 5)" "$row600" "$RENDER_DOC"
+    check "t=600: visibility 3/k (m)"           0.151 0.0005 "$(cell "$smoke" smoke_07.png 8)" "$row600" "$RENDER_DOC"
+
+    # --- the three findings' own numbers, which are not in the table -----------
+    #
+    # The descent and the recovery are the whole of "the layer does not descend
+    # monotonically", and neither was gated. That finding has been wrong once
+    # already in the other direction -- the first version of the test asserted a
+    # monotone descent -- so it is the one on this page most worth holding to a
+    # measurement. Gating both numbers *is* gating the relation: the recovery is
+    # above the minimum by construction of what is printed.
+    lowest=$(printf '%s\n' "$smoke" | sed -n 's/.*layer descended  *[0-9.]* m to \([0-9.]*\) m.*/\1/p')
+    back=$(printf '%s\n' "$smoke" | sed -n 's/.*steady state back to \([0-9.]*\) m.*/\1/p')
+    emit=$(printf '%s\n' "$smoke" | sed -n 's/.*(emission \([0-9.e+-]*\)).*/\1/p')
+    check "the lowest the interface reaches (m)" 2.96 0.005 "$lowest" \
+          "reaches 2.96 m at about t = 300" "$RENDER_DOC"
+    check "what it recovers to by t = 600 (m)"   3.13 0.005 "$back" \
+          "*recovers* to 3.13 m" "$RENDER_DOC"
+    # 9.6e-10 of full scale is the *quantitative* half of "no fire in it": the
+    # temperature pair above says the layer is under the threshold, this says by
+    # how far. A tolerance of 5e-12 is the digit the document publishes to.
+    check "the peak emission, fraction of full scale" 9.6e-10 5e-12 "$emit" \
+          "emits 9.6e-10 of full scale" "$RENDER_DOC"
+
+    # **"τ passes 10 before t = 100 s" is a relation and nothing above implies it.**
+    # Every gated cell could match while the first sample to go optically thick had
+    # moved past 100 s, because no row of the table is at that instant. So the
+    # printed table is scanned for the first row whose optical depth exceeds 10 and
+    # its own timestamp is asserted -- which is also the only thing here that would
+    # notice the frame schedule stretching underneath the figures.
+    checks=$((checks + 1))
+    thick=$(printf '%s\n' "$smoke" |
+            awk 'NF == 10 && $1 ~ /^[0-9]+$/ && $7 + 0 > 10 { print $2; exit }')
+    if [ -n "$thick" ] && awk -v t="$thick" 'BEGIN { exit !(t > 0 && t < 100) }'; then
+      printf '  %s✓%s and the layer is optically thick by t = %s s, inside the minute claimed\n' \
+             "$green" "$off" "$thick"
+    else
+      printf '  %s✗%s the layer no longer passes tau = 10 before t = 100 s (first at "%s")\n' \
+             "$red" "$off" "$thick"
+      printf '      %s%s says "passes 10 before t = 100 s"%s\n' "$dim" "$RENDER_DOC" "$off"
+      fails=$((fails + 1))
+    fi
+
+    # --- the counterfactual, which is the control for the negative finding -----
+    #
+    # "This fire has no fire in it" is only a statement about *this fire* if the
+    # renderer can draw a glow when there is one, and the document's evidence for
+    # that was a sentence nothing re-ran. Two runs, ~0.6 s each: at 10 MW the layer
+    # is past the one-byte threshold and still puts no red-dominant pixel on the
+    # screen; at 12 MW it is drawn as a light source. The pair is the point exactly
+    # as the capsize bracket above is -- either number alone would look plausible
+    # while the boundary between smoke and fire had moved.
+    #
+    # The pixel counts are rasterised on the device, so they carry a tolerance where
+    # the temperatures do not: 100 pixels of a 16 000-pixel layer is far tighter
+    # than the difference between a glow and none, and does not pretend a different
+    # card would round every edge identically.
+    # The emissions are quoted to two figures in the document where the tool prints
+    # three, so -- as the front page's Cb and GM are -- the expectation is the
+    # *published* value and the tolerance is the rounding it was published at.
+    peakof() { printf '%s\n' "$1" | sed -n 's/.*this one peaked at \([0-9]*\) K.*/\1/p'; }
+    emitof() { printf '%s\n' "$1" | sed -n 's/.*(emission \([0-9.e+-]*\)).*/\1/p'; }
+    litof()  { printf '%s\n' "$1" | sed -n 's/.*  *\([0-9][0-9]*\) red-dominant pixels.*/\1/p'; }
+    glow10=$("$SMOKE" --out=/tmp --frames=8 --duration=600 --power=10e6 2>&1)
+    glow12=$("$SMOKE" --out=/tmp --frames=8 --duration=600 --power=12e6 2>&1)
+    # **Zero tolerance on both temperatures**, which took a perturbation to settle:
+    # `876 ± 1` cannot fail on a one-kelvin move, and one kelvin is the whole digit
+    # the tool prints. Both come back exact over six repeats and over every frame
+    # count from 8 to 48, so the tolerance is what was measured -- the §8 argument
+    # for gating a deterministic integer at 0.
+    check "at 10 MW, the peak layer temperature (K)" 876 0 "$(peakof "$glow10")" \
+          "**876 K**" "$RENDER_DOC"
+    check "at 10 MW, the peak emission, fraction of full scale" 6.7e-3 5e-5 \
+          "$(emitof "$glow10")" "6.7e-3 of full scale" "$RENDER_DOC"
+    check "at 10 MW, red-dominant pixels in the last frame" 0 0 "$(litof "$glow10")" \
+          "**0** pixels of the frame come back red-dominant" "$RENDER_DOC"
+    check "at 12 MW, the peak layer temperature (K)" 990 0 "$(peakof "$glow12")" \
+          "**990 K**" "$RENDER_DOC"
+    check "at 12 MW, the peak emission, fraction of full scale" 1.1e-1 5e-3 \
+          "$(emitof "$glow12")" "1.1e-1 of full scale" "$RENDER_DOC"
+    check "at 12 MW, red-dominant pixels in the last frame" 16309 100 "$(litof "$glow12")" \
+          "**16 309** pixels of it are" "$RENDER_DOC"
   fi
 else
   echo "  - smoke_view not built, skipping the fire and smoke figures"
+  skipped="$skipped smoke_view"
 fi
 
+# **A gate that ran nothing used to report success.** With every tool absent this
+# printed `ok — 0 published figures still match the tool` and exited 0, and
+# `verify.sh` greps for `^ok — ` and passed it. That is the same shape as the
+# `exit 0` on an unbuilt `ram_view` recorded above -- a green result standing for
+# work that did not happen -- except that this one survives *every* block being
+# skipped rather than the ones after a single point, so it is strictly the larger
+# hole. The count was the only thing that would have shown it, and a count nobody
+# diffs is not a signal.
+#
+# Two things close it. **A gate that checked nothing has not passed**, so zero
+# checks is a failure in its own right. And a skip is named on the success line
+# rather than only where it happened, because the summary is the line that gets
+# read and pasted -- the per-block notes scroll off the top of a 900 s run. GPU
+# blocks must still *skip* rather than fail on a machine with no device, which is
+# why a named skip is not itself red: what was missing is that it be visible.
+if [ "$checks" -eq 0 ]; then
+  printf '%s✗%s the gate checked nothing at all — no tool it reads was built\n' "$red" "$off"
+  echo "0 of 0 published figures could be checked;$skipped did not run"
+  exit 1
+fi
 if [ "$fails" -eq 0 ]; then
-  echo "ok — $checks published figures still match the tool"
+  if [ -n "$skipped" ]; then
+    echo "ok — $checks published figures still match the tool, and these did not run:$skipped"
+  else
+    echo "ok — $checks published figures still match the tool"
+  fi
   exit 0
 fi
 echo "$fails of $checks published figures have drifted"
+[ -n "$skipped" ] && echo "   and these blocks did not run:$skipped"
 exit 1
