@@ -971,10 +971,172 @@ should be honest about that.
   the water on the deck does not shrink the gas space; and boundary cooling
   needed no new mechanism at all — it is `wallConductance` and `wallTemperature`,
   which `GasCompartment` already carries.
-- Suppression by gas: CO₂ and inert-gas total flooding (oxygen displacement, and
-  the sealing requirement that makes it fail with a door open), high-expansion
-  foam, dry powder. All of them need a second gas species with its own `R` and
-  `γ`, which is the same change the steam mass above wants.
+- ✅ **Suppression by gas: CO₂ and inert-gas total flooding** — `fire::AgentSpecies`,
+  `fire::AgentSystem`, `fire::agentMassForFraction`, `fire::exposureAt`,
+  `GasCompartment::settlingVelocity`, `DesignFire::limitingOxygen`. A second gas
+  species with its own `R` and `γ`, carried in both layers, separating under
+  gravity, displacing the oxygen the fire breathes, and leaking back out through
+  the ship's own openings.
+
+  **The closure generalises exactly rather than being approximated.** Per layer
+  `p V_k = (m_air R_air + m_agent R_agent) T_k = (γ_k−1) U_k`, so
+  `p = [(γ_u−1)U_u + (γ_l−1)U_l]/V` and the volume split is still the
+  *pressure-energy* split with no root find. `Layer::excessEnergy` carries the
+  whole difference — the extra internal energy a pure-air layer would need to
+  press as hard — and it is **exactly 0.0** without an agent, so every figure
+  already published is bit-identical. Asserted as bit-identity, not as closeness.
+
+  **The agent stratifies downward, and that is the hazard.** CO₂ is M = 44 against
+  air's 29. The discharge is delivered *mixed* (in proportion to the layers'
+  moles: a total-flooding jet is what NFPA 12's two-minute limit exists to
+  produce), and every bit of stratification is then a buoyant separation flux with
+  a single coefficient, `settlingVelocity`. Two one-way streams, not a diffusive
+  exchange, because a diffusive exchange drives towards uniformity and gravity
+  drives towards segregation: the agent falls out of the layer it does not belong
+  in, and the carrier gas is floated out of the layer it does, in proportion to
+  the agent fraction there. Both are `expm1` relaxations, both are exactly zero
+  without an agent, and the fixed point of the pair is the fully stratified state.
+  **Both limits are closed forms and both are asserted:**
+
+  | | concentration at the deck | O₂ at the deck | at the deckhead |
+  |---|---|---|---|
+  | `w = 0`, perfectly mixed | 40.0% | 12.57% | the same |
+  | `w → ∞`, perfectly stratified | **100%** | **0%** | nearly air |
+
+  In the stratified limit the blanket is pure agent under pure air at one
+  temperature, so it occupies the agent's own mole fraction of the height: **2.40 m
+  of a 6 m machinery space at 40%**, asserted as a length. The direction is a
+  consequence of the molar mass and not a hard-coded drift — the same run with
+  IG-100 (nitrogen, M = 28) puts the blanket under the *deckhead* and leaves a
+  person on the deck breathing all of the oxygen.
+
+  **The mass is not free, and the pressure is what loses you the concentration.**
+  40% by volume means the space is holding `1/(1−y)` times the moles it started
+  with, so a sealed 720 m³ machinery space at its design concentration sits
+  **67.6 kPa above atmospheric** — seven metres of water head on every boundary —
+  on 893.4 kg of CO₂. That is the term that drives the agent back out, and where
+  the opening is decides everything. Thirty minutes after a 120 s discharge, with
+  one 0.8 × 2.0 m door and nothing else different:
+
+  | | agent lost | concentration held |
+  |---|---|---|
+  | sealed | **exactly 0 kg** | 40.0% |
+  | door at the deck (sill 0 m) | **892.8 kg of 893.4** | **0.04%** |
+  | the same door at the deckhead (sill 4 m) | 220.1 kg | **46.8%** |
+
+  A door at the deck loses 99.9% of the charge. The *identical* door four metres
+  higher loses a quarter of it and leaves the space **richer than it was aimed
+  at**, because what a high vent sheds is the air standing over the blanket. A
+  single Δp at the orifice centre cannot tell those two holes apart; the height
+  integral the doorway needed for hot gas is what makes this a mechanism rather
+  than an assumption, which is the second time in this file that has been the case.
+
+  **Extinguishing is displacement.** The air the fire breathes is the air its plume
+  entrains, so the two layers are weighted by `Plume::entrainment` — the
+  correlation already there, and no new coefficient — and the design curve is
+  scaled by a linear ramp between the fuel's limiting oxygen concentration and
+  ambient. `X_O2 = 0.2095(1−y)`, so a fuel at `L = 0.13` is out at **y = 37.95%**
+  and nowhere else, which is why the marine design concentration is 40 and not 30.
+  The control beside it: the same 3 MW fire in the same space **with no agent is
+  still burning ten minutes later**, at full oxygen availability and more than
+  200 K over ambient, while the flooded one is out and cooling.
+
+  **The phase change is modelled, and the number is large.** CO₂ leaves the bottle
+  as a liquid and arrives as cold vapour and dry-ice snow at 194.65 K; the snow
+  sublimes in the compartment and the compartment pays for it, at **constant
+  volume** — `L_sub − R T_sub`, not `L_sub`, and using the constant-pressure
+  enthalpy instead over-states the sink 2.5-fold. Per kilogram the gas receives
+  **−6.31 kJ**: negative, so the discharge is a net internal-energy sink even
+  counting the agent's own gas. On the gas alone that is **145.2 K and 85.1 kPa —
+  *below* atmospheric despite a tonne of added gas**. Against a 25 W/(m²·K)
+  boundary at ambient the same space comes all the way back to 288.15 K and
+  168.9 kPa. Both are asserted. The gas-only chill is a **ceiling and not a
+  prediction**: everything the space *contains* is missing as a thermal mass, and
+  this model has only `wallConductance` against `wallTemperature`.
+
+  **What it does to the people in the space, as data.** At 40% CO₂ the oxygen is
+  12.57% — below the 19.5% entry limit, above the 10% that takes consciousness,
+  and well above the 6% that kills. **On oxygen alone the atmosphere is
+  survivable. It is lethal anyway**, because 40% CO₂ is four times CO₂'s own
+  lethal concentration and CO₂ is not merely an asphyxiant. Stratified, the deck is
+  inside a blanket at ~100% and there is no oxygen there at all while the gas at
+  the deckhead is still nearly air — so the space's *mean* concentration describes
+  neither. IG-541 at the same 40% leaves the same 12.57% oxygen and 3.2% CO₂,
+  under the 4% IDLH: not lethal, and still not an atmosphere anyone may enter.
+  That contrast is the whole reason the blend exists, and here it is emergent from
+  one species record rather than asserted.
+
+  **Two corrections, both found by measuring rather than by thinking.**
+
+  *Freezing `γ` in the `p dV` split is wrong and it shows.* With a second species
+  each layer's own `γ` moves as its composition does, and the obvious
+  generalisation — the same elimination with `a` and `b` held constant — leaves a
+  counter-current exchange between two layers at **one** temperature at two
+  temperatures. Nothing had been heated. The corrected split carries
+  `K_k = T_k(dR_k − a_k dC_k)` and is **exact** for the isothermal case, which is
+  what turns the blanket's depth from a 1% claim into a machine-precision one; the
+  spurious split was 5 K and 1% of the interface height.
+
+  *Delivering the discharge by volume under-doses the layer the fire is in.*
+  "Perfectly mixed" has to mean one *concentration*, and a concentration is a mole
+  fraction; splitting by volume gives one partial density, which at one pressure is
+  a mole fraction proportional to `T`. Measured on a 3 MW fire: the volume split
+  leaves the cool lower layer at **26.8%** while the hot upper one is at 41.6%, and
+  the fire — which breathes the cool layer — goes on burning through a flood that
+  has already reached its design concentration. Splitting by moles is uniform
+  exactly, at any temperature ratio, and identical whenever the layers are at one
+  temperature.
+
+  **On the ferry**, a 1215 kg bank into the starboard engine room with the
+  watertight door standing open: 18% of the charge leaves the ship, the fired space
+  reaches 31.4% and the *other* engine room reaches 24.3% — so flooding one space
+  half-floods its neighbour and **neither reaches the design concentration**. And
+  the finding that ties the two halves together: stratification makes a low leak
+  *worse*, not better. The same discharge into a space with a door at the deck
+  holds 39.3% when perfectly mixed and **17.6%** when it separates, because the
+  blanket forms exactly where the hole is and drains out of it — and the fire that
+  the mixed case extinguishes goes on to release 5.6× as much energy.
+
+  **Mutation-tested, and the survivors were the finding.** 50 substitutions plus
+  four deliberate controls, one at a time, each rebuilt and run against the whole
+  suite. The per-mutant bound is the substep controller's own arithmetic floor
+  rather than a wall clock — `testTheSubstepControllerStaysNearItsFloorWhileFlooding`
+  asserts one substep per `maxSubstep` of model time, so a collapsed controller
+  fails an assertion in seconds instead of running for hours — with a generous
+  wall-clock backstop behind it, scaled off the box's own measured clean run.
+  **First pass 40/50; after closing the ten survivors, MUTAFTER.** One kill was a
+  **hang** and not a failure, which is this codebase's characteristic kill and the
+  reason the bound is not optional. All four controls behaved on both passes.
+
+  Three of the ten survivors were the same shape: **a test that only ever asked
+  the question of a pure-air layer, or asked it over a step too short to see the
+  answer.** The volume split is a ratio and only its numerator carries the upper
+  layer's own excess, so every fixture with air on top was blind to dropping it.
+  The boundary loss and the spray cooling are both `C(1 − e^{−r dt/C})`, which
+  tends to `r dt` **whatever `C` is** — so every fixture that stepped short enough
+  was blind to which heat capacity they used, which is the *same* blindness this
+  repo already records for a `c_p` where a `c_v` belonged. And the
+  discharge-by-volume error above survived because the entrainment weighting
+  masked it: the fire sees a mixture of both layers, and the mixture was near
+  enough right.
+
+  **The harness needed correcting too.** Five suites at once on one GPU makes the
+  render tests fail intermittently, and a mutation harness scores that as a kill.
+  A false kill inflates the rate and hides a real gap, which is the one direction
+  a kill rate cannot afford, so Vulkan is compiled out of the mutant builds — none
+  of these substitutions is anywhere near it.
+
+  Not here, and named rather than hidden: oxygen is **diluted and never consumed**,
+  so a sealed compartment fire that would vitiate itself out does not; a space
+  holding a hot smoke layer, cool air *and* an agent blanket has three strata and
+  two zones to put them in, so the blanket and the cool air share one; the agent's
+  own radiative absorption is not modelled; a re-condensing agent (the adiabatic
+  case above ends below CO₂'s own sublimation point) has no solid phase to go to;
+  and **`les::demote` writes a `GasCompartment`'s layers without touching their
+  agent mass**, so a promoted-and-demoted compartment loses the agent it was
+  holding — the reader side is clamped so the state stays consistent, but the mass
+  is gone. High-expansion foam and dry powder are still ahead, and neither is a
+  gas.
 - ✅ **LES promotion for the local compartment** — `engine/sim/les.{hpp,cpp}`,
   `promotion::GasPromoter`, `promotion::gasCandidates`, `les::promote` and
   `les::demote`. One burning compartment's two well-mixed layers replaced by a

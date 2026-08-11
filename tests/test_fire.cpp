@@ -3770,6 +3770,1517 @@ void testBandsAreCutAtTheHeightAskedForAndNotAtTheRowPitch() {
     expectTrue("a half-band offset would move at least two rows at this band height", moved >= 2);
 }
 
+// --- Suppression by gas: total flooding ---------------------------------------
+//
+// The closed forms this section is asserted against, none of which is in
+// `fire.cpp`:
+//
+//   * **The concentration is a mole ratio and nothing else.** Put `m_g` kilograms
+//     of an agent of molar mass `M_g` into a space holding `m_a` kilograms of air,
+//     and the volume fraction is `(m_g/M_g) / (m_a/M_a + m_g/M_g)` -- exactly, at
+//     any temperature, at any pressure. The test computes it from `kUniversalGas`
+//     and the two molar masses; `fire.cpp` computes it as a ratio of `m R` sums.
+//     Two different arrangements of the same arithmetic.
+//   * **Dalton, for the pressure.** `p V = (m_a R_a + m_g R_g) T`.
+//   * **The stratified limit is geometry.** A blanket of pure agent under pure air,
+//     both at one temperature, occupies exactly the agent's mole fraction of the
+//     height. So a 40% flood puts its interface at 0.40 of the way up, and that is
+//     asserted as a length.
+//   * **The mixed limit is uniformity.** With the separation switched off, both
+//     layers hold the same fraction and it is the whole-space one.
+//   * **The extinguishing concentration is the inverse of the availability ramp.**
+//     `X_O2 = 0.2095 (1 - y)`, so a fuel with a limiting oxygen concentration of
+//     `L` is out at `y = 1 - L/0.2095` and nowhere else.
+//
+// And the controls, because on this file's record a control that fails is a bug
+// and a scenario that fails is only a result: the same space with no agent must
+// still burn, the same discharge into a space with no fire must still stratify and
+// still leak, and a sealed space must lose *exactly* nothing while an identical one
+// with a door open loses a great deal.
+
+// A machinery space at the scale the marine rules are written for: 12 x 10 x 6 m.
+constexpr double kMachineL = 12.0, kMachineW = 10.0, kMachineH = 6.0;
+constexpr double kMachineVolume = kMachineL * kMachineW * kMachineH;   // 720 m^3
+
+// SOLAS FSS Code ch. 5 sizes a machinery-space CO2 bank on 40% of the gross
+// volume of the largest such space.
+constexpr double kDesignFraction = 0.40;
+
+struct FloodedSpace {
+    fire::Model model;
+    Ship ship;
+    Sea sea{-1000.0};   // far below, so no opening is ever water-blocked
+};
+
+// A sealed machinery space. **Sealed and adiabatic by default**, because that is
+// what makes the concentration and the pressure closed forms rather than the
+// output of a leakage model: the tests that want a door or a boundary put one
+// back, and the difference between them is the finding.
+FloodedSpace makeMachinerySpace(const fire::AgentSpecies& species = fire::kCarbonDioxide,
+                                double settling = 0.0) {
+    FloodedSpace s;
+    fire::GasCompartment g;
+    g.name = "machinery";
+    g.shipCompartment = kSea;
+    g.floorZ = 0.0;
+    g.ceilingZ = kMachineH;
+    g.floorArea = kMachineL * kMachineW;
+    g.perimeter = 2.0 * (kMachineL + kMachineW);
+    g.gasVolume = kMachineVolume;
+    g.wallConductance = 0.0;
+    g.agentSpecies = species;
+    g.settlingVelocity = settling;
+    g.fillAmbient();
+    s.model.gas.push_back(g);
+    s.model.resetAccount();
+    return s;
+}
+
+// A door of the ISO room's proportions, at a chosen sill height. The whole of the
+// low-versus-high finding is this one number.
+fire::Vent makeDoor(double sillZ, double width = 0.8, double height = 2.0) {
+    fire::Vent v;
+    v.name = "door";
+    v.a = 0;
+    v.b = kSea;
+    v.sillZ = sillZ;
+    v.soffitZ = sillZ + height;
+    v.width = width;
+    v.area = width * height;
+    v.dischargeCoeff = 0.7;
+    return v;
+}
+
+// The bank, charged with exactly the mass that takes the space to `fraction` and
+// discharging it over `seconds`. NFPA 12 requires two minutes for a surface fire
+// in a machinery space, which is where the default comes from.
+fire::AgentSystem makeBank(const fire::Model& m, double fraction, double seconds = 120.0,
+                           bool phaseChange = true) {
+    fire::AgentSystem a;
+    a.name = "bank";
+    a.gasCompartment = 0;
+    a.charge = fire::agentMassForFraction(m.gas[0], fraction);
+    a.flow = a.charge / seconds;
+    a.on = true;
+    if (!phaseChange) {
+        // The pure-displacement case: the agent arrives as a gas at the space's own
+        // temperature, so the concentration arithmetic is not entangled with an
+        // energy balance. Both are asserted; keeping them apart is what makes each
+        // of them a closed form.
+        a.dischargeTemperature = kTAmbient;
+        a.solidFraction = 0.0;
+    }
+    return a;
+}
+
+// The mole fraction, from the molar masses and the universal constant, with no
+// reference at all to how `fire.cpp` arranges the same ratio.
+double moleFraction(double airMass, double agentMass, const fire::AgentSpecies& s) {
+    const double nAir = airMass / (fire::kUniversalGas / kRAir);
+    const double nAgent = agentMass / s.molarMass;
+    return nAgent / (nAir + nAgent);
+}
+
+void stepFor(fire::Model& m, const Ship& ship, const Sea& sea, int seconds) {
+    for (int i = 0; i < seconds; ++i) m.step(1.0, ship, sea);
+}
+
+// The published constants of the second species, from the SI's own exact
+// defining constants and from the molar masses, rather than quoted.
+void testTheAgentConstantsAreDerivedAndNotQuoted() {
+    // R = N_A k_B, both exact by definition since 2019, so this is not a
+    // measurement and there is no uncertainty to allow for. Asserted to the last
+    // bit of the product.
+    const double avogadro = 6.02214076e23;      // 1/mol, exact
+    const double boltzmann = 1.380649e-23;      // J/K, exact
+    expectNear("the molar gas constant is N_A k_B", fire::kUniversalGas, avogadro * boltzmann,
+               4.0 * std::abs(avogadro * boltzmann) * 2.3e-16);
+
+    // `kRAir/kCvAir` is `kGammaAir - 1` to the last bit for this repo's constants,
+    // which is what lets `Layer::excessEnergy` measure the mixture's departure
+    // against either base and get the identical double. If that ever stops being
+    // true the pressure closure picks up a systematic one-ulp bias.
+    expectTrue("R_air / c_v,air is gamma - 1 exactly", kRAir / fire::kCvAir == kGammaAir - 1.0);
+    expectTrue("and 1 + (gamma - 1) is gamma exactly", 1.0 + (kGammaAir - 1.0) == kGammaAir);
+    expectNear("air's molar mass is the one kRAir implies, 28.965 g/mol", fire::kMolarMassAir,
+               0.028965005, 1e-9);
+
+    // Each agent's caloric constants satisfy the same two identities `kCpAir` does,
+    // for the same reason: the closure is only exact if they do.
+    struct Named { const char* name; fire::AgentSpecies s; double molarMass; };
+    const Named all[] = {{"CO2", fire::kCarbonDioxide, 0.0440095},
+                         {"IG-100 nitrogen", fire::kNitrogen, 0.0280134},
+                         {"IG-01 argon", fire::kArgon, 0.039948},
+                         {"IG-55", fire::kIG55, 0.0339807},
+                         {"IG-541", fire::kIG541, 0.034066928}};
+    for (const Named& n : all) {
+        const double r = n.s.gasConstant();
+        expectNear(std::string(n.name) + " has the molar mass it claims", n.s.molarMass,
+                   n.molarMass, 1e-9);
+        expectNear(std::string(n.name) + ": R is R_u / M", r, fire::kUniversalGas / n.s.molarMass,
+                   1e-12 * r);
+        expectNear(std::string(n.name) + ": c_p - c_v is exactly R", n.s.cp() - n.s.cv(), r,
+                   1e-12 * r);
+        expectNear(std::string(n.name) + ": c_p / c_v is exactly gamma", n.s.cp() / n.s.cv(),
+                   n.s.gamma, 1e-14 * n.s.gamma);
+    }
+
+    // The direction a flooding agent stratifies is a consequence of its molar mass
+    // here, not a hard-coded downward drift, and nitrogen is the case that proves
+    // it: **IG-100 is lighter than air** and has to go up.
+    expectTrue("CO2 is heavier than air", fire::kCarbonDioxide.heavierThanAir());
+    expectTrue("argon is heavier than air", fire::kArgon.heavierThanAir());
+    expectTrue("IG-541 is heavier than air", fire::kIG541.heavierThanAir());
+    expectTrue("but nitrogen is lighter", !fire::kNitrogen.heavierThanAir());
+    expectNear("CO2's R is 188.92 J/(kg K)", fire::kCarbonDioxide.gasConstant(), 188.9243, 1e-3);
+    expectNear("and its c_p 842.6 J/(kg K), which is CO2 at 300 K and not air's 1005",
+               fire::kCarbonDioxide.cp(), 842.641, 1e-2);
+
+    // The toxicity thresholds, which are the reason a species carries any.
+    expectTrue("CO2 incapacitates at 7% by volume", fire::kCarbonDioxide.incapacitatingFraction ==
+                                                        0.07);
+    expectTrue("and kills at 10%", fire::kCarbonDioxide.lethalFraction == 0.10);
+    expectTrue("a true inert gas never does either", fire::kArgon.lethalFraction == 1.0);
+    // IG-541 is 8% CO2 by mole, so its own threshold is the CO2 one divided by that
+    // share -- which is the whole design intent of the blend.
+    expectNear("IG-541 reaches CO2's 7% only at 87.5% of the blend",
+               fire::kIG541.incapacitatingFraction, 0.07 / 0.08, 1e-15);
+}
+
+// **The mixture closure, which is the one load-bearing algebraic fact of the
+// second species.** `p = (gamma_air - 1)(U + x_u + x_l)/V` and
+// `V_u/V = (U_u + x_u)/(U + x_u + x_l)` have to reproduce Dalton exactly, and
+// `x` has to be *exactly* zero without an agent.
+void testTheMixtureClosureIsDaltonAndTheExcessIsExactlyZeroWithoutAnAgent() {
+    const fire::AgentSpecies& s = fire::kCarbonDioxide;
+
+    // A layer of pure air: every mixture term must be the pure-air one to the bit,
+    // whatever species it is asked about.
+    fire::Layer air;
+    air.mass = 12.5;
+    air.energy = air.mass * fire::kCvAir * 350.0;
+    expectTrue("a layer with no agent has exactly zero excess energy",
+               air.excessEnergy(s) == 0.0);
+    expectTrue("and against a species half its molar mass too",
+               air.excessEnergy(fire::kNitrogen) == 0.0);
+    expectTrue("its heat capacity is m c_v,air to the bit",
+               air.heatCapacity(s) == air.mass * fire::kCvAir);
+    expectTrue("its temperature is the double it always was",
+               air.temperature(s) == air.energy / (air.mass * fire::kCvAir));
+    expectTrue("and it holds no agent by volume either", air.agentFraction(s) == 0.0);
+
+    // A real mixture, built from masses and one temperature, then read back.
+    const double airMass = 700.0, agentMass = 400.0, temp = 305.0;
+    fire::Layer mix;
+    mix.mass = airMass + agentMass;
+    mix.agent = agentMass;
+    mix.energy = airMass * fire::kCvAir * temp + agentMass * s.cv() * temp;
+    expectNear("the mixture reports the temperature it was built at", mix.temperature(s), temp,
+               1e-12 * temp);
+    expectNear("and the mole fraction the molar masses say", mix.agentFraction(s),
+               moleFraction(airMass, agentMass, s), 1e-15);
+
+    // Dalton, through the compartment's own closure. One layer holding everything,
+    // so the volume split is not in the way.
+    fire::GasCompartment g;
+    g.floorZ = 0.0;
+    g.ceilingZ = 4.0;
+    g.floorArea = 25.0;
+    g.gasVolume = 100.0;
+    g.agentSpecies = s;
+    g.lower = mix;
+    const double dalton = (airMass * kRAir + agentMass * s.gasConstant()) * temp / g.gasVolume;
+    expectNear("the compartment's pressure is Dalton's sum of partial pressures", g.pressure(),
+               dalton, 1e-13 * dalton);
+    expectTrue("and it is not air's answer, which would be 12% out",
+               std::abs(g.pressure() - (kGammaAir - 1.0) * g.totalEnergy() / g.gasVolume) >
+                   0.05 * dalton);
+
+    // The volume split is the pressure-energy split: give the upper layer pure air
+    // at the same temperature and check the two volumes against Dalton's own
+    // partial volumes.
+    fire::Layer top;
+    top.mass = 30.0;
+    top.energy = top.mass * fire::kCvAir * temp;
+    g.upper = top;
+    const double nAir = (airMass + top.mass) * kRAir, nAgent = agentMass * s.gasConstant();
+    const double pBoth = (nAir + nAgent) * temp / g.gasVolume;
+    expectNear("with two layers the pressure is still Dalton's", g.pressure(), pBoth,
+               1e-13 * pBoth);
+    // At one temperature the upper layer's volume share is its own mole share.
+    const double wantUpper = g.gasVolume * (top.mass * kRAir) / (nAir + nAgent);
+    expectNear("and the volume split is the mole split at one temperature", g.upperVolume(),
+               wantUpper, 1e-12 * wantUpper);
+    expectNear("so the volumes still sum to the space", g.upperVolume() + g.lowerVolume(),
+               g.gasVolume, 1e-12 * g.gasVolume);
+    // Vacuity: the agent has to have moved the answer, or two pure-air layers would
+    // prove nothing.
+    expectTrue("and the agent really did move the split",
+               std::abs(g.upperVolume() - g.gasVolume * top.energy / g.totalEnergy()) >
+                   0.05 * g.upperVolume());
+
+    // **And the same question with the agent in the *upper* layer**, because the
+    // split is a ratio and only the numerator carries the upper layer's own excess.
+    // Mutation testing found that gap: dropping `upper.excessEnergy` from
+    // `upperVolume` survived the whole suite, every fixture having had pure air on
+    // top.
+    fire::GasCompartment h;
+    h.floorZ = 0.0;
+    h.ceilingZ = 4.0;
+    h.floorArea = 25.0;
+    h.gasVolume = 100.0;
+    h.agentSpecies = s;
+    h.upper = mix;    // 700 kg of air and 400 of CO2, at 305 K
+    h.lower = top;    // 30 kg of air, at 305 K
+    const double wantLower = h.gasVolume * (top.mass * kRAir) / (nAir + nAgent);
+    expectNear("with the agent on top the *lower* layer is the pure-air partial volume",
+               h.lowerVolume(), wantLower, 1e-12 * wantLower);
+    expectNear("and the upper one is the rest", h.upperVolume(), h.gasVolume - wantLower,
+               1e-12 * h.gasVolume);
+    expectNear("the pressure being the same either way up", h.pressure(), pBoth,
+               1e-13 * pBoth);
+    // The vacuity check goes on the *lower* volume, and that is not a detail: with
+    // the agent on top the upper layer is 97% of the space whichever split is used,
+    // and the whole 0.28 m3 the excess is worth lands on the small layer -- 9.2% of
+    // it. Asserting the big one would have been very nearly vacuous.
+    expectTrue("and the agent really did move this split too",
+               std::abs(h.lowerVolume() - h.gasVolume * top.energy / h.totalEnergy()) >
+                   0.05 * h.lowerVolume());
+}
+
+// **A sealed compartment given a known mass of agent reaches the concentration
+// ideal-gas arithmetic says, and the pressure Dalton says.** The headline closed
+// form, and it is asserted at what it measures rather than at a round number.
+void testASealedSpaceReachesTheConcentrationTheArithmeticSays() {
+    FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.0);   // the mixed limit
+    const double airMass = s.model.gas[0].totalMass();
+    expectNear("the space holds the air an ideal gas puts in it", airMass,
+               kPatm * kMachineVolume / (kRAir * kTAmbient), 1e-9);
+
+    fire::AgentSystem bank = makeBank(s.model, kDesignFraction, 120.0, /*phaseChange=*/false);
+    const double charge = bank.charge;
+    s.model.agents.push_back(bank);
+    expectTrue("the model is self-consistent", s.model.validate().empty());
+    stepFor(s.model, s.ship, s.sea, 300);
+
+    const fire::GasCompartment& g = s.model.gas[0];
+    expectNear("the bank delivered its whole charge and not a gram more",
+               s.model.account.agentDischarged, charge, 1e-12 * charge);
+    expectNear("and the gas is holding it", g.totalAgent(), charge, 1e-12 * charge);
+
+    const double want = moleFraction(airMass, charge, fire::kCarbonDioxide);
+    expectNear("which is the design concentration it was sized for", want, kDesignFraction,
+               1e-12);
+    // 1.33e-14 measured, and asserted at twice it rather than at a round number:
+    // the space is a hundred thousand substeps of mass bookkeeping deep by here, so
+    // this is the accumulated round-off of the account and nothing else.
+    expectNear("and the space reports exactly that fraction by volume", g.agentFraction(), want,
+               2.7e-14);
+
+    // Dalton, at a temperature that has not moved because the agent arrived at it.
+    expectNear("the gas is still at ambient, the discharge having been isothermal",
+               g.lower.temperature(g.agentSpecies), kTAmbient, 1e-9);
+    const double dalton =
+        (airMass * kRAir + charge * fire::kCarbonDioxide.gasConstant()) * kTAmbient /
+        kMachineVolume;
+    expectNear("and the pressure is Dalton's", g.pressure(), dalton, 1e-11 * dalton);
+    // The number that drives the whole leakage problem: a tonne of agent is 27 kPa.
+    // At 40% by volume the space is holding 1/(1-y) times the moles it started
+    // with, so the sealed pressure is 1.667 atmospheres. **67.5 kPa of gauge** is
+    // not a nuance -- it is seven metres of water head on every boundary, it is why
+    // a real system needs pressure relief, and it is the whole reason the agent
+    // leaves again through anything that is open.
+    expectNear("which is 67.6 kPa above atmospheric, five sixths of the space's own overpressure",
+               g.pressure() - kPatm, kPatm * kDesignFraction / (1.0 - kDesignFraction), 20.0);
+    expectTrue("and that is a real overpressure, not a buoyancy one",
+               g.pressure() - kPatm > 100.0 * fire::kRhoAmbient * kGravity * kMachineH);
+
+    // The accounts, at machine precision. Measured, then asserted at what was
+    // measured: a round 1e-6 here would pass on a model that had lost the property.
+    const fire::Account& a = s.model.account;
+    expectNear("the agent account closes to the bit", a.agentResidual(), 0.0, 1e-11 * charge);
+    expectNear("the mass account closes to the bit", a.massResidualFraction(), 0.0, 3e-14);
+    expectNear("and the energy account with it", a.energyResidualFraction(), 0.0, 3e-14);
+
+    // Vacuity: a sealed space has to have lost nothing, or the closed form above is
+    // a statement about a leak that did not happen rather than about the arithmetic.
+    expectTrue("nothing left the sealed space", a.agentOut == 0.0 && a.massOut == 0.0);
+    expectTrue("and the concentration is a real one, not a rounding", g.agentFraction() > 0.39);
+}
+
+// **The two limits of the separation, both closed forms, and the whole difference
+// between an atmosphere that is merely inert and one that is lethal at the deck.**
+//
+// At `settlingVelocity = 0` the space is perfectly mixed and both layers hold the
+// design concentration. In the limit the space is perfectly stratified: the blanket
+// is pure agent, the gas above it is pure air, and -- both being at one temperature
+// -- the interface sits at exactly the agent's own mole fraction of the height.
+void testTheMixedLimitIsUniformAndTheStratifiedLimitIsABlanketOfKnownDepth() {
+    // Mixed.
+    {
+        FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.0);
+        s.model.agents.push_back(makeBank(s.model, kDesignFraction, 120.0, false));
+        stepFor(s.model, s.ship, s.sea, 900);
+        const fire::GasCompartment& g = s.model.gas[0];
+        const fire::AgentSpecies& sp = g.agentSpecies;
+        expectNear("with no separation both layers hold the same fraction",
+                   g.upper.agentFraction(sp), g.lower.agentFraction(sp), 1e-12);
+        expectNear("and it is the whole space's", g.lower.agentFraction(sp), g.agentFraction(),
+                   1e-12);
+        expectNear("so a person at the deck breathes the design concentration and no more",
+                   fire::exposureAt(g, fire::kBreathingZone).agentFraction, kDesignFraction,
+                   1e-11);
+    }
+    // Stratified. 1 m/s separates a 6 m space in seconds, which is the limit and not
+    // a claim about how fast a real one settles.
+    {
+        FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 1.0);
+        s.model.agents.push_back(makeBank(s.model, kDesignFraction, 120.0, false));
+        stepFor(s.model, s.ship, s.sea, 900);
+        const fire::GasCompartment& g = s.model.gas[0];
+        const fire::AgentSpecies& sp = g.agentSpecies;
+        expectTrue("the blanket is essentially pure agent", g.lower.agentFraction(sp) > 0.999);
+        expectTrue("and the gas over it essentially pure air", g.upper.agentFraction(sp) < 1e-3);
+        // The closed form: a blanket of pure agent under pure air at one temperature
+        // occupies the agent's own mole fraction of the height.
+        const double wantZ = kMachineH * g.agentFraction();
+        expectNear("so the interface stands at the agent's own partial volume",
+                   g.interfaceZ(), wantZ, 2e-3 * kMachineH);
+        expectNear("which is 2.40 m off the deck in a 6 m space at 40%", g.interfaceZ(), 2.400,
+                   0.015);
+        expectNear("and the two layers are still at one temperature, so that is the right form",
+                   g.upper.temperature(sp), g.lower.temperature(sp), 0.5);
+        // The whole-space concentration is unchanged: the separation moves the agent,
+        // it does not create or destroy it.
+        expectNear("separation conserves the agent it rearranges", g.totalAgent(),
+                   s.model.account.agentDischarged, 1e-12 * s.model.account.agentDischarged);
+        expectNear("and the agent account still closes", s.model.account.agentResidual(), 0.0,
+                   1e-11 * s.model.account.agentDischarged);
+        expectNear("and the energy account with it",
+                   s.model.account.energyResidualFraction(), 0.0, 5e-15);
+    }
+}
+
+// **What the space does to a person in it**, at the two limits, in three agents.
+// Data, and the thresholds beside it.
+void testWhatTheDesignConcentrationDoesToAPersonInTheSpace() {
+    // CO2, perfectly mixed at its design concentration. The oxygen alone would not
+    // kill: 12.6% is impaired, not lethal. The CO2 is four times its own lethal
+    // concentration, and that is the point.
+    {
+        FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.0);
+        s.model.agents.push_back(makeBank(s.model, kDesignFraction, 120.0, false));
+        stepFor(s.model, s.ship, s.sea, 300);
+        const fire::Exposure e = fire::exposureAt(s.model.gas[0], fire::kBreathingZone);
+        expectNear("40% CO2 leaves 12.57% oxygen", e.oxygenFraction,
+                   fire::kOxygenFractionAir * (1.0 - kDesignFraction), 1e-11);
+        expectTrue("which is below the 19.5% entry limit", e.oxygenFraction <
+                                                               fire::kOxygenEntryLimit);
+        expectTrue("but above the 10% that takes consciousness",
+                   e.oxygenFraction > fire::kOxygenIncapacitating);
+        expectTrue("and well above the 6% that kills", e.oxygenFraction > fire::kOxygenLethal);
+        expectTrue("so on oxygen alone this atmosphere is survivable", !e.oxygenLethal);
+        expectTrue("and yet it is lethal, because 40% CO2 is four times CO2's own limit",
+                   e.agentLethal && e.lethal());
+        expectNear("the agent being at four times 10%", e.agentFraction / 0.10, 4.0, 0.02);
+    }
+    // The same flood, stratified. Now the deck is inside a blanket of pure agent and
+    // there is no oxygen there at all.
+    {
+        FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 1.0);
+        s.model.agents.push_back(makeBank(s.model, kDesignFraction, 120.0, false));
+        stepFor(s.model, s.ship, s.sea, 900);
+        const fire::GasCompartment& g = s.model.gas[0];
+        const fire::Exposure deck = fire::exposureAt(g, fire::kBreathingZone);
+        const fire::Exposure head = fire::exposureAt(g, kMachineH - 0.1);
+        expectTrue("a person standing on the deck is inside the blanket",
+                   deck.z < g.interfaceZ() && !deck.inUpperLayer);
+        expectTrue("breathing essentially no oxygen at all", deck.oxygenFraction < 1e-3);
+        expectTrue("which is lethal on the oxygen and on the agent alike",
+                   deck.oxygenLethal && deck.agentLethal);
+        // And the same space is breathable at the deckhead, which is the hazard: the
+        // atmosphere a person's head is in is not the atmosphere the space averages.
+        expectTrue("while the gas at the deckhead is still nearly air",
+                   head.oxygenFraction > 0.9 * fire::kOxygenFractionAir);
+        expectTrue("so the space's mean concentration describes neither of them",
+                   std::abs(g.agentFraction() - deck.agentFraction) > 0.5 &&
+                       std::abs(g.agentFraction() - head.agentFraction) > 0.3);
+    }
+    // **The band between the two thresholds**, which nothing above reached: at 8% by
+    // volume CO2 takes consciousness in minutes and does not yet kill, and the
+    // oxygen it leaves -- 19.3% -- is barely below the entry limit. A model that
+    // read the lethal threshold for both would call this atmosphere harmless.
+    {
+        FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.0);
+        s.model.agents.push_back(makeBank(s.model, 0.08, 120.0, false));
+        stepFor(s.model, s.ship, s.sea, 300);
+        const fire::Exposure e = fire::exposureAt(s.model.gas[0], fire::kBreathingZone);
+        expectNear("an 8% flood is 8% by volume", e.agentFraction, 0.08, 1e-11);
+        expectTrue("which incapacitates", e.agentIncapacitating && e.incapacitating());
+        expectTrue("and does not kill", !e.agentLethal && !e.lethal());
+        expectNear("leaving 19.27% oxygen", e.oxygenFraction,
+                   fire::kOxygenFractionAir * 0.92, 1e-11);
+        expectTrue("which the oxygen thresholds alone would call unremarkable",
+                   !e.oxygenIncapacitating && !e.oxygenLethal);
+        expectTrue("though still under the entry limit",
+                   e.oxygenFraction < fire::kOxygenEntryLimit);
+    }
+    // IG-541 at the same 40%, which is the comparison the blend exists to win. Its
+    // oxygen is the same 12.6% -- displacement does not care what displaced it --
+    // and its CO2 content is 8% of the blend, so 3.2%, below the 4% IDLH.
+    {
+        FloodedSpace s = makeMachinerySpace(fire::kIG541, 0.0);
+        s.model.agents.push_back(makeBank(s.model, kDesignFraction, 120.0, false));
+        stepFor(s.model, s.ship, s.sea, 300);
+        const fire::Exposure e = fire::exposureAt(s.model.gas[0], fire::kBreathingZone);
+        expectNear("an inert blend at 40% leaves the same 12.57% oxygen", e.oxygenFraction,
+                   fire::kOxygenFractionAir * (1.0 - kDesignFraction), 2e-3);
+        expectTrue("but it is not lethal, and CO2 at the same concentration is",
+                   !e.lethal() && !e.agentIncapacitating);
+        expectNear("its 8% CO2 content coming to 3.2%, under the 4% IDLH",
+                   0.08 * e.agentFraction, 0.032, 2e-3);
+        expectTrue("and it is still not an atmosphere anyone may enter",
+                   e.oxygenFraction < fire::kOxygenEntryLimit);
+    }
+}
+
+// **The direction is a consequence of the molar mass, not a hard-coded drift.**
+// Change the species and nothing else: CO2 makes a blanket on the deck and
+// nitrogen makes one under the deckhead.
+void testAHeavyAgentSettlesToTheDeckAndALightOneRisesToTheDeckhead() {
+    FloodedSpace heavy = makeMachinerySpace(fire::kCarbonDioxide, 1.0);
+    heavy.model.agents.push_back(makeBank(heavy.model, kDesignFraction, 120.0, false));
+    stepFor(heavy.model, heavy.ship, heavy.sea, 900);
+
+    FloodedSpace light = makeMachinerySpace(fire::kNitrogen, 1.0);
+    light.model.agents.push_back(makeBank(light.model, kDesignFraction, 120.0, false));
+    stepFor(light.model, light.ship, light.sea, 900);
+
+    const fire::GasCompartment& h = heavy.model.gas[0];
+    const fire::GasCompartment& l = light.model.gas[0];
+    expectTrue("CO2 collects in the lower layer",
+               h.lower.agentFraction(h.agentSpecies) > 0.99 &&
+                   h.upper.agentFraction(h.agentSpecies) < 0.01);
+    expectTrue("nitrogen collects in the upper one",
+               l.upper.agentFraction(l.agentSpecies) > 0.99 &&
+                   l.lower.agentFraction(l.agentSpecies) < 0.01);
+    // The same geometry, mirrored: the *agent-bearing* layer is the agent's own
+    // partial volume in both, so the interface is at `yH` for the heavy one and at
+    // `(1-y)H` for the light one.
+    expectNear("so the heavy blanket's top is at the agent's partial volume", h.interfaceZ(),
+               kMachineH * h.agentFraction(), 2e-3 * kMachineH);
+    expectNear("and the light one's bottom is at the complement", l.interfaceZ(),
+               kMachineH * (1.0 - l.agentFraction()), 2e-3 * kMachineH);
+    // What that costs a person, which is the reason the direction matters at all.
+    expectTrue("a person on the deck under CO2 has no oxygen",
+               fire::exposureAt(h, fire::kBreathingZone).oxygenFraction < 1e-3);
+    expectTrue("and under nitrogen has all of it",
+               fire::exposureAt(l, fire::kBreathingZone).oxygenFraction >
+                   0.99 * fire::kOxygenFractionAir);
+    // Vacuity: both really did flood, and to the same concentration.
+    expectNear("both spaces hold the same fraction overall", h.agentFraction(), l.agentFraction(),
+               1e-9);
+    expectTrue("and it is the design one", h.agentFraction() > 0.39);
+}
+
+// **Holding the concentration is the hard half, and where the opening is decides
+// it.** A sealed space loses exactly nothing. An identical one with a door at the
+// deck drains its blanket out of it. An identical one with the same door up at the
+// deckhead vents air instead and keeps most of the agent.
+//
+// A single pressure difference at the orifice centre cannot tell those two apart:
+// the height integral is what makes this a mechanism rather than an assumption,
+// which is the second time in this file that has been the case.
+void testWhereTheOpeningIsDecidesWhetherTheAgentStays() {
+    auto run = [](bool withDoor, double sillZ) {
+        FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.05);
+        if (withDoor) s.model.vents.push_back(makeDoor(sillZ));
+        s.model.agents.push_back(makeBank(s.model, kDesignFraction, 120.0, false));
+        stepFor(s.model, s.ship, s.sea, 1800);
+        return s;
+    };
+    FloodedSpace sealed = run(false, 0.0);
+    FloodedSpace low = run(true, 0.0);
+    FloodedSpace high = run(true, kMachineH - 2.0);
+
+    const double charged = sealed.model.account.agentDischarged;
+    expectNear("all three banks discharged the same mass", low.model.account.agentDischarged,
+               charged, 1e-9 * charged);
+    expectNear("and so did the third", high.model.account.agentDischarged, charged,
+               1e-9 * charged);
+
+    // The control, and it is the one that has to be exact: a space with no opening
+    // loses *nothing*, not a little.
+    expectTrue("the sealed space lost exactly no agent", sealed.model.account.agentOut == 0.0);
+    expectNear("and still holds the design concentration half an hour later",
+               sealed.model.gas[0].agentFraction(), kDesignFraction, 1e-11);
+
+    const double lowLeft = low.model.gas[0].agentFraction();
+    const double highLeft = high.model.gas[0].agentFraction();
+    // The figures the roadmap quotes, asserted so the document cannot drift from
+    // them: **a door at the deck loses 99.9% of the charge and a door of the same
+    // size at the deckhead loses a quarter of it and ends up richer than it was
+    // aimed at.** The high vent sheds the *air* above the blanket, which raises the
+    // fraction rather than lowering it.
+    expectNear("a 1.6 m2 door at the deck lets 892.8 kg of 893.4 out",
+               low.model.account.agentOut, 892.8, 1.0);
+    expectNear("leaving four parts in ten thousand behind", lowLeft, 0.0004, 0.0003);
+    expectNear("the same door at the deckhead lets 220 kg out",
+               high.model.account.agentOut, 220.1, 2.0);
+    expectNear("and leaves the space at 46.8% -- richer than the design concentration",
+               highLeft, 0.468, 0.005);
+    expectTrue("because what a high vent sheds is the air over the blanket",
+               highLeft > kDesignFraction);
+    expectTrue("a door at the deck loses agent", low.model.account.agentOut > 0.05 * charged);
+    expectTrue("and it loses more than the same door at the deckhead",
+               low.model.account.agentOut > 1.5 * high.model.account.agentOut);
+    expectTrue("so the low-door space holds a lower concentration", lowLeft < highLeft - 0.02);
+    // And the finding worth having: the low door takes the space below the
+    // concentration it needs, while the high one does not.
+    expectTrue("the low door drops it below the design concentration",
+               lowLeft < 0.9 * kDesignFraction);
+    expectTrue("the high door holds nearer it", highLeft > 0.9 * kDesignFraction);
+    // Vacuity: the two doors are the same hole. Only the height differs.
+    expectTrue("the two doors are the same area",
+               low.model.vents[0].area == high.model.vents[0].area);
+    expectTrue("and the same width", low.model.vents[0].width == high.model.vents[0].width);
+    // The accounts still close on the leaking cases, which is what makes the
+    // comparison a measurement rather than two different bugs.
+    for (const FloodedSpace* f : {&sealed, &low, &high}) {
+        expectNear("the agent account closes on all three", f->model.account.agentResidual(), 0.0,
+                   1e-10 * charged);
+        expectNear("and the mass account with it", f->model.account.massResidualFraction(), 0.0,
+                   1e-14);
+    }
+}
+
+// **The control the roadmap item is named after: the agent released into a space
+// with no fire must still stratify and still leak.** Nothing in this run burns, so
+// every effect below is the agent's own.
+void testTheAgentInAColdSpaceStillStratifiesAndStillLeaks() {
+    FloodedSpace sealed = makeMachinerySpace(fire::kCarbonDioxide, 0.05);
+    sealed.model.agents.push_back(makeBank(sealed.model, kDesignFraction, 120.0, false));
+    FloodedSpace leaky = makeMachinerySpace(fire::kCarbonDioxide, 0.05);
+    leaky.model.vents.push_back(makeDoor(0.0));
+    leaky.model.agents.push_back(makeBank(leaky.model, kDesignFraction, 120.0, false));
+
+    stepFor(sealed.model, sealed.ship, sealed.sea, 1800);
+    stepFor(leaky.model, leaky.ship, leaky.sea, 1800);
+
+    expectTrue("nothing burned in either", sealed.model.account.heatReleased == 0.0 &&
+                                               leaky.model.account.heatReleased == 0.0);
+    const fire::GasCompartment& g = sealed.model.gas[0];
+    // Stratified: the deck is far richer than the deckhead, in a space nobody lit.
+    expectTrue("the cold space still stratifies",
+               g.lower.agentFraction(g.agentSpecies) >
+                   g.upper.agentFraction(g.agentSpecies) + 0.30);
+    expectTrue("with the agent below and the air above",
+               g.lower.agentFraction(g.agentSpecies) > 0.55 &&
+                   g.upper.agentFraction(g.agentSpecies) < 0.25);
+    expectTrue("and the sealed one lost nothing at all", sealed.model.account.agentOut == 0.0);
+    // Leaked: and it leaked because the discharge raised the pressure, not because
+    // anything heated it.
+    expectTrue("the leaky one lost a real share of its charge",
+               leaky.model.account.agentOut > 0.05 * leaky.model.account.agentDischarged);
+    expectTrue("so the two differ by more than a rounding",
+               sealed.model.gas[0].agentFraction() - leaky.model.gas[0].agentFraction() > 0.02);
+    // Nothing heated either space, and that is the control's whole point. The
+    // sealed one is at ambient to nine figures -- the discharge was isothermal by
+    // construction -- and the leaky one is *colder*, because a vessel blowing down
+    // from 1.67 atmospheres cools as it vents. Neither is a fire.
+    expectNear("the sealed space is still at exactly ambient",
+               sealed.model.gas[0].lower.temperature(sealed.model.gas[0].agentSpecies),
+               kTAmbient, 1e-6);
+    const double ventedT =
+        leaky.model.gas[0].lower.temperature(leaky.model.gas[0].agentSpecies);
+    expectTrue("and the leaking one is colder than ambient, not hotter -- it blew down",
+               ventedT < kTAmbient - 5.0 && ventedT > 200.0);
+}
+
+// **Extinguishing is oxygen displacement, and the concentration at which it
+// happens is the inverse of the availability ramp.** With the control beside it:
+// the same space, the same fire, no agent, must still burn.
+void testTheFireGoesOutByDisplacementAndTheControlWithNoAgentDoesNot() {
+    // The ramp itself, which is arithmetic and needs no run at all.
+    fire::DesignFire f;
+    f.limitingOxygen = 0.13;
+    expectTrue("clean air allows the whole design curve, exactly",
+               f.oxygenAvailability(fire::kOxygenFractionAir) == 1.0);
+    expectNear("and the limiting concentration allows none", f.oxygenAvailability(0.13), 0.0,
+               0.0);
+    expectNear("halfway between, half of it",
+               f.oxygenAvailability(0.5 * (0.13 + fire::kOxygenFractionAir)), 0.5, 1e-15);
+    // `X_O2 = 0.2095 (1 - y)`, so the extinguishing agent fraction is `1 - L/0.2095`.
+    const double outAt = 1.0 - 0.13 / fire::kOxygenFractionAir;
+    expectNear("so this fuel is out at 37.95% agent by volume", outAt, 0.37947, 1e-4);
+    expectTrue("which is why the marine design concentration is 40 and not 30",
+               kDesignFraction > outAt && 0.30 < outAt);
+
+    auto burn = [](bool flood) {
+        FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.0);
+        s.model.gas[0].wallConductance = 25.0;
+        fire::DesignFire d;
+        d.name = "machinery";
+        d.compartment = 0;
+        d.baseZ = 0.5;
+        d.diameter = 2.0;
+        d.peakHeatRelease = 3.0e6;
+        s.model.fires.push_back(d);
+        if (flood) {
+            fire::AgentSystem bank = makeBank(s.model, kDesignFraction, 120.0, false);
+            bank.on = false;
+            s.model.agents.push_back(bank);
+        }
+        // Let it establish, then release.
+        stepFor(s.model, s.ship, s.sea, 200);
+        const double hot = s.model.gas[0].upper.temperature(s.model.gas[0].agentSpecies);
+        if (flood) s.model.agents[0].on = true;
+        double lastAvailability = 1.0;
+        for (int i = 0; i < 600; ++i)
+            lastAvailability = s.model.step(1.0, s.ship, s.sea).oxygenAvailability;
+        struct R { double hot, cooled, availability, fraction; } r{
+            hot, s.model.gas[0].upper.temperature(s.model.gas[0].agentSpecies), lastAvailability,
+            s.model.gas[0].agentFraction()};
+        return r;
+    };
+    const auto control = burn(false);
+    const auto flooded = burn(true);
+
+    // The control first, because a control that fails is a bug.
+    expectTrue("with no agent the fire established", control.hot > kTAmbient + 200.0);
+    expectTrue("and with no agent it is still burning ten minutes later",
+               control.cooled > kTAmbient + 200.0);
+    expectTrue("at exactly full oxygen availability", control.availability == 1.0);
+    expectTrue("and there is no agent in the space", control.fraction == 0.0);
+
+    // And the scenario.
+    expectTrue("the flooded space reached its design concentration",
+               flooded.fraction > kDesignFraction - 0.02);
+    expectTrue("which took the oxygen below the fuel's limit", flooded.availability == 0.0);
+    expectTrue("so the fire is out", flooded.cooled < control.cooled - 200.0);
+    expectTrue("and the space is cooling back towards ambient",
+               flooded.cooled < flooded.hot);
+}
+
+// **The phase change, as a closed form.** CO2 leaves the bottle as a liquid and
+// arrives as cold vapour and dry-ice snow; the snow sublimes in the compartment and
+// the compartment pays for it, at constant volume.
+void testTheDischargeEnthalpyIsItsClosedFormAndTheChillIsLarge() {
+    const fire::AgentSpecies& sp = fire::kCarbonDioxide;
+    // The energy one kilogram brings, from the published constants and nothing in
+    // fire.cpp: `c_v T_d - f (L_sub - R T_sub)`. The `- R T` is the difference
+    // between the constant-pressure sublimation enthalpy and the constant-volume
+    // internal energy a rigid compartment books, and it is 6.9% of the term.
+    const double perKg = sp.cv() * 194.65 - 0.25 * (sp.sublimationHeat -
+                                                    sp.gasConstant() * sp.sublimationTemperature);
+    expectNear("a kilogram of discharged CO2 brings -6.31 kJ of internal energy", perKg, -6310.4,
+               0.5);
+    expectTrue("so the discharge is a net internal-energy sink even counting its own gas",
+               perKg < 0.0);
+    expectNear("and using the sublimation *enthalpy* instead would over-state the sink 2.5-fold",
+               (sp.cv() * 194.65 - 0.25 * sp.sublimationHeat) / perKg, 2.457, 0.01);
+
+    FloodedSpace s = makeMachinerySpace(sp, 0.0);   // adiabatic: no wall at all
+    const double airMass = s.model.gas[0].totalMass();
+    const double energy0 = s.model.gas[0].totalEnergy();
+    s.model.agents.push_back(makeBank(s.model, kDesignFraction, 120.0, /*phaseChange=*/true));
+    const double charge = s.model.agents[0].charge;
+    stepFor(s.model, s.ship, s.sea, 300);
+
+    const fire::GasCompartment& g = s.model.gas[0];
+    expectNear("the account booked exactly the closed-form discharge energy",
+               s.model.account.agentEnergy, charge * perKg, 1e-9 * std::abs(charge * perKg));
+    // The temperature that leaves, in a rigid adiabatic box: total internal energy
+    // over total heat capacity.
+    const double wantT = (energy0 + charge * perKg) / (airMass * fire::kCvAir + charge * sp.cv());
+    expectNear("and the gas is at the temperature the energy balance says",
+               g.lower.temperature(sp), wantT, 1e-9 * wantT);
+    expectNear("which is 145 K -- a hundred and forty-three kelvin of chill, on the gas alone",
+               wantT, 145.23, 0.05);
+    // Which is enough to take the pressure *below* atmospheric despite a tonne of
+    // added gas, and that is the reason the boundary is not optional in an agent run.
+    expectTrue("cold enough that a tonne of added gas leaves the space below atmospheric",
+               g.pressure() < kPatm);
+    expectNear("the energy account closing throughout", s.model.account.energyResidualFraction(),
+               0.0, 3e-14);
+
+    // The same discharge against a boundary at ambient, which is what a real space
+    // has: the steel supplies the heat and the pressure comes out over atmospheric.
+    FloodedSpace warm = makeMachinerySpace(sp, 0.0);
+    warm.model.gas[0].wallConductance = 25.0;
+    warm.model.agents.push_back(makeBank(warm.model, kDesignFraction, 120.0, true));
+    stepFor(warm.model, warm.ship, warm.sea, 1800);
+    expectNear("with a boundary at ambient the space comes all the way back to it",
+               warm.model.gas[0].lower.temperature(sp), kTAmbient, 0.2);
+    expectNear("and is then 67.5 kPa over atmospheric, as a flooded space really is",
+               warm.model.gas[0].pressure() - kPatm,
+               kPatm * kDesignFraction / (1.0 - kDesignFraction), 200.0);
+    expectTrue("against the adiabatic answer, which is 16 kPa *below* it",
+               g.pressure() < kPatm - 15000.0);
+    expectTrue("the concentration being the same either way, a mole ratio not caring about heat",
+               std::abs(warm.model.gas[0].agentFraction() - g.agentFraction()) < 1e-9);
+}
+
+// A finite bank runs out, and after it does the concentration can only fall. The
+// case the roadmap item is really about: delivering the design concentration and
+// holding it are different problems and the second one is harder.
+void testAFiniteBankRunsOutAndTheConcentrationThenOnlyFalls() {
+    FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.05);
+    s.model.vents.push_back(makeDoor(0.0));
+    s.model.agents.push_back(makeBank(s.model, kDesignFraction, 120.0, false));
+    const double charge = s.model.agents[0].charge;
+
+    stepFor(s.model, s.ship, s.sea, 150);
+    const double peak = s.model.gas[0].agentFraction();
+    expectNear("the bank is empty a little after its two minutes",
+               s.model.agents[0].delivered, charge, 1e-9 * charge);
+    expectTrue("and delivers nothing further", s.model.step(1.0, s.ship, s.sea).agentDischarge ==
+                                                   0.0);
+    // **It overshoots the sealed design concentration, and that is not a bug.** The
+    // bank is charged against the air the space started with; the discharge pushes
+    // the space to 1.67 atmospheres and what leaves through the door is mostly the
+    // air, so the *fraction* left behind is higher than the sealed arithmetic says
+    // for the same charge. What it cannot do is stay there.
+    expectTrue("the leaking space overshoots the sealed design concentration while it fills",
+               peak > kDesignFraction && peak < 0.5);
+    double previous = peak;
+    bool monotone = true;
+    for (int i = 0; i < 30; ++i) {
+        stepFor(s.model, s.ship, s.sea, 60);
+        const double now = s.model.gas[0].agentFraction();
+        if (now > previous + 1e-12) monotone = false;
+        previous = now;
+    }
+    expectTrue("and from then on the concentration only falls", monotone);
+    expectTrue("to well under the design one half an hour later", previous < 0.75 * peak);
+    expectNear("with the agent account closing the whole way",
+               s.model.account.agentResidual(), 0.0, 1e-10 * charge);
+}
+
+// **The exact control.** An agent system that is switched off must be worth exactly
+// nothing, on the ship and on the gas alike, on a run that is otherwise a real
+// fire. Same discipline as the drencher's.
+std::vector<double> agentFingerprint(const fire::Model& m) {
+    std::vector<double> v;
+    v.push_back(m.time);
+    for (const fire::GasCompartment& g : m.gas) {
+        v.push_back(g.upper.mass);
+        v.push_back(g.upper.energy);
+        v.push_back(g.upper.products);
+        v.push_back(g.upper.agent);
+        v.push_back(g.lower.mass);
+        v.push_back(g.lower.energy);
+        v.push_back(g.lower.products);
+        v.push_back(g.lower.agent);
+        v.push_back(g.pressure());
+        v.push_back(g.interfaceZ());
+    }
+    for (const fire::Vent& t : m.vents) {
+        v.push_back(t.massAToB);
+        v.push_back(t.massBToA);
+        v.push_back(t.neutralPlaneZ);
+    }
+    v.push_back(m.account.energy);
+    v.push_back(m.account.mass);
+    v.push_back(m.account.wallLoss);
+    v.push_back(m.account.enthalpyOut);
+    return v;
+}
+
+void testAnAgentSystemSwitchedOffLeavesTheGasBitIdentical() {
+    FerryFire bare = makeFerryFire();
+    FerryFire off = makeFerryFire();
+    fire::AgentSystem a;
+    a.name = "idle";
+    a.gasCompartment = 0;
+    a.flow = 40.0;      // a large flow, so "off" is doing the work and not a zero
+    a.charge = 4000.0;
+    a.on = false;
+    off.model.agents.push_back(a);
+    // And a separation velocity on every space, which must also be worth nothing
+    // while there is no agent to separate.
+    for (fire::GasCompartment& g : off.model.gas) g.settlingVelocity = 1.0;
+
+    for (int i = 0; i < 400; ++i) {
+        bare.ship.step(1.0, bare.sea);
+        bare.model.step(1.0, bare.ship, bare.sea);
+        bare.model.applyTo(bare.ship);
+        off.ship.step(1.0, off.sea);
+        off.model.step(1.0, off.ship, off.sea);
+        off.model.applyTo(off.ship);
+    }
+    const std::vector<double> x = agentFingerprint(bare.model), y = agentFingerprint(off.model);
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < x.size() && i < y.size(); ++i)
+        if (std::memcmp(&x[i], &y[i], sizeof(double)) != 0) ++differing;
+    expectEqual("an idle agent system leaves the gas bit-identical, in every state double",
+                static_cast<long long>(differing), 0);
+    expectEqual("and the fingerprints are the same shape", static_cast<long long>(x.size()),
+                static_cast<long long>(y.size()));
+    const std::vector<double> sa = shipFingerprint(bare.ship), sb = shipFingerprint(off.ship);
+    differing = 0;
+    for (std::size_t i = 0; i < sa.size() && i < sb.size(); ++i)
+        if (std::memcmp(&sa[i], &sb[i], sizeof(double)) != 0) ++differing;
+    expectEqual("and the ship with it", static_cast<long long>(differing), 0);
+
+    // Nothing was written, rather than zero being written.
+    expectTrue("no agent was discharged", off.model.account.agentDischarged == 0.0);
+    expectTrue("and none is held", off.model.account.agent == 0.0);
+    expectTrue("and the discharge energy is exactly zero", off.model.account.agentEnergy == 0.0);
+    // Vacuity: the fire has to have been doing something.
+    expectTrue("while the fire really was burning",
+               bare.model.gas[0].upper.temperature() > kTAmbient + 100.0);
+}
+
+// **The account still closes with an agent running on the ferry**, which is the
+// case that is allowed to break it: two compartments, a real opening network, a
+// growth-steady-decay fire and a discharge into one of them.
+void testTheAccountClosesWithAnAgentFloodingTheFerry() {
+    FerryFire f = makeFerryFire();
+    for (fire::GasCompartment& g : f.model.gas) g.settlingVelocity = 0.05;
+    fire::AgentSystem a;
+    a.name = "co2_bank";
+    a.gasCompartment = f.model.findGas("engine_room_s");
+    a.charge = fire::agentMassForFraction(f.model.gas[static_cast<std::size_t>(a.gasCompartment)],
+                                          kDesignFraction);
+    a.flow = a.charge / 120.0;
+    a.on = false;
+    f.model.agents.push_back(a);
+    expectTrue("the model is self-consistent", f.model.validate().empty());
+
+    stepFor(f.model, f.ship, f.sea, 300);
+    f.model.agents[0].on = true;
+    stepFor(f.model, f.ship, f.sea, 900);
+
+    const fire::Account& acc = f.model.account;
+    // The figures the roadmap quotes. A 1215 kg bank into one engine room with the
+    // watertight door open: **neither space reaches the design concentration**, and
+    // the one nobody aimed at gets a quarter of the way there.
+    expectNear("the ferry's starboard engine room wants a 1215 kg bank", a.charge, 1215.4, 2.0);
+    expectNear("which discharges in full", acc.agentDischarged, a.charge, 1e-9 * a.charge);
+    expectNear("18% of it leaves the ship", acc.agentOut / a.charge, 0.184, 0.01);
+    expectNear("the fired space holds 31.4%",
+               f.model.gas[static_cast<std::size_t>(a.gasCompartment)].agentFraction(), 0.314,
+               0.008);
+    expectNear("and the engine room next door, which nobody flooded, holds 24.3%",
+               f.model.gas[static_cast<std::size_t>(f.model.findGas("engine_room_p"))]
+                   .agentFraction(),
+               0.243, 0.008);
+    expectTrue("so neither reaches the concentration the bank was sized for",
+               f.model.gas[static_cast<std::size_t>(a.gasCompartment)].agentFraction() <
+                   kDesignFraction);
+    expectTrue("the bank really discharged", acc.agentDischarged > 0.9 * a.charge);
+    expectNear("the energy account closes", acc.energyResidualFraction(), 0.0, 1e-13);
+    expectNear("the mass account closes", acc.massResidualFraction(), 0.0, 1e-13);
+    expectNear("and the agent account closes", acc.agentResidual(), 0.0, 1e-9 * a.charge);
+    // **Both species, not just the total.** The carrier's account is the mass
+    // account less the agent's, and a model that lost a kilogram of air and gained
+    // a kilogram of agent would close the first two and fail this one.
+    expectNear("so the carrier gas closes on its own", acc.massResidual() - acc.agentResidual(),
+               0.0, 1e-9 * a.charge);
+    expectNear("the products account closing as it always did", acc.productsResidual(), 0.0,
+               1e-9 * std::max(acc.productsGenerated, 1.0));
+    // The agent crossed the watertight door into the other engine room, which is the
+    // opening network doing the thing the roadmap item is about.
+    const int other = f.model.findGas("engine_room_p");
+    expectTrue("and the agent crossed the open door into the other engine room",
+               f.model.gas[static_cast<std::size_t>(other)].totalAgent() > 1.0);
+    expectTrue("while some of it left the ship altogether", acc.agentOut > 0.0);
+}
+
+// **The substep controller must stay near its own arithmetic floor while a bank is
+// discharging.** The characteristic mutation kill in this file is a hang rather
+// than a failure -- a collapsed controller turns nine seconds into hours with no
+// failing assertion -- so the floor is asserted rather than left to a wall clock.
+void testTheSubstepControllerStaysNearItsFloorWhileFlooding() {
+    for (double settling : {0.0, 1.0}) {
+        FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, settling);
+        s.model.gas[0].wallConductance = 25.0;
+        s.model.maxSubsteps = 200;
+        s.model.vents.push_back(makeDoor(0.0));
+        fire::DesignFire d;
+        d.name = "machinery";
+        d.compartment = 0;
+        d.baseZ = 0.5;
+        d.diameter = 2.0;
+        d.peakHeatRelease = 3.0e6;
+        s.model.fires.push_back(d);
+        s.model.agents.push_back(makeBank(s.model, kDesignFraction, 120.0, true));
+
+        const int ticks = 300;
+        const int floor = static_cast<int>(ticks / s.model.maxSubstep);
+        int worst = 0, total = 0;
+        bool capped = false;
+        for (int i = 0; i < ticks; ++i) {
+            const fire::StepResult r = s.model.step(1.0, s.ship, s.sea);
+            worst = std::max(worst, r.substeps);
+            total += r.substeps;
+            capped = capped || r.pressureSolveCapped;
+        }
+        expectEqual("the floor is one substep per maxSubstep of model time", floor, 1200);
+        expectTrue("a discharging machinery space stays within twice its own floor",
+                   total < 2 * floor);
+        expectTrue("and no single tick needs more than a hundred substeps", worst < 100);
+        expectTrue("while the pressure solve always brackets its root", !capped);
+        // Vacuity: the run has to have been a real discharge into a real fire.
+        expectTrue("and the space really did flood", s.model.gas[0].agentFraction() > 0.15);
+        expectTrue("with a fire in it", s.model.account.heatReleased > 1e8);
+    }
+}
+
+// **The discharge has to leave one CONCENTRATION, not one partial density**, and
+// the two are only the same thing while the layers are at one temperature. A fire
+// makes them differ by hundreds of kelvin, which is exactly when a flooding system
+// is being asked to work.
+void testTheDischargeIsUniformAcrossLayersAtDifferentTemperatures() {
+    FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.0);   // no separation
+    fire::GasCompartment& g = s.model.gas[0];
+    const fire::AgentSpecies& sp = g.agentSpecies;
+    // Two layers by hand: a hot third of the volume over a cool two thirds.
+    const double vUpper = kMachineVolume / 3.0;
+    g.upper.mass = kPatm * vUpper / (kRAir * 600.0);
+    g.upper.energy = g.upper.mass * fire::kCvAir * 600.0;
+    g.lower.mass = kPatm * (kMachineVolume - vUpper) / (kRAir * kTAmbient);
+    g.lower.energy = g.lower.mass * fire::kCvAir * kTAmbient;
+    s.model.resetAccount();
+    const double hot = g.upper.temperature(sp), cool = g.lower.temperature(sp);
+    expectTrue("the fixture really has two layers at two temperatures", hot > cool + 250.0);
+
+    s.model.agents.push_back(makeBank(s.model, kDesignFraction, 120.0, false));
+    stepFor(s.model, s.ship, s.sea, 300);
+
+    expectNear("with no separation the two layers hold one concentration",
+               g.upper.agentFraction(sp), g.lower.agentFraction(sp), 1e-11);
+    expectTrue("and they are still at two temperatures, so that was not free",
+               g.upper.temperature(sp) > g.lower.temperature(sp) + 100.0);
+    // A delivery split by volume would put the *mole* fraction in proportion to T:
+    // 41.6% in the hot layer against 26.8% in the cool one. Named, so that the
+    // assertion above is understood to be a real discrimination.
+    expectTrue("a split by volume would have left them a third apart",
+               std::abs(g.upper.temperature(sp) / g.lower.temperature(sp) - 1.0) > 0.3);
+}
+
+// **The two separation streams are exact relaxations, and here they are against
+// their own closed forms.** One controlled substep, with the accuracy cap opened so
+// that the step taken is the step asked for, so `1 - exp(-w dt / h)` can be
+// evaluated in the test and compared with what the model moved.
+//
+// The step is chosen so `w dt / h` is of order one. At small argument the exact
+// relaxation and the explicit rate agree to `O(x^2)` and no test can tell them
+// apart; the whole reason the exact form is here is the regime where they do not,
+// and that is the regime this asserts in.
+void testTheSeparationRatesAreTheirClosedFormRelaxations() {
+    FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.0);
+    fire::GasCompartment& g = s.model.gas[0];
+    const fire::AgentSpecies& sp = g.agentSpecies;
+    // A third of the volume on top, both layers at ambient, agent in both -- so
+    // both streams run and neither is starved.
+    const double vUpper = kMachineVolume / 3.0;
+    g.upper.mass = kPatm * vUpper / (kRAir * kTAmbient);
+    g.upper.energy = g.upper.mass * fire::kCvAir * kTAmbient;
+    g.lower.mass = kPatm * (kMachineVolume - vUpper) / (kRAir * kTAmbient);
+    g.lower.energy = g.lower.mass * fire::kCvAir * kTAmbient;
+    auto seed = [&](fire::Layer& l, double kg) {
+        l.mass += kg;
+        l.agent = kg;
+        l.energy += kg * sp.cv() * kTAmbient;
+    };
+    seed(g.upper, 120.0);
+    seed(g.lower, 260.0);
+    g.settlingVelocity = 20.0;         // so that w dt / h is of order one
+    s.model.maxRelativeChange = 1e9;   // one substep, exactly the one asked for
+    s.model.maxSubstep = 0.1;
+    s.model.resetAccount();
+
+    const double dt = 0.1;
+    const double hCarry = g.upperVolume() / g.floorArea;
+    const double hSink = (g.gasVolume - g.upperVolume()) / g.floorArea;
+    const double agentThere = g.upper.agent;
+    const double carrierThere = g.lower.mass - g.lower.agent;
+    const double ySink = g.lower.agentFraction(sp);
+    const double wantAgent = agentThere * -std::expm1(-g.settlingVelocity * dt / hCarry);
+    const double wantCarrier =
+        carrierThere * -std::expm1(-ySink * g.settlingVelocity * dt / hSink);
+    expectTrue("the relaxation argument really is of order one, where exact and explicit differ",
+               g.settlingVelocity * dt / hCarry > 0.5);
+
+    const double upperAgent0 = g.upper.agent, upperMass0 = g.upper.mass;
+    const fire::StepResult r = s.model.step(dt, s.ship, s.sea);
+    expectEqual("the model took the single substep it was asked for", r.substeps, 1);
+    expectNear("the agent that fell is the exact relaxation of the layer it fell out of",
+               upperAgent0 - g.upper.agent, wantAgent, 1e-9 * wantAgent);
+    expectTrue("which the explicit rate would have over-stated by a third",
+               std::abs(agentThere * g.settlingVelocity * dt / hCarry - wantAgent) >
+                   0.2 * wantAgent);
+    expectNear("and the carrier that rose is the exact relaxation of its own layer's",
+               g.upper.mass - upperMass0 + wantAgent, wantCarrier, 1e-9 * wantCarrier);
+    // The two thicknesses are not interchangeable, and the test would not know if
+    // they happened to be equal.
+    expectTrue("the two layer thicknesses differ by two to one", hSink > 1.8 * hCarry);
+
+    // **A layer that only loses mass at its own temperature does not change
+    // temperature.** Run the carrier stream on its own -- all the agent already in
+    // the layer it belongs in, so nothing falls -- with the two layers at very
+    // different temperatures, and the donor must sit still.
+    FloodedSpace t = makeMachinerySpace(fire::kCarbonDioxide, 0.0);
+    fire::GasCompartment& q = t.model.gas[0];
+    q.upper.mass = kPatm * vUpper / (kRAir * 500.0);
+    q.upper.energy = q.upper.mass * fire::kCvAir * 500.0;
+    q.lower.mass = kPatm * (kMachineVolume - vUpper) / (kRAir * kTAmbient);
+    q.lower.energy = q.lower.mass * fire::kCvAir * kTAmbient;
+    seed(q.lower, 400.0);
+    q.settlingVelocity = 0.2;
+    t.model.resetAccount();
+    const double donor0 = q.lower.temperature(sp);
+    const double receiver0 = q.upper.temperature(sp);
+    const double energy0 = q.totalEnergy();
+    // Vacuity, taken **at the start**: the receiving layer cools as the cool carrier
+    // floods into it, so by the end the two are much closer. What has to be true for
+    // the assertion below to discriminate is that the stream had two very different
+    // temperatures to choose between when it left.
+    expectTrue("the two layers started two hundred kelvin apart", receiver0 > donor0 + 200.0);
+    stepFor(t.model, t.ship, t.sea, 200);
+    expectTrue("the carrier really did rise out of the blanket", q.lower.agent == 400.0 &&
+                                                                     q.upper.agent == 0.0);
+    expectTrue("and it really moved some", q.lower.mass < 0.9 * (400.0 + kPatm *
+                   (kMachineVolume - vUpper) / (kRAir * kTAmbient)));
+    expectNear("the layer it left is at the temperature it started at", q.lower.temperature(sp),
+               donor0, 1.5);
+    expectNear("with the compartment's energy untouched", q.totalEnergy(), energy0,
+               1e-12 * energy0);
+    expectTrue("while the layer it joined is still the warmer of the two",
+               q.upper.temperature(sp) > q.lower.temperature(sp) + 20.0);
+}
+
+// **The boundary and the spray are both timed off the layer's own heat capacity**,
+// `sum_i m_i c_v,i`, and at the design concentration that is 4.4% away from air's.
+// Both are exact relaxations, so both are asserted on a single controlled substep
+// against the closed form -- and against the wrong one, so the assertion is a
+// discrimination and not a restatement.
+void testTheBoundaryAndTheSprayAreTimedOffTheMixtureHeatCapacity() {
+    for (int which = 0; which < 2; ++which) {
+        FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.0);
+        fire::GasCompartment& g = s.model.gas[0];
+        const fire::AgentSpecies& sp = g.agentSpecies;
+        // One hot agent-rich layer over a thin cool one, so the upper layer is what
+        // both terms act on and its composition is the thing being measured.
+        const double vUpper = 0.9 * kMachineVolume;
+        g.upper.mass = kPatm * vUpper / (kRAir * 450.0);
+        g.upper.energy = g.upper.mass * fire::kCvAir * 450.0;
+        g.lower.mass = kPatm * (kMachineVolume - vUpper) / (kRAir * 450.0);
+        g.lower.energy = g.lower.mass * fire::kCvAir * 450.0;
+        const double agentKg = 700.0;
+        g.upper.mass += agentKg;
+        g.upper.agent = agentKg;
+        g.upper.energy += agentKg * sp.cv() * 450.0;
+        g.wallConductance = which == 0 ? 40.0 : 0.0;
+        s.model.maxRelativeChange = 1e9;
+        // **Sixty seconds, and the length is the whole point.** Both terms are
+        // `C (1 - e^{-r dt / C})`, which tends to `r dt` *whatever C is* -- so a
+        // short step is exactly blind to which heat capacity was used. This repo has
+        // already shipped a `c_p` where a `c_v` belonged for that precise reason, and
+        // the lesson is recorded in CLAUDE.md. The step here is chosen so that
+        // `r dt / C` is of order one, and that is asserted rather than assumed.
+        s.model.maxSubstep = 60.0;
+
+        fire::Drencher d;
+        d.name = "mist";
+        d.gasCompartment = 0;
+        d.flow = 3.0;
+        d.on = which == 1;
+        s.model.drenchers.push_back(d);
+        s.model.resetAccount();
+
+        const double dt = 60.0;
+        const double capacity = g.upper.heatCapacity(sp);
+        const double airCapacity = g.upper.mass * fire::kCvAir;
+        expectTrue("the two heat capacities really differ, or this proves nothing",
+                   std::abs(capacity / airCapacity - 1.0) > 0.03);
+        const double tUpper = g.upper.temperature(sp);
+
+        double want = 0, wrong = 0;
+        if (which == 0) {
+            // **Both layers**, because `Account::wallLoss` is the enclosure's and not
+            // one layer's: the thin cool layer still wets the whole deck. Charging
+            // only the upper one reads 36% low, which is nine times the effect being
+            // measured -- and is what the first version of this assertion did.
+            const double zi = g.interfaceZ();
+            auto loss = [&](double area, double temp, double c) {
+                const double rate = g.wallConductance * area;
+                return c * (temp - g.wallTemperature) * -std::expm1(-rate * dt / c) / dt;
+            };
+            const double aUpper = g.floorArea + g.perimeter * (g.ceilingZ - zi);
+            const double aLower = g.floorArea + g.perimeter * (zi - g.floorZ);
+            const double tLower = g.lower.temperature(sp);
+            want = loss(aUpper, tUpper, capacity) +
+                   loss(aLower, tLower, g.lower.heatCapacity(sp));
+            wrong = loss(aUpper, tUpper, airCapacity) +
+                    loss(aLower, tLower, g.lower.mass * fire::kCvAir);
+        } else {
+            const double excess = tUpper - d.waterTemperature;
+            const double share =
+                std::clamp((tUpper - fire::kTSaturation) / 50.0, 0.0, 1.0);
+            const double perKg =
+                fire::kCpWater *
+                    std::max(std::min(tUpper, fire::kTSaturation) - d.waterTemperature, 0.0) +
+                d.evaporatedFraction * fire::kLatentHeat * share;
+            const double kEff = d.flow * perKg / excess;
+            auto cool = [&](double c) {
+                return c * excess * -std::expm1(-kEff * dt / c) / dt;
+            };
+            want = cool(capacity);
+            wrong = cool(airCapacity);
+        }
+
+        expectTrue("the relaxation argument is of order one, where the exponential bends",
+                   std::abs(want / wrong - 1.0) > 0.01);
+        const fire::StepResult r = s.model.step(dt, s.ship, s.sea);
+        expectEqual("the model took the single substep it was asked for", r.substeps, 1);
+        const double got = which == 0 ? s.model.account.wallLoss / dt
+                                      : s.model.drenchers[0].lastCooling;
+        expectNear(which == 0 ? "the boundary loss is the mixture's own relaxation"
+                              : "the spray cooling is the mixture's own relaxation",
+                   got, want, 1e-9 * std::abs(want));
+        expectTrue("and it is not the answer air's heat capacity would give",
+                   std::abs(got - wrong) > 0.01 * std::abs(want));
+    }
+}
+
+// **A step that would take a layer's agent negative is rejected, not clamped**, and
+// reaching that rail takes some doing: the separation is an exact relaxation and
+// cannot over-drain a layer on its own, so it needs a second sink on the same
+// layer at the same time. A high vent blowing the over-pressure out of the upper
+// layer, while the separation is taking the whole of that layer's agent downward,
+// is the case -- between them they ask for more agent than is there, and the layer
+// still has plenty of *mass*, so the mass rail does not fire first.
+//
+// The clamps in the commit are the only thing in this file that can put a hole in
+// a conservation account. This asserts that the account survives the case that
+// would have made one.
+void testAStepThatWouldTakeTheAgentNegativeIsRejectedRatherThanClamped() {
+    FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.0);
+    fire::GasCompartment& g = s.model.gas[0];
+    const fire::AgentSpecies& sp = g.agentSpecies;
+    // A big upper layer holding a little agent, over-pressurised, with a vent up in
+    // the deckhead for it to blow out of.
+    const double vUpper = 0.8 * kMachineVolume;
+    g.upper.mass = 1.6 * kPatm * vUpper / (kRAir * kTAmbient);
+    g.upper.energy = g.upper.mass * fire::kCvAir * kTAmbient;
+    g.lower.mass = 1.6 * kPatm * (kMachineVolume - vUpper) / (kRAir * kTAmbient);
+    g.lower.energy = g.lower.mass * fire::kCvAir * kTAmbient;
+    const double seeded = 8.0;
+    g.upper.agent = seeded;
+    g.upper.energy += seeded * (sp.cv() - fire::kCvAir) * kTAmbient;
+    g.settlingVelocity = 500.0;   // takes the whole of the upper layer's agent in one step
+    s.model.vents.push_back(makeDoor(kMachineH - 2.0, 2.0, 2.0));
+    // Both accuracy rails opened, so the agent's non-negativity is the only thing
+    // standing between this step and a clamped account.
+    s.model.maxRelativeChange = 1e9;
+    s.model.maxSubstep = 4.0;
+    s.model.resetAccount();
+
+    expectTrue("the fixture is over-pressurised, so the vent really runs",
+               g.pressure() > kPatm + 5.0e4);
+    expectTrue("and the layer holds far more mass than agent, so the mass rail cannot fire first",
+               g.upper.mass > 100.0 * g.upper.agent);
+
+    const fire::StepResult r = s.model.step(4.0, s.ship, s.sea);
+    expectTrue("the step was rejected and subdivided rather than taken", r.substeps > 1);
+    expectTrue("the vent really carried gas out", s.model.account.massOut > 1.0);
+    expectTrue("and agent with it", s.model.account.agentOut > 0.0);
+    expectTrue("the separation really moved the agent down", g.lower.agent > 0.9 * seeded);
+    expectTrue("no layer holds a negative agent mass",
+               g.upper.agent >= 0.0 && g.lower.agent >= 0.0);
+    expectNear("and the agent account closes exactly, which a clamp would not allow",
+               s.model.account.agentResidual(), 0.0, 1e-11 * seeded);
+    expectNear("with the mass account closing beside it",
+               s.model.account.massResidualFraction(), 0.0, 1e-14);
+}
+
+// **Stratification makes a low leak worse, not better**, and that is the finding
+// that ties the two halves of this item together. A heavy agent puts its blanket
+// exactly where a deck-level opening is, so a space that separates drains through
+// that opening while a space that stays mixed loses a far more dilute stream --
+// and the fire the mixed flood puts out goes on burning in the stratified one.
+//
+// The same fixture as the substep-floor test below, deliberately: one fire, one
+// bank, one low door, and `settlingVelocity` the only thing that differs.
+void testStratificationMakesALowLeakWorseAndNotBetter() {
+    auto run = [](double settling) {
+        FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, settling);
+        s.model.gas[0].wallConductance = 25.0;
+        s.model.vents.push_back(makeDoor(0.0));
+        fire::DesignFire d;
+        d.name = "machinery";
+        d.compartment = 0;
+        d.baseZ = 0.5;
+        d.diameter = 2.0;
+        d.peakHeatRelease = 3.0e6;
+        s.model.fires.push_back(d);
+        s.model.agents.push_back(makeBank(s.model, kDesignFraction, 120.0, true));
+        stepFor(s.model, s.ship, s.sea, 300);
+        return s;
+    };
+    FloodedSpace mixed = run(0.0);
+    FloodedSpace apart = run(1.0);
+
+    expectNear("both banks discharged the same mass", apart.model.account.agentDischarged,
+               mixed.model.account.agentDischarged, 1e-9 * mixed.model.account.agentDischarged);
+    expectNear("the perfectly mixed space holds 39.3% after five minutes",
+               mixed.model.gas[0].agentFraction(), 0.393, 0.008);
+    expectNear("the separating one holds 17.6%", apart.model.gas[0].agentFraction(), 0.176,
+               0.008);
+    expectTrue("so separation costs it more than half the concentration",
+               apart.model.gas[0].agentFraction() < 0.5 * mixed.model.gas[0].agentFraction());
+    expectTrue("because the blanket forms exactly where the hole is",
+               apart.model.account.agentOut > 1.5 * mixed.model.account.agentOut);
+    // And the consequence that matters: the mixed flood puts the fire out and the
+    // stratified one does not.
+    expectNear("the mixed flood lets 1.19e8 J out of the fire",
+               mixed.model.account.heatReleased / 1e8, 1.188, 0.05);
+    expectNear("the stratified one 6.66e8 J", apart.model.account.heatReleased / 1e8, 6.664,
+               0.15);
+    expectTrue("which is five and a half times as much",
+               apart.model.account.heatReleased > 4.0 * mixed.model.account.heatReleased);
+    // Vacuity: the two runs differ in one field and nothing else.
+    expectTrue("the two spaces differ only in their settling velocity",
+               mixed.model.gas[0].settlingVelocity == 0.0 &&
+                   apart.model.gas[0].settlingVelocity == 1.0 &&
+                   mixed.model.gas[0].gasVolume == apart.model.gas[0].gasVolume);
+}
+
+// A bad agent definition does not crash; it quietly produces a wrong answer.
+void testValidateCatchesBadAgentDefinitions() {
+    fire::Model m;
+    fire::GasCompartment g;
+    g.name = "a";
+    g.shipCompartment = kSea;
+    g.floorZ = 0.0;
+    g.ceilingZ = 3.0;
+    g.floorArea = 10.0;
+    g.gasVolume = 30.0;
+    g.fillAmbient();
+    m.gas.push_back(g);
+    g.name = "b";
+    g.agentSpecies = fire::kNitrogen;   // a different agent through a shared door
+    m.gas.push_back(g);
+    fire::Vent v;
+    v.name = "between";
+    v.a = 0;
+    v.b = 1;
+    v.sillZ = 0.0;
+    v.soffitZ = 2.0;
+    v.width = 0.8;
+    m.vents.push_back(v);
+
+    fire::AgentSystem a;
+    a.name = "nowhere";
+    a.gasCompartment = 7;
+    m.agents.push_back(a);
+    a.name = "backwards";
+    a.gasCompartment = 0;
+    a.flow = -1.0;
+    a.charge = -5.0;
+    a.solidFraction = 1.5;
+    a.dischargeTemperature = -20.0;   // celsius, which is the mistake this catches
+    m.agents.push_back(a);
+
+    const std::vector<std::string> problems = m.validate();
+    auto mentions = [&](const char* text) {
+        for (const std::string& p : problems)
+            if (p.find(text) != std::string::npos) return true;
+        return false;
+    };
+    expectTrue("a bank in a space that does not exist is caught", mentions("does not exist"));
+    expectTrue("a negative flow is caught", mentions("negative flow"));
+    expectTrue("a negative charge is caught", mentions("negative charge"));
+    expectTrue("a solid fraction outside [0, 1] is caught", mentions("solid fraction"));
+    expectTrue("and a discharge temperature in celsius is caught",
+               mentions("kelvin, not celsius"));
+    expectTrue("two agents sharing a door are caught", mentions("different flooding agents"));
+    // And a well-formed one is not.
+    fire::Model ok;
+    ok.gas.push_back(m.gas[0]);
+    fire::AgentSystem fine;
+    fine.name = "fine";
+    fine.gasCompartment = 0;
+    fine.flow = 1.0;
+    fine.charge = 50.0;
+    ok.agents.push_back(fine);
+    expectTrue("while a well-formed bank raises nothing", ok.validate().empty());
+}
+
+// The separation moves the agent and nothing else: an isolated space with no fire,
+// no boundary and no opening must conserve mass, energy and agent **to the bit**
+// however violently it rearranges them.
+void testSeparationConservesEverythingItRearranges() {
+    FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.0);
+    // Seed a badly mixed state by hand: all the agent in the *upper* layer, which is
+    // the layer it does not belong in, so the separation has the most to do.
+    fire::GasCompartment& g = s.model.gas[0];
+    const double agent = 400.0;
+    g.upper.mass += agent;
+    g.upper.agent = agent;
+    g.upper.energy += agent * g.agentSpecies.cv() * kTAmbient;
+    g.settlingVelocity = 0.5;
+    s.model.resetAccount();
+
+    const double mass0 = g.totalMass(), energy0 = g.totalEnergy(), agent0 = g.totalAgent();
+    const double upperAgent0 = g.upper.agent;
+    stepFor(s.model, s.ship, s.sea, 600);
+
+    expectNear("mass is conserved to machine precision", g.totalMass(), mass0, 4e-13 * mass0);
+    expectNear("energy is conserved to machine precision", g.totalEnergy(), energy0,
+               4e-13 * energy0);
+    expectNear("and the agent with it", g.totalAgent(), agent0, 4e-13 * agent0);
+    expectNear("the account agreeing", s.model.account.agentResidual(), 0.0, 1e-11 * agent0);
+    // And it really did rearrange: the agent started entirely in the wrong layer.
+    expectTrue("the agent started in the upper layer", upperAgent0 == agent0);
+    expectTrue("and finished in the lower one", g.lower.agent > 0.99 * agent0);
+    expectTrue("with the space still holding what it started with",
+               std::abs(g.agentFraction() - moleFraction(mass0 - agent0, agent0,
+                                                         g.agentSpecies)) < 1e-9);
+}
+
+// **A warm agent arriving through a doorway must still sink.** The rule that
+// decides which layer an incoming stream joins used to be a temperature
+// comparison, which is the same test as a density comparison only while every
+// stream is air. CO2 at 400 K is denser than air at 288 K; a temperature rule would
+// file it under the deckhead, which is the one place a flooding agent must not go.
+void testAWarmHeavyStreamSinksWhereAWarmLightOneRises() {
+    const fire::AgentSpecies& co2 = fire::kCarbonDioxide;
+    fire::VentSide side;
+    side.interfaceZ = 2.0;
+    side.tUpper = 400.0;
+    side.tLower = kTAmbient;
+    side.agentSpecies = co2;
+    side.aUpper = 1.0;   // the band above the interface is pure CO2
+    side.aLower = 0.0;
+
+    // The buoyancy temperature is what a *pure air* layer of the same density would
+    // read, so it is directly comparable with an air layer's own temperature.
+    const double want = 400.0 * co2.gasConstant() / kRAir;
+    expectNear("400 K of pure CO2 is as dense as air at 263 K", side.buoyancyTemperatureOf(true),
+               want, 1e-12 * want);
+    expectNear("which is 263.3 K", want, 263.28, 0.02);
+    expectTrue("so it is *heavier* than the 288 K air below it, 112 K of warmth notwithstanding",
+               side.buoyancyTemperatureOf(true) < side.buoyancyTemperatureOf(false));
+    expectTrue("while a temperature rule would have called it buoyant",
+               side.temperatureAt(2.5) > side.temperatureAt(1.0));
+    // The by-height form is the by-layer one, and there is exactly one of them.
+    expectTrue("the two spellings of the same question agree exactly",
+               side.buoyancyTemperatureAt(2.5) == side.buoyancyTemperatureOf(true) &&
+                   side.buoyancyTemperatureAt(1.0) == side.buoyancyTemperatureOf(false));
+    expectTrue("and so do the two spellings of the heat capacity",
+               side.heatCapacityAt(2.5) == side.heatCapacityOf(true));
+    // Air is exempt to the bit: with no agent the buoyancy temperature *is* the
+    // temperature and the heat capacity is `kCpAir`, so nothing already published
+    // moves.
+    fire::VentSide air;
+    air.interfaceZ = 2.0;
+    air.tUpper = 900.0;
+    air.tLower = 301.0;
+    expectTrue("a stream with no agent reports its own temperature, exactly",
+               air.buoyancyTemperatureOf(true) == 900.0 &&
+                   air.buoyancyTemperatureOf(false) == 301.0);
+    expectTrue("and air's own c_p, exactly", air.heatCapacityOf(true) == fire::kCpAir);
+
+    // And a light agent the other way: nitrogen at 288 K is buoyant in 288 K air.
+    fire::VentSide n2;
+    n2.agentSpecies = fire::kNitrogen;
+    n2.interfaceZ = 2.0;
+    n2.aLower = 1.0;
+    expectTrue("pure nitrogen at ambient is lighter than the air it is in",
+               n2.buoyancyTemperatureOf(false) > kTAmbient);
+    expectNear("by 3.3%", n2.buoyancyTemperatureOf(false) / kTAmbient,
+               fire::kNitrogen.gasConstant() / kRAir, 1e-12);
+}
+
+// The discharge's own cooling diagnostic, which is what a caller watching the
+// system sees, against the closed form it is a restatement of.
+void testTheDischargeReportsTheCoolingItIsApplying() {
+    FloodedSpace s = makeMachinerySpace(fire::kCarbonDioxide, 0.0);
+    s.model.agents.push_back(makeBank(s.model, kDesignFraction, 120.0, /*phaseChange=*/true));
+    stepFor(s.model, s.ship, s.sea, 30);
+    const fire::AgentSystem& a = s.model.agents[0];
+    const fire::AgentSpecies& sp = s.model.gas[0].agentSpecies;
+    const double perKg = sp.cv() * a.dischargeTemperature -
+                         a.solidFraction * (sp.sublimationHeat -
+                                            sp.gasConstant() * sp.sublimationTemperature);
+    // The diagnostic is formed on the substep's *entry* state, so it is compared
+    // against a step short enough that the layer does not move within it. Over a
+    // full second it drifts 0.16%, which is the layer cooling and not an error.
+    const double entry = s.model.gas[0].lower.temperature(sp);
+    s.model.step(1e-6, s.ship, s.sea);
+    const double want = a.lastFlow * (sp.cv() * entry - perKg);
+    expectTrue("the bank is discharging at its rated flow", a.lastFlow > 0.0);
+    expectNear("and reports the heat that raising its own agent to the layer costs",
+               a.lastCooling, want, 1e-9 * std::abs(want));
+    expectTrue("which is megawatts on a 7.4 kg/s discharge", a.lastCooling > 1.0e6);
+    // The `charge`-capped last substep is where `lastFlow` stops being `flow`, and
+    // `delivered` has to land on the charge exactly rather than near it.
+    stepFor(s.model, s.ship, s.sea, 200);
+    expectNear("the bank stops on its charge exactly", a.delivered, a.charge, 1e-12 * a.charge);
+    expectTrue("and reports nothing once it is empty", a.lastFlow == 0.0 && a.lastCooling == 0.0);
+}
+
+// `agentMassForFraction` is the closed form the whole section is sized on, so it is
+// checked against its own inverse and against the marine rule of thumb.
+void testTheDesignMassIsTheClosedFormAndItsOwnInverse() {
+    FloodedSpace s = makeMachinerySpace();
+    const fire::GasCompartment& g = s.model.gas[0];
+    const double air = g.totalMass();
+    for (double y : {0.15, 0.34, kDesignFraction, 0.62}) {
+        const double m = fire::agentMassForFraction(g, y);
+        expectNear("the design mass reproduces the fraction it was asked for",
+                   moleFraction(air, m, g.agentSpecies), y, 1e-14);
+        // n_g/(n_a+n_g) = y  =>  m_g = y/(1-y) m_a R_a / R_g.
+        expectNear("and it is y/(1-y) times the carrier's moles", m,
+                   y / (1.0 - y) * air * kRAir / g.agentSpecies.gasConstant(), 1e-12 * m);
+    }
+    expectNear("a 720 m3 machinery space wants 894 kg of CO2 for 40%",
+               fire::agentMassForFraction(g, kDesignFraction), 893.5, 1.0);
+    // SOLAS FSS ch. 5 sizes the bank at 0.56 m3 of free gas per kilogram over 40% of
+    // the gross volume, which is a *larger* number: the difference is the margin the
+    // rule carries for what leaks out during the discharge, and this file's job is
+    // the physics rather than the margin.
+    const double solas = 0.40 * kMachineVolume / 0.56;
+    expectTrue("which is well under the rule's own 514 kg, the difference being its margin",
+               solas > fire::agentMassForFraction(g, kDesignFraction) * 0.5);
+    expectNear("and an agent already in the space is credited against it",
+               fire::agentMassForFraction(g, 0.0), 0.0, 1e-12);
+    // **Asked of a space that is already part-flooded**, which is the case a second
+    // shot into a leaking compartment is and which nothing else here reaches: the
+    // answer is the *additional* mass, so topping a 20% space up to 40% costs less
+    // than flooding it from air, and 20% of the way there costs nothing at all.
+    {
+        FloodedSpace part = makeMachinerySpace();
+        part.model.agents.push_back(makeBank(part.model, 0.20, 120.0, false));
+        stepFor(part.model, part.ship, part.sea, 300);
+        const fire::GasCompartment& p = part.model.gas[0];
+        expectNear("the space is holding 20%", p.agentFraction(), 0.20, 1e-11);
+        const double top = fire::agentMassForFraction(p, kDesignFraction);
+        const double fresh = fire::agentMassForFraction(g, kDesignFraction);
+        expectTrue("topping it up to 40% costs less than flooding from air",
+                   top > 0.0 && top < 0.7 * fresh);
+        expectNear("and asking for the concentration it already has costs nothing",
+                   fire::agentMassForFraction(p, p.agentFraction()), 0.0, 1e-6);
+        // Verified the only way that means anything: discharge it and land on 40%.
+        fire::AgentSystem second;
+        second.name = "second_shot";
+        second.gasCompartment = 0;
+        second.charge = top;
+        second.flow = top / 60.0;
+        second.on = true;
+        second.dischargeTemperature = kTAmbient;
+        second.solidFraction = 0.0;
+        part.model.agents.push_back(second);
+        stepFor(part.model, part.ship, part.sea, 200);
+        expectNear("the top-up lands exactly on the design concentration",
+                   part.model.gas[0].agentFraction(), kDesignFraction, 1e-9);
+    }
+}
+
 void runFireTests() {
     std::printf("\n--- compartment fire ---\n");
     testCaloricConstantsAreExactlyConsistent();
@@ -3846,4 +5357,30 @@ void runFireTests() {
     testFilmMembershipIsExactAtTheInterface();
     testBandsAreCutAtTheHeightAskedForAndNotAtTheRowPitch();
     testAColdChainLeavesTheShipAndTheSteelBitIdentical();
+
+    std::printf("\n--- suppression by gas: total flooding ---\n");
+    testTheAgentConstantsAreDerivedAndNotQuoted();
+    testTheMixtureClosureIsDaltonAndTheExcessIsExactlyZeroWithoutAnAgent();
+    testASealedSpaceReachesTheConcentrationTheArithmeticSays();
+    testTheDesignMassIsTheClosedFormAndItsOwnInverse();
+    testAWarmHeavyStreamSinksWhereAWarmLightOneRises();
+    testTheDischargeReportsTheCoolingItIsApplying();
+    testTheMixedLimitIsUniformAndTheStratifiedLimitIsABlanketOfKnownDepth();
+    testSeparationConservesEverythingItRearranges();
+    testAHeavyAgentSettlesToTheDeckAndALightOneRisesToTheDeckhead();
+    testWhereTheOpeningIsDecidesWhetherTheAgentStays();
+    testTheAgentInAColdSpaceStillStratifiesAndStillLeaks();
+    testTheFireGoesOutByDisplacementAndTheControlWithNoAgentDoesNot();
+    testTheDischargeEnthalpyIsItsClosedFormAndTheChillIsLarge();
+    testAFiniteBankRunsOutAndTheConcentrationThenOnlyFalls();
+    testWhatTheDesignConcentrationDoesToAPersonInTheSpace();
+    testTheDischargeIsUniformAcrossLayersAtDifferentTemperatures();
+    testTheSeparationRatesAreTheirClosedFormRelaxations();
+    testTheBoundaryAndTheSprayAreTimedOffTheMixtureHeatCapacity();
+    testAStepThatWouldTakeTheAgentNegativeIsRejectedRatherThanClamped();
+    testStratificationMakesALowLeakWorseAndNotBetter();
+    testTheAccountClosesWithAnAgentFloodingTheFerry();
+    testAnAgentSystemSwitchedOffLeavesTheGasBitIdentical();
+    testTheSubstepControllerStaysNearItsFloorWhileFlooding();
+    testValidateCatchesBadAgentDefinitions();
 }
