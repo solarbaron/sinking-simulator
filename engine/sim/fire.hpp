@@ -110,6 +110,73 @@
 // as pressure-driven only, so a fire under a closed-to-flow-but-open hatch will
 // not shed smoke upward the way it should. Named rather than hidden.
 //
+// --- The second species, and why it goes *down* ---------------------------------
+//
+// A total-flooding agent -- CO2, or one of the inert-gas blends -- is a second gas
+// with its own molar mass, its own `R` and its own `gamma`, and every closure above
+// generalises to carry it **exactly**:
+//
+//     p V_k = (m_air R_air + m_agent R_agent) T_k          (Dalton, per layer)
+//     T_k   = U_k / (m_air c_v,air + m_agent c_v,agent)
+//   =>  p V_k = (gamma_k - 1) U_k  with  gamma_k - 1 = R_mix,k / c_v,mix,k
+//   =>  p     = [ (gamma_u-1) U_u + (gamma_l-1) U_l ] / V
+//   and V_u/V = (gamma_u-1) U_u / [ (gamma_u-1) U_u + (gamma_l-1) U_l ].
+//
+// So the volume split is still the *pressure-energy* split, still with no root
+// find. `Layer::excessEnergy` carries the whole of the difference: it is the extra
+// internal energy a pure-air layer would need to press as hard as this one does,
+// it is proportional to the agent mass in the layer and therefore **exactly 0.0**
+// when there is none, and every formula above is then bit-for-bit the one that was
+// here before agents existed. That is asserted, not hoped for.
+//
+// **The interesting part is that the agent stratifies the wrong way up.** CO2 is
+// M = 44 against air's 29, so it is half again as dense and it sinks -- to the
+// deck, which is where the people are, and out of any opening near the deck, which
+// is where the concentration goes. Nothing about the hot-layer machinery gives that
+// for free: two well-mixed zones with the agent dropped into them would report one
+// uniform concentration and would have thrown away the entire hazard.
+//
+// The mechanism is a **buoyant separation flux** across the interface
+// (`GasCompartment::settlingVelocity`), and it is two one-way streams rather than a
+// diffusive exchange, because a diffusive exchange drives towards *uniformity* and
+// what gravity actually does is drive towards segregation:
+//
+//   * the agent in the layer it does not belong in falls (or rises) into the other
+//     one, at a rate `agent_there / (thickness / w)`;
+//   * the carrier gas in the layer the agent does belong in is floated out, at a
+//     rate `carrier_there / (thickness / w)` times the agent's own volume fraction
+//     there -- so a compartment with no agent in it has **both** streams at exactly
+//     zero and nothing changes.
+//
+// Both are applied as exact relaxations (`expm1`, as the wall loss and the drencher
+// are), so a layer of half a millimetre cannot be over-drained at any step. The
+// fixed point of the pair is *all* the agent in one layer and *all* the carrier in
+// the other, and that state is exactly the fully stratified one: the blanket's
+// height is then the agent's own partial volume, `H y`, which
+// `tests/test_fire.cpp` asserts as a closed form. The other limit, `w = 0`, is the
+// perfectly mixed one, and it is asserted against the ideal-gas arithmetic. The
+// value of `w` between them is a modelling choice and is documented as one.
+//
+// **Extinguishing is displacement, not cooling.** The air the fire breathes is the
+// air its plume entrains, so the two layers are weighted by `Plume::entrainment`
+// itself -- the correlation already here, and not a new coefficient -- and the heat
+// release the gas receives is the design curve times a linear availability ramp
+// between the fuel's limiting oxygen concentration and ambient. Weighting by the
+// plume also makes the oxygen a *continuous* function of the interface height,
+// which matters because an agent blanket puts that interface across the fire's own
+// base. The design curve is still the input, exactly as `Drencher` leaves it --
+// what changed is that the model now reports how much of it the atmosphere allows,
+// on the same terms as `StepResult::suppressionCooling` reports applied rather than
+// demanded cooling.
+//
+// **Named rather than hidden**, in this half as in the others: oxygen is *diluted*
+// here and never *consumed*, so a sealed compartment fire that would vitiate itself
+// out does not; a compartment holding a hot smoke layer, cool air and an agent
+// blanket has three strata and two zones to put them in, so the blanket and the
+// cool air share one; the agent's own radiative absorption is not modelled; and
+// `les::demote` writes a `GasCompartment`'s layers without touching their agent
+// mass, so a promoted-and-demoted compartment loses the agent it was holding.
+//
 // Body frame and SI units per CLAUDE.md. The interface is horizontal in the
 // *body* frame, which is exact for an upright ship and approximate for a heeled
 // one; a heeled compartment's layer geometry is a real problem and is not solved
@@ -134,6 +201,112 @@ inline constexpr double kCpAir = kCvAir + kRAir;              // 1004.68 J/(kg K
 
 // Ambient air density at `kPatm` and `kTAmbient`.
 inline constexpr double kRhoAmbient = kPatm / (kRAir * kTAmbient);   // 1.2253 kg/m^3
+
+// ---------------------------------------------------------------------------
+// The flooding agent
+// ---------------------------------------------------------------------------
+
+// The molar gas constant, `N_A k_B`, which the 2019 SI defines **exactly**: both
+// factors are exact defining constants, so this is not a measurement and carries
+// no uncertainty. `tests/test_fire.cpp` re-derives it from them rather than
+// quoting it, on the same terms as `kStefanBoltzmann`.
+inline constexpr double kUniversalGas = 8.31446261815324;   // J/(mol K)
+
+// Air's molar mass **as this repo's own `kRAir` implies it**, 28.965 g/mol.
+// Derived rather than quoted: every mole fraction below is a ratio of `R`s, and a
+// quoted 28.9647 against a `kRAir` that means 28.9650 would put a part in ten
+// thousand of drift into a concentration this file asserts as a closed form.
+inline constexpr double kMolarMassAir = kUniversalGas / kRAir;   // kg/mol
+
+// Oxygen in dry air, by volume. The one number every asphyxiation threshold below
+// is measured against.
+inline constexpr double kOxygenFractionAir = 0.2095;
+
+// What a diluted atmosphere does to a person, by volume of oxygen. The standard
+// occupational-hygiene ladder: 19.5% is the minimum for entry, below about 10%
+// consciousness goes, below 6% death follows in minutes.
+inline constexpr double kOxygenEntryLimit    = 0.195;
+inline constexpr double kOxygenIncapacitating = 0.10;
+inline constexpr double kOxygenLethal         = 0.06;
+
+// One flooding agent, as a gas.
+//
+// **Trivially copyable and stringless on purpose.** A `VentSide` carries one of
+// these and `substep` builds a `VentSide` per compartment per pressure-solve
+// evaluation -- tens of times a step -- so a `std::string` in here would be an
+// allocation on the hot path. The name lives on `AgentSystem`, which is authored
+// once.
+struct AgentSpecies {
+    double molarMass = 0.0440095;   // kg/mol; CO2 by default
+    double gamma = 1.289;           // CO2 at 300 K
+
+    // Sublimation enthalpy at one atmosphere, J/kg, and the temperature it happens
+    // at. Zero for an agent that is stored and delivered as a gas. See
+    // `AgentSystem::solidFraction` for what they are for.
+    double sublimationHeat = 5.71e5;   // J/kg
+    double sublimationTemperature = 194.65;   // K, CO2's 1 atm sublimation point
+
+    // Toxicity by volume fraction, which is the whole difference between a CO2
+    // system and an inert-gas one and is the reason this is a species property
+    // rather than a constant. CO2 is not merely an asphyxiant: 7-10% brings
+    // unconsciousness in minutes and above 10% it convulses and kills, at
+    // concentrations where the *oxygen* it leaves would still be breathable. A
+    // true inert gas has no such action at all, so both are 1.0 for one -- a
+    // fraction no atmosphere can exceed.
+    double incapacitatingFraction = 0.07;
+    double lethalFraction = 0.10;
+
+    double gasConstant() const { return kUniversalGas / molarMass; }
+    double cv() const { return gasConstant() / (gamma - 1.0); }
+    // `c_p - c_v = R` and `c_p / c_v = gamma` hold exactly, for the same reason
+    // `kCpAir` is derived rather than quoted.
+    double cp() const { return cv() + gasConstant(); }
+    // Denser than air at the same pressure and temperature, so it settles
+    // downward. `R = R_u / M`, so a *smaller* R is a *heavier* gas.
+    bool heavierThanAir() const { return gasConstant() < kRAir; }
+};
+
+// The agents the marine rules name. Molar masses are the IUPAC 2021 values; the
+// blends are the mole-weighted mean of their components.
+//
+//   * **CO2** -- SOLAS FSS Code ch. 5. Heavy, and lethal at its own design
+//     concentration.
+//   * **IG-01 (argon)**, **IG-100 (nitrogen)**, **IG-55 (50/50 N2/Ar)** and
+//     **IG-541 (52% N2, 40% Ar, 8% CO2)** -- ISO 14520. Carried because nitrogen
+//     is *lighter* than air and argon is heavier, so the direction a flooding
+//     agent stratifies is a consequence of its molar mass in this model rather
+//     than a hard-coded downward drift. `tests/test_fire.cpp` checks that by
+//     changing the species and nothing else.
+inline constexpr AgentSpecies kCarbonDioxide{};
+inline constexpr AgentSpecies kNitrogen{.molarMass = 0.0280134,
+                                        .gamma = 1.4,
+                                        .sublimationHeat = 0.0,
+                                        .sublimationTemperature = 77.36,
+                                        .incapacitatingFraction = 1.0,
+                                        .lethalFraction = 1.0};
+inline constexpr AgentSpecies kArgon{.molarMass = 0.039948,
+                                     .gamma = 1.667,
+                                     .sublimationHeat = 0.0,
+                                     .sublimationTemperature = 87.30,
+                                     .incapacitatingFraction = 1.0,
+                                     .lethalFraction = 1.0};
+inline constexpr AgentSpecies kIG55{.molarMass = 0.5 * 0.0280134 + 0.5 * 0.039948,
+                                    .gamma = 1.52,
+                                    .sublimationHeat = 0.0,
+                                    .sublimationTemperature = 0.0,
+                                    .incapacitatingFraction = 1.0,
+                                    .lethalFraction = 1.0};
+inline constexpr AgentSpecies kIG541{
+    .molarMass = 0.52 * 0.0280134 + 0.40 * 0.039948 + 0.08 * 0.0440095,
+    .gamma = 1.51,
+    .sublimationHeat = 0.0,
+    .sublimationTemperature = 0.0,
+    // 8% CO2 in the blend, so the atmosphere's CO2 reaches 8% of the agent
+    // fraction. At IG-541's 40% design concentration that is 3.2% CO2 -- which is
+    // the point of the blend: it is *deliberately* below the 4% IDLH while an
+    // equivalent CO2 flood is at 40%.
+    .incapacitatingFraction = 0.07 / 0.08,
+    .lethalFraction = 0.10 / 0.08};
 
 // t-squared growth coefficients, W/s^2. The canonical NFPA 72 / SFPE set: the
 // fire reaches 1055 kW (1000 Btu/s) in 600, 300, 150 and 75 seconds.
@@ -219,7 +392,33 @@ struct DesignFire {
     // into the physics, which is what makes it safe to carry at a guessed yield.
     double productYield = 0.05 / 20.0e6;
 
+    // The oxygen volume fraction below which this fuel will not burn, and the
+    // whole of how a flooding agent puts a fire out here.
+    //
+    // The heat release the gas receives is the design curve times a linear ramp
+    // from this to ambient -- `(X_O2 - LOC) / (0.2095 - LOC)`, clamped -- taken on
+    // the **lower** layer, because that is what the plume entrains. Linear rather
+    // than a cliff at the limit for the reason `kEvaporationBand` in fire.cpp
+    // exists: a discontinuity in the source term is a discontinuity the substep
+    // controller has to subdivide against, at the one concentration a flooded
+    // space actually settles near.
+    //
+    // 0.13 is a middling value for the flaming combustion of ordinary liquid and
+    // solid fuels; NFPA 12's own minimum design concentrations imply 0.128 for
+    // heptane and 0.149 for methane. Whatever it is, it is a **fuel** property
+    // this file takes as an input, exactly as the heat release curve is.
+    //
+    // What this does *not* model, and it matters: the fire is never allowed to
+    // vitiate its own air. There is no oxygen state here, only dilution by the
+    // agent, so a sealed compartment fire that would go out on its own does not.
+    double limitingOxygen = 0.13;
+
     double heatRelease(double time) const;   // W
+
+    // The share of `heatRelease` an atmosphere at `oxygenFraction` allows, in
+    // [0, 1]. Exactly 1.0 at `kOxygenFractionAir`, which is what keeps a model
+    // with no agent in it bit-identical.
+    double oxygenAvailability(double oxygenFraction) const;
 
     // The time at which the fire has released `energy` joules, or infinity if it
     // never does. Used by the tests to state a conservation account over a run
@@ -234,12 +433,57 @@ struct DesignFire {
 // One well-mixed layer. Mass and *internal energy*, not mass and temperature --
 // see the header comment; the pressure closure depends on it.
 struct Layer {
-    double mass = 0;       // kg
+    double mass = 0;       // kg, air *and* agent together
     double energy = 0;     // J, internal (m c_v T)
     double products = 0;   // kg of combustion products carried
 
-    double temperature() const;              // K
+    // Flooding agent, kg, and it is **part of `mass`** -- unlike `products`, which
+    // is a passive tracer riding on top of it. That difference is not cosmetic: a
+    // machinery space at its design concentration is a *third* agent by mass, so
+    // an agent kept outside the mass would leave the density, the vent flow and
+    // the mass account all wrong by that much, while a soot yield of 0.05 kg/kg
+    // on a 20 MJ/kg fuel is parts per million and safely a tracer.
+    double agent = 0;
+
+    // Every mixture query needs to know what the agent *is*, and a `Layer` does
+    // not carry it -- `GasCompartment::agentSpecies` does.
+    //
+    // **The default is exact wherever it is reachable and wrong nowhere else.**
+    // With `agent == 0` every expression below multiplies the species terms by
+    // exactly zero, so a caller with no agent gets the identical double whatever
+    // it passes; and nothing inside `fire.cpp` ever takes the default, because a
+    // `GasCompartment` always has its own species to hand. The default exists for
+    // the callers outside this file that read `upper.temperature()` on gas nobody
+    // has flooded.
+    double temperature(const AgentSpecies& s = kCarbonDioxide) const;   // K
     double productFraction() const;          // kg/kg
+    double agentMassFraction() const;        // kg/kg of the layer's own mass
+
+    // The agent's share **by volume**, which for an ideal-gas mixture is its mole
+    // fraction and its partial-pressure fraction alike -- and is the unit every
+    // suppression rule and every toxicity threshold is written in.
+    double agentFraction(const AgentSpecies& s = kCarbonDioxide) const;
+
+    // `sum_i m_i c_v,i`, J/K, and `sum_i m_i R_i`, J/K. The two sums every mixture
+    // property here is a ratio of.
+    double heatCapacity(const AgentSpecies& s = kCarbonDioxide) const;
+    double gasConstantSum(const AgentSpecies& s = kCarbonDioxide) const;
+
+    // The extra internal energy a layer of *pure air* would need to exert the same
+    // pressure in the same volume: `U [(R_mix/c_v,mix) / (gamma_air - 1) - 1]`.
+    //
+    // This is the one number the whole second species costs the closure. With it,
+    // `p = (gamma_air - 1)(U + x_u + x_l)/V` and `V_u/V = (U_u + x_u)/(U + x_u + x_l)`
+    // -- the same two lines as before, with one term added. Written out it is
+    //
+    //     x = U * agent * (c_v,air R_agent - c_v,agent R_air)
+    //             / (c_v,mix_sum * R_air)
+    //
+    // whose numerator carries `agent` as a *factor*, so it is **exactly 0.0** for a
+    // layer with no agent in it -- not small, zero -- and `y + 0.0 == y`. That is
+    // what keeps every pre-existing figure bit-identical, and `tests/test_fire.cpp`
+    // asserts it as bit-identity rather than as closeness.
+    double excessEnergy(const AgentSpecies& s = kCarbonDioxide) const;
 };
 
 // The gas in one compartment: two layers, a box of known height and footprint,
@@ -268,14 +512,43 @@ struct GasCompartment {
     double wallConductance = 30.0;
     double wallTemperature = kTAmbient;   // K
 
+    // What has been, or could be, discharged in here. One species per compartment:
+    // two different agents mixed in one space would need a mixture rule on every
+    // layer, and `validate()` refuses a vent between compartments carrying
+    // different ones rather than silently averaging them.
+    AgentSpecies agentSpecies{};
+
+    // How fast the agent separates from the carrier gas by buoyancy, m/s.
+    //
+    // **This is the coefficient nothing here measures**, and it is exactly the
+    // `Drencher::evaporatedFraction` situation: the two limits are both closed
+    // forms this file asserts, and the value between them is a choice. At zero the
+    // compartment is perfectly mixed and the concentration is the ideal-gas
+    // arithmetic everywhere; in the limit the compartment is perfectly stratified,
+    // the blanket is pure agent and its depth is the agent's own partial volume.
+    // Both extremes are real: a discharge in progress is violently stirred by its
+    // own jets -- NFPA 12 requires two minutes for a surface fire *because* rapid
+    // discharge mixes -- and a space left alone afterwards settles.
+    //
+    // The default gives a time constant of `thickness / w`: about five minutes to
+    // separate a 6 m machinery space, which is the order the holding-time
+    // requirements are written at. It is a guess and it is labelled one;
+    // `tests/test_fire.cpp` measures what it is worth rather than asserting it.
+    double settlingVelocity = 0.02;   // m/s
+
     Layer upper, lower;
 
     double pressure() const;        // Pa, absolute, at the floor
     double gaugeAtFloor() const;    // Pa above the ambient hydrostatic profile
     double upperVolume() const;     // m^3
+    double lowerVolume() const;     // m^3
     double interfaceZ() const;      // body frame, m
     double totalEnergy() const { return upper.energy + lower.energy; }
     double totalMass() const { return upper.mass + lower.mass; }
+    double totalAgent() const { return upper.agent + lower.agent; }
+    // The agent's share of the whole space by volume, which is the number a
+    // suppression rule states a design concentration in.
+    double agentFraction() const;
 
     // Fill both layers with still ambient air. The upper layer gets a token
     // `seedFraction` of the volume so that its temperature is defined before the
@@ -351,10 +624,34 @@ struct VentSide {
     double rhoLower = kRhoAmbient, rhoUpper = kRhoAmbient;   // kg/m^3
     double tLower = kTAmbient, tUpper = kTAmbient;           // K
     double yLower = 0, yUpper = 0;                           // product mass fractions
+    double aLower = 0, aUpper = 0;                           // agent mass fractions
+    AgentSpecies agentSpecies{};                             // what `aLower`/`aUpper` are
 
     double densityAt(double z) const { return z >= interfaceZ ? rhoUpper : rhoLower; }
     double temperatureAt(double z) const { return z >= interfaceZ ? tUpper : tLower; }
     double productFractionAt(double z) const { return z >= interfaceZ ? yUpper : yLower; }
+    double agentFractionAt(double z) const { return z >= interfaceZ ? aUpper : aLower; }
+    // The mixture's `c_p`, J/(kg K), which is what an enthalpy flux wants. Exactly
+    // `kCpAir` where there is no agent.
+    double heatCapacityOf(bool upper) const;
+    double heatCapacityAt(double z) const { return heatCapacityOf(z >= interfaceZ); }
+    // The temperature at which *pure air* would be as dense as this gas is: `T`
+    // times `R_mix/R_air`. It is what decides which layer an incoming stream joins,
+    // because a doorway can deliver gas that is warm and still sinks -- half again
+    // as heavy is worth 150 K of buoyancy, and a rule written on temperature alone
+    // would file a CO2 blanket under the deckhead. Exactly `T` without an agent, so
+    // the pure-air deposition rule is unchanged to the bit.
+    //
+    // **Two callers and one definition**, deliberately: the vent integral asks by
+    // height and the deposition rule asks by layer, and an earlier draft answered
+    // the second by writing the formula out a second time inside `applyStream`.
+    // That is the "two answers that agree until the day they do not" this file has
+    // already deleted once, and it also left the by-height form with no caller and
+    // therefore no test.
+    double buoyancyTemperatureOf(bool upper) const;
+    double buoyancyTemperatureAt(double z) const {
+        return buoyancyTemperatureOf(z >= interfaceZ);
+    }
     // Gauge pressure at `z`: the ambient profile is already subtracted, so the
     // integrand is the *buoyancy* difference and still air gives zero.
     double gaugeAt(double z) const;
@@ -560,6 +857,149 @@ struct Scupper {
 double scupperFlow(double insideHead, double outsideHead);
 
 // ---------------------------------------------------------------------------
+// Suppression by gas
+// ---------------------------------------------------------------------------
+//
+// `docs/06-roadmap.md` Phase 4's "CO2 and inert-gas total flooding (oxygen
+// displacement, and the sealing requirement that makes it fail with a door
+// open)".
+//
+// **Two of those three clauses are the easy half.** Getting a design
+// concentration into a space is arithmetic -- `agentMassForFraction` below is the
+// closed form and a bank of bottles either holds that much or does not. Holding
+// it is the problem, and it is the problem *because* of the first clause: the
+// agent is a mass, hundreds of kilograms of it, and putting mass into a sealed
+// steel box raises its pressure, and a raised pressure drives gas out through
+// every opening the box has. The concentration is then lost through the ship's
+// own opening network, at a rate that depends on **where** the openings are,
+// because a heavy agent lies on the deck and a low door drains the blanket while a
+// high one vents air. A single pressure difference at an orifice centre cannot
+// tell those two apart. The vent integral can, and that is the second time in this
+// file that the height resolution turns out to be the difference between a
+// mechanism existing and not.
+
+// One bank of bottles and its nozzles.
+struct AgentSystem {
+    std::string name;
+    int    gasCompartment = 0;        // index into Model::gas
+    double flow = 0;                  // kg/s at the nozzles while discharging
+    // What is in the bottles, kg. **Finite by default in the sense that matters**:
+    // zero means an unlimited supply, which is a test fixture and not a ship. A
+    // real bank runs out, and running out is what turns "we reached the design
+    // concentration" into "we reached it and then watched it leak away".
+    double charge = 0;
+    bool   on = false;
+
+    // Where the discharge is delivered, between the two layers.
+    //
+    // **In proportion to their volume, and that is deliberate rather than lazy.** A
+    // total-flooding discharge is a high-momentum jet: NFPA 12 requires it inside
+    // two minutes for a surface fire *because* speed is what mixes the space. So
+    // the agent arrives mixed, and every bit of stratification this model produces
+    // is then the work of `GasCompartment::settlingVelocity` and can be switched
+    // off by setting it to zero -- which is what makes the mixed limit a control
+    // rather than an assumption. Delivering into the layer the agent "belongs" in
+    // would have hidden the separation inside the source term, and would have
+    // driven 30 kg/s into a seed layer of 0.12 kg on the first substep of every
+    // run.
+
+    // The state the agent arrives in, and what the compartment pays for it.
+    //
+    // **CO2 discharge is a phase change and it is modelled, not waved away.** The
+    // agent leaves the bottle as a liquid at storage pressure and flashes across
+    // the nozzle; at one atmosphere CO2 has no liquid phase at all, so what comes
+    // out is cold vapour and a snow of dry ice, both at the 1 atm sublimation point
+    // of 194.65 K. The snow then sublimes *in the compartment*, and the compartment
+    // pays for it. Per kilogram discharged the gas therefore receives
+    //
+    //     u = c_v,agent T_discharge - solidFraction (L_sub - R_agent T_sub)
+    //
+    // -- an internal energy, not an enthalpy, because the expansion work was done
+    // by the storage pressure outside this model's boundary and the compartment is
+    // rigid. `L_sub - R T` rather than `L_sub` because a closed rigid vessel books
+    // energy at constant volume and the sublimation enthalpy is a constant-pressure
+    // quantity; using the enthalpy here would over-state the sink by 6.9%.
+    //
+    // The number it comes to for CO2 is **-6.28 kJ per kilogram** -- negative, so
+    // the discharge is a net internal-energy *sink* even counting the agent's own
+    // internal energy. That is not a rounding: flooding a 1000 m^3 space to 35%
+    // takes a tonne of CO2 and 194 MJ out of a gas whose whole heat capacity is
+    // 0.88 MJ/K, and on the gas alone that is 127 K of chill and a pressure that
+    // ends up *below* atmospheric. It is why the boundary term is not optional in
+    // an agent run: the steel and everything bolted to it supply that heat, and
+    // this model has them only as `wallConductance` against `wallTemperature`.
+    // Everything the space *contains* is missing, so the transient chill here is a
+    // ceiling rather than a prediction, and it is named rather than hidden.
+    //
+    // Setting `solidFraction` to zero and `dischargeTemperature` to `kTAmbient`
+    // gives the pure-displacement case, which is what the concentration closed
+    // forms are asserted on -- a mole fraction does not care what temperature the
+    // gas is at, which is the reason that separation is clean.
+    double dischargeTemperature = 194.65;   // K
+    // The share of the discharged mass that arrives as solid. NFPA 12's figure for
+    // CO2 flashed from storage to atmospheric.
+    double solidFraction = 0.25;
+
+    // Diagnostic, filled every step.
+    double lastFlow = 0;        // kg/s actually leaving the bottles
+    double lastCooling = 0;     // W the discharge takes out of the gas (may be < 0)
+    double delivered = 0;       // kg out of the bottles over the system's life
+};
+
+// The mass of agent that would take `g` to `volumeFraction` by volume, kg, over
+// and above what it is already carrying. Negative if it is already above it.
+//
+// The closed form, and it is pure ideal-gas arithmetic:
+// `n_agent = y/(1-y) n_carrier`, and a mole count is `m R / R_universal`, so
+//
+//     m_agent(target) = y/(1-y) * (m_carrier R_air) / R_agent.
+//
+// Deliberately **not** the design quantity a rule would give you: SOLAS FSS ch. 5
+// sizes a machinery-space bank on 40% of the gross volume with the free-gas volume
+// taken at 0.56 m^3/kg and no credit for anything, which carries a margin for
+// leakage during discharge. This is the sealed arithmetic the margin is measured
+// from.
+double agentMassForFraction(const GasCompartment& g, double volumeFraction);
+
+// What the atmosphere in a compartment does to a person standing in it, at one
+// height. Data, and the thresholds beside it, rather than a verdict.
+//
+// This exists because the roadmap item is about a damage-control *decision*. A
+// machinery space at CO2's design concentration is not a space with a suppressed
+// fire in it, it is a space that kills anyone still inside, and a simulator that
+// models the suppression without modelling that is answering the easier question.
+// The two numbers that make the point are `agentFraction` and `oxygenFraction`,
+// and they say different things: at 35% CO2 the oxygen is still 13.6%, which is
+// impaired but survivable -- and the CO2 is three and a half times its own lethal
+// concentration. The agent kills first, and by its own action.
+struct Exposure {
+    double z = 0;                     // body frame, where it was sampled
+    double temperature = kTAmbient;   // K
+    double agentFraction = 0;         // by volume
+    double oxygenFraction = kOxygenFractionAir;   // by volume
+    double productFraction = 0;       // kg/kg of smoke in the gas
+    bool   inUpperLayer = false;
+
+    // Why, so a caller can report the cause and not only the outcome. Both are
+    // set when both apply.
+    bool   oxygenIncapacitating = false, oxygenLethal = false;
+    bool   agentIncapacitating = false, agentLethal = false;
+
+    bool incapacitating() const { return oxygenIncapacitating || agentIncapacitating; }
+    bool lethal() const { return oxygenLethal || agentLethal; }
+};
+
+// Sample the atmosphere at a height in the body frame. Heights outside
+// `[floorZ, ceilingZ]` are clamped into the space, because a breathing zone taken
+// off a deck the compartment does not reach should not silently report ambient.
+Exposure exposureAt(const GasCompartment& g, double z);
+
+// A standing person's breathing zone above the deck, m. 1.5 m is the height the
+// occupational-exposure literature samples at, and it is well inside the blanket a
+// machinery-space CO2 flood makes.
+inline constexpr double kBreathingZone = 1.5;
+
+// ---------------------------------------------------------------------------
 // The boundary the structure sees
 // ---------------------------------------------------------------------------
 //
@@ -727,6 +1167,17 @@ struct Account {
     double productsGenerated = 0;   // kg
     double productsOut = 0;         // kg across the boundary
 
+    // The agent books, kept apart from the air's for the reason the water's are:
+    // a species that leaks is a species whose account has to close on its own, or
+    // "the concentration fell" and "the model lost some" are the same observation.
+    // `agentDischarged` is a mass *source* inside the boundary and therefore
+    // appears in the mass residual too.
+    double agentDischarged = 0;  // kg out of the bottles and into the gas
+    double agentEnergy = 0;      // J the discharge added to the gas; negative for CO2
+    double agentIn = 0;          // kg of agent in across the model's boundary
+    double agentOut = 0;         // kg of agent out across it
+    double initialAgent = 0, agent = 0;   // kg at attach(), and now
+
     // The water books, kept on the same terms as the gas ones and for the same
     // reason. All three are *crossings*, not holdings: what is standing on the
     // deck at any moment is the ship's own `Compartment::waterVolume`, because
@@ -744,11 +1195,16 @@ struct Account {
 
     double energyResidual() const {
         return (heatReleased - radiativeLoss + enthalpyIn - enthalpyOut - wallLoss -
-                suppressionCooling) -
+                suppressionCooling + agentEnergy) -
                (energy - initialEnergy);
     }
-    double massResidual() const { return (massIn - massOut) - (mass - initialMass); }
+    double massResidual() const {
+        return (massIn + agentDischarged - massOut) - (mass - initialMass);
+    }
     double productsResidual() const { return (productsGenerated - productsOut) - products; }
+    double agentResidual() const {
+        return (agentDischarged + agentIn - agentOut) - (agent - initialAgent);
+    }
 
     // What suppression handed to the flooding network, kg. Delivered, less what
     // evaporated, less what the freeing ports took back overboard -- which is
@@ -784,6 +1240,15 @@ struct StepResult {
     // happens when the smoke layer reaches the floor, so reporting only the
     // correlation would be reporting a number the model did not use.
     double entrainment = 0;      // kg/s
+    // The agent systems' discharge on the last internal step, kg/s, after the cap
+    // that stops a bank delivering more than it holds -- applied, not demanded, on
+    // the same terms as everything else here.
+    double agentDischarge = 0;   // kg/s
+    // The lowest oxygen availability any design fire saw on the last internal step
+    // (1 in clean air, 0 once the space is inert). Published because "the fire went
+    // out" and "the fire's curve ended" are the same heat release and different
+    // events.
+    double oxygenAvailability = 1.0;
     int    substeps = 0;         // how many internal steps the accuracy cap took
     int    pressureSweeps = 0;   // Gauss-Seidel sweeps the last substep's solve took
     // The pressure solve failed to bracket a root in 80 doublings. Should never
@@ -803,6 +1268,7 @@ public:
     std::vector<Vent>           vents;
     std::vector<Drencher>       drenchers;
     std::vector<Scupper>        scuppers;
+    std::vector<AgentSystem>    agents;
     Account                     account;
 
     double time = 0;             // s of model time

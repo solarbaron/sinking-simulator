@@ -133,6 +133,18 @@ double DesignFire::heatRelease(double t) const {
     return peakHeatRelease * (1.0 - into / decayDuration);
 }
 
+double DesignFire::oxygenAvailability(double oxygenFraction) const {
+    const double loc = std::clamp(limitingOxygen, 0.0, kOxygenFractionAir);
+    const double span = kOxygenFractionAir - loc;
+    // A fuel that needs the whole of the air's oxygen is either burning or not,
+    // with no ramp to be had; anything else gets the linear one.
+    if (span <= 0) return oxygenFraction >= kOxygenFractionAir ? 1.0 : 0.0;
+    // Exactly 1.0 at ambient -- numerator and denominator are then the same
+    // expression on the same doubles -- which is what makes `q * availability` the
+    // identity on a model with no agent in it.
+    return std::clamp((oxygenFraction - loc) / span, 0.0, 1.0);
+}
+
 double DesignFire::totalEnergy() const {
     if (peakHeatRelease <= 0) return 0.0;
     if (decayDuration <= 0) return kInf;   // never goes out
@@ -146,7 +158,31 @@ double DesignFire::totalEnergy() const {
 // Layers
 // ---------------------------------------------------------------------------
 
-double Layer::temperature() const {
+// The agent mass a layer is holding, never more than the layer's own mass.
+//
+// The clamp is not defensive tidiness: `les::demote` writes a compartment's layer
+// masses back after a resolved run and does not know this field exists, so a
+// promoted-and-demoted compartment can come back with an agent mass larger than
+// the layer holding it. Clamping keeps every mixture ratio in [0, 1] and the
+// densities finite; the *loss* of that agent is a real gap and fire.hpp names it.
+double Layer::agentMassFraction() const {
+    if (mass <= kMassFloor || agent <= 0) return 0.0;
+    return std::min(agent / mass, 1.0);
+}
+
+double Layer::heatCapacity(const AgentSpecies& s) const {
+    // Written as air plus a *difference* times the agent mass, not as
+    // `m_air c_v,air + m_agent c_v,agent`, so that `agent == 0` gives
+    // `mass * kCvAir + 0.0` -- which is `mass * kCvAir` to the bit, and is the
+    // expression that was here before this file knew about agents.
+    return mass * kCvAir + std::min(agent, mass) * (s.cv() - kCvAir);
+}
+
+double Layer::gasConstantSum(const AgentSpecies& s) const {
+    return mass * kRAir + std::min(agent, mass) * (s.gasConstant() - kRAir);
+}
+
+double Layer::temperature(const AgentSpecies& s) const {
     // Both guards matter, and the second one is not symmetry. A layer that has
     // been emptied down to a residue of mass while its energy has gone to zero
     // reports T = 0, which becomes an infinite density in `sideOf` and a NaN in
@@ -154,7 +190,9 @@ double Layer::temperature() const {
     // not arise; this is the second line of defence, and the tests assert it is
     // never reached on a realistic case.
     if (mass <= kMassFloor || energy <= 0) return kTAmbient;
-    return energy / (mass * kCvAir);
+    const double c = heatCapacity(s);
+    if (c <= 0) return kTAmbient;
+    return energy / c;
 }
 
 double Layer::productFraction() const {
@@ -162,9 +200,48 @@ double Layer::productFraction() const {
     return products / mass;
 }
 
+double Layer::agentFraction(const AgentSpecies& s) const {
+    // By volume, which for an ideal-gas mixture is the mole fraction and is
+    // `n_agent / (n_air + n_agent)`. A mole count is `m R / R_universal`, so the
+    // universal constant cancels and this is a ratio of the two `m R` terms --
+    // exactly the quantities `gasConstantSum` is built from, so there is one
+    // definition of "how much agent" and not two.
+    if (mass <= kMassFloor || agent <= 0) return 0.0;
+    const double both = gasConstantSum(s);
+    if (both <= 0) return 0.0;
+    return std::min(agent, mass) * s.gasConstant() / both;
+}
+
+double Layer::excessEnergy(const AgentSpecies& s) const {
+    // `U [(R_sum/C_sum)/(gamma_air - 1) - 1]`, rearranged so that the agent mass is
+    // a *factor* of the numerator rather than a difference of two nearly equal
+    // quotients:
+    //
+    //     x = U * m_agent (c_v,air R_agent - c_v,agent R_air) / (C_sum R_air)
+    //
+    // -- which is exactly 0.0 when there is no agent, with no cancellation and no
+    // branch. `kRAir / kCvAir` is `kGammaAir - 1.0` to the last bit for this
+    // repo's constants (asserted in tests/test_fire.cpp), which is what lets the
+    // two bases be used interchangeably above.
+    if (mass <= kMassFloor || energy <= 0) return 0.0;
+    const double c = heatCapacity(s);
+    if (c <= 0) return 0.0;
+    return energy * std::min(agent, mass) * (kCvAir * s.gasConstant() - s.cv() * kRAir) /
+           (c * kRAir);
+}
+
+// The pressure-energy of the compartment: `sum_k (gamma_k - 1) U_k / (gamma_air - 1)`,
+// i.e. the internal energy a pure-air compartment would need to press as hard.
+// `x + 0.0 + 0.0` is `x`, so this is the old `totalEnergy()` to the bit whenever
+// there is no agent anywhere.
+static double effectiveEnergy(const GasCompartment& g) {
+    return g.totalEnergy() + g.upper.excessEnergy(g.agentSpecies) +
+           g.lower.excessEnergy(g.agentSpecies);
+}
+
 double GasCompartment::pressure() const {
     if (gasVolume <= 0) return kPatm;
-    return (kGammaAir - 1.0) * totalEnergy() / gasVolume;
+    return (kGammaAir - 1.0) * effectiveEnergy(*this) / gasVolume;
 }
 
 double GasCompartment::gaugeAtFloor() const {
@@ -172,16 +249,30 @@ double GasCompartment::gaugeAtFloor() const {
 }
 
 double GasCompartment::upperVolume() const {
-    const double u = totalEnergy();
+    const double u = effectiveEnergy(*this);
     if (u <= 0) return 0.0;
-    // The exact closure: the volume split *is* the internal-energy split.
-    return gasVolume * (upper.energy / u);
+    // The exact closure: the volume split *is* the pressure-energy split.
+    return gasVolume * ((upper.energy + upper.excessEnergy(agentSpecies)) / u);
 }
+
+double GasCompartment::lowerVolume() const { return std::max(gasVolume - upperVolume(), 0.0); }
 
 double GasCompartment::interfaceZ() const {
     if (floorArea <= 0) return ceilingZ;
     const double z = ceilingZ - upperVolume() / floorArea;
     return std::clamp(z, floorZ, ceilingZ);
+}
+
+double GasCompartment::agentFraction() const {
+    // The whole space's mole fraction, which is *not* the volume-weighted mean of
+    // the two layers' fractions unless they are at the same temperature -- it is
+    // the mole-weighted one. Summed over the layers' own `m R` terms, so it agrees
+    // with `Layer::agentFraction` by construction.
+    const double both = upper.gasConstantSum(agentSpecies) + lower.gasConstantSum(agentSpecies);
+    if (both <= 0) return 0.0;
+    const double a = std::min(upper.agent, upper.mass) + std::min(lower.agent, lower.mass);
+    if (a <= 0) return 0.0;
+    return a * agentSpecies.gasConstant() / both;
 }
 
 void GasCompartment::fillAmbient(double seedFraction) {
@@ -196,6 +287,41 @@ void GasCompartment::fillAmbient(double seedFraction) {
     lower.mass = lower.energy / (kCvAir * kTAmbient);
     upper.products = 0;
     lower.products = 0;
+    upper.agent = 0;
+    lower.agent = 0;
+}
+
+double agentMassForFraction(const GasCompartment& g, double volumeFraction) {
+    const double y = std::clamp(volumeFraction, 0.0, 1.0 - 1e-12);
+    const AgentSpecies& s = g.agentSpecies;
+    const double rAgent = s.gasConstant();
+    if (rAgent <= 0) return 0.0;
+    const double held = std::min(g.upper.agent, g.upper.mass) +
+                        std::min(g.lower.agent, g.lower.mass);
+    // The carrier's mole count, as `m R / R_universal` with the universal constant
+    // cancelling out of the ratio below.
+    const double carrier = (g.totalMass() - held) * kRAir;
+    // n_agent = y/(1-y) n_carrier, and m = n M = n R_u / R.
+    return y / (1.0 - y) * carrier / rAgent - held;
+}
+
+Exposure exposureAt(const GasCompartment& g, double z) {
+    Exposure e;
+    e.z = std::clamp(z, g.floorZ, g.ceilingZ);
+    const AgentSpecies& s = g.agentSpecies;
+    e.inUpperLayer = e.z >= g.interfaceZ();
+    const Layer& l = e.inUpperLayer ? g.upper : g.lower;
+    e.temperature = l.temperature(s);
+    e.agentFraction = l.agentFraction(s);
+    e.productFraction = l.productFraction();
+    // The agent dilutes the air; what is left of the air is still 20.95% oxygen.
+    // Nothing here consumes oxygen -- see `DesignFire::limitingOxygen`.
+    e.oxygenFraction = kOxygenFractionAir * (1.0 - e.agentFraction);
+    e.oxygenIncapacitating = e.oxygenFraction < kOxygenIncapacitating;
+    e.oxygenLethal = e.oxygenFraction < kOxygenLethal;
+    e.agentIncapacitating = e.agentFraction >= s.incapacitatingFraction;
+    e.agentLethal = e.agentFraction >= s.lethalFraction;
+    return e;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +358,21 @@ VentShape ventShapeFor(const Opening& o) {
             break;
     }
     return s;
+}
+
+double VentSide::heatCapacityOf(bool upper) const {
+    // `kCpAir + a (c_p,agent - c_p,air)`: exactly `kCpAir` at `a == 0`, so an
+    // enthalpy flux through a vent with no agent either side is the same double it
+    // has always been.
+    return kCpAir + (upper ? aUpper : aLower) * (agentSpecies.cp() - kCpAir);
+}
+
+double VentSide::buoyancyTemperatureOf(bool upper) const {
+    // `T R_mix / R_air`: the temperature at which pure air would be this dense.
+    // Exactly `T` at `a == 0`, because the ratio is then `kRAir / kRAir`, which is
+    // 1.0, and `T * 1.0` is `T`.
+    const double rMix = kRAir + (upper ? aUpper : aLower) * (agentSpecies.gasConstant() - kRAir);
+    return (upper ? tUpper : tLower) * (rMix / kRAir);
 }
 
 double VentSide::gaugeAt(double z) const {
@@ -298,13 +439,14 @@ void accumulateBand(const Vent& v, const VentSide& a, const VentSide& b, double 
 
     const bool fromUpper = zm >= donor.interfaceZ;
     const double temp = donor.temperatureAt(zm);
+    const double cp = donor.heatCapacityAt(zm);
     if (aToB) {
         r.massAToB += mdot;
-        r.enthalpyAToB += mdot * kCpAir * temp;
+        r.enthalpyAToB += mdot * cp * temp;
         if (fromUpper) r.fromUpperA += mdot;
     } else {
         r.massBToA += mdot;
-        r.enthalpyBToA += mdot * kCpAir * temp;
+        r.enthalpyBToA += mdot * cp * temp;
         if (fromUpper) r.fromUpperB += mdot;
     }
 }
@@ -326,13 +468,14 @@ VentResult ventMassFlow(const Vent& v, const VentSide& a, const VentSide& b) {
         const double rho = donor.densityAt(z);
         const double mdot = v.dischargeCoeff * v.area * std::sqrt(2.0 * rho * std::abs(dp));
         const bool fromUpper = z >= donor.interfaceZ;
+        const double h = mdot * donor.heatCapacityAt(z) * donor.temperatureAt(z);
         if (dp > 0) {
             r.massAToB = mdot;
-            r.enthalpyAToB = mdot * kCpAir * donor.temperatureAt(z);
+            r.enthalpyAToB = h;
             if (fromUpper) r.fromUpperA = mdot;
         } else {
             r.massBToA = mdot;
-            r.enthalpyBToA = mdot * kCpAir * donor.temperatureAt(z);
+            r.enthalpyBToA = h;
             if (fromUpper) r.fromUpperB = mdot;
         }
         return r;
@@ -404,13 +547,14 @@ double Account::energyResidualFraction() const {
     // with no design fire in it -- not because a test currently reaches it.
     const double scale = std::max({std::abs(heatReleased), std::abs(enthalpyIn),
                                    std::abs(enthalpyOut), std::abs(wallLoss),
-                                   std::abs(suppressionCooling),
+                                   std::abs(suppressionCooling), std::abs(agentEnergy),
                                    std::abs(energy - initialEnergy), std::abs(energy), 1.0});
     return energyResidual() / scale;
 }
 
 double Account::massResidualFraction() const {
     const double scale = std::max({std::abs(massIn), std::abs(massOut),
+                                   std::abs(agentDischarged),
                                    std::abs(mass - initialMass), std::abs(mass), 1e-9});
     return massResidual() / scale;
 }
@@ -559,7 +703,7 @@ namespace {
 // multiplied by the step until the step has been accepted, which is what lets a
 // trial step be abandoned without leaving a mark on the account.
 struct Deltas {
-    std::vector<double> dmU, dmL, dEU, dEL, dsU, dsL;
+    std::vector<double> dmU, dmL, dEU, dEL, dsU, dsL, daU, daL;
     // Water the drenchers landed less what the freeing ports took back, kg/s.
     // Signed, and per compartment, because `applyTo` writes it per compartment.
     std::vector<double> dWater;
@@ -569,9 +713,11 @@ struct Deltas {
     double enthalpyIn = 0, enthalpyOut = 0;
     double massIn = 0, massOut = 0;
     double productsGenerated = 0, productsOut = 0;
+    double agentDischarged = 0, agentEnergy = 0, agentIn = 0, agentOut = 0;
+    double oxygenAvailability = 1.0;
     explicit Deltas(std::size_t n)
         : dmU(n, 0.0), dmL(n, 0.0), dEU(n, 0.0), dEL(n, 0.0), dsU(n, 0.0), dsL(n, 0.0),
-          dWater(n, 0.0) {}
+          daU(n, 0.0), daL(n, 0.0), dWater(n, 0.0) {}
 };
 
 // The gas column against one side of a vent.
@@ -580,8 +726,11 @@ VentSide sideOf(const GasCompartment& g) {
     s.gaugeAtFloor = g.gaugeAtFloor();
     s.floorZ = g.floorZ;
     s.interfaceZ = g.interfaceZ();
-    s.tUpper = g.upper.temperature();
-    s.tLower = g.lower.temperature();
+    s.agentSpecies = g.agentSpecies;
+    s.aUpper = g.upper.agentMassFraction();
+    s.aLower = g.lower.agentMassFraction();
+    s.tUpper = g.upper.temperature(g.agentSpecies);
+    s.tLower = g.lower.temperature(g.agentSpecies);
     // Densities for the *buoyancy* term come off `kPatm`, not off the
     // compartment's own pressure.
     //
@@ -598,8 +747,15 @@ VentSide sideOf(const GasCompartment& g) {
     // off ambient, which is a spurious buoyancy of a hundredth of a pascal per
     // metre. That is invisible next to a fire and fatal to the control that says
     // an unlit fire changes nothing: it moved 74 of the ship's state doubles.
-    s.rhoUpper = kPatm / (kRAir * s.tUpper);
-    s.rhoLower = kPatm / (kRAir * s.tLower);
+    //
+    // **The mixture's `R`, not air's**, and that is what makes a heavy agent sink
+    // and a light one rise rather than being told to. `R_mix = R_air + a (R_agent -
+    // R_air)` is exactly `kRAir` when there is no agent in the band, so this whole
+    // expression is bit-for-bit the pure-air one it replaces.
+    const double rUpper = kRAir + s.aUpper * (s.agentSpecies.gasConstant() - kRAir);
+    const double rLower = kRAir + s.aLower * (s.agentSpecies.gasConstant() - kRAir);
+    s.rhoUpper = kPatm / (rUpper * s.tUpper);
+    s.rhoLower = kPatm / (rLower * s.tLower);
     s.yUpper = g.upper.productFraction();
     s.yLower = g.lower.productFraction();
     return s;
@@ -637,12 +793,72 @@ bool waterAgainst(const Ship& ship, const Sea& sea, int shipCompartment, const V
 // cheaper expression and because summing to `E` exactly is a property worth
 // having; no test here can tell the two apart, and that is a statement about the
 // size of the effect rather than about the tests.
-void layerSplit(double energyUpper, double energyTotal, double eUpper, double eLower,
-                double& dUpper, double& dLower) {
+// **With an agent the two layers no longer share one `gamma`, and each layer's own
+// `gamma` moves as its composition does.** Both matter, and the second one is the
+// one that is easy to miss. Writing `a_k = gamma_k - 1`, `Pi_k = a_k U_k = p V_k`
+// and `f = Pi_u/Pi`, the volume the closure gives layer u now varies through `a_u`
+// as well as through `U_u`:
+//
+//     dPi_k = a_k dU_k + K_k,     K_k = T_k (dR_k - a_k dC_k)
+//
+// with `R_k = sum_i m_i R_i` and `C_k = sum_i m_i c_v,i` the layer's own two sums
+// and `dR_k`, `dC_k` the rates at which the mass fluxes move them. Then
+// `p dV_u = dPi_u - f dPi` and the open-system energy equation
+// `dU_u = E_u - p dV_u` closes in one line:
+//
+//     dU_u = [E_u - K_u + f (K_u + K_l + a_l E)] / (1 + a_u + f (a_l - a_u))
+//
+// **Freezing `a` instead -- which is the obvious thing and was the first version --
+// is wrong in a way that shows.** A counter-current exchange that swaps agent for
+// carrier between two layers at *one* temperature must leave them at one
+// temperature: nothing has been heated. With `K` dropped it does not, and the ferry
+// -- no, the sealed machinery space -- came out with its blanket 5 K colder than
+// the air over it and its interface 1% low. With `K` in, the isothermal case is
+// **exact**, which is what turns the stratified blanket's depth from a 1% claim
+// into a machine-precision one. That is asserted directly.
+//
+// The single-species case is kept as its own branch, entered exactly when there is
+// no agent anywhere (`a_u == a_l` and both `K` exactly zero), because it has to
+// produce the *identical* double and not an algebraically equal one.
+void layerSplit(double aUpper, double aLower, double energyUpper, double energyLower,
+                double kUpper, double kLower, double eUpper, double eLower, double& dUpper,
+                double& dLower) {
     const double e = eUpper + eLower;
-    const double f = energyTotal > 0 ? energyUpper / energyTotal : 0.0;
-    dUpper = (eUpper + (kGammaAir - 1.0) * f * e) / kGammaAir;
+    if (aUpper == aLower && kUpper == 0.0 && kLower == 0.0) {
+        const double energyTotal = energyUpper + energyLower;
+        const double f = energyTotal > 0 ? energyUpper / energyTotal : 0.0;
+        dUpper = (eUpper + (kGammaAir - 1.0) * f * e) / kGammaAir;
+        dLower = e - dUpper;
+        return;
+    }
+    const double piUpper = aUpper * energyUpper, piLower = aLower * energyLower;
+    const double pi = piUpper + piLower;
+    const double f = pi > 0 ? piUpper / pi : 0.0;
+    const double denom = 1.0 + aUpper + f * (aLower - aUpper);
+    dUpper = denom != 0.0
+                 ? (eUpper - kUpper + f * (kUpper + kLower + aLower * e)) / denom
+                 : eUpper;
     dLower = e - dUpper;
+}
+
+// `gamma - 1` for a layer, as the mixture makes it: `Pi / U`, and exactly
+// `kGammaAir - 1.0` where there is no agent because `excessEnergy` is exactly zero
+// there.
+double gammaMinusOne(const Layer& l, const AgentSpecies& s) {
+    if (l.energy <= 0) return kGammaAir - 1.0;
+    return (kGammaAir - 1.0) * (1.0 + l.excessEnergy(s) / l.energy);
+}
+
+// `K = T (dR - a dC)`, the term above, written so that its pure-air part is
+// **exactly zero**: `kRAir - (kGammaAir-1) kCvAir` is 0.0 to the last bit for this
+// repo's constants, and the agent part carries `dAgent` as a factor. So a layer
+// with no agent and no agent flux contributes exactly 0.0 and takes the branch that
+// reproduces the old closure bit for bit.
+double compositionTerm(const Layer& l, const AgentSpecies& s, double dMass, double dAgent) {
+    const double a = gammaMinusOne(l, s);
+    const double air = dMass * (kRAir - a * kCvAir);
+    const double agent = dAgent * ((s.gasConstant() - kRAir) - a * (s.cv() - kCvAir));
+    return l.temperature(s) * (air + agent);
 }
 
 // Move one directed stream, resolved into the portion that left the donor's upper
@@ -660,22 +876,28 @@ void applyStream(int fromGas, int toGas, const VentSide& donor, const VentSide& 
         if (mass <= 0) continue;
         const double temp = upper ? donor.tUpper : donor.tLower;
         const double yield = upper ? donor.yUpper : donor.yLower;
-        const double h = mass * kCpAir * temp;
+        const double agentShare = upper ? donor.aUpper : donor.aLower;
+        // The mixture's own `c_p`, from the band the stream left.
+        const double h = mass * donor.heatCapacityOf(upper) * temp;
         const double s = mass * yield;
+        const double a = mass * agentShare;
 
         if (fromGas == kSea) {
             d.massIn += mass;
             d.enthalpyIn += h;
+            d.agentIn += a;
         } else {
             const std::size_t i = static_cast<std::size_t>(fromGas);
             if (upper) {
                 d.dmU[i] -= mass;
                 d.dEU[i] -= h;
                 d.dsU[i] -= s;
+                d.daU[i] -= a;
             } else {
                 d.dmL[i] -= mass;
                 d.dEL[i] -= h;
                 d.dsL[i] -= s;
+                d.daL[i] -= a;
             }
         }
 
@@ -683,21 +905,34 @@ void applyStream(int fromGas, int toGas, const VentSide& donor, const VentSide& 
             d.massOut += mass;
             d.enthalpyOut += h;
             d.productsOut += s;
+            d.agentOut += a;
         } else {
             const std::size_t i = static_cast<std::size_t>(toGas);
             // Buoyancy decides the destination, not which layer it left: gas that
             // came out of a hot layer next door arrives buoyant and runs along the
             // deckhead, and cool air arrives dense and sinks whatever door it came
             // through.
-            const bool joinUpper = temp > recv.tLower + kDepositionMargin;
+            //
+            // **Buoyancy, and not temperature**, which are the same test only while
+            // every stream is air. A doorway delivering 400 K carbon dioxide is
+            // delivering something denser than the 288 K air it arrives in; a rule
+            // written on temperature would file it under the deckhead, and the
+            // whole hazard of a heavy agent is that it does not go there. The
+            // comparison is against pure air's density at `recv.tLower`, so it is
+            // the identical branch on the identical doubles when nothing carries an
+            // agent.
+            const bool joinUpper = donor.buoyancyTemperatureOf(upper) >
+                                   recv.buoyancyTemperatureOf(false) + kDepositionMargin;
             if (joinUpper) {
                 d.dmU[i] += mass;
                 d.dEU[i] += h;
                 d.dsU[i] += s;
+                d.daU[i] += a;
             } else {
                 d.dmL[i] += mass;
                 d.dEL[i] += h;
                 d.dsL[i] += s;
+                d.daL[i] += a;
             }
         }
     }
@@ -796,9 +1031,11 @@ void Model::resetAccount() {
         account.initialEnergy += g.totalEnergy();
         account.initialMass += g.totalMass();
         account.products += g.upper.products + g.lower.products;
+        account.initialAgent += g.totalAgent();
     }
     account.energy = account.initialEnergy;
     account.mass = account.initialMass;
+    account.agent = account.initialAgent;
 }
 
 std::vector<std::string> Model::validate() const {
@@ -837,6 +1074,41 @@ std::vector<std::string> Model::validate() const {
         // would quietly deliver water that cools nothing.
         if (s.waterTemperature >= kTSaturation)
             problems.push_back("drencher '" + s.name + "' supplies water at or above boiling");
+    }
+    for (const AgentSystem& a : agents) {
+        if (a.gasCompartment < 0 || a.gasCompartment >= n) {
+            problems.push_back("agent system '" + a.name +
+                               "' is in a gas space that does not exist");
+            continue;
+        }
+        if (a.flow < 0) problems.push_back("agent system '" + a.name + "' has a negative flow");
+        if (a.charge < 0) problems.push_back("agent system '" + a.name + "' has a negative charge");
+        if (a.solidFraction < 0 || a.solidFraction > 1)
+            problems.push_back("agent system '" + a.name +
+                               "' has a solid fraction outside [0, 1]");
+        // A discharge temperature at or below absolute zero is not a temperature,
+        // and this file's units have been got wrong in exactly that direction
+        // before: `kTAmbient` is 288.15 K and not 15.
+        if (a.dischargeTemperature <= 0)
+            problems.push_back("agent system '" + a.name +
+                               "' discharges at or below absolute zero -- kelvin, not celsius");
+        const GasCompartment& g = gas[static_cast<std::size_t>(a.gasCompartment)];
+        if (g.agentSpecies.molarMass <= 0)
+            problems.push_back("agent system '" + a.name +
+                               "' discharges into a space whose agent has no molar mass");
+    }
+    // One species per space, and per *network* of spaces: a vent between two
+    // compartments carrying different agents would move a mass this file has no
+    // mixture rule for, and the receiving layer would silently reinterpret it as
+    // its own agent. Said rather than averaged.
+    for (const Vent& v : vents) {
+        if (v.a == kSea || v.b == kSea) continue;
+        if (v.a < 0 || v.a >= n || v.b < 0 || v.b >= n) continue;
+        const AgentSpecies& sa = gas[static_cast<std::size_t>(v.a)].agentSpecies;
+        const AgentSpecies& sb = gas[static_cast<std::size_t>(v.b)].agentSpecies;
+        if (sa.molarMass != sb.molarMass || sa.gamma != sb.gamma)
+            problems.push_back("vent '" + v.name +
+                               "' joins two gas spaces carrying different flooding agents");
     }
     for (const Scupper& sc : scuppers) {
         if (sc.gasCompartment < 0 || sc.gasCompartment >= n) {
@@ -931,7 +1203,45 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
         // exactly one substep of heat short -- 50 kJ, forever, on every run. The
         // midpoint rule is exact for a steady fire and second order on a t^2
         // growth curve.
-        const double q = f.heatRelease(time + 0.5 * dt);
+        double q = f.heatRelease(time + 0.5 * dt);
+        if (q <= 0) continue;
+        // The plume at the *design* release, used only as the shape the entrainment
+        // weight below is taken from. The plume that actually moves mass is built
+        // after the availability has scaled `q`, because a suppressed fire drives a
+        // weaker plume.
+        const Plume design{q, f.diameter, f.convectiveFraction};
+
+        // **Oxygen displacement, which is the whole of how a flooding agent puts a
+        // fire out.** The design curve is scaled by what the atmosphere allows.
+        // Applied rather than demanded, and published on `StepResult` as such, on
+        // exactly the terms `Drencher`'s cooling is: reporting the design curve for
+        // a fire standing in an inert atmosphere would be reporting a number the
+        // model did not use.
+        //
+        // **The air the fire breathes is the air its plume entrains**, so the two
+        // layers are weighted by how much of the entrainment comes from each --
+        // and the weight is the plume's own correlation rather than a new
+        // coefficient. `entrainment(interfaceZ - baseZ)` is what the plume drags out
+        // of the cool layer on its way up; the rest of the enclosure height is the
+        // hot one. That makes the oxygen a *continuous* function of the interface
+        // height, which is the same requirement `kEvaporationBand` records: a step
+        // in a source term is a step the substep controller has to subdivide
+        // against, and the interface crossing a fire's own base is precisely where
+        // an agent blanket puts it. Reading one layer unconditionally is the same
+        // answer in a well-mixed space and quite the wrong one in the two cases that
+        // matter -- a post-flashover room whose interface is on the floor, and a
+        // blanket the fire is standing in.
+        //
+        // `oxygenAvailability` is exactly 1.0 in clean air, so a model with no
+        // agent system in it multiplies by one and changes nothing.
+        const double eLower = design.entrainment(std::max(g.interfaceZ() - f.baseZ, 0.0));
+        const double eFull = design.entrainment(std::max(g.ceilingZ - f.baseZ, 0.0));
+        const double wLower = eFull > 0 ? std::clamp(eLower / eFull, 0.0, 1.0) : 0.0;
+        const double yBreathed = wLower * g.lower.agentFraction(g.agentSpecies) +
+                                 (1.0 - wLower) * g.upper.agentFraction(g.agentSpecies);
+        const double available = f.oxygenAvailability(kOxygenFractionAir * (1.0 - yBreathed));
+        d.oxygenAvailability = std::min(d.oxygenAvailability, available);
+        q *= available;
         if (q <= 0) continue;
 
         d.heat += q;
@@ -954,14 +1264,21 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
         mp = std::min(mp, 0.5 * std::max(g.lower.mass, 0.0) / dt);
 
         d.entrained += mp;
-        const double tl = g.lower.temperature();
+        const double tl = g.lower.temperature(g.agentSpecies);
         const double yl = g.lower.productFraction();
+        // The plume drags the lower layer's *composition* up, agent included --
+        // which is the one mechanism that actively un-does the stratification, and
+        // it is the reason a fire in a flooded space is not a fire in a sealed jar.
+        const double al = g.lower.agentMassFraction();
+        const double cpl = kCpAir + al * (g.agentSpecies.cp() - kCpAir);
         d.dmL[i] -= mp;
         d.dmU[i] += mp;
-        d.dEL[i] -= mp * kCpAir * tl;
-        d.dEU[i] += mp * kCpAir * tl + toGas;
+        d.dEL[i] -= mp * cpl * tl;
+        d.dEU[i] += mp * cpl * tl + toGas;
         d.dsL[i] -= mp * yl;
         d.dsU[i] += mp * yl;
+        d.daL[i] -= mp * al;
+        d.daU[i] += mp * al;
 
         // Products are a tracer riding the gas, not part of its mass: a 1 MW fire
         // burns about 0.05 kg/s of fuel against several kg/s through the vent, so
@@ -1020,7 +1337,7 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
         // Written this way the sink vanishes as the layer reaches the water's own
         // temperature, so there is a real equilibrium -- `Q_fire = Q_spray(T)` --
         // and it is the same at any step size.
-        const double tu = g.upper.temperature();
+        const double tu = g.upper.temperature(g.agentSpecies);
         const double excess = tu - s.waterTemperature;
         const double share = std::clamp((tu - kTSaturation) / kEvaporationBand, 0.0, 1.0);
         const double perKg =
@@ -1040,7 +1357,7 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
         // the layer past the water's temperature at any dt, nor remove more than
         // the demand; and it tends to the demand as dt shrinks, which is what
         // makes the scheme converge.
-        const double capacity = g.upper.mass * kCvAir;
+        const double capacity = g.upper.heatCapacity(g.agentSpecies);
         double cooling = 0;
         if (demand > 0 && excess > 0 && capacity > 0 && dt > 0) {
             const double kEff = demand / excess;   // W/K, the equivalent coefficient
@@ -1066,6 +1383,150 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
         d.waterDelivered += s.flow;
         d.waterEvaporated += evaporated;
         d.dWater[i] += toDeck;
+    }
+
+    // --- Suppression by gas: what the bottles put in ------------------------
+    //
+    // Before the vents, and for the third time for the same reason: this is a
+    // non-vent mass *and* energy rate, and the implicit pressure solve needs both
+    // as the constant term of its equation. Here it is not a refinement but the
+    // entire mechanism -- a tonne of agent into a thousand cubic metres is a 27 kPa
+    // rise, three hundred times the buoyancy pressures the vents usually work on,
+    // and it is that rise that drives the agent back out through the openings and
+    // loses the concentration. Leaving it out of the pressure equation would model
+    // a system that never leaks.
+    for (AgentSystem& a : agents) {
+        a.lastFlow = a.lastCooling = 0;
+        if (!a.on || a.flow <= 0) continue;
+        if (a.gasCompartment < 0 || a.gasCompartment >= static_cast<int>(n)) continue;
+        const std::size_t i = static_cast<std::size_t>(a.gasCompartment);
+        GasCompartment& g = gas[i];
+        const AgentSpecies& sp = g.agentSpecies;
+
+        double flow = a.flow;
+        // A bank is finite. Capped by what is left rather than switched off at the
+        // end, so the last substep discharges the remainder exactly and the
+        // delivered mass is the charge to the bit -- which is what the account is
+        // asserted against.
+        if (a.charge > 0) flow = std::min(flow, std::max(a.charge - a.delivered, 0.0) / dt);
+        if (flow <= 0) continue;
+
+        // What one kilogram brings with it. See `AgentSystem::dischargeTemperature`:
+        // an internal energy at the discharge temperature, less the constant-volume
+        // sublimation heat of the share that arrives as solid.
+        const double perKg =
+            sp.cv() * a.dischargeTemperature -
+            std::clamp(a.solidFraction, 0.0, 1.0) *
+                (sp.sublimationHeat - sp.gasConstant() * sp.sublimationTemperature);
+        // Relative to the gas the agent joins, this is a sink of
+        // `flow (c_v,agent T_layer - perKg)` -- reported for the caller, not used:
+        // the state update is the energy itself.
+        const double energyRate = flow * perKg;
+
+        // **Delivered in proportion to the layers' MOLES.** A total-flooding
+        // discharge is a jet and it mixes; every bit of the stratification that
+        // follows is `settlingVelocity`'s doing, and can be switched off. See
+        // `AgentSystem`.
+        //
+        // Moles, and not volume, and the difference is only visible once the two
+        // layers are at different temperatures -- which is to say, only when there
+        // is a fire, which is the case this whole item exists for. "Perfectly
+        // mixed" has to mean one *concentration*, and a concentration is a mole
+        // fraction; splitting by volume gives one partial *density*, which at one
+        // pressure is a mole fraction proportional to T. Measured on a 3 MW fire in
+        // this space: the volume split leaves the cool lower layer at 26.8% while
+        // the hot upper one is at 41.6%, and the fire -- which breathes the cool
+        // layer -- goes on burning through a flood that has already reached its
+        // design concentration. Splitting by moles preserves a uniform fraction
+        // exactly, at any temperature ratio, and is bit-identical to the volume
+        // split whenever the layers are at one temperature.
+        const double nUpper = g.upper.gasConstantSum(sp);
+        const double nBoth = nUpper + g.lower.gasConstantSum(sp);
+        const double share = nBoth > 0 ? std::clamp(nUpper / nBoth, 0.0, 1.0) : 0.0;
+        d.dmU[i] += flow * share;
+        d.dmL[i] += flow * (1.0 - share);
+        d.daU[i] += flow * share;
+        d.daL[i] += flow * (1.0 - share);
+        d.dEU[i] += energyRate * share;
+        d.dEL[i] += energyRate * (1.0 - share);
+
+        sourceRate[i] += energyRate;
+        d.agentDischarged += flow;
+        d.agentEnergy += energyRate;
+        a.lastFlow = flow;
+        a.lastCooling = flow * (sp.cv() * g.lower.temperature(sp) - perKg);
+    }
+
+    // --- Suppression by gas: which way up the agent settles ------------------
+    //
+    // Two one-way streams, not a diffusive exchange -- see fire.hpp. The agent
+    // leaves the layer it does not belong in; the carrier gas is floated out of the
+    // layer it does. Both are exact relaxations, so neither can over-drain a layer
+    // at any step, and both are exactly zero in a compartment with no agent in it.
+    for (std::size_t i = 0; i < n; ++i) {
+        GasCompartment& g = gas[i];
+        if (g.settlingVelocity <= 0 || g.floorArea <= 0) continue;
+        const AgentSpecies& sp = g.agentSpecies;
+        if (g.upper.agent <= 0 && g.lower.agent <= 0) continue;
+        const double rAgent = sp.gasConstant();
+        if (rAgent == kRAir) continue;   // neutrally buoyant: nothing to separate
+
+        const bool heavy = sp.heavierThanAir();
+        // `sink` is the layer the agent ends up in, `carry` the other one.
+        const Layer& sink = heavy ? g.lower : g.upper;
+        const Layer& carry = heavy ? g.upper : g.lower;
+        const double vUpper = g.upperVolume();
+        const double hSink = std::max((heavy ? g.gasVolume - vUpper : vUpper) / g.floorArea, 0.0);
+        const double hCarry = std::max((heavy ? vUpper : g.gasVolume - vUpper) / g.floorArea, 0.0);
+        // Which set of accumulators each of those is.
+        std::vector<double>& dmSink = heavy ? d.dmL : d.dmU;
+        std::vector<double>& dmCarry = heavy ? d.dmU : d.dmL;
+        std::vector<double>& dESink = heavy ? d.dEL : d.dEU;
+        std::vector<double>& dECarry = heavy ? d.dEU : d.dEL;
+        std::vector<double>& dsSink = heavy ? d.dsL : d.dsU;
+        std::vector<double>& dsCarry = heavy ? d.dsU : d.dsL;
+        std::vector<double>& daSink = heavy ? d.daL : d.daU;
+        std::vector<double>& daCarry = heavy ? d.daU : d.daL;
+
+        // Falling (or rising) agent: the agent in the wrong layer, relaxing across
+        // with a time constant of that layer's own thickness over `w`.
+        const double agentThere = std::min(std::max(carry.agent, 0.0), carry.mass);
+        if (agentThere > 0 && hCarry > 0) {
+            const double moved =
+                agentThere * -std::expm1(-g.settlingVelocity * dt / hCarry) / dt;
+            // Pure agent, at the temperature of the layer it leaves. No products:
+            // smoke rides the air, not the agent.
+            const double h = moved * sp.cp() * carry.temperature(sp);
+            dmCarry[i] -= moved;
+            daCarry[i] -= moved;
+            dECarry[i] -= h;
+            dmSink[i] += moved;
+            daSink[i] += moved;
+            dESink[i] += h;
+        }
+
+        // Displaced carrier gas: the air the agent is standing under (or over),
+        // floated out in proportion to how much agent there is to float it. That
+        // factor is what makes the stream vanish in a compartment with no agent --
+        // and, at the other end, what stops it once the sink layer is pure agent.
+        const double sinkMass = std::max(sink.mass, 0.0);
+        const double sinkAgent = std::min(std::max(sink.agent, 0.0), sinkMass);
+        const double carrierThere = sinkMass - sinkAgent;
+        const double ySink = sink.agentFraction(sp);
+        if (carrierThere > 0 && ySink > 0 && hSink > 0) {
+            const double moved =
+                carrierThere * -std::expm1(-ySink * g.settlingVelocity * dt / hSink) / dt;
+            // Pure carrier, so it takes air's own `c_p`, and it takes the layer's
+            // smoke with it in proportion to the carrier it is a share of.
+            const double h = moved * kCpAir * sink.temperature(sp);
+            const double s = moved * (sink.products / carrierThere);
+            dmSink[i] -= moved;
+            dESink[i] -= h;
+            dsSink[i] -= s;
+            dmCarry[i] += moved;
+            dECarry[i] += h;
+            dsCarry[i] += s;
+        }
     }
 
     // --- Suppression: what the freeing ports get back out -------------------
@@ -1148,16 +1609,21 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
         // substeps -- and each excursion through zero energy tripped the
         // non-negativity clamp, which is the only thing in this file that can
         // break the energy account. It did, at 0.09%.
-        auto relax = [&](double area, double temp, double mass) {
-            const double capacity = mass * kCvAir;
+        auto relax = [&](double area, double temp, double capacity) {
             const double rate = g.wallConductance * area;
             if (capacity <= 0 || rate <= 0) return 0.0;
             const double removed = capacity * (temp - g.wallTemperature) *
                                    -std::expm1(-rate * dt / capacity);
             return removed / dt;
         };
-        const double qu = relax(aUpper, g.upper.temperature(), g.upper.mass);
-        const double ql = relax(aLower, g.lower.temperature(), g.lower.mass);
+        // The layer's *mixture* heat capacity, `sum_i m_i c_v,i`. A cold blanket of
+        // CO2 has half again the heat capacity per kilogram that air does, and a
+        // boundary relaxation timed off the wrong one is the same class of mistake
+        // as the `c_p`-for-`c_v` one this file already records.
+        const double qu = relax(aUpper, g.upper.temperature(g.agentSpecies),
+                                g.upper.heatCapacity(g.agentSpecies));
+        const double ql = relax(aLower, g.lower.temperature(g.agentSpecies),
+                                g.lower.heatCapacity(g.agentSpecies));
         d.dEU[i] -= qu;
         d.dEL[i] -= ql;
         d.wall += qu + ql;
@@ -1410,9 +1876,20 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
             // energy account -- they conjure whatever they clamp away. Rejecting
             // the step instead keeps the account exact.
             double dU = 0, dL = 0;
-            layerSplit(g.upper.energy, g.totalEnergy(), d.dEU[i], d.dEL[i], dU, dL);
+            layerSplit(gammaMinusOne(g.upper, g.agentSpecies),
+                       gammaMinusOne(g.lower, g.agentSpecies), g.upper.energy, g.lower.energy,
+                       compositionTerm(g.upper, g.agentSpecies, d.dmU[i], d.daU[i]),
+                       compositionTerm(g.lower, g.agentSpecies, d.dmL[i], d.daL[i]),
+                       d.dEU[i], d.dEL[i], dU, dL);
             if (g.upper.energy + dU * dt < 0 || g.lower.energy + dL * dt < 0) return false;
             if (g.upper.mass + d.dmU[i] * dt < 0 || g.lower.mass + d.dmL[i] * dt < 0) return false;
+            // The agent is a species inside the mass, so a step that would take it
+            // negative is rejected on its own terms rather than being clamped away
+            // -- the clamps below are the only thing here that can put a hole in a
+            // conservation account, and the agent's account is asserted at machine
+            // precision.
+            if (g.upper.agent + d.daU[i] * dt < 0 || g.lower.agent + d.daL[i] * dt < 0)
+                return false;
         }
     }
 
@@ -1420,14 +1897,22 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
     for (std::size_t i = 0; i < n; ++i) {
         GasCompartment& g = gas[i];
         double dU = 0, dL = 0;
-        layerSplit(g.upper.energy, g.totalEnergy(), d.dEU[i], d.dEL[i], dU, dL);
+        layerSplit(gammaMinusOne(g.upper, g.agentSpecies),
+                   gammaMinusOne(g.lower, g.agentSpecies), g.upper.energy, g.lower.energy,
+                   compositionTerm(g.upper, g.agentSpecies, d.dmU[i], d.daU[i]),
+                   compositionTerm(g.lower, g.agentSpecies, d.dmL[i], d.daL[i]),
+                   d.dEU[i], d.dEL[i], dU, dL);
         g.upper.energy = std::max(g.upper.energy + dU * dt, 0.0);
         g.lower.energy = std::max(g.lower.energy + dL * dt, 0.0);
         g.upper.mass = std::max(g.upper.mass + d.dmU[i] * dt, 0.0);
         g.lower.mass = std::max(g.lower.mass + d.dmL[i] * dt, 0.0);
         g.upper.products = std::max(g.upper.products + d.dsU[i] * dt, 0.0);
         g.lower.products = std::max(g.lower.products + d.dsL[i] * dt, 0.0);
+        g.upper.agent = std::max(g.upper.agent + d.daU[i] * dt, 0.0);
+        g.lower.agent = std::max(g.lower.agent + d.daL[i] * dt, 0.0);
     }
+    for (AgentSystem& a : agents)
+        if (a.lastFlow > 0) a.delivered += a.lastFlow * dt;
 
     // The water the drenchers landed and the ports did not take back, converted
     // to volume at the density `Ship` weighs floodwater with -- so that the mass
@@ -1448,17 +1933,25 @@ bool Model::substep(double dt, const Ship& ship, const Sea& sea, StepResult& out
     account.massOut += d.massOut * dt;
     account.productsGenerated += d.productsGenerated * dt;
     account.productsOut += d.productsOut * dt;
+    account.agentDischarged += d.agentDischarged * dt;
+    account.agentEnergy += d.agentEnergy * dt;
+    account.agentIn += d.agentIn * dt;
+    account.agentOut += d.agentOut * dt;
     out.entrainment = d.entrained;
     out.suppressionCooling = d.suppression;
+    out.agentDischarge = d.agentDischarged;
+    out.oxygenAvailability = d.oxygenAvailability;
 
     time += dt;
     account.energy = 0;
     account.mass = 0;
     account.products = 0;
+    account.agent = 0;
     for (const GasCompartment& g : gas) {
         account.energy += g.totalEnergy();
         account.mass += g.totalMass();
         account.products += g.upper.products + g.lower.products;
+        account.agent += g.upper.agent + g.lower.agent;
     }
     return true;
 }
