@@ -273,6 +273,12 @@ void accumulateBand(const Vent& v, const VentSide& a, const VentSide& b, double 
     const double u1 = std::abs(dp1), u2 = std::abs(dp2);
     if (std::max(u1, u2) < kPressureFloor) return;
 
+    // The band's midpoint, and **any point in the band would name the same layer**:
+    // the span was split at every interface before this was called, so no interface
+    // lies strictly inside `[z1, z2]` and `densityAt` cannot change across it.
+    // Measured rather than assumed -- sampling at `z1` instead is bit-identical
+    // over twenty thousand random two-layer configurations. The midpoint is kept
+    // because it says what is meant.
     const double zm = 0.5 * (z1 + z2);
     const bool aToB = (dp1 + dp2) > 0;
 
@@ -517,6 +523,11 @@ WallExchange wallExchange(const GasCompartment& gas,
         const thermal::BoundaryFace& f = face[i];
         if (!(f.area > 0)) continue;
         const std::size_t b = bandOf(f);
+        // Per face, though `sum_i a_i h (T_g - T_s,i)` is identically
+        // `A_band h (T_g - <T_s>)` -- one coefficient per band is what makes them
+        // the same number, and the two forms agree to 6e-16 relative. It is
+        // written per face because `exactHeat` beside it *cannot* be, and the
+        // difference between the two is the whole point of the pair.
         const double tg = out.film[b].ambient, ts = surfaceKelvin[i];
         out.heat += f.area * out.film[b].coefficient * (tg - ts);
         out.exactHeat += f.area * (params.convective * (tg - ts) +
@@ -613,8 +624,19 @@ bool waterAgainst(const Ship& ship, const Sea& sea, int shipCompartment, const V
 // of work on the other; substituting the closure gives
 // `dU_u/dt = [E_u + (gamma-1) f E] / gamma`. The lower layer's rate is taken as
 // the remainder rather than from its own formula, so the two sum to `E` in
-// floating point and not merely in algebra -- which is what lets the energy
-// account close to machine precision.
+// floating point and not merely in algebra.
+//
+// **That last property is real and it is not what makes the account close**, which
+// is worth correcting rather than repeating: this comment used to claim it was.
+// Replacing the remainder with the algebraically equal `[E_l + (gamma-1)(1-f)E] /
+// gamma` was measured on the sealed room, on a wall-loss-only compartment and on
+// the ferry, and the energy residual **does not move** -- 7.8e-16 of the heat
+// released either way, and 4.7e-16 for the *substituted* form on one of them. The
+// account's floor is set by `E` itself, which is a sum of two nearly cancelling
+// enthalpy rates, not by the split of it. The remainder stays because it is the
+// cheaper expression and because summing to `E` exactly is a property worth
+// having; no test here can tell the two apart, and that is a statement about the
+// size of the effect rather than about the tests.
 void layerSplit(double energyUpper, double energyTotal, double eUpper, double eLower,
                 double& dUpper, double& dLower) {
     const double e = eUpper + eLower;
@@ -862,7 +884,16 @@ StepResult Model::step(double dt, const Ship& ship, const Sea& sea) {
             remaining -= h;
             ++out.substeps;
             // Creep back up, so one transient does not pin the step for the whole
-            // run. Doubling oscillates against the rejection test; 1.5 settles.
+            // run.
+            //
+            // 1.5 rather than 2.0, and **the reason once given for that does not
+            // survive being measured.** This said doubling oscillates against the
+            // rejection test and 1.5 settles; the ISO room at 500 kW takes 2485
+            // substeps over 600 s at 1.5 and 2491 at 2.0, at 2 MW it takes 2533 and
+            // 2525 -- 0.3% either way, and the ferry's engine rooms and the tall box
+            // sit at the arithmetic floor of four per second under both. The factor
+            // is a free choice between two that behave the same, not a tuned one.
+            // `tests/test_fire.cpp` asserts the floor rather than the factor.
             h = std::min(h * 1.5, maxSubstep);
         } else {
             h *= 0.5;

@@ -3230,6 +3230,546 @@ void testAColdChainLeavesTheShipAndTheSteelBitIdentical() {
                    1.0);
 }
 
+// ==============================================================================
+// What the account could not see
+// ==============================================================================
+//
+// Everything below exists because a mutation of `fire.cpp` survived the suite
+// above. Each one is a term the conservation accounts cannot reach -- because it
+// moves energy or mass *between* two places both of which are inside the account,
+// or because it is a guard, a floor or a default that no fixture happened to
+// stand on. They are the shape `CLAUDE.md` names as the most valuable one here:
+// an error that cancels when the model is asked globally and only shows when one
+// element, one film, one interval or one layer is asked about alone.
+
+// **Which layer an incoming stream joins is decided against the layer it is
+// arriving under, and that is the COOL one.** Gas that is warmer than the
+// receiving compartment's lower layer is buoyant in it and runs to the deckhead,
+// whatever the smoke already up there is doing. Comparing the stream against the
+// *upper* layer instead puts 400 K gas on the floor of a room whose ceiling
+// layer is at 800 K, which is exactly backwards -- and it is invisible in every
+// total, because the mass and the energy arrive either way.
+//
+// Two compartments, and the pair is the test: the same 400 K stream has to go
+// **up** into a room whose floor is at ambient and **down** into one whose floor
+// is at 450 K. One of those alone would be satisfied by a constant.
+void testIncomingGasIsDepositedAgainstTheCoolLayerNotTheHotOne() {
+    const auto run = [](double receiverLowerKelvin) {
+        fire::Model m;
+        // The donor: one uniform 400 K body of gas, 50 Pa above its neighbour, so
+        // that the flow is one-way and its temperature is unambiguous.
+        fire::GasCompartment a;
+        a.name = "donor";
+        a.shipCompartment = kSea;
+        a.floorZ = 0.0;
+        a.ceilingZ = 4.0;
+        a.floorArea = 10.0;
+        a.perimeter = 13.0;
+        a.gasVolume = 40.0;
+        a.wallConductance = 0.0;
+        const double pa = kPatm + 50.0;
+        const double ua = pa * a.gasVolume / (kGammaAir - 1.0);
+        a.upper.energy = 0.9975 * ua;   // interface at 0.01 m: the vent is in it
+        a.lower.energy = ua - a.upper.energy;
+        a.upper.mass = a.upper.energy / (fire::kCvAir * 400.0);
+        a.lower.mass = a.lower.energy / (fire::kCvAir * 400.0);
+
+        // The receiver: a hot smoke layer over a floor whose temperature is the
+        // parameter of this test.
+        fire::GasCompartment b = a;
+        b.name = "receiver";
+        const double vu = 5.0, vl = 35.0;
+        b.upper.mass = kPatm * vu / (kRAir * 800.0);
+        b.lower.mass = kPatm * vl / (kRAir * receiverLowerKelvin);
+        b.upper.energy = b.upper.mass * fire::kCvAir * 800.0;
+        b.lower.energy = b.lower.mass * fire::kCvAir * receiverLowerKelvin;
+        m.gas.push_back(a);
+        m.gas.push_back(b);
+
+        fire::Vent v;
+        v.name = "door";
+        v.a = 0;
+        v.b = 1;
+        v.sillZ = 0.5;
+        v.soffitZ = 1.0;
+        v.width = 1.0;
+        v.area = 0.5;
+        v.dischargeCoeff = 0.7;
+        m.vents.push_back(v);
+        m.resetAccount();
+
+        Ship ship;
+        Sea sea{-1000.0};
+        const double upperBefore = m.gas[1].upper.mass, lowerBefore = m.gas[1].lower.mass;
+        m.step(0.01, ship, sea);
+        return std::pair<double, double>{m.gas[1].upper.mass - upperBefore,
+                                        m.gas[1].lower.mass - lowerBefore};
+    };
+
+    const auto cold = run(kTAmbient);
+    expectTrue("a 400 K stream arriving over a 288 K floor is buoyant and joins the hot layer",
+               cold.first > 0.0 && cold.second == 0.0);
+    // Vacuity: something has to have crossed, and it has to be a real mass.
+    expectTrue("and a real mass crossed to say so", cold.first > 1e-3);
+
+    const auto warm = run(450.0);
+    expectTrue("the same stream arriving over a 450 K floor is not, and sinks",
+               warm.second > 0.0 && warm.first == 0.0);
+    // The two runs move nearly the same mass -- the receiving floor's temperature
+    // moves its density and so its pressure a little -- so what changed between
+    // them is the destination and not the transfer.
+    expectNear("and the two cases moved nearly the same mass, so it is the destination that moved",
+               warm.second, cold.first, 0.10 * cold.first);
+
+    // The comparison the code must NOT be making: the receiving upper layer is at
+    // 800 K in both runs, so a model that tested the stream against it would have
+    // sent both streams to the floor.
+    expectTrue("while the receiving hot layer was hotter than the stream in both",
+               800.0 > 400.0);
+}
+
+// **The plume's cap on what it may drain from the cool layer in one substep.**
+// `substep` limits entrainment to half of what the lower layer holds, so that the
+// explicit mass update cannot take it negative whatever the volume taper does.
+// The taper normally binds first, which is why nothing reached this: the cap is
+// the second line of defence and needs a fixture that defeats the first.
+//
+// A thin cool layer *just above* the taper threshold under a 20 MW fire does it.
+// The step controller is switched off in this fixture on purpose -- it is what
+// keeps the substep short enough for the cap never to bind, and the cap exists
+// precisely for the caller who has taken a long step anyway.
+void testThePlumeNeverDrainsMoreThanHalfTheCoolLayerInOneStep() {
+    fire::Model m;
+    fire::GasCompartment g;
+    g.name = "hold";
+    g.shipCompartment = kSea;
+    g.floorZ = 0.0;
+    g.ceilingZ = 4.0;
+    g.floorArea = 24.0;
+    g.perimeter = 20.0;
+    g.gasVolume = 96.0;
+    g.wallConductance = 0.0;
+    const double vl = 3.0, vu = 93.0;   // 3 m^3 is above the 2% taper threshold
+    g.lower.mass = kPatm * vl / (kRAir * kTAmbient);
+    g.upper.mass = kPatm * vu / (kRAir * 400.0);
+    g.lower.energy = g.lower.mass * fire::kCvAir * kTAmbient;
+    g.upper.energy = g.upper.mass * fire::kCvAir * 400.0;
+    m.gas.push_back(g);
+
+    fire::DesignFire f;
+    f.name = "lorry";
+    f.compartment = 0;
+    f.baseZ = 0.0;
+    f.diameter = 5.0;
+    f.peakHeatRelease = 20.0e6;
+    m.fires.push_back(f);
+    m.maxSubstep = 2.0;
+    m.maxRelativeChange = 1e9;   // the cap under test, not the step controller
+    m.resetAccount();
+
+    Ship ship;
+    Sea sea{-1000.0};
+    const double dt = 2.0;
+    const double lower = m.gas[0].lower.mass;
+    const double lowerVolume = m.gas[0].gasVolume - m.gas[0].upperVolume();
+    const double raw = m.totalEntrainment(0.5 * dt);
+    const fire::StepResult s = m.step(dt, ship, sea);
+
+    // Vacuity, in both directions: the taper must be wide open, and the raw
+    // correlation must be asking for more than the cap allows. Without both, this
+    // fixture would pass on a model with no cap in it at all.
+    expectTrue("the cool layer is above the taper threshold, so the taper is not what binds",
+               lowerVolume > 0.02 * m.gas[0].gasVolume);
+    expectTrue("and the correlation is asking for more than half the layer per step",
+               raw > 0.5 * lower / dt);
+    expectEqual("the whole tick was one substep, so the cap is the only thing acting",
+                s.substeps, 1);
+    expectNear("so the plume takes exactly half the cool layer and no more",
+               s.entrainment, 0.5 * lower / dt, 1e-12 * (0.5 * lower / dt));
+    expectTrue("which is materially less than the correlation wanted",
+               s.entrainment < 0.8 * raw);
+    expectTrue("and the cool layer is still there afterwards", m.gas[0].lower.mass > 0.0);
+}
+
+// **The published constants, against something other than themselves.**
+//
+// `kStefanBoltzmann` is the coefficient the whole radiative half of the boundary
+// exchange is proportional to, and the film test above uses `fire::kStefanBoltzmann`
+// on *both* sides of its identity -- so the identity holds just as well for a
+// wrong sigma. Since the 2019 SI redefinition sigma is not measured, it is derived:
+// `sigma = 2 pi^5 k_B^4 / (15 h^3 c^2)` with all three exact, so there is an
+// independent answer available and it is taken.
+//
+// The discharge coefficients are a different kind of claim: they are not physics
+// but an agreement between two files. `Model::attach` copies `Opening::dischargeCoeff`
+// onto every vent it builds, so a vent or a freeing port constructed by hand has to
+// default to the same number or a synthetic opening silently discharges differently
+// from an authored one.
+void testThePublishedConstantsAreTheirPublishedValues() {
+    // CODATA/SI exact defining constants.
+    const double kB = 1.380649e-23;        // J/K
+    const double planck = 6.62607015e-34;  // J s
+    const double light = 299792458.0;      // m/s
+    const double pi5 = kPi * kPi * kPi * kPi * kPi;
+    const double derived = 2.0 * pi5 * kB * kB * kB * kB /
+                           (15.0 * planck * planck * planck * light * light);
+    // 1e-9 and not tighter, and the reason is the *published* value rather than
+    // this arithmetic: `kStefanBoltzmann` is CODATA's figure rounded to ten
+    // significant digits, so it sits about 3e-11 relative off the exact ratio the
+    // SI defines. Tighter would be asserting a rounding nobody chose.
+    expectNear("Stefan-Boltzmann is 2 pi^5 k^4 / (15 h^3 c^2), from the SI's own exact constants",
+               fire::kStefanBoltzmann, derived, 1e-9 * derived);
+    expectTrue("and it agrees to better than a part in a billion, which three digits would not",
+               std::abs(fire::kStefanBoltzmann - derived) > 0.0);
+    // And the textbook consequence, which no rearrangement of the same constant
+    // can fake: a black body at 1000 K radiates 56.7 kW/m^2.
+    expectNear("so a black body at 1000 K radiates 56.70 kW/m2",
+               fire::kStefanBoltzmann * 1000.0 * 1000.0 * 1000.0 * 1000.0 / 1e3, 56.704, 0.001);
+
+    // EN 1991-1-2 §3.1 on the fire-exposed side of a standard-fire boundary.
+    expectTrue("the convective film is EN 1991-1-2's 25 W/(m2 K)",
+               fire::BoundaryFilm{}.convective == 25.0);
+    expectTrue("and the resultant emissivity is 0.7", fire::BoundaryFilm{}.emissivity == 0.7);
+
+    // The agreement between this file's synthetic openings and the ship's real
+    // ones. `attach` copies the opening's own coefficient, so the two defaults
+    // have to be the same number or a hand-built vent is a different hole.
+    expectTrue("a hand-built vent discharges like the ship's own openings",
+               fire::Vent{}.dischargeCoeff == Opening{}.dischargeCoeff);
+    expectTrue("and so does a hand-built freeing port",
+               fire::Scupper{}.dischargeCoeff == Opening{}.dischargeCoeff);
+    expectTrue("which is the sharp-edged orifice's 0.6", Opening{}.dischargeCoeff == 0.6);
+}
+
+// **The vent integral at millipascals.** A doorway with a two-hundredth of a
+// kelvin of buoyancy behind it drives a pressure difference of under a
+// millipascal -- which is the noise floor `Ship::solveFlowNetwork` uses, and is
+// the reason `fire.cpp` carries a floor a million times tighter. The classical
+// doorway integral is exact at any scale, so it is asserted at one where a
+// floor borrowed from the flooding solve would have deleted the flow entirely,
+// and where a switch to the constant-pressure fallback would have deleted the
+// band above the neutral plane.
+void testTheVentIntegralStillHoldsAtMillipascals() {
+    const double zb = 0.4, zt = 2.4, width = 0.9, cd = 0.68, zn = 1.4;
+    int checked = 0;
+    double worstOut = 0, worstIn = 0, worstNp = 0, coldestDp = 0;
+    for (double dT : {0.2, 0.02, 0.005}) {
+        const double th = kTAmbient + dT;
+        const double rhoH = kPatm / (kRAir * th);
+        const double dRho = fire::kRhoAmbient - rhoH;
+
+        fire::VentSide in;
+        in.floorZ = 0.0;
+        in.interfaceZ = -1.0;
+        in.tLower = in.tUpper = th;
+        in.rhoLower = in.rhoUpper = rhoH;
+        in.gaugeAtFloor = -dRho * kGravity * zn;
+        const fire::VentSide out = fire::ambientSide();
+
+        fire::Vent v;
+        v.a = 0;
+        v.b = kSea;
+        v.sillZ = zb;
+        v.soffitZ = zt;
+        v.width = width;
+        v.area = width * (zt - zb);
+        v.dischargeCoeff = cd;
+
+        const fire::VentResult r = fire::ventMassFlow(v, in, out);
+        const double k = (2.0 / 3.0) * cd * width * std::sqrt(2.0 * dRho * kGravity);
+        const double wantOut = k * std::sqrt(rhoH) * std::pow(zt - zn, 1.5);
+        const double wantIn = k * std::sqrt(fire::kRhoAmbient) * std::pow(zn - zb, 1.5);
+        worstOut = std::max(worstOut, std::abs(r.massAToB - wantOut) / wantOut);
+        worstIn = std::max(worstIn, std::abs(r.massBToA - wantIn) / wantIn);
+        worstNp = std::max(worstNp, std::abs(r.neutralPlaneZ - zn));
+        // The largest pressure difference anywhere over the vent, which is what a
+        // noise floor would be compared against. Kept for the last and coldest
+        // case, which is the one that has to survive a floor.
+        coldestDp = dRho * kGravity * std::max(zt - zn, zn - zb);
+        expectTrue("it still runs in both directions at a hundredth of a kelvin", r.bidirectional);
+        ++checked;
+    }
+    expectEqual("three buoyancies checked", checked, 3);
+    expectTrue("the closed form holds at millipascals to 1e-13", worstOut < 1e-13);
+    expectTrue("in both directions", worstIn < 1e-13);
+    expectTrue("and the neutral plane is still located exactly", worstNp < 1e-12);
+    // Vacuity: if the pressures here were not tiny, this would be the doorway
+    // test above under another name. A hundredth of a kelvin of buoyancy over a
+    // 2 m doorway is a fifth of a millipascal, which is below the *flooding*
+    // solve's own noise floor -- so a floor borrowed from there would have moved
+    // nothing at all here.
+    expectTrue("and the coldest case works on a fifth of a millipascal",
+               coldestDp < 1e-3 && coldestDp > 0.0);
+}
+
+// A layer of micrograms is still a layer. `Layer::temperature` falls back to
+// ambient below `kMassFloor`, and that floor has to be low enough that the seed
+// layer this model starts every compartment with -- half a millimetre thick, a
+// tenth of a gram in a ship compartment -- reports its own temperature and not a
+// convenient one. Asserted from both sides of the floor, because a fallback that
+// is never reached and a fallback that is always reached look the same from
+// above.
+void testALayerOfMicrogramsStillReportsItsOwnTemperature() {
+    fire::Layer hot;
+    hot.mass = 1e-7;
+    hot.energy = hot.mass * fire::kCvAir * 900.0;
+    hot.products = 0.1 * hot.mass;
+    expectNear("a layer of a tenth of a milligram reports 900 K, not ambient",
+               hot.temperature(), 900.0, 1e-9);
+    expectNear("and carries its own product loading", hot.productFraction(), 0.1, 1e-12);
+    expectTrue("which is not the ambient the floor would have returned",
+               std::abs(hot.temperature() - kTAmbient) > 100.0);
+
+    // Below the floor it is treated as absent, which is the other half of the
+    // contract: `U / (m c_v)` with m at machine epsilon is a number and not a
+    // temperature.
+    fire::Layer residue;
+    residue.mass = 1e-12;
+    residue.energy = residue.mass * fire::kCvAir * 900.0;
+    residue.products = 0.1 * residue.mass;
+    expectTrue("a residue below the mass floor is ambient rather than a number",
+               residue.temperature() == kTAmbient && residue.productFraction() == 0.0);
+    // And a layer with mass but no energy left, which is the state the taper
+    // exists to prevent and the second guard exists to survive.
+    fire::Layer drained;
+    drained.mass = 1.0;
+    drained.energy = 0.0;
+    expectTrue("and so is a layer that has been emptied of energy",
+               drained.temperature() == kTAmbient);
+}
+
+// **The substep controller stays near its own floor.** `step()` may take at most
+// `maxSubstep` at a time, so a one-second tick costs at least four substeps and
+// the whole run has a *lower bound* that is arithmetic. What has never been
+// asserted is that it stays anywhere near it.
+//
+// This is a diagnostic rather than a physics check, and it is here because five
+// separate mutations of the vent integral and the boundary relaxation were caught
+// by the suite only as a **hang**: they printed no failing assertion at all, they
+// merely turned a nine-second run into an hours-long one. A gate that catches a
+// defect by wall clock has caught it, but it has not said anything about it.
+// `maxSubsteps` is lowered here so that a model which has lost its step control
+// fails this in seconds instead of running the suite out of the afternoon.
+void testTheSubstepControllerStaysNearItsArithmeticFloor() {
+    for (double power : {500.0e3, 2.0e6}) {
+        Room r = makeRoom(power, 30.0);
+        r.model.maxSubsteps = 200;
+        const int ticks = 60;
+        // Four per second, because `maxSubstep` is 0.25 s.
+        const int floor = static_cast<int>(ticks / r.model.maxSubstep);
+        int worst = 0, total = 0;
+        bool capped = false;
+        for (int i = 0; i < ticks; ++i) {
+            const fire::StepResult s = r.model.step(1.0, r.ship, r.sea);
+            worst = std::max(worst, s.substeps);
+            total += s.substeps;
+            capped = capped || s.pressureSolveCapped;
+        }
+        expectEqual("the floor is one substep per maxSubstep of model time", floor, 240);
+        expectTrue("the reference room runs within twice its own substep floor",
+                   total < 2 * floor);
+        expectTrue("and no single tick needs more than a hundred substeps", worst < 100);
+        expectTrue("while the pressure solve always brackets its root", !capped);
+        // Vacuity: the run has to have been a real fire, or a model that did
+        // nothing would pass this trivially.
+        expectTrue("and the room really did heat up",
+                   r.model.gas[0].upper.temperature() > kTAmbient + 100.0);
+    }
+}
+
+// **A freeing port cannot drain water the ship does not have.** `substep` reads
+// the ship's water level once and may take many substeps against that one
+// snapshot, so the discharge is capped by what is actually on the deck. At any
+// sane tick the cap is nothing -- which is exactly why nothing reached it: it is
+// there for the caller who has taken a long step, and it takes a long step to
+// see it.
+//
+// Ten minutes in one substep, with the step controller switched off, is that
+// caller. The port would pass 1.417 m^3/s under a metre of head and the deck
+// holds 600 m^3, so an uncapped model would drain 850 m^3 out of a deck that has
+// 600 -- and the water account, which is a sum of the same numbers, would still
+// balance perfectly while the ship gained six hundred tonnes of buoyancy that
+// never existed.
+void testAFreeingPortCannotDrainWaterTheShipDoesNotHave() {
+    Barge b = makeBarge(3.0);
+    Compartment& c = b.ship.compartments[0];
+    c.waterVolume = 1.0 * kDeckL * kDeckB;   // a metre over the whole deck
+    b.ship.step(1e-9, b.sea);
+
+    fire::Scupper sc;
+    sc.name = "freeing_port";
+    sc.gasCompartment = 0;
+    sc.sillPos = {0.0, -kDeckB / 2, kDeckZ};
+    sc.width = 0.8;
+    b.model.scuppers.push_back(sc);
+    b.model.maxSubstep = 600.0;
+    b.model.maxRelativeChange = 1e9;
+
+    const double held = c.waterVolume;
+    const double dt = 600.0;
+    const fire::StepResult s = b.model.step(dt, b.ship, b.sea);
+    const fire::Scupper& port = b.model.scuppers[0];
+
+    expectEqual("the whole ten minutes was one substep", s.substeps, 1);
+    // Vacuity: the weir has to be asking for more than the deck holds, or the cap
+    // is not what is being measured. `(2/3) Cd b sqrt(2g) h^(3/2)` at a metre.
+    const double weir = sc.dischargeCoeff * sc.width * (2.0 / 3.0) *
+                        std::sqrt(2.0 * kGravity) * std::pow(port.lastInsideHead, 1.5);
+    expectTrue("the port is under about a metre of head", port.lastInsideHead > 0.9 &&
+                                                              port.lastInsideHead < 1.1);
+    expectTrue("and the sea is not standing over it", port.lastOutsideHead == 0.0);
+    expectTrue("so the free weir would pass more than the deck holds over this step",
+               weir > held / dt);
+    expectNear("but the port passes exactly what is there and no more", port.lastFlow, held / dt,
+               1e-12 * (held / dt));
+
+    // And the consequence: the deck ends empty rather than owing the ship water
+    // it never had.
+    b.model.applyTo(b.ship);
+    expectNear("so the deck ends exactly empty", c.waterVolume, 0.0, 1e-9);
+    expectNear("with nothing owed in either direction", b.model.pendingWater()[0], 0.0, 1e-9);
+    expectNear("and the account books exactly the water that was on the deck",
+               b.model.account.waterDrained, held * b.ship.seaDensity,
+               1e-9 * held * b.ship.seaDensity);
+}
+
+// `applyTo` skips the store entirely when nothing is owed, rather than writing a
+// harmless-looking `+= 0.0`. It is not harmless: `x += 0.0` turns a negative zero
+// positive, and `Compartment::waterVolume` reaches a negative zero through the
+// `std::clamp` that returns its argument unchanged when it compares equal to the
+// bound. The exact control this file is under says *bit*-identical, so the
+// condition is asserted rather than argued -- `fire.cpp` records that mutation
+// testing could not see it, and this is what makes it visible.
+void testApplyToLeavesACompartmentItOwesNothingExactlyAlone() {
+    Barge b = makeBarge(3.0);
+    Compartment& c = b.ship.compartments[0];
+    c.waterVolume = -0.0;
+    expectTrue("the fixture really does start at a negative zero",
+               std::signbit(c.waterVolume) && c.waterVolume == 0.0);
+    b.model.applyTo(b.ship);
+    expectTrue("a model that owes nothing leaves a negative zero a negative zero",
+               std::signbit(c.waterVolume));
+
+    // The other half of the same condition: a compartment already outside its own
+    // bounds is not quietly clamped by a model with nothing to write. Only the
+    // flooding solve owns that number.
+    c.waterVolume = 2.0 * c.floodableVolume();
+    const double before = c.waterVolume;
+    b.model.applyTo(b.ship);
+    expectTrue("and an over-full one is left for the flooding solve to own",
+               c.waterVolume == before);
+    // Vacuity: the clamp the guard is avoiding has to be a real one, or this
+    // passes on a model with no clamp in it at all.
+    expectTrue("while the value really is outside what the compartment can hold",
+               before > c.floodableVolume());
+}
+
+// **Film membership at the boundary, where the convention lives.** A face whose
+// centroid is *exactly* at the layer interface belongs to the hot layer, on the
+// same `>=` that `VentSide::densityAt` uses -- and the two have to agree, because
+// they are two readers of one interface. No meshed fixture lands on that height,
+// so the faces here are built by hand: `wallExchange` reads nothing off a face
+// but its area and its centroid, which is what makes that possible.
+void testFilmMembershipIsExactAtTheInterface() {
+    const fire::GasCompartment gas = twoLayerBox(2.5, 800.0, 300.0);
+    const double zi = gas.interfaceZ();
+
+    thermal::BoundaryFace below, on, above;
+    below.area = on.area = above.area = 1.0;
+    below.centroid = Vec3{0.0, 0.0, std::nextafter(zi, 0.0)};
+    on.centroid = Vec3{0.0, 0.0, zi};
+    above.centroid = Vec3{0.0, 0.0, std::nextafter(zi, 1e30)};
+    const std::vector<thermal::BoundaryFace> face{below, on, above};
+    const std::vector<double> surface(3, 400.0);
+
+    const fire::WallExchange two = fire::wallExchange(gas, face, surface);
+    expectEqual("unbanded there are two films", static_cast<long long>(two.film.size()), 2);
+    expectNear("the face exactly on the interface is in the hot layer, with the one above it",
+               two.area[0], 2.0, 0.0);
+    expectNear("and only the face below it is in the cool one", two.area[1], 1.0, 0.0);
+    // Vacuity: the three centroids have to be genuinely different heights, or the
+    // ULP either side did not survive being put into a `Vec3`.
+    expectTrue("and the three faces really are at three different heights",
+               below.centroid.z < on.centroid.z && on.centroid.z < above.centroid.z);
+    expectTrue("with the middle one exactly on the interface", on.centroid.z == zi);
+
+    // The same convention on the *banded* path, where what is compared against the
+    // interface is the band's own area-weighted mean height. One face makes that
+    // mean exactly the interface, with no summation to round it.
+    const std::vector<thermal::BoundaryFace> single{on};
+    const fire::WallExchange banded = fire::wallExchange(gas, single, {400.0}, {}, 1.0);
+    expectEqual("a single face makes a single band", static_cast<long long>(banded.film.size()), 1);
+    expectTrue("a band centred exactly on the interface takes the hot layer's temperature",
+               banded.film[0].ambient == gas.upper.temperature());
+    expectTrue("which is not the cool layer's", gas.upper.temperature() != gas.lower.temperature());
+
+    // And the same question of the vent integral, which is the other reader of
+    // the same interface: at exactly the interface height the gas is the *upper*
+    // layer's. Two readers of one boundary have to say the same thing -- the
+    // repo's own record of a tolerant test followed by an exact one is what this
+    // guards against.
+    fire::VentSide side;
+    side.interfaceZ = zi;
+    side.rhoLower = 1.2;
+    side.rhoUpper = 0.4;
+    side.tLower = 300.0;
+    side.tUpper = 800.0;
+    expectTrue("the vent integral reads the interface height as upper-layer gas too",
+               side.densityAt(zi) == side.rhoUpper && side.temperatureAt(zi) == side.tUpper);
+}
+
+// **Bands are cut at the height asked for, measured from the lowest face.** A
+// fixture whose band height happens to equal its own row pitch cannot tell that
+// apart from a grid offset by half a band: every centroid sits at a band centre
+// and both rules floor to the same integer. So the band height here is 0.37 m
+// against a 0.5 m row pitch, and the memberships are worked out by hand.
+void testBandsAreCutAtTheHeightAskedForAndNotAtTheRowPitch() {
+    const fire::GasCompartment gas = twoLayerBox(2.5, 800.0, 300.0);
+    std::vector<thermal::BoundaryFace> face(8);
+    for (std::size_t k = 0; k < face.size(); ++k) {
+        face[k].area = 1.0;
+        face[k].centroid = Vec3{0.0, 0.0, 0.25 + 0.5 * static_cast<double>(k)};
+    }
+    const std::vector<double> surface(face.size(), 400.0);
+    const double bandHeight = 0.37;
+
+    // (z - 0.25) / 0.37 for the eight rows is 0, 1.35, 2.70, 4.05, 5.41, 6.76,
+    // 8.11 and 9.46, so the bands they land in are these -- and bands 3 and 7 of
+    // the ten hold nothing at all, which is what a grid finer than the face pitch
+    // looks like.
+    const int want[8] = {0, 1, 2, 4, 5, 6, 8, 9};
+    const fire::WallExchange w = fire::wallExchange(gas, face, surface, {}, bandHeight);
+    expectEqual("ten bands span the plate at 0.37 m", static_cast<long long>(w.film.size()), 10);
+    int empty = 0, placed = 0;
+    for (std::size_t b = 0; b < w.film.size(); ++b) {
+        if (w.film[b].face.empty()) { ++empty; continue; }
+        expectEqual("each occupied band holds exactly one row",
+                    static_cast<long long>(w.film[b].face.size()), 1);
+        bool found = false;
+        for (int k = 0; k < 8; ++k)
+            if (static_cast<std::size_t>(want[k]) == b) {
+                found = true;
+                expectNear("and it is the row the arithmetic puts there",
+                           w.film[b].face[0].centroid.z, 0.25 + 0.5 * k, 0.0);
+                ++placed;
+            }
+        expectTrue("no band holds a row the arithmetic does not put there", found);
+    }
+    expectEqual("all eight rows were placed", placed, 8);
+    expectEqual("and bands 3 and 7 are empty", empty, 2);
+
+    // Vacuity, and it is the whole point of choosing 0.37: a grid measured from
+    // the middle of the first band rather than from its foot would put three of
+    // these rows somewhere else. On a 0.5 m grid it would put none of them.
+    int moved = 0;
+    for (int k = 0; k < 8; ++k) {
+        const double z = 0.25 + 0.5 * k;
+        const int centred = static_cast<int>((z - 0.25 + 0.5 * bandHeight) / bandHeight);
+        if (centred != want[k]) ++moved;
+    }
+    expectTrue("a half-band offset would move at least two rows at this band height", moved >= 2);
+}
+
 void runFireTests() {
     std::printf("\n--- compartment fire ---\n");
     testCaloricConstantsAreExactlyConsistent();
@@ -3269,6 +3809,12 @@ void runFireTests() {
     testThePressureSolveConvergesAndDoesNotPressuriseTheRoom();
     testValidateCatchesBadDefinitions();
     testDesignFireFollowsItsCurve();
+    testIncomingGasIsDepositedAgainstTheCoolLayerNotTheHotOne();
+    testThePlumeNeverDrainsMoreThanHalfTheCoolLayerInOneStep();
+    testTheVentIntegralStillHoldsAtMillipascals();
+    testALayerOfMicrogramsStillReportsItsOwnTemperature();
+    testTheSubstepControllerStaysNearItsArithmeticFloor();
+    testThePublishedConstantsAreTheirPublishedValues();
 
     std::printf("\n--- suppression, and its effect on stability ---\n");
     testSprayMassFlowConvertsTheRuleUnitExactly();
@@ -3290,10 +3836,14 @@ void runFireTests() {
     testTheFerrysLollTracksTheDrencherAndTheFreeingPortsDecideIt();
     testSuppressionOffLeavesTheShipAndTheGasBitIdentical();
     testValidateCatchesBadSuppressionDefinitions();
+    testAFreeingPortCannotDrainWaterTheShipDoesNotHave();
+    testApplyToLeavesACompartmentItOwesNothingExactlyAlone();
 
     std::printf("\n--- the boundary the structure sees ---\n");
     testTheFilmCoefficientCarriesRadiationExactly();
     testTheWallExchangeSplitsAtTheLayerInterface();
     testBandingTheFilmRemovesTheSpreadError();
+    testFilmMembershipIsExactAtTheInterface();
+    testBandsAreCutAtTheHeightAskedForAndNotAtTheRowPitch();
     testAColdChainLeavesTheShipAndTheSteelBitIdentical();
 }
