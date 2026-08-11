@@ -3,7 +3,13 @@
 // Slice 1, headless. Hole the ferry and watch what the physics does about it.
 //
 //   ./shipsim [--scenario=none|doors|full] [--duration=900] [--dt=0.01] [--csv=path]
-//              [--ship=path]
+//              [--ship=path] [--gm-detail]
+//
+// `--gm-detail` prints how the metacentric height at the end of the run was
+// arrived at -- the angle, the halvings, whether it converged, the layer that set
+// the angle, and the slope at the fixed +/-0.03 rad this used to be taken at.
+// One quantity per line with stable labels, because the numbers the front page
+// publishes about that repair were otherwise re-derivable only by writing C++.
 //
 // There is no renderer here on purpose. Everything the eventual game shows on a
 // damage-control board is already decided by this loop; getting it right in a
@@ -96,6 +102,52 @@ void printGzCurve(const Ship& s, const char* title) {
     std::printf("\n");
 }
 
+// --- `--gm-detail` -------------------------------------------------------------
+//
+// The metacentric height's own working, one quantity per line, so that the claims
+// made about it are re-derivable without writing C++ against the library. Every
+// line is `gm-detail: <label> <value>`; the labels are an interface and do not
+// move.
+//
+// **The last line is a control and it is deliberately the wrong answer.**
+// `gm_at_fixed_0.03rad_m` is the current code asked for the slope at the angle
+// this repository used to take unconditionally -- not a remembered number from
+// before the change, which would be a historical note rather than a measurement.
+// It is what makes "a fixed sample is wrong by 4.7 m on this ship" reproducible,
+// and it is here rather than on `Diagnostics` for exactly the reason it is
+// interesting: an engine that returns a GM taken at an angle nobody checked is
+// how this went wrong the first time. A caller has to ask for it by name, on a
+// tool, with `--gm-detail` on the command line.
+//
+// `pockets_at_rad` and `fixed_sample_sees_frac` come from `sim::largestFreeSurface`
+// -- the wedge closed form evaluated on the layer's own measured geometry -- and
+// are what say *why* a fixed angle is wrong rather than merely that it is.
+void printGmDetail(const Ship& s, const Diagnostics& d, const Sea& sea) {
+    constexpr double kFixed = 0.03;
+    const double atFixed =
+        (s.rightingArmAtHeel(kFixed, sea) - s.rightingArmAtHeel(-kFixed, sea)) / (2 * kFixed);
+    const FreeSurfaceLayer layer = largestFreeSurface(s);
+
+    std::printf("\ngm-detail: gm_converged_m %.6f\n", d.gmTransverse);
+    std::printf("gm-detail: gm_sampled_at_rad %.6e\n", d.gmSampledAtRad);
+    std::printf("gm-detail: gm_halvings %d\n", d.gmHalvings);
+    std::printf("gm-detail: gm_converged %s\n", d.gmSlopeConverged ? "yes" : "no");
+    std::printf("gm-detail: gm_at_fixed_0.03rad_m %.6f\n", atFixed);
+    std::printf("gm-detail: layer_compartment %s\n",
+                layer.compartment < 0
+                    ? "none"
+                    : s.compartments[static_cast<std::size_t>(layer.compartment)].name.c_str());
+    std::printf("gm-detail: layer_water_t %.6f\n",
+                layer.compartment < 0 ? 0.0
+                                      : s.compartments[static_cast<std::size_t>(layer.compartment)]
+                                                .waterVolume * s.seaDensity / 1000.0);
+    std::printf("gm-detail: layer_plan_area_m2 %.3f\n", layer.planArea);
+    std::printf("gm-detail: layer_depth_m %.6e\n", layer.depth);
+    std::printf("gm-detail: layer_breadth_m %.3f\n", layer.breadth);
+    std::printf("gm-detail: pockets_at_rad %.6e\n", layer.pocketingRad);
+    std::printf("gm-detail: fixed_sample_sees_frac %.6f\n", layer.momentFractionAt(kFixed));
+}
+
 void printCompartments(const Ship& s) {
     std::printf("  %-20s %10s %8s %8s %9s\n", "compartment", "gross m3", "fill %", "P kPa", "water t");
     for (const Compartment& c : s.compartments) {
@@ -123,6 +175,10 @@ int main(int argc, char** argv) {
     // positive value attaches Ikeda's viscous roll damping instead. A ro-pax of
     // this size carries keels around a third of her length.
     double bilgeKeelLength = 0.0;
+    // Print the metacentric height's own working at the end of the run. Off by
+    // default because the answer is `gmTransverse` and everything here is about
+    // *how it was arrived at* -- see printGmDetail().
+    bool gmDetail = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view a = argv[i];
@@ -132,6 +188,7 @@ int main(int argc, char** argv) {
         else if (a.starts_with("--csv=")) csvPath = std::string(a.substr(6));
         else if (a.starts_with("--ship=")) shipPath = std::string(a.substr(7));
         else if (a.starts_with("--bilge-keels=")) bilgeKeelLength = std::atof(argv[i] + 14);
+        else if (a == "--gm-detail") gmDetail = true;
         else { std::fprintf(stderr, "unknown argument: %s\n", argv[i]); return 2; }
     }
 
@@ -180,7 +237,13 @@ int main(int argc, char** argv) {
     std::printf("  waterplane area   %10.0f m2\n", intact.waterplaneArea);
     std::printf("  KG                %10.2f m\n", intact.centreOfGravity.z);
     std::printf("  KB                %10.2f m\n", intact.centreOfBuoyancy.z);
-    std::printf("  GM (transverse)   %10.2f m\n", intact.gmTransverse);
+    // An intact ship has no free surface to pocket and is sampled at the full
+    // 0.03 rad, so this is a metacentric height on every ship this prototype
+    // builds. It is not guaranteed to be one on a ship loaded from a file with
+    // water already in a compartment, and an unresolved GM must not reach the
+    // reader looking like a resolved one anywhere it is printed.
+    std::printf("  GM (transverse)   %10.2f m%s\n", intact.gmTransverse,
+                intact.gmSlopeConverged ? "" : "   (unresolved: no linear region)");
     std::printf("  freeboard to veh. deck %5.2f m\n", intact.freeboardMin);
     printGzCurve(ship, "Intact righting arm curve");
 
@@ -193,7 +256,12 @@ int main(int argc, char** argv) {
     std::ofstream csv;
     if (!csvPath.empty()) {
         csv.open(csvPath);
-        csv << "t,draft,heel_deg,trim_deg,gm_m,gz_m,floodwater_t,freeboard_m,displacement_t\n";
+        // `gm_resolved` rides with `gm_m` and not somewhere else, because a plot
+        // of the GM column alone is exactly the reading this whole exercise is
+        // about: the column is a metacentric height on the rows where that is 1
+        // and the last thing a bisection was holding on the rows where it is 0.
+        csv << "t,draft,heel_deg,trim_deg,gm_m,gm_resolved,gz_m,floodwater_t,freeboard_m,"
+               "displacement_t\n";
     }
 
     std::printf("\n  %8s %8s %8s %8s %8s %8s %11s %10s\n",
@@ -217,11 +285,21 @@ int main(int argc, char** argv) {
             std::printf("  %8.0f %8.2f %8.2f %8.2f %8.2f %8.3f %11.0f %10.2f\n",
                         t, d.draftMidship, d.heelDeg, d.trimDeg, d.gmTransverse,
                         d.gzRighting, d.floodwaterMass / 1000.0, d.freeboardMin);
+            // **The note is a line of its own, and it begins with a word.** The
+            // obvious place for it is the end of the row above, and that would be a
+            // trapdoor: `scripts/check-figures.sh` reads this table with
+            // `awk 'NF == 8 && $1 ~ /^[0-9]+$/'`, so a marker appended to a row
+            // would silently *remove that row from the gate* -- exactly on the
+            // steps where GM is least trustworthy. A separate line whose first
+            // field is not a number is invisible to those readers by construction.
+            if (!d.gmSlopeConverged)
+                std::printf("      note: the GM above is not a metacentric height -- the arm is"
+                            " not linear at any angle down to +/-%.2e rad\n", d.gmSampledAtRad);
             if (csv)
                 csv << t << ',' << d.draftMidship << ',' << d.heelDeg << ',' << d.trimDeg
-                    << ',' << d.gmTransverse << ',' << d.gzRighting << ','
-                    << d.floodwaterMass / 1000.0 << ',' << d.freeboardMin << ','
-                    << d.displacementMass / 1000.0 << '\n';
+                    << ',' << d.gmTransverse << ',' << (d.gmSlopeConverged ? 1 : 0) << ','
+                    << d.gzRighting << ',' << d.floodwaterMass / 1000.0 << ','
+                    << d.freeboardMin << ',' << d.displacementMass / 1000.0 << '\n';
 
             if (std::abs(d.heelDeg) > 60.0) { outcome = "CAPSIZED"; break; }
             if (!d.afloat)                  { outcome = "FOUNDERED"; break; }
@@ -233,23 +311,23 @@ int main(int argc, char** argv) {
     }
 
     const Diagnostics fin = ship.diagnostics(seaLevel);
-    // "Still afloat" is not a verdict. A ship lying at 55 degrees with negative GM
-    // and water still coming in has already been lost; it just has not finished.
-    if (std::string_view(outcome).starts_with("still")) {
-        if (fin.gmTransverse < 0 && std::abs(fin.heelDeg) > 20.0)
-            outcome = "LOST - lolled over with negative GM, flooding continuing";
-        else if (fin.gmTransverse < 0)
-            outcome = "LOST - negative GM, loll imminent";
-        else if (fin.freeboardMin < 0)
-            outcome = "SURVIVED but the deck edge is under; no margin left";
-        else
-            outcome = "SURVIVED - positive GM, deck edge dry";
-    }
+    // The verdict itself is in `game::floodingOutcome`, where a test can reach it.
+    if (std::string_view(outcome).starts_with("still")) outcome = game::floodingOutcome(fin);
     std::printf("\n=== Outcome at t+%.0fs: %s ===\n", t, outcome);
     std::printf("  heel %.1f deg, trim %.1f deg, draft %.2f m, %.0f t of floodwater aboard\n",
                 fin.heelDeg, fin.trimDeg, fin.draftMidship, fin.floodwaterMass / 1000.0);
-    std::printf("  effective GM %.2f m (intact was %.2f m)\n\n",
-                fin.gmTransverse, intact.gmTransverse);
+    // The GM line says which of the two things it is. A slope the refinement gave
+    // up on is still worth printing -- it is the only number there is -- but it is
+    // printed as what it is, next to the angle it bottomed out at, and it is not
+    // called a metacentric height.
+    if (fin.gmSlopeConverged)
+        std::printf("  effective GM %.2f m (intact was %.2f m)\n\n",
+                    fin.gmTransverse, intact.gmTransverse);
+    else
+        std::printf("  effective GM unresolved: %.2f m is the best slope available, and it is\n"
+                    "  still moving at +/-%.2e rad (intact GM was %.2f m)\n\n",
+                    fin.gmTransverse, fin.gmSampledAtRad, intact.gmTransverse);
+    if (gmDetail) printGmDetail(ship, fin, seaLevel);
     printCompartments(ship);
     printGzCurve(ship, "Damaged righting arm curve");
     return 0;

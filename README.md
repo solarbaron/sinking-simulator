@@ -22,7 +22,7 @@ slice.
 ```sh
 cmake -S . -B build -G Ninja
 ninja -C build
-./build/shipsim_tests                       # 195663 validation checks against closed-form answers
+./build/shipsim_tests                       # 195756 validation checks against closed-form answers
 ./build/shipsim --scenario=none             # 120 m ferry, holed, nobody does anything
 ./build/shipsim --scenario=doors            # close the watertight door
 ./build/shipsim --scenario=full             # full damage control response
@@ -63,11 +63,19 @@ out of the integrals.
 The bottom row used to read "survives", and it changed on the day GM stopped
 being finite-differenced at a fixed ±0.03 rad. Every tonnage, list and draft in
 it is the same; what moved is the number that judges them. Eleven tonnes of water
-on that deck is a **6 mm** layer, and it pulls off the high side at 6.8e-4 rad —
-so a slope taken at forty-four times that angle sees **6%** of that deck's free
+on that deck is a **6.6 mm** layer, and it pulls off the high side at 7.07e-4 rad
+— so a slope taken at forty-two times that angle sees **6%** of that deck's free
 surface and reports +1.38 m where the metacentric height is −3.23 m. The full
 damage-control response buys her a great deal and it does not buy her positive
 stability. See `docs/02-simulation.md` §1.
+
+Every figure in that sentence now comes from `shipsim --scenario=full
+--duration=1800 --gm-detail` and is gated. The angle used to read 6.8e-4 rad,
+computed from the deck's **nominal** 100 × 19 m; the deck the ship actually
+carries is 1868.4 m² with a **mean** breadth of 18.684 m, and a bounding box
+would have said 20.00 m — the deck at its widest, which is the one width no part
+of the calculation wants. That is a 4% error in the angle and it changes nothing
+here, but it is the kind that survives precisely because it looks derived.
 
 The same physics declines to let you cheat. In an earlier run the counterflooding
 attempt failed, and it failed for the right reason: by the time the valves were

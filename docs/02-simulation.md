@@ -142,6 +142,54 @@ Phase 4. What this leaves in place is the hull's own O(ε²) truncation at
 different and much smaller error, and moving it would move all of them for no
 gain.
 
+### What a verdict may be drawn from — **implemented**
+
+The flag above had **no consumer** for a while, which made it decoration. Both
+tools that judge whether the ferry lives — `shipsim` in a sentence, `ram_view` in
+a word — tested `gmTransverse < 0` and nothing else, so a GM the ship had already
+reported as unusable was scored exactly as confidently as one it had not. That is
+the same failure one level up: the fixed ±0.03 rad published a number that was not
+a metacentric height, and this published a *verdict* drawn from one.
+
+**It fires on runs this repository ships, and only for about a tenth of a
+second.** Instrumenting every 0.2 s of all three scenarios and the four `ram_view`
+cases the gates run finds it twice: `--scenario=none` at t+679.4 and
+`ram_view --speed=4` at t+97.0, both at the instant the first *litres* reach the
+vehicle deck — 1.2 to 4.8 kg spread over 1868 m², a layer under three microns
+deep. Sampling `none` at every step across that window shows three steps of a
+thousand, not a contiguous run of them. Neither run *ends* there, so no published
+verdict changes; but `ram_view --speed=4 --duration=97` ends there deliberately,
+and it is the one invocation of anything shipped here that prints the new
+outcome. Forty milliseconds earlier the same run reads +1.77 m converged and says
+SURVIVED; by t+120 it reads −3.26 m converged and says LOST. The discontinuity is
+not a story about a pathological input: it is what a vehicle deck does as it
+starts to flood.
+
+**The policy is refusal, and the reason is that the alternative reading is wrong
+on the measurement.** `sim::judgeStability` answers `Unresolved`, `Negative` or
+`Positive`, and `Unresolved` is not a degree of danger — it is the statement that
+there is no metacentric height to have a sign. It would be tempting to default it
+to "negative" as the conservative choice; the measurement says that would cry
+wolf exactly where the water is negligible, since the condition arises only for a
+layer microns deep, while the 50 t layer that started all of this converges and is
+genuinely −3.77 m. So `shipsim` prints `UNDETERMINED - the righting arm is not
+linear at any angle it can be sampled at, so there is no GM to judge her by`, and
+`ram_view` prints `UNDETERMINED`, and the slope the bisection was holding is
+printed underneath as what it is rather than as a GM.
+
+**What the refusal does not swallow** is anything that was never a statement
+about GM. `afloat` is asked first — a hull with no reserve buoyancy left is lost
+whatever her GM reads, and the ram at 6 m/s ends at 165° with a GM of +0.34 m and
+is still LOST. The heel, trim, draft and floodwater are printed as always, and the
+deck edge is reported beneath the refusal rather than promoted into a verdict of
+its own.
+
+The two verdict strings live in `game/prototype/ferry.cpp` and not in either
+tool, because that is the only translation unit `shipsim`, `ram_view` *and*
+`shipsim_tests` all compile: the old rule was untestable exactly because it lived
+in two `main()`s. `scripts/mutate-stability.py` runs both tools on every mutant
+for the same reason.
+
 ### Gas temperature in the flooding network — **implemented, opt-in**
 
 The flooding network's gas used to be isothermal by construction: the pressure

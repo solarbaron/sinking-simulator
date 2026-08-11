@@ -262,4 +262,45 @@ Ship buildFerry() {
     return ship;
 }
 
+// --- The verdict --------------------------------------------------------------
+//
+// The ordering is the argument. `afloat` and the heel are *observations* -- a
+// hull with no reserve buoyancy left, a ship lying over -- and they hold whether
+// or not a metacentric height could be measured, so they are asked first and are
+// untouched by any of this. Only the branches that read GM are refused when GM is
+// not a GM, and the deck edge, which is geometry rather than stability, is still
+// reported underneath.
+const char* floodingOutcome(const sim::Diagnostics& d) {
+    if (!d.afloat) return "FOUNDERED";
+    switch (sim::judgeStability(d)) {
+        case sim::StabilityJudgement::Unresolved:
+            // No number follows the reason on this line: the angle and the slope
+            // the refinement bottomed out at are printed beneath it, where they
+            // cannot be mistaken for a metacentric height.
+            return "UNDETERMINED - the righting arm is not linear at any angle it can "
+                   "be sampled at, so there is no GM to judge her by";
+        case sim::StabilityJudgement::Negative:
+            // "Still afloat" is not a verdict. A ship lying at 55 degrees with
+            // negative GM and water still coming in has already been lost; she
+            // just has not finished.
+            return std::abs(d.heelDeg) > 20.0
+                       ? "LOST - lolled over with negative GM, flooding continuing"
+                       : "LOST - negative GM, loll imminent";
+        case sim::StabilityJudgement::Positive:
+            break;
+    }
+    return d.freeboardMin < 0 ? "SURVIVED but the deck edge is under; no margin left"
+                              : "SURVIVED - positive GM, deck edge dry";
+}
+
+const char* stabilityWord(const sim::Diagnostics& d) {
+    if (!d.afloat) return "LOST";
+    switch (sim::judgeStability(d)) {
+        case sim::StabilityJudgement::Unresolved: return "UNDETERMINED";
+        case sim::StabilityJudgement::Negative:   return "LOST";
+        case sim::StabilityJudgement::Positive:   break;
+    }
+    return "SURVIVED";
+}
+
 }  // namespace game

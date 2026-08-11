@@ -300,6 +300,12 @@ int main(int argc, char** argv) {
             const sim::Diagnostics d = ferry.diagnostics(sea);
             std::printf("%8.0f %10.0f %7.2f° %7.2f° %8.2f\n", i * dt,
                         d.floodwaterMass / 1000.0, d.heelDeg, d.trimDeg, d.gmTransverse);
+            // On its own line and starting with a word, so that a reader keying on
+            // a numeric first field -- `scripts/check-figures.sh` reads this tool
+            // that way -- cannot lose a row by gaining a note.
+            if (!d.gmSlopeConverged)
+                std::printf("         note: that GM is not a metacentric height; the arm is not"
+                            " linear down to +/-%.2e rad\n", d.gmSampledAtRad);
         }
         if (!drawing || frame >= options.frames || i % framesEvery != 0) continue;
 
@@ -355,9 +361,17 @@ int main(int argc, char** argv) {
     if (drawing) std::printf("       %d frame(s) written to %s\n", frame, options.out.c_str());
 
     const sim::Diagnostics after = ferry.diagnostics(sea);
+    // `game::stabilityWord` and not `after.gmTransverse < 0`: a hull with no
+    // reserve buoyancy left is lost whatever her GM reads, and a GM the ship
+    // itself could not resolve is not evidence of anything. The rest of the line
+    // is unchanged, deliberately -- `scripts/check-figures.sh` reads the tonnage
+    // and the heel off it.
     std::printf("\noutcome: %s -- %.0f t of water, heel %.1f deg, GM %.2f m\n",
-                (!after.afloat || after.gmTransverse < 0) ? "LOST" : "SURVIVED",
-                after.floodwaterMass / 1000.0, after.heelDeg, after.gmTransverse);
+                game::stabilityWord(after), after.floodwaterMass / 1000.0, after.heelDeg,
+                after.gmTransverse);
+    if (!after.gmSlopeConverged)
+        std::printf("         that GM is the last slope a bisection was holding at "
+                    "+/-%.2e rad, not a metacentric height\n", after.gmSampledAtRad);
     std::printf("ok\n");
     return 0;
 }

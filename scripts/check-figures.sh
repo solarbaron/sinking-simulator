@@ -265,7 +265,7 @@ fi
 #     108 m3 tank that was double-counted inside it. The same drift the header of
 #     this file was written about, one document further out.
 #   - two mutually contradictory counts of the same test suite, `116` and `1309`,
-#     against a measured 195 663.
+#     against a measured 195 756.
 #
 # **The durations are the interesting part and they are now written into the README.**
 # `full` is still flooding when the run ends, so its figures are a function of how
@@ -437,10 +437,45 @@ fi
 # that the failures are zero.
 if [ -x "$TESTS" ]; then
   suite=$("$TESTS" 2>&1 | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  check "closed-form validation checks in the suite" 195663 0 "$suite" \
-        "195663 validation checks" "$FRONT"
+  check "closed-form validation checks in the suite" 195756 0 "$suite" \
+        "195756 validation checks" "$FRONT"
 else
   echo "  - shipsim_tests not built, skipping the README's check count"
+fi
+
+# The three numbers the SURVIVED -> LOST verdict actually rests on. Until `--gm-detail`
+# existed these were the least checkable figures on the front page: nothing in the
+# repository printed the angle GM was sampled at, so re-deriving them meant writing a
+# C++ driver against `libshipsim_engine`. They are gated here because an argument that
+# only its author can reproduce is not evidence.
+#
+# **The angle is the one that had drifted, and it looked derived.** The README published
+# 6.8e-4 rad, taken off the deck's *nominal* 100 x 19 m. The deck the ship carries is
+# 1868.4 m2 with a mean breadth of 18.684 m, and the run measures 7.07e-4 -- 4% out. A
+# bounding box would say 20.00 m, the deck at its widest, which is the one width nothing
+# in this calculation wants; `test_ship.cpp` asserts the mean and not the box for exactly
+# that reason.
+#
+# The fixed-angle figure is deliberately a *control*: it is the current code asked for the
+# answer it used to give, not a number kept from before the change. That is what makes it
+# reproducible rather than historical.
+if [ -x "$SHIPSIM" ]; then
+  gmd=$("$SHIPSIM" --scenario=full --duration=1800 --gm-detail 2>/dev/null)
+  detail() { printf '%s\n' "$gmd" | sed -n "s/^gm-detail: $1 \(.*\)$/\1/p"; }
+
+  check "GM at a fixed +-0.03 rad, the answer that used to be published" \
+        1.3799 5e-4 "$(detail gm_at_fixed_0.03rad_m)" "reports +1.38 m" "$FRONT"
+  check "the angle the layer pockets at (rad)" \
+        7.0655e-4 5e-8 "$(detail pockets_at_rad)" "7.07e-4 rad" "$FRONT"
+  check "fraction of the deck's free surface a fixed sample sees" \
+        0.06341 5e-5 "$(detail fixed_sample_sees_frac)" "sees **6%**" "$FRONT"
+  check "the layer's depth (mm)" \
+        6.6005 5e-4 "$(awk -v d="$(detail layer_depth_m)" 'BEGIN{print d*1000}')" \
+        "a **6.6 mm** layer" "$FRONT"
+  check "the vehicle deck's mean breadth (m)" \
+        18.684 5e-4 "$(detail layer_breadth_m)" "mean** breadth of 18.684 m" "$FRONT"
+else
+  echo "  - shipsim not built, skipping the README's GM-detail figures"
 fi
 
 # **`ram_view` is a Vulkan target, so a machine with no device never builds it --
