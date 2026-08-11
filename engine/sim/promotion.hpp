@@ -18,6 +18,13 @@
 //   3. `preloadFor` -- the girder stress the zone starts from, as
 //      `zone::Preload`.
 //
+// A fourth answer now sits beside them and it is not structural at all:
+// `GasPromoter` decides which *burning compartment* deserves `les.hpp`'s resolved
+// flow instead of `fire.hpp`'s two zones. It is here rather than in `les.hpp` for
+// the reason `Promoter` is here rather than in `zone.hpp` -- a promotion criterion
+// is a decision about cost and evidence, it needs no solver, and the two are the
+// same state machine over different evidence. §6 has the criterion.
+//
 // Where the three-tier plan in `02-simulation.md` §3 says a zone couples to Tier-1
 // through retained interface DOF, this couples it to Tier-0 through a section.
 // **That coupling now exists -- `coupling.{hpp,cpp}` -- and this file is still
@@ -301,6 +308,7 @@
 #include "buckling.hpp"
 #include "collapse.hpp"
 #include "girder.hpp"
+#include "les.hpp"
 #include "scantlings.hpp"
 #include "zone.hpp"
 
@@ -596,6 +604,163 @@ SectionReduction reactionOf(const StructuralMesh& structure, const zone::Patch& 
 // `breach.hpp`'s view of the same structure still lines up; a fully lost panel
 // keeps its place with zero thickness rather than being erased.
 StructuralMesh reduce(const StructuralMesh& structure, const SectionReduction& reduction);
+
+// --- 6. The gas side: when a two-zone compartment deserves a resolved model -----
+//
+// Everything above is structural, and everything below is not; what they share is
+// the *shape of the decision*, which is why they live in one file. A fidelity tier
+// is worth paying for when the cheap model is answering a question it cannot
+// answer, the decision has to be cheap enough to take often, and it has to not
+// chatter. `Promoter` and `GasPromoter` are the same state machine over different
+// evidence -- absolute threshold, hysteresis band, dwell, budget -- and neither
+// owns a solver.
+//
+// **What the cheap model asserts here is that the upper layer is one temperature.**
+// `fire.hpp` has two well-mixed control volumes per compartment, so a bulkhead
+// forty metres from a fire sees exactly the same gas as the deckhead above it. That
+// is right in a small room and wrong in a long one, and *how* wrong is a published
+// closed form rather than a judgement: Alpert's ceiling-jet correlation has two
+// branches either side of `r/H = 0.18`, and their ratio is
+//
+//     dT(0) / dT(r) = (16.9 / 5.38) (r / H)^(2/3)
+//
+// with the heat release **cancelling exactly**, and passing through one at the
+// crossover to 0.1427% -- which is the closest thing to a validation two independent
+// branches of one correlation can give. So the geometric trigger is a
+// property of the compartment and not of the fire in it -- a bigger fire does not
+// switch it on -- and it needs an activity trigger beside it, which is the layer
+// temperature rise. Neither implies the other and both are required: a cold ro-ro
+// deck has the shape and nothing to resolve, a fierce fire in a tank has plenty to
+// resolve and a shape a zone model gets right.
+//
+// `radius` is the **half-diagonal of the plan rectangle** `les::planRectangle`
+// derives from the compartment's own area and perimeter: the distance from a fire
+// at the centre to the farthest corner, which is how far the ceiling jet has to
+// travel before it stops being one temperature. A `fire::DesignFire` carries no
+// horizontal position at all, so the fire is at the centre -- which is the *least*
+// favourable reading for promotion, since a fire in a corner is further from the far
+// bulkhead than this says, and understating the case is the right direction for a
+// criterion that spends core-seconds.
+//
+// **The threshold is anchored on the published guidance rather than picked.** Zone
+// models are held to be sound for compartments up to about `L/H = 3`; for a square
+// room the half-diagonal is `L/sqrt(2)`, so `r/H = 2.121` there and the spread is
+// `3.1413 * 2.121^(2/3) = 5.16`. `spreadPromote = 5.0` is that boundary, and the
+// consequence is that a 6 x 5 x 4 m tank (3.09) and a 12 x 10 x 5 m machinery space
+// (4.24) stay two-zone while a 20 x 8 x 5 m hold (5.27) and the ferry's own
+// 100 x 19 m vehicle deck (14.8) do not.
+//
+// **Cost here is not linear in the resolution, and that is the difference from §1.**
+// A Tier-2 zone costs `4.0 x elements` core-seconds per simulated second, exactly,
+// because the step is fixed. Halving this model's cell size multiplies the cells by
+// eight *and* halves the advective step *and* lengthens the pressure solve, so the
+// measured cost per cell per simulated second **rises** with refinement: 1.5e-6 at
+// 168 cells, 8.9e-6 at 600, 1.2e-5 at 1456, on one core. `cellBudget` therefore
+// bounds the arithmetic honestly and the wall time only loosely, and
+// `coreSecondsPerCell` is a figure for the resolution the default parameters give
+// rather than a constant of the model.
+//
+// The budget is in **cells**, on the same terms the structural budget is in
+// elements, and `les::estimateCells` is what it is spent against.
+
+struct GasCriterion {
+    // Alpert's near/far ratio at which the two-zone model's single upper-layer
+    // temperature is asserting away a factor this large. Five is the `L/H = 3` a
+    // zone model is conventionally trusted to -- see above; it is a threshold with a
+    // published anchor rather than a round number.
+    double spreadPromote = 5.0, spreadHold = 4.0;
+
+    // And the fire has to be doing something: the upper layer standing this far
+    // above the lower one. A compartment with no stratification has no layer whose
+    // uniformity could be wrong.
+    double risePromote = 20.0, riseHold = 10.0;   // K
+
+    // Consecutive reviews a candidate must qualify for before it is promoted, and
+    // consecutive reviews a resolved compartment must fail to qualify for before it
+    // is dropped. One and one is no dwell at all.
+    int dwell = 2;
+    int hold = 3;
+
+    // Cells across every resolved compartment at once. One compartment at 0.5 m on
+    // a machinery space is a few thousand, so this is a statement about how many
+    // compartments may be resolved rather than about how fine any of them is.
+    int cellBudget = 12000;
+
+    // Core-seconds of wall time per simulated second per cell, for reporting only,
+    // exactly as `Criterion::coreSecondsPerElement` is. Measured in
+    // `tests/test_promotion.cpp` rather than assumed.
+    double coreSecondsPerCell = 1.0e-5;
+
+    les::Params grid;
+};
+
+struct GasCandidate {
+    int compartment = -1;    // index into fire::Model::gas -- the identity
+    std::string name;
+    double spread = 0;       // Alpert's near/far ratio for this compartment
+    double rise = 0;         // K, upper layer over lower
+    // How far past its own threshold the **weaker** of the two triggers is, so a
+    // score of one means both have just cleared. Ranking on the weaker one is what
+    // stops a compartment with an enormous fire and a cubical shape from outranking
+    // one the zone model is actually wrong about.
+    double score = 0;
+    int    cells = 0;        // what a resolved model here would cost, estimated
+    double cost = 0;         // core-seconds per simulated second
+    std::string why;
+};
+
+// Every tracked compartment that qualifies, ranked, before the budget is applied.
+// Exposed for the same reason `candidates()` is: a caller is entitled to see what
+// was considered and rejected.
+std::vector<GasCandidate> gasCandidates(const fire::Model& model, const GasCriterion& criterion);
+
+// Half the diagonal of the plan rectangle a compartment's area and perimeter imply
+// -- the distance from a fire at its centre to the farthest corner. Falls back to
+// `sqrt(A/2)`, the square's own half-diagonal, when no rectangle has both.
+double compartmentReach(double floorArea, double perimeter);
+
+struct GasActive {
+    int compartment = -1;
+    std::string name;
+    double spread = 0, rise = 0, score = 0;
+    int cells = 0;
+    double cost = 0;
+    int promotedAtReview = 0;
+    int idleReviews = 0;
+};
+
+struct GasReview {
+    std::vector<GasCandidate> considered;  // ranked, before the budget
+    std::vector<GasActive> promoted;       // newly promoted this review
+    std::vector<GasActive> demoted;        // dropped this review
+    int cellsActive = 0;
+    double costActive = 0;
+    double microseconds = 0;
+    std::vector<std::string> problems;
+};
+
+// The decision, and nothing else: it does not build a grid, step one, or own one.
+class GasPromoter {
+public:
+    explicit GasPromoter(GasCriterion criterion = {});
+
+    GasReview review(const fire::Model& model);
+
+    const std::vector<GasActive>& active() const { return active_; }
+    const GasCriterion& criterion() const { return criterion_; }
+    int reviews() const { return reviews_; }
+    int promotions() const { return promotions_; }
+    int demotions() const { return demotions_; }
+    int activeCells() const;
+    double activeCost() const;
+    void clear();
+
+private:
+    GasCriterion criterion_;
+    std::vector<GasActive> active_;
+    std::vector<std::pair<int, int>> qualifying_;  // compartment -> consecutive reviews
+    int reviews_ = 0, promotions_ = 0, demotions_ = 0;
+};
 
 // Compressive capacity left in a panel dented out of plane, by Perry-Robertson on
 // the measured deviation as an initial imperfection:

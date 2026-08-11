@@ -19,13 +19,23 @@
 //   3. **The pre-load and the reaction back.** Both against closed forms -- the
 //      stress a patch is handed, the energy it stores, the capacity it spends --
 //      rather than against the previous run's output.
+//   4. **The gas side of the same file** -- `GasPromoter`, and the mapping between
+//      `fire.hpp`'s two zones and `les.hpp`'s resolved field. That one is a
+//      *conservation* suite before it is anything else: the acceptance test for a
+//      fidelity boundary is that crossing it twice returns what went in, and that
+//      nothing is created or destroyed on either side of it or in between. Section
+//      12 below, and it carries its own vacuity guards and its own negative
+//      controls for the same reasons the sections above do.
 #include "harness.hpp"
 
+#include "engine/sim/fire.hpp"
+#include "engine/sim/les.hpp"
 #include "engine/sim/promotion.hpp"
 #include "engine/sim/solid_shell.hpp"
 #include "game/prototype/ferry.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -2186,6 +2196,1320 @@ void testTheElementEstimateOverStatesRatherThanUnder() {
     }
 }
 
+// --- 12. LES promotion: the fidelity boundary between two zones and a field -----
+//
+// `les.hpp` replaces one compartment's two well-mixed layers with a coarse
+// low-Mach solve on a regular grid. The interesting failure of a model like that is
+// **not** that the flow looks wrong -- it is that the flow looks plausible while
+// the compartment has quietly gained or lost mass, or while the state that goes
+// back to `fire.hpp` is not the state that came out of it. So the tests below are
+// mostly conservation and mostly exact, and where they are not exact they say what
+// was measured.
+//
+// Three of them interrogate **single cells** rather than totals, deliberately. A
+// wall area summed over the box is right even if every cell's share of it is wrong;
+// a mass total is right even if the flux bookkeeping is reading the wrong axis. The
+// corner/edge/face/interior ratio, the one-heated-cell closed form and the mirror
+// symmetry each fail on exactly those defects and pass on none of the others.
+
+// A prismatic gas compartment of known plan, filled with still ambient air.
+fire::GasCompartment gasBox(double lengthX, double lengthY, double height, double floorZ = 0.0) {
+    fire::GasCompartment gas;
+    gas.name = "box";
+    gas.floorZ = floorZ;
+    gas.ceilingZ = floorZ + height;
+    gas.floorArea = lengthX * lengthY;
+    gas.perimeter = 2.0 * (lengthX + lengthY);
+    gas.gasVolume = lengthX * lengthY * height;
+    gas.fillAmbient();
+    return gas;
+}
+
+// The same box carrying a real smoke layer `depth` metres deep at `hot` kelvin over
+// still ambient air, at exactly one pressure -- which is what makes the two-zone
+// closure `V_u/V = U_u/U` hold on it, and so what makes it a state the mapping is
+// entitled to reproduce.
+fire::GasCompartment gasStratified(double lengthX, double lengthY, double height, double depth,
+                                   double hot, double floorZ = 0.0) {
+    fire::GasCompartment gas = gasBox(lengthX, lengthY, height, floorZ);
+    const double upperVolume = gas.floorArea * depth;
+    const double pressure = kPatm - fire::kRhoAmbient * kGravity * gas.floorZ;
+    gas.upper.energy = pressure * upperVolume / (kGammaAir - 1.0);
+    gas.lower.energy = pressure * (gas.gasVolume - upperVolume) / (kGammaAir - 1.0);
+    gas.upper.mass = gas.upper.energy / (fire::kCvAir * hot);
+    gas.lower.mass = gas.lower.energy / (fire::kCvAir * kTAmbient);
+    // Products only in the smoke, which is where they are, and which makes the
+    // round trip's product check a statement about *both* layers rather than about
+    // one number appearing twice.
+    gas.upper.products = 0.02 * gas.upper.mass;
+    gas.lower.products = 0.0;
+    return gas;
+}
+
+// A field whose every cell holds exactly the same mass at exactly the same
+// temperature -- not "uniform to rounding", but the same double in every slot. The
+// quiescent control is asserted at exactly zero and that is only meaningful if the
+// state it starts from is exactly uniform.
+les::Field uniformField(double lengthX, double lengthY, double height, const les::Params& params,
+                        double kelvin) {
+    les::Field field = les::promote(gasBox(lengthX, lengthY, height), params);
+    const double cellMass = kPatm * field.grid.cellVolume() / (kRAir * kelvin);
+    for (double& m : field.mass) m = cellMass;
+    for (double& s : field.products) s = 0.0;
+    field.energy = cellMass * fire::kCvAir * kelvin * field.grid.cells();
+    field.wallTemperature = kelvin;
+    return field;
+}
+
+les::HeatSource pool(double power, double diameter, double flameHeight, double baseZ = 0.1) {
+    les::HeatSource source;
+    source.baseZ = baseZ;
+    source.diameter = diameter;
+    source.flameHeight = flameHeight;
+    source.power = power;
+    return source;
+}
+
+les::Params coarse(double cellSize = 1.0) {
+    les::Params params;
+    params.cellSize = cellSize;
+    return params;
+}
+
+double fieldSpan(const les::Field& field, double* lowest = nullptr, double* highest = nullptr) {
+    double lo = 1e300, hi = -1e300;
+    for (int c = 0; c < field.grid.cells(); ++c) {
+        lo = std::min(lo, field.temperature(c));
+        hi = std::max(hi, field.temperature(c));
+    }
+    if (lowest != nullptr) *lowest = lo;
+    if (highest != nullptr) *highest = hi;
+    return hi - lo;
+}
+
+double peakSpeed(const les::Field& field) {
+    double peak = 0;
+    for (int axis = 0; axis < 3; ++axis)
+        for (double v : field.velocity[axis]) peak = std::max(peak, std::abs(v));
+    return peak;
+}
+
+void testTheResolvedGridIsTheCompartmentItCameFrom() {
+    std::printf("\n   the grid a two-zone compartment implies\n");
+
+    // The plan rectangle is a closed form: `L W = A` and `2(L + W) = P` together.
+    double lx = 0, ly = 0;
+    expectTrue("a 10 x 8 footprint is recovered from its own area and perimeter",
+               les::planRectangle(80.0, 36.0, &lx, &ly));
+    expectNear("and it is 10 m long", lx, 10.0, 1e-12);
+    expectNear("and 8 m wide", ly, 8.0, 1e-12);
+    expectNear("so it has the area it was given", lx * ly, 80.0, 1e-12);
+    expectNear("and the perimeter", 2.0 * (lx + ly), 36.0, 1e-12);
+
+    // A ship compartment's perimeter is its bounding box's and its area is the
+    // prismatic equivalent, so no rectangle has both. The square keeps the area,
+    // because the area is what the interface height and the wall exchange read.
+    expectTrue("no rectangle has an area of 80 inside a perimeter of 20",
+               !les::planRectangle(80.0, 20.0, &lx, &ly));
+    expectNear("so the fallback keeps the area exactly", lx * ly, 80.0, 1e-12);
+    expectNear("and is square", lx, ly, 0.0);
+
+    const fire::GasCompartment gas = gasBox(10, 8, 5);
+    const les::Grid grid = les::gridFor(gas, coarse(1.0));
+    testing::expectEqual("a 1 m cell divides the box exactly", grid.cells(), 400);
+    expectNear("the grid holds the compartment's own gas volume", grid.volume(), gas.gasVolume,
+               1e-9);
+    expectNear("and its own footprint", grid.planArea(), gas.floorArea, 1e-9);
+    expectNear("the cells fill the box", grid.cellVolume() * grid.cells(), grid.volume(), 0.0);
+    testing::expectEqual("and the estimate a criterion spends is that count",
+                         les::estimateCells(gas, coarse(1.0)), grid.cells());
+
+    // The budget binds by growing the cell, not by truncating the box.
+    les::Params budgeted = coarse(0.25);
+    budgeted.maxCells = 900;
+    const les::Grid bounded = les::gridFor(gas, budgeted);
+    expectTrue("the cell budget binds", bounded.cells() <= 900);
+    expectTrue("and the unbudgeted grid would have blown it",
+               les::gridFor(gas, coarse(0.25)).cells() > 900);
+    expectNear("the bounded grid still holds the whole compartment", bounded.volume(),
+               gas.gasVolume, 1e-9);
+    std::printf("     10 x 8 x 5 m: %d x %d x %d at 1.0 m, %d cells under a 900 budget at 0.25 m\n",
+                grid.n[0], grid.n[1], grid.n[2], bounded.cells());
+
+    // The derived readers, against the ideal gas law rather than against each
+    // other. A reader that disagrees with the field it reads is the "two answers
+    // that agree until the day they do not" this project has deleted before.
+    const les::Field derived = les::promote(gasStratified(10, 8, 5, 1.7, 500.0), coarse(1.0));
+    expectNear("the compartment is at one atmosphere by construction", derived.pressure(), kPatm,
+               1e-9 * kPatm);
+    expectNear("the cell energy is the total shared out by volume", derived.cellEnergy(),
+               derived.energy / derived.grid.cells(), 0.0);
+    expectNear("a cell's density is its own mass over its own volume", derived.density(0),
+               derived.mass[0] / derived.grid.cellVolume(), 0.0);
+    expectNear("the top row carries the hot layer at p / (R T)",
+               derived.rowDensity(derived.grid.n[2] - 1), kPatm / (kRAir * 500.0), 1e-12);
+    expectNear("and the bottom row still-ambient air", derived.rowDensity(0), fire::kRhoAmbient,
+               1e-12);
+    expectNear("so a cell under the deckhead is at the layer's own temperature",
+               derived.temperature(derived.grid.cell(0, 0, derived.grid.n[2] - 1)), 500.0, 1e-9);
+    expectTrue("and the two rows are far apart, which is what makes that a check",
+               derived.rowDensity(0) > 1.5 * derived.rowDensity(derived.grid.n[2] - 1));
+}
+
+void testPromotionAndDemotionReturnTheStateTheyWereGiven() {
+    std::printf("\n   promote then demote: the state that comes back\n");
+    const les::Params params = coarse(1.0);
+    const fire::GasCompartment gas = gasStratified(10, 8, 5, 1.7, 500.0);
+
+    // The vacuity guard first: a round trip that returns what it was given proves
+    // nothing if what it was given is symmetric, or uniform, or empty in one layer.
+    expectTrue("the layers are at genuinely different temperatures",
+               gas.upper.temperature() - gas.lower.temperature() > 200.0);
+    expectTrue("and hold genuinely different masses",
+               gas.lower.mass > 3.0 * gas.upper.mass);
+    expectTrue("the interface is strictly inside the space",
+               gas.interfaceZ() > gas.floorZ + 1.0 && gas.interfaceZ() < gas.ceilingZ - 1.0);
+    expectTrue("and the products are in one layer only",
+               gas.upper.products > 0 && gas.lower.products == 0.0);
+
+    const les::Field field = les::promote(gas, params);
+    expectTrue("the field has no problems with the compartment", les::validate(field).empty());
+    expectNear("promotion carries the mass across", field.totalMass(), gas.totalMass(),
+               5e-15 * gas.totalMass());
+    expectNear("and the energy, which needs no distribution at all", field.energy,
+               gas.totalEnergy(), 5e-15 * gas.totalEnergy());
+    expectNear("and the products", field.totalProducts(),
+               gas.upper.products + gas.lower.products, 5e-15 * gas.upper.products);
+
+    fire::GasCompartment back = gas;
+    les::demote(field, back);
+    const double interfaceError = std::abs(back.interfaceZ() - gas.interfaceZ());
+    const double upperError = std::abs(back.upper.mass - gas.upper.mass) / gas.upper.mass;
+    const double lowerError = std::abs(back.lower.mass - gas.lower.mass) / gas.lower.mass;
+    const double energyError = std::abs(back.upper.energy - gas.upper.energy) / gas.upper.energy;
+    std::printf("     interface %.6f m recovered to %.3e m; upper mass to %.3e, lower to %.3e,"
+                " upper energy to %.3e relative\n",
+                gas.interfaceZ(), interfaceError, upperError, lowerError, energyError);
+
+    // Measured at 8.9e-16 m and 6e-16 relative on this fixture, which is the last
+    // bit of the arithmetic and not a convergence: the reduction is a closed form
+    // that is *algebraically* exact on a two-layer field, and the reductions it
+    // reads are compensated sums. Asserted an order above the measurement, which is
+    // still twelve orders tighter than "the interface came back roughly".
+    expectTrue("the interface comes back to the last bit", interfaceError <= 1e-14);
+    expectTrue("the upper layer's mass comes back to the last bit", upperError <= 5e-15);
+    expectTrue("and the lower layer's", lowerError <= 5e-15);
+    expectTrue("and the energy split", energyError <= 5e-15);
+    expectNear("the layer temperatures are the ones it started with", back.upper.temperature(),
+               gas.upper.temperature(), 1e-11);
+    expectNear("both of them", back.lower.temperature(), gas.lower.temperature(), 1e-11);
+    expectNear("the products come back into the layer they were in", back.upper.products,
+               gas.upper.products, 5e-15 * gas.upper.products);
+    expectNear("and the other layer still has none", back.lower.products, 0.0, 1e-15);
+    expectNear("total mass is untouched", back.totalMass(), gas.totalMass(),
+               5e-15 * gas.totalMass());
+    expectNear("total energy is untouched", back.totalEnergy(), gas.totalEnergy(),
+               5e-15 * gas.totalEnergy());
+
+    // A compartment nobody has lit is uniform, and a uniform gas **determines no
+    // interface at all** -- every split of it is the same gas. Holding the last
+    // known one is what makes this exact rather than arbitrary.
+    const fire::GasCompartment cold = gasBox(10, 8, 5);
+    const les::Field coldField = les::promote(cold, params);
+    fire::GasCompartment coldBack = cold;
+    les::demote(coldField, coldBack);
+    expectNear("an unlit compartment round trips its seed interface", coldBack.interfaceZ(),
+               cold.interfaceZ(), 1e-12);
+    expectNear("and its seed upper layer", coldBack.upper.mass, cold.upper.mass,
+               1e-12 * cold.upper.mass);
+    expectTrue("which is a real seed and not zero", cold.upper.mass > 0);
+    expectNear("the held interface is the field's own", les::equivalentInterface(coldField, 1.25),
+               1.25, 0.0);
+
+    // **And it is not exact for free.** A layer thinner than one cell cannot be
+    // represented on the grid at all, so the reduction reports the layer the grid
+    // *does* hold -- one cell deep -- and the promotion's smearing is what was lost,
+    // not the reduction's arithmetic. Measured rather than asserted away, because it
+    // is the condition under which the whole mapping is exact.
+    std::printf("     layer depth against a 1 m cell:\n");
+    for (double depth : {0.2, 0.5, 1.0, 1.5, 2.5, 3.5, 4.4}) {
+        const fire::GasCompartment thin = gasStratified(10, 8, 5, depth, 500.0);
+        fire::GasCompartment thinBack = thin;
+        les::demote(les::promote(thin, params), thinBack);
+        const double moved = std::abs(thinBack.interfaceZ() - thin.interfaceZ());
+        std::printf("       %.2f m: interface moves %.3e m, upper layer %.1f K -> %.1f K\n", depth,
+                    moved, thin.upper.temperature(), thinBack.upper.temperature());
+        // Exact where the *cool* layer is also at least a cell deep: the reduction
+        // reads the bottom row as well as the top one, and a 4.4 m layer under a 5 m
+        // deckhead leaves the bottom row mixed, which is the same quantisation at
+        // the other end of the box.
+        if (depth >= 1.0 && depth <= 4.0) {
+            expectTrue("a layer at least one cell deep round trips exactly", moved <= 1e-14);
+            expectNear("and keeps its temperature", thinBack.upper.temperature(),
+                       thin.upper.temperature(), 1e-9);
+        } else {
+            const double intoCell = depth < 1.0 ? 1.0 - depth : depth - 4.0;
+            expectTrue("a layer thinner than a cell, at either end, is quantised to the cell"
+                       " it is in", moved > 0.1 * intoCell && moved <= 1.0);
+        }
+    }
+}
+
+void testTheResolvedFieldConservesMassAndEnergyThroughEveryStep() {
+    std::printf("\n   conservation across the boundary and through the run\n");
+    const les::Params params = coarse(1.0);
+    fire::GasCompartment gas = gasBox(10, 8, 5);
+    gas.wallConductance = 30.0;
+    gas.wallTemperature = kTAmbient;
+
+    const double initialMass = gas.totalMass();
+    const double initialEnergy = gas.totalEnergy();
+    les::Field field = les::promote(gas, params);
+    les::Account account;
+    les::resetAccount(field, account);
+
+    std::vector<les::HeatSource> burning{pool(200e3, 1.0, 0.94)};
+    // A real product yield, so the tracer account is a statement about something
+    // rather than about zero equalling zero.
+    burning[0].productRate = 200e3 * 0.05 / 20.0e6;
+    double worstMass = 0, worstEnergy = 0;
+    for (int second = 0; second < 60; ++second) {
+        const les::StepResult moved = les::step(field, 1.0, burning, params, account);
+        expectTrue("the pressure solve never runs out of sweeps", !moved.projectionCapped);
+        expectNear("the run reports the model time it left the field at", moved.time, field.time,
+                   0.0);
+        expectNear("and the power its sources are putting in", moved.heatRelease, 200e3, 0.0);
+        expectTrue("and the substep budget takes the whole second it was asked for",
+                   !moved.incomplete);
+        worstMass = std::max(worstMass, std::abs(account.massResidualFraction()));
+        worstEnergy = std::max(worstEnergy, std::abs(account.energyResidualFraction()));
+        // Asked every step, not only at the end: a model can close its books over a
+        // run while breaking them in the middle, and the recovery would be a second
+        // error cancelling the first.
+        expectTrue("mass closes at every step", std::abs(account.massResidualFraction()) <= 1e-15);
+        expectTrue("energy closes at every step",
+                   std::abs(account.energyResidualFraction()) <= 1e-14);
+    }
+    std::printf("     60 s at 200 kW: worst mass residual %.3e, worst energy residual %.3e,"
+                " products %.3e kg of %.3e generated\n",
+                worstMass, worstEnergy, account.productsResidual(), account.productsGenerated);
+    expectTrue("the fire generated a real tracer load", account.productsGenerated > 1e-3);
+    expectTrue("and every gram of it is still in the box",
+               std::abs(account.productsResidual()) <= 1e-12 * account.productsGenerated);
+    expectNear("which is the sum of the cells, taken outside the model", field.totalProducts(),
+               account.productsGenerated, 1e-12 * account.productsGenerated);
+
+    // The account is one reader of the state. A second, independent one: sum the
+    // cells here, in the test, rather than trusting the model's own reduction.
+    double summed = 0;
+    for (int c = 0; c < field.grid.cells(); ++c)
+        summed += field.mass[static_cast<std::size_t>(c)];
+    expectNear("a sum taken outside the model agrees with the one inside it", summed,
+               field.totalMass(), 1e-12 * field.totalMass());
+    expectNear("and the box has exactly the mass it started with", field.totalMass(), initialMass,
+               1e-13 * initialMass);
+    expectTrue("the fire released something", account.heatReleased > 1e7);
+    expectTrue("and the boundary took a real share of it back",
+               account.wallLoss > 0.1 * account.heatReleased &&
+                   account.wallLoss < 0.9 * account.heatReleased);
+    expectNear("the energy in the box is what went in less what went out", field.energy,
+               initialEnergy + account.heatReleased - account.wallLoss,
+               1e-13 * field.energy);
+
+    // And back across the boundary: the two-zone state a resolved run hands back
+    // holds the same mass and the same energy, to the same tolerance.
+    fire::GasCompartment back = gas;
+    les::demote(field, back);
+    expectNear("demotion after a run carries the mass", back.totalMass(), initialMass,
+               1e-13 * initialMass);
+    expectNear("and the energy", back.totalEnergy(),
+               initialEnergy + account.heatReleased - account.wallLoss, 1e-13 * field.energy);
+    expectNear("and the interface the field determined", back.interfaceZ(), field.interfaceZ,
+               1e-9);
+    expectTrue("the layer really did descend, so the interface is not the seed",
+               field.interfaceZ < gas.ceilingZ - 1.0);
+
+    // The sealed closed form `p = p_0 + (gamma-1) E / V`, which `fire.hpp` asserts
+    // of its own two zones. It is an **independent** statement here: the released
+    // energy is the design fire's own analytic integral, not anything the field
+    // computed.
+    fire::GasCompartment sealed = gasBox(6, 5, 4);
+    sealed.wallConductance = 0.0;
+    les::Field adiabatic = les::promote(sealed, params);
+    les::Account book;
+    les::resetAccount(adiabatic, book);
+    const double startPressure = adiabatic.pressure();
+    const double power = 40e3;
+    for (int second = 0; second < 20; ++second)
+        les::step(adiabatic, 1.0, {pool(power, 0.8, 0.5)}, params, book);
+    const double predicted =
+        startPressure + (kGammaAir - 1.0) * power * 20.0 / adiabatic.grid.volume();
+    std::printf("     sealed 6 x 5 x 4 m box, 40 kW for 20 s: %.4f Pa against the closed form"
+                " %.4f Pa\n", adiabatic.pressure(), predicted);
+    expectNear("a sealed compartment reaches the pressure the first law says it does",
+               adiabatic.pressure(), predicted, 1e-9 * predicted);
+    expectTrue("and that is a real rise, not a rounding",
+               predicted - startPressure > 1000.0);
+    expectNear("its mass is untouched", adiabatic.totalMass(), sealed.totalMass(),
+               1e-13 * sealed.totalMass());
+}
+
+void testAQuiescentCompartmentStaysQuiescentExactly() {
+    std::printf("\n   the quiescent control, and what it takes to break it\n");
+    const les::Params params = coarse(1.0);
+
+    // 350 K, not ambient: if the buoyancy were referred to a fixed ambient density
+    // instead of the box's own, a hot but uniform compartment would develop a plume
+    // out of nothing, and a control run at `kTAmbient` could not tell.
+    les::Field field = uniformField(9, 7, 5, params, 350.0);
+    field.wallConductance = 30.0;
+    const les::Field before = field;
+    les::Account account;
+    les::resetAccount(field, account);
+    const les::StepResult result = les::step(field, 120.0, {}, params, account);
+
+    bool bitwise = true;
+    for (int c = 0; c < field.grid.cells(); ++c)
+        bitwise = bitwise && field.mass[static_cast<std::size_t>(c)] ==
+                                 before.mass[static_cast<std::size_t>(c)];
+    expectTrue("120 s of a uniform compartment leaves every cell mass bit-identical", bitwise);
+    expectTrue("and the internal energy exactly where it was", field.energy == before.energy);
+    expectTrue("and every face velocity at exactly zero", peakSpeed(field) == 0.0);
+    expectTrue("it did take steps, so this is not a run that never ran", result.substeps > 100);
+    expectTrue("the compartment is nowhere near ambient, which is the point",
+               std::abs(field.temperature(0) - kTAmbient) > 60.0);
+    std::printf("     %d substeps at 350 K: temperature span %.1f K, peak speed %.1f m/s\n",
+                result.substeps, fieldSpan(field), peakSpeed(field));
+
+    // The negative control. The same field with a cold boundary has to move, or the
+    // exact statement above is a statement about a model that does nothing at all.
+    les::Field cooled = uniformField(9, 7, 5, params, 350.0);
+    cooled.wallConductance = 30.0;
+    cooled.wallTemperature = kTAmbient;
+    les::Account cooling;
+    les::resetAccount(cooled, cooling);
+    les::step(cooled, 120.0, {}, params, cooling);
+    std::printf("     the same field against a cold boundary: span %.3f K, peak speed %.4f m/s\n",
+                fieldSpan(cooled), peakSpeed(cooled));
+    expectTrue("a cold boundary stratifies the same compartment", fieldSpan(cooled) > 0.5);
+    expectTrue("and sets it moving", peakSpeed(cooled) > 0.05);
+
+    // --- and the same boundary asked cell by cell -------------------------------
+    //
+    // The **total** wall area is right even when every cell's share of it is wrong,
+    // which is exactly the defect shape this repo keeps finding. A corner cell owns
+    // three of the box's faces, an edge cell two, a face cell one and an interior
+    // cell none, so on a cubic grid their heat losses stand in the ratio 3 : 2 : 1 : 0
+    // -- above a common term every cell shares, because a sealed box's pressure
+    // falls on all of them alike.
+    les::Params tiny = params;
+    tiny.maxSubstep = 1e-4;
+    tiny.maxRelativeChange = 1.0;
+    tiny.courant = 1e9;
+    les::Field probe = uniformField(9, 7, 5, tiny, 400.0);
+    probe.wallConductance = 30.0;
+    probe.wallTemperature = kTAmbient;
+    les::Account single;
+    les::resetAccount(probe, single);
+    const double start = probe.temperature(0);
+    les::step(probe, 1e-4, {}, tiny, single);
+    const les::Grid& grid = probe.grid;
+    const double corner = probe.temperature(grid.cell(0, 0, 0)) - start;
+    const double edge = probe.temperature(grid.cell(0, 3, 0)) - start;
+    const double face = probe.temperature(grid.cell(4, 3, 0)) - start;
+    const double inside = probe.temperature(grid.cell(4, 3, 2)) - start;
+    std::printf("     one 0.1 ms step: corner %.4e K, edge %.4e, face %.4e, interior %.4e\n",
+                corner, edge, face, inside);
+    expectTrue("the cells that touch a cold wall cool and the one that does not barely does",
+               corner < edge && edge < face && face < inside);
+    expectNear("a corner cell loses through three faces", (corner - inside) / (face - inside), 3.0,
+               1e-4);
+    expectNear("an edge cell through two", (edge - inside) / (face - inside), 2.0, 1e-4);
+    const double area = 2.0 * (9 * 7 + 7 * 5 + 9 * 5);
+    expectNear("and the box as a whole through its own surface", single.wallLoss / 1e-4,
+               30.0 * area * (start - kTAmbient), 1e-4 * 30.0 * area * (start - kTAmbient));
+    std::printf("     total boundary loss %.1f W against h A dT = %.1f W over %.0f m^2\n",
+                single.wallLoss / 1e-4, 30.0 * area * (start - kTAmbient), area);
+
+    // The ratios above are a cubic-cell question and the total area is not. On a box
+    // whose three cell spacings all differ, `2(LW + LH + WH)` is the *only* answer a
+    // per-cell exterior area can add up to, and a wall charged at another axis's
+    // face area is not it.
+    les::Field oblong = uniformField(10.5, 9, 4.5, tiny, 400.0);
+    oblong.wallConductance = 30.0;
+    oblong.wallTemperature = kTAmbient;
+    les::Account oblongBook;
+    les::resetAccount(oblong, oblongBook);
+    const double oblongStart = oblong.temperature(0);
+    les::step(oblong, 1e-4, {}, tiny, oblongBook);
+    const double oblongArea = 2.0 * (10.5 * 9.0 + 9.0 * 4.5 + 10.5 * 4.5);
+    expectTrue("the three cell spacings really do differ",
+               oblong.grid.h[0] != oblong.grid.h[1] && oblong.grid.h[1] != oblong.grid.h[2]);
+    expectNear("a box with three different cell spacings is charged over its own surface", oblongBook.wallLoss / 1e-4,
+               30.0 * oblongArea * (oblongStart - kTAmbient),
+               1e-4 * 30.0 * oblongArea * (oblongStart - kTAmbient));
+    std::printf("     and a non-cubic 10.5 x 9 x 4.5 m box over %.1f m^2: %.1f W against"
+                " %.1f W\n", oblongArea, oblongBook.wallLoss / 1e-4,
+                30.0 * oblongArea * (oblongStart - kTAmbient));
+
+    // --- and the time constant that exponential carries ------------------------
+    //
+    // **Everything above is taken at a step so short that the exponential is
+    // linear, and a linear boundary term does not care what heat capacity is in
+    // it**: `C (1 − exp(−r dt / C))` tends to `r dt` whatever `C` is, so the
+    // ratios, the areas and the totals are all identical with the wrong one. That
+    // is not a suspicion -- mutation testing swapped `c_p` for `c_v` here and
+    // survived the entire suite, which is exactly the shape of defect this project
+    // keeps finding: right in every global question, wrong in the one nobody asked.
+    //
+    // The time constant is only visible at a step comparable with it. A **cell**
+    // relaxes at constant pressure -- the thermodynamic pressure belongs to the box,
+    // not to the cell, and gas flows in as the cell cools -- so its time constant is
+    // `m c_p / (h A)` and the heat it gives up over `dt` is
+    //
+    //     m c_p (T_0 − T_w) (1 − exp(−h A dt / (m c_p)))
+    //
+    // written here from that argument rather than read from the model. At
+    // 1000 W/(m²·K) a 1 m cell's time constant is about a second, so one 1 s step
+    // is the regime where the two capacities differ: `c_v` in the exponent is a
+    // time constant 1.4 times too short and removes visibly more.
+    les::Params stiff = params;
+    stiff.maxSubstep = 1.0;
+    stiff.maxRelativeChange = 0.9;
+    stiff.courant = 1e9;
+    les::Field chilled = uniformField(9, 7, 5, stiff, 400.0);
+    chilled.wallConductance = 1000.0;
+    chilled.wallTemperature = kTAmbient;
+    les::Account chilledBook;
+    les::resetAccount(chilled, chilledBook);
+    const double chilledStart = chilled.temperature(0);
+    const double chilledMass = chilled.mass[0];
+    const les::StepResult oneStep = les::step(chilled, 1.0, {}, stiff, chilledBook);
+    testing::expectEqual("the whole second is taken in one substep", oneStep.substeps, 1);
+
+    const les::Grid& box = chilled.grid;
+    double constantPressure = 0, constantVolume = 0;
+    for (int k = 0; k < box.n[2]; ++k)
+        for (int j = 0; j < box.n[1]; ++j)
+            for (int i = 0; i < box.n[0]; ++i) {
+                const int faces = (i == 0) + (i == box.n[0] - 1) + (j == 0) +
+                                  (j == box.n[1] - 1) + (k == 0) + (k == box.n[2] - 1);
+                if (faces == 0) continue;
+                const double rate = 1000.0 * faces * box.faceArea(0);
+                const double excess = chilledStart - kTAmbient;
+                const double cp = chilledMass * fire::kCpAir;
+                const double cv = chilledMass * fire::kCvAir;
+                constantPressure += cp * excess * (1.0 - std::exp(-rate / cp));
+                constantVolume += cv * excess * (1.0 - std::exp(-rate / cv));
+            }
+    std::printf("     one 1 s step at h = 1000: %.1f kJ leaves against the constant-pressure"
+                " closed form %.1f kJ (constant volume would be %.1f kJ)\n",
+                chilledBook.wallLoss / 1e3, constantPressure / 1e3, constantVolume / 1e3);
+    expectNear("a cell gives up the heat a constant-pressure relaxation says it does",
+               chilledBook.wallLoss, constantPressure, 1e-9 * constantPressure);
+    // The vacuity guard, and the whole reason this test exists: the two capacities
+    // have to give *different* answers at this step, or asserting one of them is
+    // asserting nothing.
+    expectTrue("and the two capacities are far apart at this step, which is what makes"
+               " that a check", std::abs(constantVolume - constantPressure) >
+                                    0.1 * constantPressure);
+}
+
+void testOneHeatedCellHeatsByItsOwnClosedForm() {
+    std::printf("\n   one heated cell, one step, against the first law\n");
+    les::Params params = coarse(1.0);
+    params.maxSubstep = 1e-3;
+    params.maxRelativeChange = 1.0;
+    params.courant = 1e9;
+
+    // **Deliberately not cubic.** On a cubic cell the three face areas are one
+    // number, so a flux or a wall reading the wrong axis is invisible; here they are
+    // 0.900, 0.859 and 0.955 m^2 and the closed form below is a statement about each
+    // of them. Both plan counts are still odd, which is what the fire needs to land
+    // on a cell centre.
+    les::Field field = uniformField(10.5, 9, 4.5, params, 300.0);
+    field.wallConductance = 0.0;
+    les::Account account;
+    les::resetAccount(field, account);
+    const les::Grid& grid = field.grid;
+    testing::expectEqual("eleven cells along x", grid.n[0], 11);
+    testing::expectEqual("nine along y", grid.n[1], 9);
+    expectTrue("and the three face areas are all different",
+               grid.faceArea(0) != grid.faceArea(1) && grid.faceArea(1) != grid.faceArea(2) &&
+                   grid.faceArea(0) != grid.faceArea(2));
+    const int heated = grid.cell(5, 4, 0);
+    const double start = field.temperature(heated);
+    const double pressure = field.pressure();
+    const double power = 50e3, dt = 1e-3;
+
+    // A 0.5 m pool at the plan centre reaches exactly one cell centre on a 9 x 7
+    // grid, which is what makes this a single-cell question.
+    const les::StepResult result = les::step(field, dt, {pool(power, 0.5, 0.0, 0.5)}, params,
+                                             account);
+    testing::expectEqual("the step was taken whole", result.substeps, 1);
+
+    // `T = p / (rho R)` with `dp/dt = (gamma-1) Q / V` and
+    // `div u = (gamma-1)(q'''- Q/V)/(gamma p)` gives, to first order in dt,
+    //
+    //   dT / T = (gamma-1) q dt / (gamma p V_c) * (1 + (gamma-1)/N)
+    //
+    // whose large-N limit is `q dt / (m c_p)` -- constant-pressure heating, which is
+    // what a cell in a low-Mach model is under. Nothing in the model computes this
+    // expression; it is the physics the discretisation is supposed to reproduce.
+    const double cells = grid.cells();
+    const double predicted = start * (kGammaAir - 1.0) * power * dt /
+                             (kGammaAir * pressure * grid.cellVolume()) *
+                             (1.0 + (kGammaAir - 1.0) / cells);
+    const double measured = field.temperature(heated) - start;
+    std::printf("     the flame cell warms %.6e K against the closed form %.6e K (%.2e relative)\n",
+                measured, predicted, measured / predicted - 1.0);
+    expectNear("a heated cell warms by what the first law says", measured, predicted,
+               1e-3 * predicted);
+    expectTrue("and that is a real rise", predicted > 1e-3);
+    // And the large-box limit of that expression is `q dt / (m c_p)` -- a cell in a
+    // low-Mach model is heated at constant pressure, and `c_p` rather than `c_v` is
+    // what the boundary relaxation is written against for the same reason.
+    const double cellMass = pressure * grid.cellVolume() / (kRAir * start);
+    expectNear("whose large-box limit is q dt / (m c_p), heating at constant pressure",
+               predicted / (1.0 + (kGammaAir - 1.0) / cells),
+               power * dt / (cellMass * fire::kCpAir), 1e-12 * predicted);
+
+    // **Every cell that is not in the flame moves by exactly the same amount**, at
+    // first order, because the divergence a non-heated cell sees is the box mean and
+    // nothing else. So the cell next door and the cell in the far top corner agree,
+    // and they would not if the source had leaked into its neighbours or if the
+    // projection were not enforcing the constraint cell by cell.
+    const double neighbour = field.temperature(grid.cell(6, 4, 0)) - start;
+    const double distant = field.temperature(grid.cell(0, 0, 4)) - start;
+    std::printf("     the cell next door moves %.6e K and the far corner %.6e K (%.2e apart)\n",
+                neighbour, distant, std::abs(neighbour - distant) / std::abs(distant));
+    expectTrue("the unheated cells all move together",
+               std::abs(neighbour - distant) <= 2e-3 * std::abs(distant));
+    expectTrue("and the flame cell is three orders above them",
+               measured > 500.0 * std::abs(distant));
+    expectTrue("the unheated cells warm rather than cool, because the box is sealed",
+               distant > 0);
+}
+
+void testTheResolvedFieldIsExactlyMirrorSymmetric() {
+    std::printf("\n   a centred fire in a mirror-symmetric box\n");
+    const les::Params params = coarse(1.0);
+    fire::GasCompartment gas = gasBox(10.5, 9, 4.5);
+    gas.wallConductance = 30.0;
+    les::Field field = les::promote(gas, params);
+    const les::Grid& grid = field.grid;
+    // Odd counts on both plan axes, and **different** counts at **different**
+    // spacings: odd so that the red-black colouring maps onto itself under either
+    // reflection, different so that an axis swapped for its neighbour cannot pass
+    // unnoticed in either the indexing or the geometry.
+    testing::expectEqual("eleven cells along x", grid.n[0], 11);
+    testing::expectEqual("nine along y", grid.n[1], 9);
+    expectTrue("the two plan axes are different lengths", grid.n[0] != grid.n[1]);
+    expectTrue("and the cells are not cubes", grid.h[0] != grid.h[1] && grid.h[1] != grid.h[2]);
+
+    les::Account account;
+    les::resetAccount(field, account);
+    for (int second = 0; second < 40; ++second)
+        les::step(field, 1.0, {pool(150e3, 1.4, 1.0)}, params, account);
+
+    double lowest = 0, highest = 0;
+    const double span = fieldSpan(field, &lowest, &highest);
+    std::printf("     40 s at 150 kW: %.1f .. %.1f K, peak speed %.3f m/s\n", lowest, highest,
+                peakSpeed(field));
+    expectTrue("the field is genuinely structured, so the symmetry is not the symmetry"
+               " of nothing", span > 40.0);
+    expectTrue("and it is moving", peakSpeed(field) > 0.5);
+
+    // Bit-identical, not close. Red-black relaxation reads only the other colour
+    // within a half sweep, the Laplacian and the flux gather are accumulated axis
+    // pair by axis pair, and floating-point addition is commutative -- so a
+    // reflection of the grid maps every sum onto itself term for term. Anything
+    // less than exact equality here is an index reading the wrong axis.
+    int scalarFailures = 0, velocityFailures = 0;
+    for (int k = 0; k < grid.n[2]; ++k)
+        for (int j = 0; j < grid.n[1]; ++j)
+            for (int i = 0; i < grid.n[0]; ++i) {
+                const std::size_t here = static_cast<std::size_t>(grid.cell(i, j, k));
+                const std::size_t mirrorX =
+                    static_cast<std::size_t>(grid.cell(grid.n[0] - 1 - i, j, k));
+                const std::size_t mirrorY =
+                    static_cast<std::size_t>(grid.cell(i, grid.n[1] - 1 - j, k));
+                if (field.mass[here] != field.mass[mirrorX]) ++scalarFailures;
+                if (field.mass[here] != field.mass[mirrorY]) ++scalarFailures;
+                if (field.products[here] != field.products[mirrorX]) ++scalarFailures;
+                if (field.products[here] != field.products[mirrorY]) ++scalarFailures;
+            }
+    for (int axis = 0; axis < 3; ++axis) {
+        const int count[3] = {grid.faceCount(axis, 0), grid.faceCount(axis, 1),
+                              grid.faceCount(axis, 2)};
+        for (int k = 0; k < count[2]; ++k)
+            for (int j = 0; j < count[1]; ++j)
+                for (int i = 0; i < count[0]; ++i) {
+                    const double here =
+                        field.velocity[axis][static_cast<std::size_t>(grid.face(axis, i, j, k))];
+                    // Reflecting x flips the sign of the x component and leaves the
+                    // other two alone; likewise for y.
+                    const double acrossX = field.velocity[axis][static_cast<std::size_t>(
+                        grid.face(axis, count[0] - 1 - i, j, k))];
+                    const double acrossY = field.velocity[axis][static_cast<std::size_t>(
+                        grid.face(axis, i, count[1] - 1 - j, k))];
+                    if (here != (axis == 0 ? -acrossX : acrossX)) ++velocityFailures;
+                    if (here != (axis == 1 ? -acrossY : acrossY)) ++velocityFailures;
+                }
+    }
+    testing::expectEqual("every cell mass and product load is bit-identical to its mirror",
+                         scalarFailures, 0);
+    testing::expectEqual("and every face velocity is its mirror's, with the sign the axis"
+                         " demands", velocityFailures, 0);
+}
+
+void testTheResolvedModelAgreesWithTwoZonesWhereTwoZonesAreRight() {
+    std::printf("\n   where a zone model is right: a well-mixed compartment cooling down\n");
+    const les::Params params = coarse(1.0);
+    const double lengthX = 9, lengthY = 7, height = 5, start = 400.0;
+
+    les::Field field = uniformField(lengthX, lengthY, height, params, start);
+    field.wallConductance = 30.0;
+    field.wallTemperature = kTAmbient;
+    les::Account account;
+    les::resetAccount(field, account);
+
+    // The same compartment as two zones, with both layers at the same temperature --
+    // which is what "well mixed" means, and is the one state a two-zone model
+    // describes without asserting anything it cannot see.
+    fire::GasCompartment zoned = gasBox(lengthX, lengthY, height);
+    zoned.wallConductance = 30.0;
+    zoned.wallTemperature = kTAmbient;
+    zoned.upper.energy = kPatm * 0.5 * zoned.gasVolume / (kGammaAir - 1.0);
+    zoned.lower.energy = zoned.upper.energy;
+    zoned.upper.mass = zoned.upper.energy / (fire::kCvAir * start);
+    zoned.lower.mass = zoned.upper.mass;
+    fire::Model twoZone;
+    twoZone.gas.push_back(zoned);
+    twoZone.resetAccount();
+    const Ship ship;
+    const Sea sea;
+
+    expectNear("the two models hold the same gas to begin with", field.totalMass(),
+               twoZone.gas[0].totalMass(), 1e-9 * field.totalMass());
+    expectNear("at the same temperature", field.meanTemperature(),
+               twoZone.gas[0].totalEnergy() / (twoZone.gas[0].totalMass() * fire::kCvAir), 1e-9);
+
+    // The independent answer: a lumped body of `M c_v` behind `h A` relaxes as
+    // `exp(-t h A / (M c_v))`, and both models are supposed to reproduce it. `A` is
+    // the same surface in both -- the box's `2(LW + LH + WH)` is the two-zone
+    // model's own `2 A_floor + P H` -- which is what makes this a comparison of two
+    // models of one room rather than of two rooms.
+    const double area = 2.0 * (lengthX * lengthY + lengthY * height + lengthX * height);
+    const double tau = field.totalMass() * fire::kCvAir / (30.0 * area);
+    double worstDifference = 0, worstAgainstAnalytic = 0;
+    for (int minute = 1; minute <= 6; ++minute) {
+        les::step(field, 60.0, {}, params, account);
+        twoZone.step(60.0, ship, sea);
+        const double zoneT =
+            twoZone.gas[0].totalEnergy() / (twoZone.gas[0].totalMass() * fire::kCvAir);
+        const double analytic =
+            kTAmbient + (start - kTAmbient) * std::exp(-minute * 60.0 / tau);
+        worstDifference = std::max(worstDifference, std::abs(field.meanTemperature() - zoneT));
+        worstAgainstAnalytic =
+            std::max(worstAgainstAnalytic, std::abs(field.meanTemperature() - analytic));
+        std::printf("     t = %3d s: resolved %.4f K, two-zone %.4f K, lumped closed form"
+                    " %.4f K\n", minute * 60, field.meanTemperature(), zoneT, analytic);
+        expectNear("the two-zone model is the lumped exponential, exactly", zoneT, analytic,
+                   1e-3);
+    }
+    const double drop = start - kTAmbient;
+    std::printf("     worst disagreement %.4f K, which is %.2f%% of the %.1f K the compartment"
+                " loses\n", worstDifference, 100.0 * worstDifference / drop, drop);
+    expectTrue("the resolved model reproduces the lumped answer to better than 2% of the"
+               " excess it starts with", worstDifference < 0.02 * drop);
+    expectTrue("and the same against the closed form rather than against the other model",
+               worstAgainstAnalytic < 0.02 * drop);
+    // The vacuity guard: agreeing about a compartment that never changed would be
+    // agreeing about nothing.
+    expectTrue("the compartment really did cool", field.meanTemperature() < start - 0.9 * drop);
+    expectNear("and the resolved run's mass never moved", field.totalMass(),
+               account.initialMass, 1e-13 * account.initialMass);
+}
+
+void testTheResolvedModelDepartsFromTwoZonesWhereTheyAreWrong() {
+    std::printf("\n   where a zone model is wrong: a plume and a ceiling jet it asserts away\n");
+    const les::Params params = coarse(1.0);
+
+    struct Run {
+        double ceilingSpread = 0;
+        double plume = 0;
+        double corner = 0;
+        double jetLeft = 0, jetRight = 0;
+        int hottestI = 0, hottestJ = 0;
+        double mean = 0;
+    };
+    const auto run = [&](double diameter, double flameHeight) {
+        fire::GasCompartment gas = gasBox(9, 7, 5);
+        gas.wallConductance = 30.0;
+        les::Field field = les::promote(gas, params);
+        les::Account account;
+        les::resetAccount(field, account);
+        for (int second = 0; second < 60; ++second)
+            les::step(field, 1.0, {pool(150e3, diameter, flameHeight)}, params, account);
+        const les::Grid& grid = field.grid;
+        const int top = grid.n[2] - 1;
+        Run out;
+        double lo = 1e300, hi = -1e300;
+        for (int j = 0; j < grid.n[1]; ++j)
+            for (int i = 0; i < grid.n[0]; ++i) {
+                const double t = field.temperature(grid.cell(i, j, top));
+                if (t > hi) {
+                    hi = t;
+                    out.hottestI = i;
+                    out.hottestJ = j;
+                }
+                lo = std::min(lo, t);
+            }
+        out.ceilingSpread = hi - lo;
+        const int ci = grid.n[0] / 2, cj = grid.n[1] / 2;
+        out.plume = field.velocity[2][static_cast<std::size_t>(grid.face(2, ci, cj, top))];
+        out.corner = field.velocity[2][static_cast<std::size_t>(grid.face(2, 0, 0, top))];
+        out.jetLeft = field.velocity[0][static_cast<std::size_t>(grid.face(0, 1, cj, top))];
+        out.jetRight =
+            field.velocity[0][static_cast<std::size_t>(grid.face(0, grid.n[0] - 1, cj, top))];
+        out.mean = field.meanTemperature();
+        return out;
+    };
+
+    const Run localised = run(1.4, 1.0);
+    // The control: the **same power** released over the whole floor instead of over
+    // a 1.4 m pool. Without it, "the resolved model produces a spread" is a claim
+    // about the model being noisy rather than about the fire being local.
+    const Run spread = run(40.0, 0.0);
+
+    std::printf("     150 kW over a 1.4 m pool: ceiling spans %.2f K, hottest cell (%d, %d),"
+                " plume %+.3f m/s, corner %+.3f m/s\n",
+                localised.ceilingSpread, localised.hottestI, localised.hottestJ, localised.plume,
+                localised.corner);
+    std::printf("     the same 150 kW over the whole floor: ceiling spans %.2f K, hottest cell"
+                " (%d, %d), plume %+.3f m/s\n",
+                spread.ceilingSpread, spread.hottestI, spread.hottestJ, spread.plume);
+
+    // A two-zone model says the upper layer is one temperature. It is not.
+    expectTrue("a local fire puts a real gradient under the deckhead the zone model has no"
+               " way to carry", localised.ceilingSpread > 20.0);
+    expectTrue("and it is not what the same power spread over the floor does",
+               localised.ceilingSpread > 3.0 * spread.ceilingSpread);
+    testing::expectEqual("the hottest ceiling cell is the one over the fire, along x",
+                         localised.hottestI, 4);
+    testing::expectEqual("and along y", localised.hottestJ, 3);
+
+    // The plume, and the return flow that has to balance it.
+    expectTrue("gas rises over the fire", localised.plume > 1.0);
+    expectTrue("and descends in the far corner", localised.corner < 0);
+    expectTrue("the spread fire raises no plume at all",
+               std::abs(spread.plume) < 0.1 * localised.plume);
+
+    // The ceiling jet: under the deckhead the flow runs *away* from the plume, on
+    // both sides. Reading one side alone cannot tell a jet from a draught.
+    std::printf("     ceiling jet %+.4f m/s to port of the fire and %+.4f to starboard\n",
+                localised.jetLeft, localised.jetRight);
+    expectTrue("the ceiling jet runs outboard on the far side", localised.jetRight > 0.1);
+    expectTrue("and outboard on the near side too", localised.jetLeft < -0.1);
+    expectNear("and symmetrically, because the fire is on the centreline",
+               localised.jetRight, -localised.jetLeft, 0.0);
+
+    // Both models agree about the one thing a zone model *does* know -- how much
+    // energy is in the room -- which is what makes the disagreement above a
+    // disagreement about structure and not about bookkeeping.
+    std::printf("     mean gas temperature %.2f K local against %.2f K spread\n", localised.mean,
+                spread.mean);
+    expectNear("the two fires put the same energy into the same room", localised.mean,
+               spread.mean, 1.0);
+}
+
+void testTheCeilingJetCriterionIsAClosedForm() {
+    std::printf("\n   Alpert's two branches, and what they say about a compartment\n");
+
+    // The branches are independent fits and they meet at `r/H = 0.18`. The
+    // agreement is derived from the published coefficients here, not remembered:
+    // `(16.9/5.38) * 0.18^(2/3)`.
+    const double crossover = (16.9 / 5.38) * std::cbrt(0.18 * 0.18);
+    const double height = 3.0;
+    for (double power : {1e5, 1e6, 1e7}) {
+        const double near = les::alpertCeilingJetRise(power, 0.17 * height, height);
+        const double far = les::alpertCeilingJetRise(power, 0.18 * height * (1.0 + 1e-12), height);
+        expectNear("the two branches meet at the crossover, whatever the fire's power",
+                   near / far, crossover, 1e-9);
+    }
+    std::printf("     the branches differ by %.4f%% at r = 0.18 H, at every power\n",
+                100.0 * (crossover - 1.0));
+    expectTrue("which is a small step and not a smooth join", crossover - 1.0 > 1e-3 &&
+                                                                  crossover - 1.0 < 3e-3);
+    expectNear("and the spread the criterion reads is exactly that ratio",
+               les::ceilingJetSpread(0.18 * height * (1.0 + 1e-12), height), crossover, 1e-9);
+    expectNear("inside the crossover the jet is the layer, so the ratio is one",
+               les::ceilingJetSpread(0.1 * height, height), 1.0, 0.0);
+
+    // The heat release cancels out of the ratio exactly. That is what makes it a
+    // statement about the compartment: a bigger fire does not switch the criterion
+    // on, and the activity trigger beside it is therefore doing independent work.
+    const double ratioA = les::alpertCeilingJetRise(1e5, 0.1, 3.0) /
+                          les::alpertCeilingJetRise(1e5, 6.0, 3.0);
+    const double ratioB = les::alpertCeilingJetRise(4e7, 0.1, 3.0) /
+                          les::alpertCeilingJetRise(4e7, 6.0, 3.0);
+    expectNear("a four-hundred-fold fire gives the same ratio", ratioA, ratioB, 1e-12 * ratioA);
+    expectTrue("and the ratio is not one, so there was something to be independent of",
+               ratioA > 2.0);
+    expectNear("which is what ceilingJetSpread returns", les::ceilingJetSpread(6.0, 3.0), ratioA,
+               1e-12 * ratioA);
+
+    // And the reach it is evaluated at is the plan rectangle's half diagonal.
+    std::printf("     compartment                 area     reach   spread\n");
+    struct Room { const char* name; double x, y, z; };
+    for (const Room& room : {Room{"6 x 5 x 4 m tank    ", 6, 5, 4},
+                             Room{"12 x 10 x 5 m engine", 12, 10, 5},
+                             Room{"20 x 8 x 5 m hold   ", 20, 8, 5},
+                             Room{"100 x 19 x 5 m deck ", 100, 19, 5}}) {
+        const double reach =
+            promotion::compartmentReach(room.x * room.y, 2.0 * (room.x + room.y));
+        std::printf("     %s %7.0f m^2 %7.2f m %8.3f\n", room.name, room.x * room.y, reach,
+                    les::ceilingJetSpread(reach, room.z));
+        expectNear("the reach is half the plan diagonal", reach,
+                   0.5 * std::sqrt(room.x * room.x + room.y * room.y), 1e-9);
+    }
+    // The anchor: for a square room the half diagonal is `L/sqrt(2)`, so the
+    // conventional `L/H = 3` limit of a zone model lands at a spread of 5.16 -- which
+    // is where `spreadPromote` is set, and not at a round number chosen to suit.
+    const double square = promotion::compartmentReach(225.0, 60.0);
+    expectNear("a square room at L/H = 3 sits at the default threshold",
+               les::ceilingJetSpread(square, 5.0), 5.186, 2e-3);
+    expectTrue("which is where the criterion's own default is",
+               promotion::GasCriterion{}.spreadPromote < les::ceilingJetSpread(square, 5.0));
+}
+
+// A one-compartment gas model with a chosen plan and a chosen layer temperature,
+// for the criterion to look at. No fire object: the criterion reads the *state*,
+// which is what a caller stepping `fire::Model` would hand it.
+// **Not on the baseline**: a compartment whose floor is at z = 0 cannot tell a
+// ceiling height measured from its own floor from one measured from the keel, and
+// every other fixture in this file sits on the baseline.
+fire::Model gasModelWith(double lengthX, double lengthY, double height, double layerKelvin) {
+    fire::Model model;
+    fire::GasCompartment gas =
+        gasStratified(lengthX, lengthY, height, 0.4 * height, layerKelvin, 2.5);
+    gas.name = "space";
+    model.gas.push_back(gas);
+    model.resetAccount();
+    return model;
+}
+
+void testAGasPromotionNeedsBothOfItsTriggers() {
+    std::printf("\n   which burning compartment deserves a field\n");
+    const promotion::GasCriterion criterion;
+
+    // Long and hot: both triggers clear.
+    const fire::Model hot = gasModelWith(20, 8, 5, 400.0);
+    std::vector<promotion::GasCandidate> found = promotion::gasCandidates(hot, criterion);
+    expectTrue("a long compartment with a real layer is a candidate", found.size() == 1);
+    if (!found.empty()) {
+        std::printf("     20 x 8 x 5 m at 400 K: spread %.3f, rise %.1f K, score %.3f, %d cells\n",
+                    found[0].spread, found[0].rise, found[0].score, found[0].cells);
+        expectTrue("its score says both triggers cleared", found[0].score >= 1.0);
+        expectTrue("and it says why", !found[0].why.empty());
+        expectTrue("and costs the cells the grid would build",
+                   found[0].cells == les::estimateCells(hot.gas[0], criterion.grid));
+    }
+
+    // Long and cold: the shape is there and there is nothing to resolve.
+    const fire::Model cold = gasModelWith(20, 8, 5, kTAmbient + 5.0);
+    expectTrue("the same compartment with no layer worth the name promotes nothing",
+               promotion::gasCandidates(cold, criterion).empty());
+    // Compact and hot: plenty to resolve and a shape a zone model gets right.
+    const fire::Model compact = gasModelWith(6, 5, 4, 700.0);
+    expectTrue("a fierce fire in a small space promotes nothing either",
+               promotion::gasCandidates(compact, criterion).empty());
+    // The vacuity guards: both of those have to be *nearly* qualifying, or "nothing
+    // promoted" is a statement about a criterion that never fires.
+    const double coldSpread =
+        les::ceilingJetSpread(promotion::compartmentReach(160.0, 56.0), 5.0);
+    const double compactRise = compact.gas[0].upper.temperature() -
+                               compact.gas[0].lower.temperature();
+    std::printf("     the cold long room clears the shape trigger (%.3f >= %.1f) and fails the"
+                " layer one; the small hot one clears the layer trigger (%.0f K) and fails the"
+                " shape\n", coldSpread, criterion.spreadPromote, compactRise);
+    expectTrue("the cold room did clear the geometric trigger", coldSpread >= criterion.spreadPromote);
+    expectTrue("and the compact one cleared the activity trigger",
+               compactRise >= criterion.risePromote);
+
+    // Ranked by the weaker of the two, so a compartment with an enormous fire and a
+    // cubical shape cannot outrank one the zone model is actually wrong about.
+    fire::Model both;
+    both.gas.push_back(gasStratified(20, 8, 5, 2.0, 900.0, 2.5));
+    both.gas.back().name = "hot but short";
+    both.gas.push_back(gasStratified(100, 19, 5, 2.0, 330.0, 2.5));
+    both.gas.back().name = "long but mild";
+    both.resetAccount();
+    found = promotion::gasCandidates(both, criterion);
+    expectTrue("both qualify", found.size() == 2);
+    if (found.size() == 2) {
+        std::printf("     ranked: %s (spread %.2f, rise %.0f K, score %.2f) then %s (spread %.2f,"
+                    " rise %.0f K, score %.2f)\n",
+                    found[0].name.c_str(), found[0].spread, found[0].rise, found[0].score,
+                    found[1].name.c_str(), found[1].spread, found[1].rise, found[1].score);
+        expectTrue("the mild one ranks first even though the hot one has fifteen times its"
+                   " layer rise", found[0].name == "long but mild");
+        expectTrue("and it really does have fifteen times", found[1].rise > 10.0 * found[0].rise);
+        expectTrue("so raw temperature would have ranked them the other way round",
+                   found[1].rise > found[0].rise);
+        expectNear("the score is the weaker of the two triggers and nothing else",
+                   found[0].score,
+                   std::min(found[0].spread / criterion.spreadPromote,
+                            found[0].rise / criterion.risePromote),
+                   1e-12);
+        expectNear("for the other one too", found[1].score,
+                   std::min(found[1].spread / criterion.spreadPromote,
+                            found[1].rise / criterion.risePromote),
+                   1e-12);
+    }
+}
+
+void testGasHysteresisAndDwellPreventChatter() {
+    std::printf("\n   a fire hovering at the threshold must not chatter\n");
+    const promotion::GasCriterion criterion;
+    // A layer rise that crosses the promote threshold every other review and never
+    // drops below the hold one: the case a hysteresis band exists for.
+    const double above = kTAmbient + criterion.risePromote + 2.0;
+    const double below = kTAmbient + criterion.risePromote - 2.0;
+    expectTrue("the low state is still above the hold threshold, so a band can catch it",
+               below - kTAmbient > criterion.riseHold);
+    expectTrue("and below the promote one, so without a band it cannot",
+               below - kTAmbient < criterion.risePromote);
+
+    const auto swing = [&](const promotion::GasCriterion& rule, int reviews) {
+        promotion::GasPromoter promoter(rule);
+        for (int i = 0; i < reviews; ++i)
+            promoter.review(gasModelWith(20, 8, 5, (i % 2 == 0) ? above : below));
+        return promoter;
+    };
+
+    // Hysteresis on its own: dwell and hold at one, so nothing else is in play.
+    promotion::GasCriterion band = criterion;
+    band.dwell = 1;
+    band.hold = 1;
+    promotion::GasCriterion flat = band;
+    flat.riseHold = flat.risePromote;      // no band at all
+    flat.spreadHold = flat.spreadPromote;
+    const promotion::GasPromoter withBand = swing(band, 12);
+    const promotion::GasPromoter without = swing(flat, 12);
+    std::printf("     12 reviews across the threshold: %d promotions with the band, %d without\n",
+                withBand.promotions(), without.promotions());
+    expectTrue("without a hysteresis band the compartment chatters", without.promotions() >= 4);
+    expectTrue("and is torn down as often as it is built", without.demotions() >= 4);
+    testing::expectEqual("with the band it is resolved once", withBand.promotions(), 1);
+    testing::expectEqual("and never dropped", withBand.demotions(), 0);
+    testing::expectEqual("and is still resolved at the end",
+                         static_cast<long long>(withBand.active().size()), 1);
+
+    // Dwell on its own, against a *transient* -- a signal wider than any band, which
+    // is exactly what hysteresis cannot catch and dwell can.
+    const auto flash = [&](int dwell) {
+        promotion::GasCriterion rule = criterion;
+        rule.dwell = dwell;
+        rule.hold = 1;
+        promotion::GasPromoter promoter(rule);
+        promoter.review(gasModelWith(20, 8, 5, above));
+        for (int i = 0; i < 4; ++i) promoter.review(gasModelWith(20, 8, 5, kTAmbient + 1.0));
+        return promoter;
+    };
+    const promotion::GasPromoter transient = flash(2);
+    const promotion::GasPromoter eager = flash(1);
+    std::printf("     one qualifying review then four quiet ones: %d promotions at dwell 2,"
+                " %d at dwell 1\n", transient.promotions(), eager.promotions());
+    testing::expectEqual("a one-review transient does not buy a grid", transient.promotions(), 0);
+    testing::expectEqual("but without the dwell it does, and is thrown away again",
+                         eager.promotions(), 1);
+    testing::expectEqual("having been demoted", eager.demotions(), 1);
+
+    // And the two counts on a fire that stays: promoted on the dwell-th review,
+    // dropped on the hold-th quiet one.
+    promotion::GasPromoter sustained(criterion);
+    for (int i = 0; i < criterion.dwell - 1; ++i) {
+        sustained.review(gasModelWith(20, 8, 5, above));
+        testing::expectEqual("a candidate is not resolved before its dwell is served",
+                             static_cast<long long>(sustained.active().size()), 0);
+    }
+    sustained.review(gasModelWith(20, 8, 5, above));
+    testing::expectEqual("and is resolved on the dwell-th", sustained.promotions(), 1);
+    for (int i = 0; i < criterion.hold - 1; ++i) {
+        sustained.review(gasModelWith(20, 8, 5, kTAmbient + 1.0));
+        testing::expectEqual("a resolved compartment survives its quiet reviews",
+                             static_cast<long long>(sustained.active().size()), 1);
+    }
+    const promotion::GasReview last = sustained.review(gasModelWith(20, 8, 5, kTAmbient + 1.0));
+    testing::expectEqual("and is dropped on the hold-th", sustained.demotions(), 1);
+    testing::expectEqual("saying which", static_cast<long long>(last.demoted.size()), 1);
+    testing::expectEqual("and leaving nothing resolved",
+                         static_cast<long long>(sustained.active().size()), 0);
+    std::printf("     a fire that stays is resolved on review %d and dropped %d quiet reviews"
+                " after it goes out\n", criterion.dwell, criterion.hold);
+}
+
+void testWhatAResolvedRunIsHandedAndWhatItReports() {
+    std::printf("\n   the design fire, the subgrid term, and what the run says about itself\n");
+
+    // --- what a `fire::DesignFire` becomes -----------------------------------
+    fire::Model model;
+    model.gas.push_back(gasBox(9, 7, 5));
+    model.gas.push_back(gasBox(9, 7, 5));
+    model.resetAccount();
+    fire::DesignFire design;
+    design.name = "lorry";
+    design.compartment = 1;
+    design.baseZ = 0.4;
+    design.diameter = 1.6;
+    design.growthCoefficient = fire::kGrowthFast;
+    design.peakHeatRelease = 2.0e6;
+    design.steadyDuration = 600.0;
+    design.radiativeLossFraction = 0.25;
+    model.fires.push_back(design);
+
+    // Past the growth phase: a fast t-squared curve reaches 2 MW at
+    // `sqrt(Q / alpha)` = 206.5 s, so 300 s is on the steady plateau and the power
+    // is the one the design fire names rather than one the test has to compute.
+    const double atTime = 300.0;
+    expectTrue("a fire in another compartment is not that compartment's source",
+               les::sourcesFor(model, 0, atTime).empty());
+    const std::vector<les::HeatSource> sources = les::sourcesFor(model, 1, atTime);
+    testing::expectEqual("and its own compartment gets exactly one",
+                         static_cast<long long>(sources.size()), 1);
+    const double q = design.heatRelease(atTime);
+    expectTrue("the fire is at its peak by then", q == design.peakHeatRelease);
+    expectTrue("and was still growing a minute earlier, so the plateau is a real one",
+               design.heatRelease(120.0) < 0.5 * q);
+    expectNear("the source carries the power that reaches the gas, radiation already removed",
+               sources[0].power, q * 0.75, 1e-9);
+    expectNear("and the products the yield says", sources[0].productRate, design.productYield * q,
+               1e-15 * design.productYield * q);
+    expectNear("at the fire's own base", sources[0].baseZ, design.baseZ, 0.0);
+    expectNear("and its own diameter", sources[0].diameter, design.diameter, 0.0);
+    // The heat goes over the **flame**, which is `fire::Plume`'s own height, and not
+    // over the pan. That is a factor of several in the source density a cell at the
+    // base has to absorb, and it is the difference between a step set by the flow
+    // and one set by the first cell.
+    const fire::Plume plume{q, design.diameter, design.convectiveFraction};
+    expectNear("spread over the flame Heskestad's correlation gives", sources[0].flameHeight,
+               plume.flameHeight(), 1e-12);
+    expectTrue("which is a real height", plume.flameHeight() > 1.0);
+    std::printf("     a 2 MW, 1.6 m pool: %.0f kW into the gas over a %.2f m flame, %.3g kg/s of"
+                " products\n", sources[0].power / 1e3, sources[0].flameHeight,
+                sources[0].productRate);
+
+    // A fire that has not started yet, and one that has gone out, produce nothing --
+    // an empty source list rather than a zero-power one, so a caller cannot spend a
+    // pressure solve on a fire that is not burning.
+    expectTrue("a fire that has not been lit is not a source", les::sourcesFor(model, 1, 0.0).empty());
+
+    // --- and what the model refuses ------------------------------------------
+    les::Field broken;
+    expectTrue("a field with no cells says so", !les::validate(broken).empty());
+    les::Field field = les::promote(gasBox(9, 7, 5), coarse(1.0));
+    expectTrue("a promoted field has nothing to complain about", les::validate(field).empty());
+    field.velocity[1].pop_back();
+    expectTrue("a velocity component that does not match the grid is caught",
+               !les::validate(field).empty());
+    les::Field starved = les::promote(gasBox(9, 7, 5), coarse(1.0));
+    starved.mass[0] = 0.0;
+    expectTrue("and so is a cell holding no gas, whose temperature is not defined",
+               !les::validate(starved).empty());
+    // A compartment whose area and perimeter do not describe a rectangle is resolved
+    // anyway, on a square of the same area, and says so.
+    fire::GasCompartment odd = gasBox(9, 7, 5);
+    odd.perimeter = 20.0;
+    expectTrue("a compartment with no rectangle reports the square it got",
+               !les::promote(odd, coarse(1.0)).problems.empty());
+
+    // --- the subgrid term earns its place ------------------------------------
+    //
+    // Constant-coefficient Smagorinsky is the whole of the closure, so switching it
+    // off has to change the answer -- a closure that changes nothing is a term with
+    // no content, and this is the one place to find that out.
+    struct PlumeRun {
+        les::Field field;
+        les::StepResult last;
+        int substeps = 0, rejections = 0;
+        double worstCourant = 0;
+    };
+    const auto plumeRun = [&](double smagorinsky, double reference) {
+        les::Params params = coarse(1.0);
+        params.smagorinsky = smagorinsky;
+        params.buoyancyReference = reference;
+        fire::GasCompartment gas = gasBox(9, 7, 5);
+        gas.wallConductance = 30.0;
+        PlumeRun out;
+        out.field = les::promote(gas, params);
+        les::Account account;
+        les::resetAccount(out.field, account);
+        for (int second = 0; second < 30; ++second) {
+            out.last = les::step(out.field, 1.0, {pool(150e3, 1.4, 1.0)}, params, account);
+            out.substeps += out.last.substeps;
+            out.rejections += out.last.rejections;
+            out.worstCourant = std::max(out.worstCourant, out.last.courant);
+        }
+        return out;
+    };
+    const auto modelled = plumeRun(0.20, 0.0);
+    const auto unclosed = plumeRun(0.0, 0.0);
+    const double closureSpeed = peakSpeed(modelled.field), rawSpeed = peakSpeed(unclosed.field);
+    std::printf("     Smagorinsky 0.20 against 0: peak speed %.4f vs %.4f m/s, ceiling span"
+                " %.2f vs %.2f K\n", closureSpeed, rawSpeed, fieldSpan(modelled.field),
+                fieldSpan(unclosed.field));
+    expectTrue("the subgrid closure changes the flow it is closing",
+               std::abs(closureSpeed - rawSpeed) > 0.01 * closureSpeed);
+    expectTrue("and it damps rather than drives", closureSpeed < rawSpeed);
+
+    // The buoyancy reference is a **linearisation point and not a free constant** --
+    // `g (rho_ref - rho)/rho_ref` is `g - g rho/rho_ref`, so only its offset is
+    // absorbed by the projection. What that costs is measured here rather than
+    // argued: one step from a common field, at two references 35% apart.
+    les::Params params = coarse(1.0);
+    fire::GasCompartment gas = gasBox(9, 7, 5);
+    gas.wallConductance = 30.0;
+    les::Field seed = les::promote(gas, params);
+    les::Account book;
+    les::resetAccount(seed, book);
+    for (int second = 0; second < 20; ++second)
+        les::step(seed, 1.0, {pool(150e3, 1.4, 1.0)}, params, book);
+    les::Params shifted = params;
+    shifted.buoyancyReference = fire::kRhoAmbient;
+    les::Field asIs = seed, asAmbient = seed;
+    les::Account one = book, two = book;
+    les::step(asIs, 0.05, {pool(150e3, 1.4, 1.0)}, params, one);
+    les::step(asAmbient, 0.05, {pool(150e3, 1.4, 1.0)}, shifted, two);
+    double worst = 0, scale = 0;
+    for (int axis = 0; axis < 3; ++axis)
+        for (std::size_t i = 0; i < asIs.velocity[axis].size(); ++i) {
+            worst = std::max(worst, std::abs(asIs.velocity[axis][i] - asAmbient.velocity[axis][i]));
+            scale = std::max(scale, std::abs(asIs.velocity[axis][i]));
+        }
+    std::printf("     moving the buoyancy reference to ambient moves the velocity field by"
+                " %.4f%% of its peak in one step\n", 100.0 * worst / scale);
+    expectTrue("the field is really moving, so this is a fraction of something", scale > 1.0);
+    expectTrue("the reference is a linearisation point and shifting it costs under a per cent",
+               worst < 0.01 * scale);
+    expectTrue("but it is not free either, which is why it is not called arbitrary", worst > 0);
+
+    // What the run reports about itself, asserted rather than printed: the substep
+    // controller keeps its own Courant bound, and it says how many trial steps it
+    // threw away getting there.
+    std::printf("     30 s at 150 kW took %d substeps and threw away %d, worst Courant %.3f,"
+                " last solve %d sweeps to %.2e\n",
+                modelled.substeps, modelled.rejections, modelled.worstCourant,
+                modelled.last.projectionSweeps, modelled.last.projectionResidual);
+    expectTrue("every committed step respects the Courant bound the parameters set",
+               modelled.worstCourant <= coarse(1.0).courant);
+    expectTrue("and it got close enough to it to be bound by it rather than by the ceiling",
+               modelled.worstCourant > 0.5 * coarse(1.0).courant);
+    expectTrue("trial steps were thrown away, so the controller is what set the step",
+               modelled.rejections > 0);
+    // The reported peak is the worst *any* substep reached, so it is at or above the
+    // speed the field is left carrying -- and within reach of it, because a plume
+    // this far in is steady rather than spiking.
+    expectTrue("the reported peak covers the field the run left behind",
+               modelled.last.peakSpeed >= closureSpeed);
+    expectTrue("and is not wildly above it", modelled.last.peakSpeed < 1.2 * closureSpeed);
+    expectTrue("the pressure solve met its tolerance rather than running out of sweeps",
+               !modelled.last.projectionCapped);
+}
+
+void testTheCellBudgetBindsAndTheCostIsMeasured() {
+    std::printf("\n   what a resolved compartment costs, and the budget that bounds it\n");
+    fire::Model model;
+    model.gas.push_back(gasStratified(100, 19, 5, 2.0, 500.0, 2.5));
+    model.gas.back().name = "vehicle deck";
+    model.gas.push_back(gasStratified(20, 8, 5, 2.0, 500.0, 2.5));
+    model.gas.back().name = "hold";
+    model.resetAccount();
+
+    promotion::GasCriterion criterion;
+    criterion.cellBudget = 1;   // room for nothing
+    promotion::GasPromoter starved(criterion);
+    promotion::GasReview review;
+    for (int i = 0; i < criterion.dwell; ++i) review = starved.review(model);
+    expectTrue("both compartments qualify", review.considered.size() == 2);
+    testing::expectEqual("and none is resolved under a budget of one cell",
+                         static_cast<long long>(starved.active().size()), 0);
+    expectTrue("and it says so rather than dropping them silently", !review.problems.empty());
+
+    criterion.cellBudget = les::estimateCells(model.gas[1], criterion.grid);
+    promotion::GasPromoter funded(criterion);
+    for (int i = 0; i < criterion.dwell; ++i) review = funded.review(model);
+    testing::expectEqual("a budget that fits exactly one of them resolves exactly one",
+                         static_cast<long long>(funded.active().size()), 1);
+    expectTrue("and it is the one the budget fits, not the one that ranked first",
+               funded.active()[0].name == "hold");
+    expectTrue("the higher ranked one was refused and reported", !review.problems.empty());
+    testing::expectEqual("the promoter counted every review it was given", funded.reviews(),
+                         criterion.dwell);
+    expectNear("a candidate's cost is its cells at the criterion's rate",
+               review.considered[0].cost,
+               criterion.coreSecondsPerCell * review.considered[0].cells, 1e-12);
+    expectNear("and the resolved cost is the sum of the compartments'", review.costActive,
+               funded.activeCost(), 0.0);
+    expectNear("which is the cells it is holding", funded.activeCost(),
+               criterion.coreSecondsPerCell * funded.activeCells(), 1e-12);
+    testing::expectEqual("the review's cell count is the resolved compartment's",
+                         review.cellsActive, funded.active()[0].cells);
+    funded.clear();
+    testing::expectEqual("clearing drops what is resolved",
+                         static_cast<long long>(funded.active().size()), 0);
+    testing::expectEqual("without forgetting what it has already done", funded.promotions(), 1);
+    std::printf("     %s ranks first at %d cells; %s fits the budget at %d\n",
+                review.considered[0].name.c_str(), review.considered[0].cells,
+                funded.active()[0].name.c_str(), funded.active()[0].cells);
+
+    // What it actually costs, measured rather than quoted, and it is **not linear in
+    // the cells** the way a Tier-2 zone is linear in its elements: refining the grid
+    // multiplies the cells, shortens the advective step and lengthens the pressure
+    // solve all at once.
+    std::printf("     measured cost of 20 simulated seconds in a 12 x 10 x 5 m space:\n");
+    double coarsest = 0, finest = 0;
+    int coarsestCells = 0, finestCells = 0;
+    for (double cell : {1.5, 0.75}) {
+        fire::GasCompartment gas = gasBox(12, 10, 5);
+        gas.wallConductance = 30.0;
+        const les::Params params = coarse(cell);
+        les::Field field = les::promote(gas, params);
+        les::Account account;
+        les::resetAccount(field, account);
+        // Best of three: a wall clock measures the machine as much as the code, and
+        // contention can only ever make a run slower -- the same reason the Tier-2
+        // cost test above takes a minimum rather than a sample.
+        double best = std::numeric_limits<double>::infinity();
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            les::Field trial = field;
+            les::Account book = account;
+            const auto begin = std::chrono::steady_clock::now();
+            for (int second = 0; second < 20; ++second)
+                les::step(trial, 1.0, {pool(300e3, 1.4, 1.2)}, params, book);
+            best = std::min(best, std::chrono::duration<double>(
+                                      std::chrono::steady_clock::now() - begin).count());
+        }
+        const double perCell = best / (20.0 * field.grid.cells());
+        std::printf("       %.2f m cells: %d cells, %.3f s wall, %.2e core-s per cell per"
+                    " simulated second\n", cell, field.grid.cells(), best, perCell);
+        if (cell > 1.0) {
+            coarsest = perCell;
+            coarsestCells = field.grid.cells();
+        } else {
+            finest = perCell;
+            finestCells = field.grid.cells();
+        }
+    }
+    expectTrue("a resolved compartment costs a measurable time at all", coarsest > 0);
+    expectTrue("halving the cell size really does multiply the cells",
+               finestCells > 5 * coarsestCells);
+    expectTrue("and the cost per cell rises with refinement rather than staying flat,"
+               " which is what stops the cell budget from being a wall-clock budget",
+               finest > 1.5 * coarsest);
+}
+
 }  // namespace
 
 void runPromotionTests() {
@@ -2211,4 +3535,19 @@ void runPromotionTests() {
     testTheContactTriggerIsAClosedForm();
     testTheDentedCapacityKnockdownIsContinuousAndMonotone();
     testTheElementEstimateOverStatesRatherThanUnder();
+
+    std::printf("\n--- LES promotion for the local compartment ---\n");
+    testTheResolvedGridIsTheCompartmentItCameFrom();
+    testPromotionAndDemotionReturnTheStateTheyWereGiven();
+    testTheResolvedFieldConservesMassAndEnergyThroughEveryStep();
+    testAQuiescentCompartmentStaysQuiescentExactly();
+    testOneHeatedCellHeatsByItsOwnClosedForm();
+    testTheResolvedFieldIsExactlyMirrorSymmetric();
+    testTheResolvedModelAgreesWithTwoZonesWhereTwoZonesAreRight();
+    testTheResolvedModelDepartsFromTwoZonesWhereTheyAreWrong();
+    testTheCeilingJetCriterionIsAClosedForm();
+    testAGasPromotionNeedsBothOfItsTriggers();
+    testGasHysteresisAndDwellPreventChatter();
+    testWhatAResolvedRunIsHandedAndWhatItReports();
+    testTheCellBudgetBindsAndTheCostIsMeasured();
 }

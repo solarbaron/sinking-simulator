@@ -60,6 +60,9 @@ add_library(shipsim_engine
   engine/sim/scantlings.cpp
   engine/sim/fem.cpp
   engine/sim/fire.cpp
+  # The fidelity tier above the two-zone fire: a coarse low-Mach finite-volume
+  # solve inside one compartment, promoted and demoted by `promotion.hpp`.
+  engine/sim/les.cpp
   engine/sim/plasticity.cpp
   engine/sim/promotion.cpp
   engine/sim/reduction.cpp
