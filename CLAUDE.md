@@ -157,6 +157,22 @@ correct code by looking at test output, and that applies to *your own* leftovers
 The same run is also why the harness must be able to detect a **hang**: mutant 43
 did not fail, it drove a rejection test into a corner and stopped.
 
+**A mutation harness that only distinguishes pass from fail is under-powered here,
+because the characteristic kill in this codebase is a hang.** That is now measured
+rather than anecdotal: one leftover mutant in `les.cpp`, and *five of 196* in
+`fire.cpp`/`thermal.cpp` — a zone swap, an interface height taken from the floor, a
+band donor swap, a direction flip and a sign on the wall relaxation — killed the
+suite with **zero failing assertions** by turning a nine-second run into an
+hours-long one. Whether those score as kills or survivors depends entirely on where
+the timeout lands, so a sweep without a per-mutant time bound is reporting a number
+it did not measure. Assert against the arithmetic floor of the substep controller,
+not against a wall clock, so the bound survives a busy box.
+
+**And a mutation harness on a busy box reports strength it does not have.** A
+wall-clock assertion falsely killed two *controls* during the GM sweep — controls
+being mutants that are supposed to survive. A false kill inflates the rate and
+hides a real gap, which is the one direction of error a kill rate cannot afford.
+
 **A failure path that only reports the failures it already anticipated is not a
 failure path.** `verify.sh` had this twice in adjacent functions: `expect_ok` and
 `build_into` each summarised a failing step by grepping its log for the text a
