@@ -173,6 +173,24 @@ int main(int argc, char** argv) {
     }
     const double glowTemperature = 0.5 * (glowLo + glowHi);
 
+    // **A second threshold, because the check below does not test the first one.**
+    // `glowTemperature` is where emission first registers *at all* -- one byte of
+    // red. The pixel counter asks something much stronger: `red > blue + 8`, red
+    // *dominance*, against a sky-blue clear colour whose blue byte is 143. Between
+    // the two a layer is emitting and is not red-dominant, and the tool used to
+    // assert a glow it had never claimed it would draw -- so it exited non-zero at
+    // 10 MW (876 K, above 834, zero red-dominant pixels) for no reason but its own
+    // disagreement with itself. Bisected on the same margin the counter uses, so
+    // the two move together if the display mapping changes.
+    double domLo = 300.0, domHi = 3000.0;
+    for (int i = 0; i < 200; ++i) {
+        const double mid = 0.5 * (domLo + domHi);
+        double emission[3];
+        gpu::emissiveColour(mid, shading, emission);
+        (emission[0] * 255.0 >= emission[2] * 255.0 + 8.0 ? domHi : domLo) = mid;
+    }
+    const double dominantTemperature = 0.5 * (domLo + domHi);
+
     // --- the identity that says the picture is the model's ---------------------
     std::printf("\n1. The drawn prism is the prism the model solved on\n");
     {
@@ -322,24 +340,47 @@ int main(int argc, char** argv) {
     check("the layer thickened optically", lastOpacity > firstOpacity * 10.0,
           "k " + number(firstOpacity) + " to " + number(lastOpacity) + " 1/m, visibility 3/k = " +
               number(3.0 / lastOpacity, 3) + " m");
+    // **Both counts, because the layer can reach the frame either way.** Fifty lines
+    // above, the counting loop says so outright -- "the two things a two-zone layer
+    // can do to a frame are opposite: emission adds red, and extinction takes
+    // everything away" -- and then this check looked only at extinction. A layer hot
+    // enough to glow is not black, so at 12 MW it blacked out zero pixels, lit 16 309,
+    // and was reported as never having reached the frame. The tool exited non-zero on
+    // a picture that was right, which is the expensive kind of wrong: it makes a
+    // correct render indistinguishable from a broken one.
+    const auto grew = [](const std::vector<std::size_t>& v) -> std::size_t {
+        return v.empty() || v.back() <= v.front() ? 0 : v.back() - v.front();
+    };
     check("and the smoke reached the frame",
-          !darkPixels.empty() && darkPixels.back() > darkPixels.front() + 3000,
-          std::to_string(darkPixels.empty() ? 0 : darkPixels.front()) + " to " +
-              std::to_string(darkPixels.empty() ? 0 : darkPixels.back()) +
-              " pixels the layer blacked out");
+          !darkPixels.empty() && grew(darkPixels) + grew(litPixels) > 3000,
+          std::to_string(grew(darkPixels)) + " pixels blacked out and " +
+              std::to_string(grew(litPixels)) + " lit, against 3000 either way");
 
     // **Whether there is a glow at all is a result, not a setting.** The layer
     // emits Planck's spectrum at its own temperature, so it is a light source only
     // above the threshold printed here -- and a 4 MW machinery fire in 1150 m^3 of
     // engine room does not get there. What a two-zone fire looks like, at this
     // power, is smoke.
-    std::printf("     a grey layer first puts one byte of red on the screen at %.0f K;"
-                " this one peaked at %.0f K (emission %.2e)\n",
-                glowTemperature, peakTemperature, peakEmission);
+    std::printf("     a grey layer first puts one byte of red on the screen at %.0f K and"
+                " first goes red-dominant at %.0f K;\n     this one peaked at %.0f K"
+                " (emission %.2e)\n",
+                glowTemperature, dominantTemperature, peakTemperature, peakEmission);
     if (peakTemperature < glowTemperature) {
         check("the layer never got hot enough to be a light source, and is not drawn as one",
               !litPixels.empty() && litPixels.back() == 0 && peakEmission * 255.0 < 0.5,
               "no red-dominant pixels, as Planck requires");
+    } else if (peakTemperature < dominantTemperature) {
+        // **The band the tool used to be wrong in, and it is a real state rather
+        // than a gap in the argument.** The layer is emitting -- so the first check
+        // would be false -- and it is not red-dominant, so the third would fail.
+        // A 10 MW fire in this room lands here. What Planck requires of it is
+        // exactly this: emission on the screen, no dominance.
+        check("the layer emits but is not yet red-dominant, which is what Planck requires here",
+              !litPixels.empty() && litPixels.back() == 0 && peakEmission * 255.0 >= 0.5,
+              number(peakEmission * 255.0, 3) + " codes of red, " +
+                  std::to_string(litPixels.empty() ? 0 : litPixels.back()) +
+                  " red-dominant pixels; dominance needs " +
+                  number(dominantTemperature, 4) + " K");
     } else {
         check("the layer got hot enough to glow, and does",
               !litPixels.empty() && litPixels.back() > litPixels.front(),

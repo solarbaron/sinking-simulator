@@ -214,6 +214,25 @@ int main(int argc, char** argv) {
     for (const std::string& problem : patch.problems)
         std::printf("       ! %s\n", problem.c_str());
 
+    // **Every input that moves a printed number, on one line, so a table can carry
+    // its own provenance.** `zone_gpu_probe` has always printed a `run :` line and
+    // this tool never did, and the asymmetry cost two published tables their
+    // parameters: §8's profile named `--radius=2.5` and omitted `--depth`, whose
+    // default of 0.45 m is 42 396 steps and half the patch torn rather than the
+    // 6 608 steps the table was taken at -- a different experiment wearing the same
+    // invocation. The `RestForms` 17 800-element row lost its mesh entirely and had
+    // to be found by search, and its published time still does not reproduce.
+    //
+    // The rule this encodes: a tool whose answer depends on a default must print
+    // the default it used, because the person transcribing the number is copying
+    // the command line and the command line is exactly where the default is not.
+    std::printf("run    : speed %.3f m/s, depth %.3f m, radius %.3f m, aim %.3f m,"
+                " height %.3f m, sub %d, forms-cache %s%s%s%s\n",
+                options.speed, options.depth, options.radius, options.aim,
+                options.height, options.subdivision, options.formsCache.c_str(),
+                options.elastic ? ", elastic" : "", options.force ? ", force" : "",
+                options.noPreload ? ", no-preload" : "");
+
     const double cost = sim::zone::estimatedCost(patch, !options.elastic);
     std::printf("cost   : dt = %.3f us (t/c_p, in-plane size irrelevant), %.0f steps per"
                 " simulated second\n", patch.criticalTimestep * 1e6, 1.0 / patch.criticalTimestep);

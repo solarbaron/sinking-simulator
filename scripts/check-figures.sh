@@ -227,6 +227,39 @@ if [ -x "$GPU" ]; then
     check "§8 3 072 el, GPU float torn, invocation mapping" 213 0 \
           "$(torn_gpu "$gpu3072")" "GPU float, torn (invocation) | **44**" \
           "$FEM_DOC"
+
+    # **The 3 072-element workgroup pair, which is the other half of §8's headline
+    # and was ungated.** The block above checks 768 and the *invocation* mapping at
+    # 3 072; the "52% over" that the section's conclusion rests on is the workgroup
+    # kernel's 247 against the double reference's 162, and its jittered control.
+    # The control is the load-bearing cell: without it, 247-against-162 is a
+    # statement about the problem rather than about float.
+    wg3072=$("$GPU" --radius=2.5 --sub=16 --steps=5505 --mapping=workgroup --jitter=2e-7 2>&1)
+    check "§8 3 072 el, CPU double torn" 162 0 \
+          "$(torn_cpu "$wg3072")" "| CPU double, torn | **32** | **162** |" "$FEM_DOC"
+    check "§8 3 072 el, GPU float torn (workgroup)" 247 0 \
+          "$(torn_gpu "$wg3072")" "| GPU float, torn (workgroup) | **40** | **247** |" "$FEM_DOC"
+    check "§8 3 072 el, jittered control torn" 162 0 \
+          "$(ctl "$wg3072" 'torn elements')" \
+          "control: double, mesh jittered 2 × 10⁻⁷ m, torn" "$FEM_DOC"
+
+    # **The sharpest assertion available in this document, and it costs half a
+    # second.** Below 50 steps the float kernel's enhanced modes never switch on at
+    # all: alpha comes back *bit-zero* on every element where the CPU has 7.671e-9.
+    # A bit-zero is not a tolerance, it is an identity, and it is the mechanism
+    # behind §8's closing negative -- the divergence cannot be the enhanced block,
+    # because at this step count there is no enhanced block. `tight` is the control
+    # that says so: the same arithmetic with the CPU's stopping rule does *not*
+    # stall, and returns 2.010e-8.
+    alpha() { printf '%s\n' "$1" | grep '^peak |alpha|' | awk "{ print \$$2 }"; }
+    a50f=$("$GPU" --radius=2.5 --sub=4 --steps=50 --mapping=workgroup --eas=float 2>&1)
+    a50t=$("$GPU" --radius=2.5 --sub=4 --steps=50 --mapping=workgroup --eas=tight 2>&1)
+    check "§8 peak |alpha| at 50 steps, CPU" 7.671e-9 1e-12 \
+          "$(alpha "$a50f" 3)" "| 7.671e-9 |" "$FEM_DOC"
+    check "§8 peak |alpha| at 50 steps, GPU float (bit-zero)" 0 0 \
+          "$(alpha "$a50f" 4)" "| 7.671e-9 |" "$FEM_DOC"
+    check "§8 peak |alpha| at 50 steps, GPU tight" 2.010e-8 1e-11 \
+          "$(alpha "$a50t" 4)" "2.010e-8" "$FEM_DOC"
   fi
 else
   echo "  - zone_gpu_probe not built, skipping the §8 torn counts"
@@ -822,13 +855,24 @@ fi
 #
 # ~12 s: the 4 MW run is the one `verify.sh` already makes, and the two `--power`
 # runs cost under a second each. **They are read for their output and not for their
-# exit status, deliberately.** Above its design fire `smoke_view` fails checks
-# written for a layer that does not glow -- at 10 MW the red-dominance assertion
-# fires with 0 pixels, at 12 MW the "layer blacked out" one fires because a glowing
-# layer is not black -- so both runs print `CHECKS FAILED` while printing exactly
-# the figures the document publishes. That is a limitation of the tool's acceptance
-# contract at powers it was not written for, recorded here rather than worked
-# around, and it is why the `--power` runs are parsed rather than trusted.
+# exit status, deliberately.**
+#
+# **That limitation has since been fixed in the tool, and this note is kept because
+# the reason it was true is the interesting part.** `smoke_view` used to fail its own
+# checks above its design fire: it bisected one threshold -- the temperature at which
+# emission first puts a single byte of red on the screen, 834 K -- and then asserted
+# against a completely different one, `red > blue + 8`, red *dominance* against a
+# sky-blue background. Between them sat a real state the tool had no branch for: a
+# layer that is emitting and is not red-dominant. A 10 MW fire lands exactly there, so
+# the tool asserted a glow it had never claimed it would draw and exited non-zero on a
+# correct picture. At 12 MW it failed the opposite way -- "the smoke reached the frame"
+# counted only pixels the layer *blacked out*, and a glowing layer is not black, so a
+# frame with 16 309 lit pixels was reported as never reached. The tool now bisects the
+# dominance threshold too (935 K), carries the middle branch, and counts both of the
+# things its own comment says a layer can do to a frame.
+#
+# The runs are still parsed rather than trusted, because an acceptance contract and a
+# figure are different claims and this block only wants the figure.
 SMOKE=${SMOKE:-./build/smoke_view}
 if [ -x "$SMOKE" ]; then
   smoke=$("$SMOKE" --out=/tmp --frames=8 --duration=600 2>&1)
