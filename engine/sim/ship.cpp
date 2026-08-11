@@ -1129,6 +1129,9 @@ Diagnostics Ship::diagnostics(const Sea& sea) const {
             }
             eps = halved;
             gm = gmHalved;
+            // Counted where the angle actually moves, so the count and the angle
+            // cannot disagree: the pass that *stops* the search leaves both alone.
+            ++d.gmHalvings;
         }
     }
     d.gmTransverse = gm;
@@ -1146,6 +1149,50 @@ Diagnostics Ship::diagnostics(const Sea& sea) const {
     const double hullVolume = integrate(hull).volume;
     d.afloat = d.buoyantVolume < 0.995 * hullVolume && std::abs(d.heelDeg) < 90.0;
     return d;
+}
+
+// The convergence flag is read *before* the sign and not alongside it, because a
+// slope that is not a metacentric height has no sign worth reading. See
+// StabilityJudgement in ship.hpp for why the answer is "no reading" rather than a
+// conservative "negative".
+StabilityJudgement judgeStability(const Diagnostics& d) {
+    if (!d.gmSlopeConverged) return StabilityJudgement::Unresolved;
+    return d.gmTransverse < 0 ? StabilityJudgement::Negative : StabilityJudgement::Positive;
+}
+
+double FreeSurfaceLayer::momentFractionAt(double heelRad) const {
+    if (depth <= 0 || breadth <= 0) return 0.0;
+    const double tau = std::abs(std::tan(heelRad)) * breadth / (2.0 * depth);
+    if (tau <= 1.0) return 1.0;
+    return 3.0 / tau - 2.0 / (tau * std::sqrt(tau));
+}
+
+FreeSurfaceLayer largestFreeSurface(const Ship& s) {
+    // The floor's plan area, from a 5 cm slab standing on it. One-sided *upward*
+    // from `bboxLo.z`, so it is not measured through a slab half outside the space
+    // -- and taken at the floor rather than at the water surface because that is
+    // where a layer thin enough to matter actually sits.
+    constexpr double kSlab = 0.05;
+
+    FreeSurfaceLayer best;
+    for (std::size_t i = 0; i < s.compartments.size(); ++i) {
+        const Compartment& c = s.compartments[i];
+        if (c.waterVolume * s.seaDensity <= 0) continue;
+        const double area =
+            integrate(clipToBox(c.mesh, c.bboxLo,
+                                {c.bboxHi.x, c.bboxHi.y, c.bboxLo.z + kSlab})).volume / kSlab;
+        const double length = c.bboxHi.x - c.bboxLo.x;
+        if (area <= best.planArea || area <= 0 || length <= 0) continue;
+        best.compartment = static_cast<int>(i);
+        best.planArea = area;
+        // Over the *geometric* region the water occupies, `V/mu`, which is what
+        // sets the depth and hence the angle -- the same quantity the free-surface
+        // moment in rightingArmAtHeel() is taken over.
+        best.depth = c.waterVolume / std::max(c.permeability, 1e-6) / area;
+        best.breadth = area / length;
+        best.pocketingRad = std::atan(2.0 * best.depth / best.breadth);
+    }
+    return best;
 }
 
 }  // namespace sim

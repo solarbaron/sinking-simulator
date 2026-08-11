@@ -189,6 +189,14 @@ struct Diagnostics {
     // layer pockets. See Ship::diagnostics().
     double gmSampledAtRad = 0;
 
+    // How many halvings it took to get there, so that `gmSampledAtRad` can be read
+    // as a *statement about the refinement* and not just as an angle: zero on a
+    // ship with no free surface, and 24 -- the bound -- on one where the search
+    // ran to the floor. It is exactly `log2(0.03 / gmSampledAtRad)`, and it is
+    // reported rather than left to be derived because the two ways of saying it
+    // must not be able to drift apart.
+    int gmHalvings = 0;
+
     // False when that refinement ran out of room: the free surface pockets at an
     // angle the righting arm cannot be resolved across, so `gmTransverse` is the
     // best slope available rather than a metacentric height, and a consumer that
@@ -210,6 +218,73 @@ struct Diagnostics {
     Vec3   centreOfBuoyancy{};     // body frame
     bool   afloat = true;
 };
+
+// What transverse stability a set of diagnostics will support being asked about.
+//
+// **`Unresolved` is not a degree of danger.** It is the statement that
+// `gmTransverse` is not a metacentric height, so *neither* sign is available from
+// it -- and that is a different thing from a GM that came out near zero. The
+// discontinuity documented on `gmSlopeConverged` is what makes it different: on
+// the ferry's vehicle deck half a litre reports +2.00 m and one tonne reports
+// -3.78 m, both converged, and the litre between them resolves to nothing at all.
+// A consumer handed that litre and reading only the sign gets whatever the
+// refinement happened to be holding, which is how `--scenario=full` published
+// SURVIVED off a 6 mm puddle.
+//
+// **So an unresolved GM must not be answered with a conservative "negative"
+// either**, which is the tempting reading and is wrong on the measurement. The
+// condition arises when the layer is thin enough that its free surface is not
+// there at any angle the arm can be sampled across: microns, in every case
+// observed. In `--scenario=none` it is three steps inside a 0.12 s window at
+// t+679.4, while the first 1.2 to 4.8 kg of water reach the vehicle deck -- a ship
+// in no more danger there than one step earlier. Defaulting to "negative" would
+// cry wolf precisely where the water is negligible, and would say nothing new
+// where it is not: the 50 t layer that started all of this converges perfectly
+// well and is genuinely -3.77 m. The honest answer is that the instrument has no
+// reading, and the caller has to decide what to do about that rather than be
+// handed a sign it cannot support.
+enum class StabilityJudgement {
+    Unresolved,   // gmSlopeConverged is false: no metacentric height exists to judge
+    Negative,     // GM < 0: she has no initial stability and will loll or worse
+    Positive,     // GM >= 0
+};
+
+// The one place that rule lives. Two tools drew a survival verdict from their own
+// copy of `gmTransverse < 0`, neither reachable from the test suite, and both
+// scored a flooded ship exactly as confidently as a dry one.
+StabilityJudgement judgeStability(const Diagnostics& d);
+
+// The shallow-layer geometry of one flooded compartment: what the wedge closed
+// form needs, measured off the compartment's own mesh rather than assumed.
+//
+// **Reported, never used.** Nothing in the flooding solution reads any of this --
+// the free surface is a re-levelled water body and not a correction term, which is
+// the whole point of the model. It exists because the *angle a metacentric height
+// stops meaning anything above* is a published claim about this ship, and until
+// now the only way to re-derive it was to write C++ against the library.
+struct FreeSurfaceLayer {
+    int    compartment = -1;  // index into Ship::compartments, or -1 if none is wet
+    double planArea = 0;      // m^2, of the compartment floor
+    double depth = 0;         // m, mean over the geometric region V/mu
+    double breadth = 0;       // m, plan area / length: the mean breadth, not the maximum
+    double pocketingRad = 0;  // atan(2h/b): above this the surface has left the high side
+
+    // The fraction of the linear theory's free-surface moment that survives at
+    // `heel`. Below the pocketing angle the surface spans the compartment and this
+    // is 1; above it the water is a triangular prism of the same area whose base is
+    // `b/sqrt(tau)` wide, and the moment collapses as `3/tau - 2/tau^1.5` in
+    // `tau = tan(heel) b / 2h`. Exact for a box, and about 1% on the ferry's own
+    // tapered vehicle deck.
+    double momentFractionAt(double heelRad) const;
+};
+
+class Ship;
+
+// The wettest free surface aboard, by floor area -- which on any ro-pax is the
+// vehicle deck by an order of magnitude, and is the surface that decides her.
+// `compartment` is -1 when nothing is wet, on the same test `Ship::diagnostics()`
+// uses to decide whether to refine the sampling angle at all.
+FreeSurfaceLayer largestFreeSurface(const Ship& s);
 
 class Ship {
 public:

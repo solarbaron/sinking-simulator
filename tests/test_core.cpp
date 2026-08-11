@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <limits>
 #include <string>
+#include <vector>
 
 using namespace sim;
 using testing::expectEqual;
@@ -1029,6 +1030,449 @@ void testAnUnresolvableLinearRegionIsReportedAsOne() {
                half.gmTransverse - tonne.gmTransverse > 5.7);
 }
 
+// --- What a verdict may be drawn from -----------------------------------------
+
+// The ferry's vehicle deck holding `cubicMetres` of loose water, with the
+// geometry of the layer it makes alongside: everything the wedge closed form
+// needs, measured off the compartment's own mesh rather than assumed. The deck's
+// plan area comes from a 5 cm slab on its floor, one-sided upward so it is not
+// measured through a slab half outside the space.
+struct DeckLayer {
+    Ship   ship;
+    double depth = 0;         // m, over the geometric region V/mu
+    double breadth = 0;       // m, plan area / deck length
+    double pocketingRad = 0;  // atan(2h/b): where the surface leaves the high side
+};
+
+DeckLayer ferryDeckLayer(double cubicMetres) {
+    DeckLayer layer{game::buildFerry(), 0, 0, 0};
+    layer.ship.initialise(0.0);
+    const auto deck = static_cast<std::size_t>(layer.ship.findCompartment("vehicle_deck"));
+    layer.ship.compartments[deck].waterVolume = cubicMetres;
+    layer.ship.step(1e-9, 0.0);
+
+    const Compartment& c = layer.ship.compartments[deck];
+    const double planArea =
+        integrate(clipToBox(c.mesh, c.bboxLo, {c.bboxHi.x, c.bboxHi.y, c.bboxLo.z + 0.05}))
+            .volume / 0.05;
+    layer.depth = c.waterVolume / c.permeability / planArea;
+    layer.breadth = planArea / (c.bboxHi.x - c.bboxLo.x);
+    layer.pocketingRad = std::atan(2.0 * layer.depth / layer.breadth);
+    return layer;
+}
+
+// The refinement's own ladder of sampling angles, walked from the righting arm
+// instead of read off the flag: 0.03 rad, halved, until two successive slopes
+// agree to `max(1e-6, 1e-4 |GM|)`. Nothing here touches `Diagnostics`, so an
+// assertion that the ladder cannot agree is a statement about the *arm* rather
+// than about the code that reports on it.
+struct Ladder {
+    int    agreedAtRung = -1;    // -1 when none of the twenty-four pairs agree
+    double agreedAt = 0;         // rad, the coarser angle of the agreeing pair
+    double tightestMargin = 0;   // min over the rungs walked of |change| / tolerance
+    std::vector<double> eps;     // the finer angle of each pair, in order
+    std::vector<double> change;  // |slope(eps) - slope(2 eps)| at each
+};
+
+Ladder walkTheLadder(const Ship& s, const Sea& sea) {
+    Ladder l;
+    l.tightestMargin = kInfinity;
+    double eps = 0.03;
+    double gm = slopeAtHeel(s, sea, eps);
+    for (int i = 0; i < 24; ++i) {
+        const double halved = 0.5 * eps;
+        const double gmHalved = slopeAtHeel(s, sea, halved);
+        const double moved = std::abs(gmHalved - gm);
+        const double tolerance = std::max(1e-6, 1e-4 * std::abs(gm));
+        l.eps.push_back(halved);
+        l.change.push_back(moved);
+        l.tightestMargin = std::min(l.tightestMargin, moved / tolerance);
+        if (moved <= tolerance) {
+            l.agreedAtRung = i;
+            l.agreedAt = eps;
+            return l;
+        }
+        eps = halved;
+        gm = gmHalved;
+    }
+    return l;
+}
+
+// **Why one litre cannot be resolved, as algebra rather than as an observation.**
+//
+// The flag is a claim that no two sampling angles agree, and "we looked and they
+// did not" is the weakest possible support for it -- it would hold just as well on
+// a refinement that was merely noisy. The wedge closed form says something much
+// stronger. With the layer pocketed the slope carries `C f(tau)` of free-surface
+// loss, `tau = tan(eps) b / 2h`, so *halving the angle moves the slope by a known
+// amount* -- `C [f(tau/2) - f(tau)]`, which is `3C/tau` in the deep-wedge limit and
+// therefore **doubles with every halving**. The iteration is not converging slowly
+// there; it is walking away from agreement at a rate the algebra predicts, and it
+// can only stop when it reaches the linear region below `atan(2h/b)`. A litre puts
+// that region at 6.4e-8 rad, five rungs above the refinement's floor, and the
+// movement is still 1.5e-3 m -- four times the tolerance -- when the floor arrives.
+//
+// `C` is not fitted here: it is the full free-surface loss, and it is taken from
+// the *neighbouring case that does resolve*. `rho mu I / displacement` is a
+// property of the deck rather than of what is standing on it, so the case that has
+// an answer is what predicts the case that has none.
+void testTheLitreCaseProvablyCannotConverge() {
+    const Sea sea{0.0};
+    const DeckLayer litre = ferryDeckLayer(0.001);
+    const DeckLayer tonne = ferryDeckLayer(1.0);
+    const Diagnostics intact = game::buildFerry().diagnostics(sea);
+
+    // The full loss, from the resolved neighbour: she reads +2.00 m dry and
+    // -3.78 m once a tonne has spread out, and the difference is the deck's own
+    // free-surface moment over her displacement.
+    const Diagnostics resolved = tonne.ship.diagnostics(sea);
+    const double fullLoss = intact.gmTransverse - resolved.gmTransverse;
+    expectNear("the resolved neighbour puts the deck's free-surface loss at 5.78 m",
+               fullLoss, 5.7823, 0.02);
+
+    const Ladder l = walkTheLadder(litre.ship, sea);
+    expectEqual("with a litre on the deck no pair of angles on the ladder agrees",
+                l.agreedAtRung, -1);
+    expectEqual("all twenty-four rungs were walked", static_cast<int>(l.eps.size()), 24);
+    // Measured 1.385, at the third rung, which is where the free surface first
+    // outruns the hull's own curvature. The margin is asserted because "they did
+    // not agree" is worth much less if they nearly did.
+    expectTrue("and the closest of them misses the tolerance by 38%",
+               l.tightestMargin > 1.3 && l.tightestMargin < 1.45);
+
+    // The closed form, rung by rung, over the fourteen where the free surface is
+    // what moves the slope. Above them the movement is the hull's own O(eps^2)
+    // curvature -- 1.2e-3 m of GM between 0.03 and 0.0075 rad, which swamps a wedge
+    // that has barely started -- and below them the layer is a fifth of a micron
+    // deep and the volume solve that re-levels it is not exact at that scale either.
+    const auto tauOf = [&](double e) {
+        return std::tan(e) * litre.breadth / (2.0 * litre.depth);
+    };
+    int compared = 0;
+    double worst = 0;
+    for (std::size_t i = 0; i < l.eps.size(); ++i) {
+        const double eps = l.eps[i];
+        if (eps > 1e-3 || eps < 1.1e-7) continue;
+        const double predicted = fullLoss * (pocketedMomentFraction(tauOf(eps)) -
+                                             pocketedMomentFraction(tauOf(2 * eps)));
+        worst = std::max(worst, std::abs(l.change[i] / predicted - 1.0));
+        expectTrue("every rung moves the slope by more than the tolerance it is judged by",
+                   l.change[i] > 1e-4 * 3.8);
+        ++compared;
+    }
+    expectEqual("fourteen rungs are governed by the wedge", compared, 14);
+    expectTrue("and on every one the movement is the wedge's own, to 5%", worst < 0.05);
+
+    // The doubling itself, which is why refining cannot help: it is a property of
+    // `3/tau` and needs no constant at all. Only in the deep wedge, though --
+    // `f = 3/tau - 2/tau^1.5` gives a ratio of `2(1 - 1.72/sqrt tau)/(1 - 1.22/sqrt
+    // tau)`, which is 1.91 at tau = 157 and falls under 1 as the wedge reaches the
+    // full breadth. The window below runs tau from 157 to 1.5e4, where the closed
+    // form's own ratio is 1.91 to 1.99 and the measurement is 1.95 to 1.99.
+    double slowest = kInfinity, fastest = 0;
+    int ratios = 0;
+    for (std::size_t i = 1; i < l.eps.size(); ++i) {
+        if (l.eps[i] > 1e-3 || l.eps[i] < 1e-5 || l.eps[i - 1] > 1e-3) continue;
+        slowest = std::min(slowest, l.change[i] / l.change[i - 1]);
+        fastest = std::max(fastest, l.change[i] / l.change[i - 1]);
+        ++ratios;
+    }
+    expectEqual("over six halvings of the deep wedge", ratios, 6);
+    expectTrue("each moves the slope about twice as far as the one before",
+               slowest > 1.94 && fastest < 2.0);
+
+    // And where it would have to stop, which the floor does not reach: the ladder's
+    // finest angle is 0.03 / 2^24 = 1.79e-9 rad.
+    const double floorAngle = 0.03 / std::pow(2.0, 24);
+    expectTrue("the linear region begins at 6.4e-8 rad",
+               litre.pocketingRad > 6.3e-8 && litre.pocketingRad < 6.5e-8);
+    expectTrue("which is five rungs above the floor the refinement bottoms out at",
+               litre.pocketingRad > 32.0 * floorAngle && litre.pocketingRad < 64.0 * floorAngle);
+
+    // So the ship says so, and that is the only line here that reads the flag.
+    expectTrue("so the ship reports her GM as unresolved",
+               !litre.ship.diagnostics(sea).gmSlopeConverged);
+
+    // --- The neighbours, which resolve, and for two different reasons -----------
+    //
+    // A tonne agrees *inside* the linear region: both angles of the agreeing pair
+    // are below its own pocketing angle, where the surface spans the deck and the
+    // slope is constant. That is a metacentric height in the textbook sense.
+    const Ladder resolvedLadder = walkTheLadder(tonne.ship, sea);
+    expectEqual("a tonne agrees at the tenth rung", resolvedLadder.agreedAtRung, 9);
+    expectTrue("and it agrees inside its own linear region, which is where GM lives",
+               resolvedLadder.agreedAt < tonne.pocketingRad &&
+                   resolvedLadder.agreedAt > 0.5 * tonne.pocketingRad);
+    expectTrue("the ship agrees that it resolved", tonne.ship.diagnostics(sea).gmSlopeConverged);
+
+    // Half a litre agrees for the opposite reason, and five decades the other side
+    // of its own pocketing angle: the wedge it makes at the angle it agreed at
+    // carries less loss than the tolerance, so there is nothing there to resolve.
+    // The closed form is what says so -- 1.47e-4 m of free surface against a
+    // 2.0e-4 m tolerance -- rather than the fact that the loop stopped. The pair
+    // actually moves 1.83e-4 m, the balance being the hull's own O(eps^2)
+    // curvature, which is on the dry ship too and is not a free surface at all.
+    const DeckLayer half = ferryDeckLayer(0.0005);
+    const Ladder halfLadder = walkTheLadder(half.ship, sea);
+    expectEqual("half a litre agrees at the fourth rung", halfLadder.agreedAtRung, 3);
+    expectTrue("five decades above its own pocketing angle",
+               halfLadder.agreedAt > 1e5 * half.pocketingRad);
+    const auto halfTau = [&](double e) {
+        return std::tan(e) * half.breadth / (2.0 * half.depth);
+    };
+    const double wedgeThere =
+        fullLoss * (pocketedMomentFraction(halfTau(0.5 * halfLadder.agreedAt)) -
+                    pocketedMomentFraction(halfTau(halfLadder.agreedAt)));
+    expectTrue("because the wedge there is worth 1.47e-4 m of GM",
+               wedgeThere > 1.4e-4 && wedgeThere < 1.55e-4);
+    expectTrue("which is under the tolerance the pair is judged by", wedgeThere < 1e-4 * 2.0);
+    expectTrue("so that one resolves", half.ship.diagnostics(sea).gmSlopeConverged);
+
+    // Vacuity: the three cases have to be three cases. Half a litre and a tonne
+    // straddle zero by 5.8 m with a factor of 2000 of water between them, and the
+    // litre sits between them resolving to nothing.
+    expectTrue("and the two that resolve disagree about her by 5.8 m",
+               half.ship.diagnostics(sea).gmTransverse -
+                       tonne.ship.diagnostics(sea).gmTransverse > 5.7);
+}
+
+// **The consumer.** A verdict drawn off `gmTransverse < 0` scores an unresolved GM
+// exactly as confidently as a resolved one, which is how `--scenario=full`
+// published SURVIVED off a 6 mm puddle. Both tools now go through
+// `sim::judgeStability`, and an unresolved GM buys a refusal rather than a sign.
+void testAnUnresolvedGmIsRefusedAVerdictRatherThanGivenOne() {
+    const Sea sea{0.0};
+    const Diagnostics half  = ferryDeckLayer(0.0005).ship.diagnostics(sea);
+    const Diagnostics litre = ferryDeckLayer(0.001).ship.diagnostics(sea);
+    const Diagnostics tonne = ferryDeckLayer(1.0).ship.diagnostics(sea);
+
+    expectTrue("half a litre supports a positive verdict",
+               judgeStability(half) == StabilityJudgement::Positive);
+    expectTrue("one litre supports none at all",
+               judgeStability(litre) == StabilityJudgement::Unresolved);
+    expectTrue("a tonne supports a negative one",
+               judgeStability(tonne) == StabilityJudgement::Negative);
+
+    // The strings, exactly: `scripts/verify.sh` compares the compiled ferry's
+    // outcome line with `ships/ferry.ship`'s as exact strings, so they are asserted
+    // here as exact strings too.
+    expectTrue("and the outcome line says so",
+               std::string(game::floodingOutcome(half)) == "SURVIVED - positive GM, deck edge dry");
+    expectTrue("refuses to say so",
+               std::string(game::floodingOutcome(litre)) ==
+                   "UNDETERMINED - the righting arm is not linear at any angle it can be "
+                   "sampled at, so there is no GM to judge her by");
+    expectTrue("and says so the other way",
+               std::string(game::floodingOutcome(tonne)) == "LOST - negative GM, loll imminent");
+    expectTrue("the one-word form too", std::string(game::stabilityWord(litre)) == "UNDETERMINED");
+    expectTrue("SURVIVED", std::string(game::stabilityWord(half)) == "SURVIVED");
+    expectTrue("LOST", std::string(game::stabilityWord(tonne)) == "LOST");
+
+    // **The vacuity guard, and the whole argument in one line.** The refusal is not
+    // merely different from a sign; it replaces a sign that a factor of two in
+    // water flips. The old rule read the sign of a number the ship had already
+    // flagged as meaningless, and it would have reached a definite verdict from it
+    // -- one of the two, and which one is not the point.
+    expectTrue("the two resolvable neighbours reach opposite verdicts",
+               std::string(game::stabilityWord(half)) != std::string(game::stabilityWord(tonne)));
+    expectTrue("while the sign the old rule keyed off is perfectly definite",
+               std::isfinite(litre.gmTransverse) && litre.gmTransverse != 0.0);
+    expectTrue("and the new verdict is not that sign under another name",
+               std::string(game::stabilityWord(litre)) !=
+                   std::string(litre.gmTransverse < 0 ? "LOST" : "SURVIVED"));
+
+    // --- What the refusal does not swallow -------------------------------------
+    //
+    // `afloat` and the heel are observations. They hold whether or not a
+    // metacentric height could be measured, they are asked first, and an
+    // unresolved GM must not turn a hull with no reserve buoyancy left into an
+    // open question.
+    Diagnostics d;
+    d.afloat = false;
+    d.gmSlopeConverged = false;
+    d.gmTransverse = 1.0;
+    expectTrue("a foundered ship needs no GM to be lost",
+               std::string(game::floodingOutcome(d)) == "FOUNDERED");
+    expectTrue("in either vocabulary", std::string(game::stabilityWord(d)) == "LOST");
+    d.gmSlopeConverged = true;
+    expectTrue("and that holds with a perfectly good positive GM",
+               std::string(game::stabilityWord(d)) == "LOST");
+
+    // The boundary is pinned on purpose. A GM of exactly zero is *neutral* -- the
+    // last state before she loses her initial stability rather than the first
+    // state after -- so it takes the positive branch. Nothing in this suite
+    // reaches it by accident, which is exactly why it is asserted here rather
+    // than left to whichever way the comparison happened to be written.
+    d = Diagnostics{};
+    d.gmTransverse = 0.0;
+    expectTrue("a GM of exactly zero is neutral, and neutral is not negative",
+               judgeStability(d) == StabilityJudgement::Positive);
+    d.gmTransverse = -std::numeric_limits<double>::denorm_min();
+    expectTrue("while the smallest representable step below it is",
+               judgeStability(d) == StabilityJudgement::Negative);
+
+    // The rest of the branch table, which is the published vocabulary and is
+    // otherwise reachable only by running a 900 s scenario to its end.
+    d = Diagnostics{};
+    d.gmTransverse = -0.5;
+    d.heelDeg = 21.0;
+    expectTrue("negative GM past 20 degrees is a loll that has already happened",
+               std::string(game::floodingOutcome(d)) ==
+                   "LOST - lolled over with negative GM, flooding continuing");
+    d.heelDeg = 19.0;
+    expectTrue("and short of it, one that has not",
+               std::string(game::floodingOutcome(d)) == "LOST - negative GM, loll imminent");
+    d.heelDeg = -21.0;
+    expectTrue("to port as readily as to starboard",
+               std::string(game::floodingOutcome(d)) ==
+                   "LOST - lolled over with negative GM, flooding continuing");
+    d.gmTransverse = 0.5;
+    d.heelDeg = 0.0;
+    d.freeboardMin = -0.1;
+    expectTrue("a positive GM with the deck edge under is survival with no margin",
+               std::string(game::floodingOutcome(d)) ==
+                   "SURVIVED but the deck edge is under; no margin left");
+    d.freeboardMin = 0.1;
+    expectTrue("and with it dry, survival",
+               std::string(game::floodingOutcome(d)) == "SURVIVED - positive GM, deck edge dry");
+    // The deck edge is geometry rather than stability: it must not become a verdict
+    // of its own when there is no GM for it to qualify.
+    d.gmSlopeConverged = false;
+    d.freeboardMin = -0.1;
+    expectTrue("an unresolved GM outranks the deck edge, which is reported beneath it",
+               std::string(game::floodingOutcome(d)) ==
+                   "UNDETERMINED - the righting arm is not linear at any angle it can be "
+                   "sampled at, so there is no GM to judge her by");
+}
+
+// **What `--gm-detail` publishes, against the box it can be computed by hand on.**
+//
+// `sim::largestFreeSurface` reports the geometry the pocketing angle is made of,
+// and the ferry's own numbers for it are on the front page. The barge is where it
+// can be checked exactly: the tank is a box, so its floor area is `48 x 11 m` to
+// the last bit, the layer is `V/mu` over that area, and the angle at which the
+// surface leaves the high side is `atan(2h/b)` and nothing else.
+//
+// Every assertion here is against that arithmetic rather than against a
+// remembered number, which is what makes the *ferry's* published angle a
+// measurement of the same quantity rather than a coincidence.
+void testTheReportedLayerGeometryIsTheBoxsOwnArithmetic() {
+    const FreeSurfacePair p = freeSurfacePair(30.0);
+    const FreeSurfaceLayer layer = largestFreeSurface(p.liquid);
+
+    expectEqual("the wet tank is the one reported", layer.compartment, 0);
+    // The mesh integration has to return the box's plan area, not merely something
+    // close to it: this is a clip and an integral over a prism, both exact.
+    expectNear("its floor area is the box's own", layer.planArea, kFsTankL * kFsTankB, 1e-9);
+    expectNear("its mean breadth is that area over its length", layer.breadth, kFsTankB, 1e-9);
+    expectNear("the layer is the water over the geometric region",
+               layer.depth, p.layerDepth, 1e-12);
+    expectNear("and it pockets at atan(2h/b)", layer.pocketingRad, p.pocketingRad, 1e-12);
+
+    // The fraction is the wedge closed form and is asserted against the test's own
+    // copy of it, which shares no code with the engine's.
+    int compared = 0;
+    for (double tau : {0.5, 1.0, 1.5, 3.0, 10.0, 44.0}) {
+        const double heel = std::atan(tau * 2.0 * layer.depth / layer.breadth);
+        expectNear("the reported moment fraction is 3/tau - 2/tau^1.5",
+                   layer.momentFractionAt(heel), pocketedMomentFraction(tau), 1e-12);
+        ++compared;
+    }
+    expectEqual("over six values of tau either side of the pocketing angle", compared, 6);
+    expectTrue("which is a collapse and not a constant: 2.8% left at a hundred times over",
+               layer.momentFractionAt(std::atan(100.0 * 2.0 * layer.depth / layer.breadth)) < 0.03);
+
+    // **And the fraction means what it claims to mean**, which no amount of
+    // self-consistent algebra would establish: at 0.03 rad the barge's *measured*
+    // free-surface loss, taken as the difference between the loose-water ship and
+    // the same mass bolted down, has to be that fraction of the linear theory's
+    // `rho mu I / displacement`. This is the assertion that makes the front page's
+    // "a fixed sample sees 6% of the free surface" a statement about the ship.
+    // Measured 0.6888 against the closed form's 0.6886, on a 6.5 cm layer that
+    // pockets at 0.0118 rad -- so a fixed 0.03 rad sample on *this* ship sees 69%
+    // of its free surface, where the ferry's 6 mm layer leaves 6%.
+    expectNear("and the loss measured at 0.03 rad is that fraction of the linear theory",
+               freeSurfaceFraction(p, 0.03), layer.momentFractionAt(0.03), 3e-4);
+    expectTrue("with the fraction a real departure from linear theory, or this proves nothing",
+               layer.momentFractionAt(0.03) > 0.65 && layer.momentFractionAt(0.03) < 0.72);
+
+    // A dry ship has no free surface to report, on the same test `diagnostics()`
+    // uses to decide whether to refine the sampling angle at all.
+    const FreeSurfaceLayer none = largestFreeSurface(p.solid);
+    expectEqual("a ship with the same mass bolted down reports no free surface",
+                none.compartment, -1);
+    expectTrue("and no geometry with it", none.planArea == 0 && none.pocketingRad == 0);
+
+    // The selection is by floor area, and the ferry is where that matters: a wing
+    // tank and the vehicle deck are both wet, and it is the deck -- eighteen times
+    // the area -- that sets the angle GM can be measured at.
+    Ship ferry = game::buildFerry();
+    ferry.initialise(0.0);
+    const auto deck = static_cast<std::size_t>(ferry.findCompartment("vehicle_deck"));
+    const auto wing = static_cast<std::size_t>(ferry.findCompartment("wing_tank_fwd_p"));
+    ferry.compartments[wing].waterVolume = 50.0;
+    ferry.compartments[deck].waterVolume = 1.0;
+    ferry.step(1e-9, 0.0);
+    const FreeSurfaceLayer chosen = largestFreeSurface(ferry);
+    expectEqual("the deck is chosen over a wing tank holding fifty times the water",
+                chosen.compartment, static_cast<int>(deck));
+
+    // **And the breadth is the deck's *mean*, not the widest part of it.** The
+    // bounding box is 20.00 m across -- the deck at its widest, amidships -- while
+    // the surface that actually pockets averages 18.68 m over a hull with a fine
+    // bow and a fuller stern. The pocketing angle is inversely proportional to
+    // this, so the two differ by 7% in the one number the front page publishes
+    // about where a metacentric height stops meaning anything, and a breadth taken
+    // off the bounding box would be plausible, convenient and wrong.
+    const Compartment& deckC = ferry.compartments[deck];
+    expectNear("the deck's mean breadth is its area over its length", chosen.breadth,
+               chosen.planArea / (deckC.bboxHi.x - deckC.bboxLo.x), 1e-12);
+    expectTrue("which is 18.68 m", chosen.breadth > 18.6 && chosen.breadth < 18.8);
+    expectTrue("and is not the 20.00 m the bounding box would have given",
+               deckC.bboxHi.y - deckC.bboxLo.y - chosen.breadth > 1.3);
+    // 1868 m2 of deck against 193 m2 of tank -- and the tank holds fifty times the
+    // water. Area is what decides which surface can be resolved, not volume.
+    expectTrue("because it is nearly ten times the surface, holding a fiftieth of the water",
+               chosen.planArea > 9.0 * largestFreeSurface([&] {
+                   Ship only = game::buildFerry();
+                   only.initialise(0.0);
+                   only.compartments[wing].waterVolume = 50.0;
+                   only.step(1e-9, 0.0);
+                   return only;
+               }()).planArea);
+}
+
+// The halving count is the sampling angle said the other way round, and the two
+// must not be able to drift apart: `eps = 0.03 * 2^-n` exactly, because halving a
+// double is exact in binary.
+void testTheHalvingCountAndTheAngleAreTheSameStatement() {
+    const Sea sea{0.0};
+    int distinct = 0;
+    double previous = -1;
+    for (double cubicMetres : {0.0, 0.0005, 0.001, 1.0, 50.0e3 / kRhoSeawater}) {
+        const Diagnostics d = cubicMetres == 0.0
+                                  ? game::buildFerry().diagnostics(sea)
+                                  : ferryDeckLayer(cubicMetres).ship.diagnostics(sea);
+        expectTrue("the sampling angle is 0.03 halved as many times as it says",
+                   d.gmSampledAtRad == 0.03 / std::pow(2.0, d.gmHalvings));
+        expectTrue("and the count never exceeds the bound the search is given",
+                   d.gmHalvings >= 0 && d.gmHalvings <= 24);
+        if (d.gmHalvings != previous) ++distinct;
+        previous = d.gmHalvings;
+    }
+    // Vacuity: an implementation that always reported zero halvings would satisfy
+    // the identity above on every ship, so the sweep has to have moved it.
+    expectTrue("over a sweep that actually moves the count", distinct >= 4);
+
+    // The two ends of it, named. A dry ship is not refined at all; the litre runs
+    // the search to its floor and reports that it did.
+    expectEqual("a dry ship is sampled at 0.03 rad with no halvings at all",
+                game::buildFerry().diagnostics(sea).gmHalvings, 0);
+    const Diagnostics litre = ferryDeckLayer(0.001).ship.diagnostics(sea);
+    expectEqual("a litre on the deck runs the search to the bound", litre.gmHalvings, 24);
+    expectTrue("which is the case that does not converge", !litre.gmSlopeConverged);
+}
+
 // **The exact control.** Refining the sampling angle is a repair to a case that
 // only arises with a free surface, so a ship without one has to come out not
 // merely close but bit-identical -- which is what lets every published figure
@@ -1886,6 +2330,10 @@ void runCoreTests() {
     testGmIsSampledInsideTheLinearRegionAndIsTheSlopeThere();
     testTheFerrysShallowLayerGmIsTheNegativeOne();
     testAnUnresolvableLinearRegionIsReportedAsOne();
+    testTheLitreCaseProvablyCannotConverge();
+    testAnUnresolvedGmIsRefusedAVerdictRatherThanGivenOne();
+    testTheReportedLayerGeometryIsTheBoxsOwnArithmetic();
+    testTheHalvingCountAndTheAngleAreTheSameStatement();
     testAnIntactShipsGmIsTheUnrefinedDifferenceExactly();
     testTrappedAirArrestsFlooding();
     testAdiabaticCompressionFollowsTheIsentrope();
