@@ -68,6 +68,7 @@ add_library(shipsim_engine
   engine/sim/flip.cpp
   engine/sim/plasticity.cpp
   engine/sim/promotion.cpp
+  engine/sim/water_promotion.cpp
   engine/sim/reduction.cpp
   engine/sim/section.cpp
   engine/sim/solid_shell.cpp
@@ -175,6 +176,7 @@ add_executable(shipsim_tests
   tests/test_zone.cpp
   tests/test_jobs.cpp
   tests/test_waves.cpp
+  tests/test_water_promotion.cpp
   # The ship file is validated against the ship it describes, so the reference
   # ferry is compiled into the tests as well as into the game.
   game/prototype/ferry.cpp

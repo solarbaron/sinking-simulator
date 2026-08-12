@@ -69,3 +69,4 @@ void runIndentationTests();
 void runHullFormTests();
 void runRaoTests();
 void runZoneTests();
+void runWaterPromotionTests();

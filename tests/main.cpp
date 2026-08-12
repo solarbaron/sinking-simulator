@@ -68,6 +68,7 @@ int main() {
     runRaoTests();
     runZoneTests();
     runPromotionTests();
+    runWaterPromotionTests();
     runReductionTests();
     runSectionTests();
     runCouplingTests();
