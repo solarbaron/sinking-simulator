@@ -311,9 +311,19 @@ void testAntiChatterWithHysteresis() {
         demotions += static_cast<int>(rev.demoted.size());
     }
 
-    // Should promote once and stay stable
-    expectTrue("hysteresis prevents chatter", promotions <= 1);
-    expectTrue("demotions also suppressed", demotions <= 1);
+    // Exactly zero, not "at most one". A signal that alternates every review
+    // can never build a dwell streak of 2: the qualifying review sets the
+    // streak to 1, and the review after it scores 0, which drops the
+    // compartment out of `qualifying_` and resets the streak rather than
+    // holding it. So the compartment never promotes, and having never
+    // promoted it can never demote either.
+    //
+    // Asserted at 0 rather than <= 1 because <= 1 is also what a promoter
+    // that never qualifies *anything* would return -- which is the failure
+    // the control above exists to rule out, and the tolerance should not
+    // quietly readmit it.
+    expectEqual("hysteresis prevents chatter", promotions, 0);
+    expectEqual("demotions also suppressed", demotions, 0);
 
     std::printf("      (saw %d promotions, %d demotions in 10 reviews)\n", promotions, demotions);
 }
@@ -335,7 +345,15 @@ void testParticleBudgetEnforcement() {
 
     WaterCriterion crit;
     crit.dwell = 1;
-    crit.particleBudget = 6000;  // Only room for one compartment
+
+    // Room for exactly one, derived from the estimator for the same reason the
+    // tile budget below is: a constant here is a guess about the estimator's
+    // internals, and it is the wrong side of the boundary that passes silently.
+    int oneParticles = 0, oneTiles = 0;
+    estimateFlipCost(ferry.compartments[0], crit, oneParticles, oneTiles);
+    expectTrue("one compartment needs particles", oneParticles > 0);
+    crit.particleBudget = 2 * oneParticles - 1;  // fits one, one short of two
+
     WaterPromoter promoter(crit);
 
     WaterReview rev = promoter.review(ferry);
@@ -364,7 +382,16 @@ void testTileBudgetEnforcement() {
     WaterCriterion crit;
     crit.dwell = 1;
     crit.particleBudget = 100000;  // Ample particle budget
-    crit.tileBudget = 5;           // Very tight tile budget
+
+    // Size the tile budget off the estimator rather than a guessed constant:
+    // room for exactly one of these compartments and not two. A hardcoded
+    // number here silently became "room for none" when the estimator's cell
+    // size changed, and the test then asserted the wrong side of the boundary.
+    int oneParticles = 0, oneTiles = 0;
+    estimateFlipCost(ferry.compartments[0], crit, oneParticles, oneTiles);
+    expectTrue("one compartment needs tiles", oneTiles > 0);
+    crit.tileBudget = 2 * oneTiles - 1;  // fits one, one short of two
+
     WaterPromoter promoter(crit);
 
     WaterReview rev = promoter.review(ferry);
@@ -387,7 +414,13 @@ void testBudgetAccountingAcrossReviews() {
 
     WaterCriterion crit;
     crit.dwell = 1;
-    crit.particleBudget = 7000;  // Room for ~2 compartments
+
+    // Room for exactly two of these three, derived rather than guessed.
+    int oneParticles = 0, oneTiles = 0;
+    estimateFlipCost(ferry.compartments[0], crit, oneParticles, oneTiles);
+    expectTrue("one compartment needs particles", oneParticles > 0);
+    crit.particleBudget = 3 * oneParticles - 1;  // fits two, one short of three
+
     WaterPromoter promoter(crit);
 
     // First review: promote two
@@ -444,6 +477,7 @@ void testMultipleCompartmentsRankedByScore() {
 
     // All should have same score since ship motion is uniform
     for (size_t i = 1; i < rev.considered.size(); ++i) {
+        if (rev.considered[i].score <= 0) break;  // Only check qualifying candidates
         expectNear("all scores equal", rev.considered[i].score, rev.considered[0].score, 1e-6);
     }
 }

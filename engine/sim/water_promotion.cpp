@@ -27,6 +27,16 @@ static double computeLateralAccel(const Ship& ship) {
     return length(ship.state.velocity);
 }
 
+// Mean depth if the water were spread flat over the compartment's whole
+// bounding-box footprint. That is a *floor*, not the depth anywhere in
+// particular: the ferry's compartments are tens of metres on a side, so 5 m3
+// in the forepeak reads 0.0215 m however deep the water actually stands
+// against a bulkhead once she heels. `criterion.minDepth` of 0.5 m is
+// therefore not a quantity this function can be compared against as a
+// promotion gate -- doing so silently filtered *every* compartment on the
+// ship, and the review came back with an empty candidate list. Only
+// `minVolume` gates promotion until there is a real free-surface calculation
+// here; see the TODO below.
 static double computeWaterDepth(const Compartment& comp) {
     if (comp.waterVolume <= 0) return 0;
 
@@ -79,12 +89,22 @@ std::vector<WaterCandidate> waterCandidates(const Ship& ship, const WaterCriteri
         const auto& comp = ship.compartments[i];
 
         // Skip dry or nearly-dry compartments
-        if (comp.waterVolume < criterion.minVolume) continue;
-
-        double depth = computeWaterDepth(comp);
-        if (depth < criterion.minDepth) continue;
+        if (comp.waterVolume < criterion.minVolume) {
+            WaterCandidate cand;
+            cand.compartment = static_cast<int>(i);
+            cand.name = comp.name;
+            cand.rollRate = rollRate;
+            cand.accel = accel;
+            cand.depth = 0;
+            cand.volume = comp.waterVolume;
+            cand.score = 0;
+            cand.why = "insufficient volume";
+            candidates.push_back(cand);
+            continue;
+        }
 
         WaterCandidate cand;
+        double depth = computeWaterDepth(comp);
         cand.compartment = static_cast<int>(i);
         cand.name = comp.name;
         cand.rollRate = rollRate;
@@ -102,6 +122,7 @@ std::vector<WaterCandidate> waterCandidates(const Ship& ship, const WaterCriteri
         if (!rollQualifies && !accelQualifies) {
             cand.why = "below motion thresholds";
             cand.score = 0;
+            candidates.push_back(cand);  // Include in considered with score 0
             continue;
         }
 
@@ -163,7 +184,6 @@ WaterReview WaterPromoter::review(const Ship& ship) {
         // Check hold thresholds (lower than promote)
         bool rollHolds = rollRate >= criterion_.rollRateHold;
         bool accelHolds = accel >= criterion_.accelHold;
-        bool depthHolds = act.depth >= criterion_.minDepth;
         bool volumeHolds = act.volume >= criterion_.minVolume;
 
         if (!rollHolds && !accelHolds) {
@@ -172,8 +192,8 @@ WaterReview WaterPromoter::review(const Ship& ship) {
             act.idleReviews = 0;
         }
 
-        // Demote if idle too long OR geometric guards fail
-        if (act.idleReviews >= criterion_.hold || !depthHolds || !volumeHolds) {
+        // Demote if idle too long OR volume drops below minimum
+        if (act.idleReviews >= criterion_.hold || !volumeHolds) {
             result.demoted.push_back(act);
             demotions_++;
         } else {

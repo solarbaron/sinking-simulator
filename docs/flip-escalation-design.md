@@ -34,7 +34,7 @@ struct WaterCriterion {
     double accelHold = 1.0;
     
     // Water state thresholds
-    double minDepth = 0.5;              // m — too shallow to slosh
+    double minDepth = 0.5;              // m — declared, NOT enforced (see below)
     double minVolume = 1.0;             // m³ — not worth the cost
     
     // Hysteresis
@@ -47,6 +47,22 @@ struct WaterCriterion {
     
     flip::Params solver;
 };
+```
+
+**`minDepth` is declared and not read.** The only depth available is
+`waterVolume` divided by the compartment's whole bounding-box footprint — a
+mean over a space 24 x 8 m in the holds. Five cubic metres in the forepeak
+reads **0.0215 m** by that measure, however deep the water actually stands
+against a bulkhead once she heels, so a 0.5 m gate rejects volumes that slosh
+freely. Enforced on promotion it filtered every compartment aboard and returned
+an empty `considered` list from every review; enforced on hold it demoted each
+compartment on the review after it promoted. Both are now off, and `minVolume`
+is the only geometric guard on either side. The threshold stays in the struct
+as what a real free-surface calculation will be compared against — restoring
+force does go as depth, and that reasoning was never wrong; the *measurement*
+was.
+
+```cpp
 
 struct WaterCandidate {
     int compartment = -1;

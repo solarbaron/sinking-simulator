@@ -61,6 +61,15 @@ struct WaterCriterion {
     double accelHold = 1.0;             // m/s²
 
     // Geometric guards: shallow puddles can't slosh, tiny volumes aren't worth it.
+    //
+    // **`minDepth` is not enforced yet.** The only depth available is the mean
+    // over the compartment's whole bounding-box footprint, and on a ship whose
+    // compartments are 24 x 8 m that reads ~0.02 m for volumes that stand well
+    // over half a metre against a bulkhead under heel. Gating on it filtered
+    // every compartment aboard and returned an empty candidate list from every
+    // review. It stays here as the threshold the real free-surface calculation
+    // will be compared against (`computeWaterDepth`'s TODO); until then
+    // `minVolume` is the only geometric guard, on promotion and on hold alike.
     double minDepth = 0.5;              // m — restoring force goes as depth
     double minVolume = 1.0;             // m³ — FLIP has fixed overhead
 
