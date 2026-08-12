@@ -56,6 +56,17 @@ inline double gasBuoyancyHead(const Compartment& c, double worldZ) {
            (worldZ - c.gasCentroidWorldZ);
 }
 
+// The diameter of the circle with the same area as an orifice.
+//
+// The buoyancy exchange below needs a *length* and this is the only one an
+// `Opening` carries: it has an area and a centre and no height. Taken from the
+// authored area rather than from the projection onto the horizontal, because it
+// stands for the physical size of the hole -- the scale of the overturning that
+// the heavy fluid has to organise itself into to get through -- and a hole does
+// not get smaller when the ship heels. What heeling takes away is the area
+// available to a vertical counterflow, which is a separate factor.
+inline double hydraulicDiameter(double area) { return std::sqrt(4.0 * area / kPi); }
+
 // Ship "up" expressed in the body frame. Every free surface -- the sea outside and
 // the floodwater inside -- is a plane with this normal.
 inline Vec3 bodyFrameUp(const Mat3& R) { return R.transposed() * Vec3{0, 0, 1}; }
@@ -327,15 +338,54 @@ Ship::SideState Ship::sideStateAt(int idx, const Vec3& worldPos, const Sea& sea)
         // damage in a seaway is worse than damage alongside.
         const double surface = sea.heightAt(worldPos.x, worldPos.y);
         if (worldPos.z < surface)
-            return {kPatm + seaDensity * kGravity * (surface - worldPos.z), true};
-        return {kPatm, false};
+            return {kPatm + seaDensity * kGravity * (surface - worldPos.z), true, seaDensity,
+                    seaDensity};
+        return {kPatm, false, kRhoAirAmbient, kRhoAirAmbient};
     }
     const Compartment& c = compartments[static_cast<std::size_t>(idx)];
     if (c.waterVolume > 1e-9 && worldPos.z < c.surfaceWorldZ)
         return {c.airPressure + gasBuoyancyHead(c, c.surfaceWorldZ) +
                     seaDensity * kGravity * (c.surfaceWorldZ - worldPos.z),
-                true};
-    return {c.airPressure + gasBuoyancyHead(c, worldPos.z), false};
+                true, seaDensity, seaDensity};
+    const double p = c.airPressure + gasBuoyancyHead(c, worldPos.z);
+    return {p, false, p / (kRAir * c.gasTemperature), gasBuoyancyDensity(c.gasTemperature)};
+}
+
+// A hatch is in a deck, so its normal is the body's own +z and the sea is above
+// it: a hatch to open water is a weather-deck hatch. Which of `a` and `b` is
+// physically the upper one is therefore *not* the authored order -- it is decided
+// in the world frame, every tick, because heeling her past ninety degrees puts the
+// sea over what used to be a deckhead and the exchange has to reverse with her.
+Ship::HorizontalSides Ship::horizontalSidesOf(const Opening& o, const Mat3& R) const {
+    HorizontalSides h;
+    if (o.kind != OpeningKind::Hatch || o.area <= 0) return h;
+
+    // The cosine of the angle between the deck and the horizon. Heel her and the
+    // hole stops facing up; at ninety degrees a deck hatch is a scuttle in a wall,
+    // and since `Opening` carries no height there is no neutral plane for the
+    // doorway integral to find, so zero is the honest limit for this struct rather
+    // than a modelling shortcut. The *sign* is what says which way is down.
+    const double tilt = (R * Vec3{0, 0, 1}).z;
+    if (tilt == 0) return h;
+
+    const auto heightOf = [&](int i) {
+        if (i == kSea) return kInf;
+        const Compartment& c = compartments[static_cast<std::size_t>(i)];
+        return 0.5 * (c.bboxLo.z + c.bboxHi.z);
+    };
+    const double ha = heightOf(o.a);
+    const double hb = heightOf(o.b);
+    // Two spaces whose centres sit at the same height are not above and below each
+    // other, so nothing here can say which way the heavy fluid would fall. That
+    // also catches a hatch authored between the sea and the sea.
+    if (!(ha != hb)) return h;
+
+    const bool aAbove = (ha > hb) == (tilt > 0);
+    h.valid = true;
+    h.upper = aAbove ? o.a : o.b;
+    h.lower = aAbove ? o.b : o.a;
+    h.area = o.area * std::abs(tilt);
+    return h;
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +427,12 @@ void Ship::solveFlowNetwork(double dt, const Sea& sea) {
         o.lastFlow = 0;
         o.lastGasMassFlow = 0;
         o.lastGasDonorTemperature = 0;
+        o.lastGasEnthalpyFlow = 0;
+        o.lastExchangeDown = 0;
+        o.lastExchangeUp = 0;
+        o.lastExchangeMassDown = 0;
+        o.lastExchangeMassUp = 0;
+        o.lastExchangeUpper = kSea;
         if (!o.open || o.area <= 0) continue;
 
         const Vec3 worldPos = R * o.pos + state.position;
@@ -384,6 +440,167 @@ void Ship::solveFlowNetwork(double dt, const Sea& sea) {
         const SideState sb = sideStateAt(o.b, worldPos, sea);
 
         const double dp = sa.pressure - sb.pressure;
+
+        // --- Counter-current exchange through a horizontal opening ------------
+        //
+        // Tested *before* the noise floor below, because the case this exists for
+        // is precisely the one the noise floor throws away: dp at rest at the
+        // orifice and a tonne a second going through it anyway.
+        //
+        // A doorway has a height, so `fire.cpp` integrates Torricelli up it and
+        // splits the band at the neutral plane. A hatch has none -- there is one
+        // elevation and one dp -- so what is split instead is the *area*: the
+        // heavy fluid falls through part of the hole while the light one rises
+        // through the rest. The buoyancy head drives the two in opposite
+        // directions, so it *adds* to each one's own driving pressure:
+        //
+        //     dp_b = (rho_up - rho_lo) g D/2,   D = sqrt(4A/pi)
+        //     v_dn = sqrt(2 (dp_net + dp_b) / rho_up)    the heavy fluid, falling
+        //     v_up = sqrt(2 (dp_b - dp_net) / rho_lo)    the light one, rising
+        //
+        // **What sets the split between them is the net.** Two linear equations,
+        // and no free parameter in them:
+        //
+        //     A_dn + A_up             = Cd A      they share one hole
+        //     A_dn v_dn - A_up v_up   = q_net     and pass the net between them
+        //
+        // where `q_net` is the single-orifice Torricelli on the net head over the
+        // whole area -- exactly what this file gives every other opening.
+        //
+        // **That second equation is the one that took a second try, and the first
+        // attempt failed in a way worth recording.** Requiring the two *volumes* to
+        // be equal instead -- neither space changes volume, so what falls has to be
+        // let past by what rises -- is right at rest and wrong everywhere else. It
+        // drives the exchange to zero as the net head approaches dp_b, so the model
+        // reported a hole passing **nothing at all** in a window 0.7 mm of water
+        // deep, and then jumped to 2.3 m^3/s the instant the net took over. Solved
+        // against the net instead, the two regimes agree at the edge *identically*:
+        // at dp_net = dp_b, v_up is zero, A_dn comes out at Cd A / sqrt(2), and
+        // A_dn v_dn is q_net to the last bit.
+        //
+        // **D/2 is the one modelling choice in it, and it is a choice of length
+        // scale rather than a fitted coefficient.** The head that drives the
+        // overturning is the weight of a plug of fluid about half a hole across --
+        // an opening's own size is the only length in the problem, which is why
+        // every published correlation for this (Epstein, Cooper) reports a rate
+        // going as `sqrt(g') D^{5/2}`, and the form above reproduces that exponent
+        // exactly. In the ship's own limit, water over air with no net head, it
+        // collapses to `Q = Cd A sqrt(g D)` each way. The discharge coefficient is
+        // the opening's own, so an author who wants a different constant has one to
+        // turn.
+        //
+        // Two limits, and both are exact rather than approached:
+        //
+        //   * `dp_b = 0` -- equal densities, or light already lying on heavy. The
+        //     branch below is simply not taken, and the single-orifice code beneath
+        //     runs character for character as it always did, which is what keeps a
+        //     cold ship bit-identical. Two cold compartments give a density
+        //     difference of exactly +0.0 by IEEE arithmetic and not merely a small
+        //     one.
+        //   * `dp_net = 0` -- the pure exchange, and the whole point. `q_net`
+        //     vanishes, the areas fall out as `A_dn : A_up = v_up : v_dn`, and the
+        //     two volumes are then equal: `Q = Cd A sqrt(2 dp_b) / (sqrt(rho_up) +
+        //     sqrt(rho_lo))` each way, with no net whatever. That is precisely the
+        //     state a model reading one dp at the orifice centre calls a hatch at
+        //     rest.
+        //
+        // Past `|dp_net| >= dp_b` the hole is flushed one way and the exchange has
+        // stopped of its own accord -- Cooper's critical pressure difference,
+        // falling out of the two driving pressures rather than being imposed.
+        const HorizontalSides hs = horizontalSidesOf(o, R);
+        if (hs.valid) {
+            const SideState& su = hs.upper == o.a ? sa : sb;
+            const SideState& sl = hs.upper == o.a ? sb : sa;
+            const double drho = su.buoyancyDensity - sl.buoyancyDensity;
+            const double dpB = drho > 0 ? drho * kGravity * 0.5 * hydraulicDiameter(o.area) : 0.0;
+            const double dpDown = su.pressure - sl.pressure;
+            if (dpB > std::abs(dpDown) && su.flowDensity > 0 && sl.flowDensity > 0) {
+                const double vDown = std::sqrt(2.0 * (dpDown + dpB) / su.flowDensity);
+                const double vUp = std::sqrt(2.0 * (dpB - dpDown) / sl.flowDensity);
+                const double cdA = o.dischargeCoeff * hs.area;
+                // The net the pair passes, at the density of whichever side is
+                // donating it -- the same expression, on the same head, that the
+                // single-orifice solve below would apply to this opening.
+                const double rhoNet = dpDown >= 0 ? su.flowDensity : sl.flowDensity;
+                const double qNet = (dpDown >= 0 ? 1.0 : -1.0) * cdA *
+                                    std::sqrt(2.0 * std::abs(dpDown) / rhoNet);
+                // Both areas come out non-negative for every net head inside the
+                // window, so there is nothing to clamp here: `cdA v_up` always
+                // dominates a negative `q_net` and `cdA v_dn` a positive one,
+                // because each stream carries dp_b on top of the net that is trying
+                // to cancel it.
+                const double aDown = (qNet + cdA * vUp) / (vDown + vUp);
+                const double aUp = cdA - aDown;
+                double dvDown = aDown * vDown * dt;
+                double dvUp = aUp * vUp * dt;
+
+                // **Clamped by one common factor, not stream by stream.** Scaling
+                // them apart would change the net the pair passes, which is the
+                // quantity the split was solved against; scaling them together
+                // leaves the net proportional and leaves the equal volumes at rest
+                // exactly equal.
+                const auto share = [&](int from, int to, const SideState& s, double dv) {
+                    if (dv <= 0) return 1.0;
+                    const double room =
+                        s.isWater ? std::min(std::max(waterAvailable(from), 0.0),
+                                             std::max(waterCapacity(to), 0.0))
+                                  : std::max(airAvailable(from), 0.0) / s.flowDensity;
+                    return room < dv ? room / dv : 1.0;
+                };
+                const double scale = std::min(share(hs.upper, hs.lower, su, dvDown),
+                                              share(hs.lower, hs.upper, sl, dvUp));
+                dvDown *= scale;
+                dvUp *= scale;
+
+                // One stream. Returns the mass it carried, so the diagnostics
+                // below do not have to re-derive which density applied.
+                const auto move = [&](int from, int to, const SideState& s, double dv) {
+                    const double dm = s.flowDensity * dv;
+                    if (s.isWater) {
+                        if (from != kSea) dWater[from] -= dv;
+                        if (to   != kSea) dWater[to]   += dv;
+                        return dm;
+                    }
+                    const double dE = kGammaAir * gasTemperatureOf(from) * dm;
+                    if (from != kSea) { dAir[from] -= dm; dMassT[from] -= dE; }
+                    if (to   != kSea) { dAir[to]   += dm; dMassT[to]   += dE; }
+                    return dm;
+                };
+                const double mDown = move(hs.upper, hs.lower, su, dvDown);
+                const double mUp = move(hs.lower, hs.upper, sl, dvUp);
+                const double perSecond = dt > 0 ? 1.0 / dt : 0.0;
+                o.lastExchangeDown = dvDown * perSecond;
+                o.lastExchangeUp = dvUp * perSecond;
+                o.lastExchangeMassDown = mDown * perSecond;
+                o.lastExchangeMassUp = mUp * perSecond;
+                o.lastExchangeUpper = hs.upper;
+
+                // The same two streams as a signed a -> b net, for consumers that
+                // only ever wanted one number. Water crosses one way at most -- the
+                // rising stream is never the denser phase -- so `lastFlow` still
+                // says everything there is to say about it.
+                const double sign = hs.upper == o.a ? 1.0 : -1.0;
+                o.lastFlowWasWater = su.isWater;
+                if (su.isWater) o.lastFlow = sign * o.lastExchangeDown;
+                const double tUp = gasTemperatureOf(hs.upper);
+                const double tLo = gasTemperatureOf(hs.lower);
+                if (!su.isWater) {
+                    o.lastGasMassFlow += sign * o.lastExchangeMassDown;
+                    o.lastGasEnthalpyFlow += sign * kGammaAir * tUp * o.lastExchangeMassDown;
+                }
+                if (!sl.isWater) {
+                    o.lastGasMassFlow -= sign * o.lastExchangeMassUp;
+                    o.lastGasEnthalpyFlow -= sign * kGammaAir * tLo * o.lastExchangeMassUp;
+                }
+                // Left at zero when both streams were gas: two donors at two
+                // temperatures, and a single donor temperature would be a
+                // diagnostic that lies. `lastGasEnthalpyFlow` is the one that still
+                // adds up.
+                o.lastGasDonorTemperature = su.isWater && !sl.isWater ? tLo : 0.0;
+                continue;
+            }
+        }
+
         if (std::abs(dp) < 1e-3) continue;  // below the noise floor of the solve
 
         const bool aIsDonor = dp > 0;
@@ -500,6 +717,7 @@ void Ship::solveFlowNetwork(double dt, const Sea& sea) {
             o.lastFlow = (aIsDonor ? 1.0 : -1.0) * (dt > 0 ? (rho > 0 ? dm / rho / dt : 0.0) : 0.0);
             o.lastGasMassFlow = (aIsDonor ? 1.0 : -1.0) * (dt > 0 ? dm / dt : 0.0);
             o.lastGasDonorTemperature = tDonor;
+            o.lastGasEnthalpyFlow = kGammaAir * tDonor * o.lastGasMassFlow;
         }
         o.lastFlowWasWater = water;
     }

@@ -147,6 +147,7 @@ add_executable(shipsim_tests
   tests/test_serialise.cpp
   tests/test_solid_shell.cpp
   tests/test_thermal.cpp
+  tests/test_ship.cpp
   tests/test_shipfile.cpp
   tests/test_smoke.cpp
   tests/test_worldio.cpp
