@@ -256,13 +256,57 @@ Budget implications:
 - Compare to 10 Hz target = 0.1 sim-s per tick
 - Affordable if promotions are rare and brief
 
-## Open Questions (awaiting agent findings)
+## Findings from Test Analysis Agent
 
-1. How does Ship currently detect motion (roll rate, accel)? Or derive from state?
-2. What's the review cadence for structural/gas promoters?
-3. Is there a Compartment index → flip::Solver* map already, or create one?
-4. How are compartment meshes stored? TriMesh vs AABB?
-5. Threading: can FLIP solvers run parallel per compartment?
+### Test Coverage Status
+- **FLIP solver:** 11 dedicated sections, 1,344 lines, excellent closed-form validation
+- **Horizontal openings:** Strong coverage with exact conservation tests
+- **CO2 suppression:** Implementation complete, tests appear stubbed
+- **FLIP-Ship integration:** ❌ **GAP CONFIRMED** — no tests coupling FLIP to compartment flooding
+
+### Test Infrastructure
+- Custom harness (expectNear, expectTrue, expectEqual)
+- 200,249 checks, 0 failures
+- Closed-form validation discipline (exact identities, not tolerances)
+- Mutation testing evidence throughout
+- No external frameworks (GoogleTest, etc.)
+
+### Integration Test Gaps
+1. **FLIP ↔ Ship:** No tests for escalation, compartment coupling
+2. **Performance regression:** No automated tracking
+3. **Parallel execution:** Single-threaded test runner
+
+### Recommendations Applied
+- Add round-trip conservation test (FLIP-Ship-FLIP with 0.0 tolerance)
+- Add escalation scenario tests (roll triggers promotion)
+- Enable parallel test execution opportunity (3-5x speedup possible)
+
+## Findings from Code Analysis
+
+### Ship State Structure
+- `Ship` class has `RigidState state` member
+- `state.angularVelocity` — Vec3 in world frame (rad/s) → roll rate directly available
+- `state.velocity` — world frame linear velocity
+- Ship motion derivatives available from RK4 integrator
+
+### Promoter Integration Pattern
+- `GasPromoter` exists in `promotion.hpp` but **not yet wired into fire model**
+- Pattern: promoters designed/tested independently, then integrated
+- `Promoter::review()` takes model state, returns Review with promote/demote lists
+- Tests exist (`test_promotion.cpp`) but production integration pending
+
+### Ship Structure
+- `std::vector<Compartment> compartments` — indexed access
+- Each compartment has `waterVolume`, `waterCentroid`, `mesh` (TriMesh)
+- No existing `flip::Solver*` map — need to create `std::map<int, flip::Solver*> activeWater_`
+
+## Open Questions (awaiting architecture agent)
+
+1. ~~How does Ship detect motion?~~ → **ANSWERED:** `state.angularVelocity` directly
+2. What's the review cadence for structural/gas promoters? → Check test_promotion.cpp
+3. ~~Compartment tracking?~~ → **ANSWERED:** Need new `std::map<int, flip::Solver*> activeWater_`
+4. ~~Compartment meshes?~~ → **ANSWERED:** `TriMesh mesh` in body frame
+5. Threading: can FLIP solvers run parallel per compartment? → Depends on step() structure
 
 ## Next Steps
 
