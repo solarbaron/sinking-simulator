@@ -63,6 +63,9 @@ add_library(shipsim_engine
   # The fidelity tier above the two-zone fire: a coarse low-Mach finite-volume
   # solve inside one compartment, promoted and demoted by `promotion.hpp`.
   engine/sim/les.cpp
+  # The fidelity tier above a compartment's `waterVolume`: a sparse FLIP/APIC
+  # solver on a tiled staggered grid, so an empty compartment costs nothing.
+  engine/sim/flip.cpp
   engine/sim/plasticity.cpp
   engine/sim/promotion.cpp
   engine/sim/reduction.cpp
@@ -112,6 +115,23 @@ add_executable(bulkhead_probe tools/bulkhead_probe/main.cpp game/prototype/ferry
 target_link_libraries(bulkhead_probe PRIVATE shipsim_engine)
 target_compile_options(bulkhead_probe PRIVATE -Wall -Wextra)
 
+# The sparse FLIP/APIC water solver at sizes a unit test cannot afford: the
+# resolution sweep behind the sloshing period, the PIC/FLIP/APIC comparison, the
+# CG-against-SOR measurement and the sparsity table. No GPU and no ship.
+add_executable(flip_probe tools/flip_probe/main.cpp)
+target_link_libraries(flip_probe PRIVATE shipsim_engine)
+target_compile_options(flip_probe PRIVATE -Wall -Wextra)
+
+# `tests/test_flip.cpp` on its own, for `tools/flip_probe/mutate.py`. The same
+# translation unit and the same harness the gate runs -- a mutation sweep that runs
+# a different set of assertions is reporting a kill rate for a suite nobody ships --
+# but without the other forty suites, none of which can be reached by a mutation of
+# `flip.cpp`. Fifty-one substitutions is where that multiplier starts to matter.
+add_executable(flip_tests tools/flip_probe/test_main.cpp tests/harness.cpp tests/test_flip.cpp)
+target_include_directories(flip_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(flip_tests PRIVATE shipsim_engine)
+target_compile_options(flip_tests PRIVATE -Wall -Wextra)
+
 add_executable(section_probe tools/section_probe/main.cpp game/prototype/ferry.cpp)
 target_link_libraries(section_probe PRIVATE shipsim_engine)
 target_compile_options(section_probe PRIVATE -Wall -Wextra)
@@ -136,6 +156,7 @@ add_executable(shipsim_tests
   tests/test_constraint.cpp
   tests/test_coupling.cpp
   tests/test_fire.cpp
+  tests/test_flip.cpp
   tests/test_girder.cpp
   tests/test_indentation.cpp
   tests/test_hullform.cpp

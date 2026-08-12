@@ -60,6 +60,7 @@ int main() {
     runCollisionTests();
     runConstraintTests();
     runFireTests();
+    runFlipTests();
     runGirderTests();
     runIndentationTests();
     runHullFormTests();

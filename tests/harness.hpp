@@ -62,6 +62,7 @@ void runCollisionTests();
 void runConstraintTests();
 void runCouplingTests();
 void runFireTests();
+void runFlipTests();
 void runGirderTests();
 void runIndentationTests();
 void runHullFormTests();
