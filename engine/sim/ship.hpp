@@ -35,8 +35,10 @@
 #include "propulsion.hpp"
 #include "radiation.hpp"
 #include "roll_damping.hpp"
+#include "water_promotion.hpp"
 #include "waves.hpp"
 
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -430,7 +432,24 @@ public:
 
     RigidState state;
 
+    // --- Water promotion ---
+    // Decided which flooded compartments deserve flip::Solver's resolved flow instead
+    // of the lumped waterVolume model. Follows the same pattern as structural/gas
+    // promotion: the promoter decides, Ship owns the fields and steps them.
+    promotion::WaterPromoter waterPromoter_;
+    std::map<int, flip::Field*> activeWaterFields_;  // compartment index -> FLIP field
+
     // --- Lifecycle ---
+
+    Ship() = default;
+    ~Ship();
+
+    // Copy/move: activeWaterFields_ contains raw pointers that must be deep-copied.
+    // Move leaves the source empty (nullptr fields cleared).
+    Ship(const Ship& other);
+    Ship& operator=(const Ship& other);
+    Ship(Ship&& other) noexcept;
+    Ship& operator=(Ship&& other) noexcept;
 
     // Caches gross volumes and puts the ship at its floating equilibrium.
     void initialise(const Sea& sea);

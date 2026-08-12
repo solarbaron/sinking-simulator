@@ -38,6 +38,7 @@
 
 #include "flip.hpp"
 #include "engine/core/math.hpp"
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -179,16 +180,16 @@ private:
 void estimateFlipCost(const Compartment& comp, const WaterCriterion& criterion,
                       int& particles, int& tiles);
 
-// Create a FLIP solver for a compartment, seeded with its exact water mass.
-// Returns a new solver owned by the caller (Ship will store in its activeWater_ map).
+// Create a FLIP field for a compartment, seeded with its exact water mass.
+// Returns a new field owned by the caller (Ship will store in its activeWater_ map).
 // Initial velocity set from ship motion at compartment centroid.
-flip::Solver* promoteWater(const Compartment& comp, const Ship& ship,
-                           const WaterCriterion& criterion);
+std::unique_ptr<flip::Field> promoteWater(const Compartment& comp, const Ship& ship,
+                                          const WaterCriterion& criterion);
 
 // Read FLIP state back into compartment quiescent representation.
-// Deletes the solver (caller must remove from activeWater_ map).
+// Takes ownership of the field and destroys it after reading state.
 // Mass conservation is exact (not tolerance-based).
-void demoteWater(Compartment& comp, flip::Solver* solver);
+void demoteWater(Compartment& comp, std::unique_ptr<flip::Field> field);
 
 } // namespace promotion
 } // namespace sim

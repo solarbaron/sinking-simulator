@@ -2,6 +2,7 @@
 
 #include "water_promotion.hpp"
 #include "ship.hpp"
+#include "flip.hpp"
 #include "engine/core/math.hpp"
 #include <algorithm>
 #include <chrono>
@@ -290,25 +291,74 @@ void WaterPromoter::clear() {
 // --- 3. State transfer (stubs) --------------------------------------------
 //
 // These will be implemented in ship.cpp where Ship internals are accessible.
-// For now, placeholders that compile.
+std::unique_ptr<flip::Field> promoteWater(const Compartment& comp, const Ship& /*ship*/,
+                                          const WaterCriterion& /*criterion*/) {
+    if (comp.waterVolume <= 0) return nullptr;
 
-flip::Solver* promoteWater(const Compartment& /*comp*/, const Ship& /*ship*/,
-                           const WaterCriterion& /*criterion*/) {
-    // TODO: implement in ship.cpp
-    // - Create flip::Solver with criterion.solver params
-    // - Get compartment AABB from comp.mesh.bounds()
-    // - flip::seedBox(solver, aabb)
-    // - flip::setTotalMass(solver, comp.waterVolume * 1000.0)  // kg
-    // - Set initial velocity from ship motion at comp.waterCentroid
-    return nullptr;
+    // Create FLIP field with compartment bounding box
+    auto field = std::make_unique<flip::Field>();
+    // Grid cell size: use FLIP default 0.05 m (5 cm cells).
+    const double h = 0.05;
+
+    // Compute wetted depth from volume and plan area, matching computeWaterDepth()
+    // and estimateFlipCost()'s assumption of ~1000 particles per m³.
+    const double planArea = (comp.bboxHi.x - comp.bboxLo.x) * (comp.bboxHi.y - comp.bboxLo.y);
+    const double wettedDepth = (planArea > 0) ? comp.waterVolume / planArea : 0;
+
+    // Grid constructor: need lo[3], hi[3], and h. Vec3 doesn't have .data().
+    double lo[3] = {comp.bboxLo.x, comp.bboxLo.y, comp.bboxLo.z};
+    double hi[3] = {comp.bboxHi.x, comp.bboxHi.y, comp.bboxLo.z + wettedDepth};
+
+    // Compute cell count from bounding box and h
+    int nx = std::max(1, static_cast<int>(std::ceil((hi[0] - lo[0]) / h)));
+    int ny = std::max(1, static_cast<int>(std::ceil((hi[1] - lo[1]) / h)));
+    int nz = std::max(1, static_cast<int>(std::ceil((hi[2] - lo[2]) / h)));
+
+    field->grid.h = h;
+    field->grid.lo[0] = lo[0];
+    field->grid.lo[1] = lo[1];
+    field->grid.lo[2] = lo[2];
+    field->grid.n[0] = nx;
+    field->grid.n[1] = ny;
+    field->grid.n[2] = nz;
+
+    // Seed particles: 2^3 lattice per cell
+    const int particlesPerCell = 2;
+    flip::seedBox(*field, lo, hi, particlesPerCell, kRhoSeawater);
+
+    // Set exact mass from compartment water volume (m³ → kg)
+    const double mass = comp.waterVolume * kRhoSeawater;
+    flip::setTotalMass(*field, mass);
+
+    // Initial velocity: particles at rest in body frame
+    // TODO: add ship motion contribution when Ship::step() wiring is in place
+
+    return field;
 }
 
-void demoteWater(Compartment& /*comp*/, flip::Solver* /*solver*/) {
-    // TODO: implement in ship.cpp
-    // - Read solver->totalMass() → comp.waterVolume (kg → m³)
-    // - Read flip::quiescentLevel(solver) → comp.surfaceOffset
-    // - Update comp.waterCentroid from particle centroid
-    // - delete solver
+void demoteWater(Compartment& comp, std::unique_ptr<flip::Field> field) {
+    if (!field) return;
+
+    // Read FLIP state back into compartment quiescent representation.
+
+    // Mass: exact from particle total
+    const double mass = field->totalMass();
+    comp.waterVolume = mass / kRhoSeawater;
+
+    // Centroid: mass-weighted position
+    double cog[3];
+    flip::centroid(*field, cog);
+    comp.waterCentroid = Vec3{cog[0], cog[1], cog[2]};
+
+    // Surface offset: quiescent level above floor
+    // Plan area from mesh horizontal cross-section (TODO: proper from TriMesh)
+    // For now use grid plan area as conservative estimate
+    const double planArea = field->grid.planArea();
+    const double floorZ = comp.bboxLo.z;
+    const double level = flip::quiescentLevel(*field, kRhoSeawater, planArea, floorZ);
+    comp.surfaceOffset = level - floorZ;
+
+    // field is automatically destroyed when unique_ptr goes out of scope
 }
 
 } // namespace promotion

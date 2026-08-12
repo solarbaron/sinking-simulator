@@ -107,6 +107,179 @@ Mat3 boxInertia(double m, const Vec3& e) {
 // Setup
 // ---------------------------------------------------------------------------
 
+Ship::~Ship() {
+    for (auto& [idx, field] : activeWaterFields_) {
+        delete field;
+    }
+}
+
+Ship::Ship(const Ship& other)
+    : hull(other.hull)
+    , compartments(other.compartments)
+    , openings(other.openings)
+    , pumps(other.pumps)
+    , lightshipMass(other.lightshipMass)
+    , lightshipCog(other.lightshipCog)
+    , gyradii(other.gyradii)
+    , seaDensity(other.seaDensity)
+    , deckEdgeZ(other.deckEdgeZ)
+    , hullLo(other.hullLo)
+    , hullHi(other.hullHi)
+    , zetaHeave(other.zetaHeave)
+    , zetaRoll(other.zetaRoll)
+    , zetaPitch(other.zetaPitch)
+    , addedMassSurge(other.addedMassSurge)
+    , addedMassSway(other.addedMassSway)
+    , addedMassHeave(other.addedMassHeave)
+    , addedInertiaRoll(other.addedInertiaRoll)
+    , addedInertiaPitch(other.addedInertiaPitch)
+    , addedInertiaYaw(other.addedInertiaYaw)
+    , radiation(other.radiation)
+    , propulsion(other.propulsion)
+    , rollDampingForm(other.rollDampingForm)
+    , rollCondition(other.rollCondition)
+    , rollDampingApplied(other.rollDampingApplied)
+    , externalForce(other.externalForce)
+    , externalMoment(other.externalMoment)
+    , state(other.state)
+    , waterPromoter_(other.waterPromoter_)
+    , cachedWaterplaneArea_(other.cachedWaterplaneArea_)
+    , cachedKRoll_(other.cachedKRoll_)
+    , cachedKPitch_(other.cachedKPitch_)
+    , stabilityRefreshCounter_(other.stabilityRefreshCounter_)
+{
+    // activeWaterFields_ left empty - deep copy not needed for current use cases
+    // (girder calculations happen on ships without active FLIP fields)
+}
+
+Ship& Ship::operator=(const Ship& other) {
+    if (this != &other) {
+        // Clean up existing fields
+        for (auto& [idx, field] : activeWaterFields_) {
+            delete field;
+        }
+        activeWaterFields_.clear();
+
+        hull = other.hull;
+        compartments = other.compartments;
+        openings = other.openings;
+        pumps = other.pumps;
+        lightshipMass = other.lightshipMass;
+        lightshipCog = other.lightshipCog;
+        gyradii = other.gyradii;
+        seaDensity = other.seaDensity;
+        deckEdgeZ = other.deckEdgeZ;
+        hullLo = other.hullLo;
+        hullHi = other.hullHi;
+        zetaHeave = other.zetaHeave;
+        zetaRoll = other.zetaRoll;
+        zetaPitch = other.zetaPitch;
+        addedMassSurge = other.addedMassSurge;
+        addedMassSway = other.addedMassSway;
+        addedMassHeave = other.addedMassHeave;
+        addedInertiaRoll = other.addedInertiaRoll;
+        addedInertiaPitch = other.addedInertiaPitch;
+        addedInertiaYaw = other.addedInertiaYaw;
+        radiation = other.radiation;
+        propulsion = other.propulsion;
+        rollDampingForm = other.rollDampingForm;
+        rollCondition = other.rollCondition;
+        rollDampingApplied = other.rollDampingApplied;
+        externalForce = other.externalForce;
+        externalMoment = other.externalMoment;
+        state = other.state;
+        waterPromoter_ = other.waterPromoter_;
+        cachedWaterplaneArea_ = other.cachedWaterplaneArea_;
+        cachedKRoll_ = other.cachedKRoll_;
+        cachedKPitch_ = other.cachedKPitch_;
+        stabilityRefreshCounter_ = other.stabilityRefreshCounter_;
+    }
+    return *this;
+}
+
+Ship::Ship(Ship&& other) noexcept
+    : hull(std::move(other.hull))
+    , compartments(std::move(other.compartments))
+    , openings(std::move(other.openings))
+    , pumps(std::move(other.pumps))
+    , lightshipMass(other.lightshipMass)
+    , lightshipCog(other.lightshipCog)
+    , gyradii(other.gyradii)
+    , seaDensity(other.seaDensity)
+    , deckEdgeZ(other.deckEdgeZ)
+    , hullLo(other.hullLo)
+    , hullHi(other.hullHi)
+    , zetaHeave(other.zetaHeave)
+    , zetaRoll(other.zetaRoll)
+    , zetaPitch(other.zetaPitch)
+    , addedMassSurge(other.addedMassSurge)
+    , addedMassSway(other.addedMassSway)
+    , addedMassHeave(other.addedMassHeave)
+    , addedInertiaRoll(other.addedInertiaRoll)
+    , addedInertiaPitch(other.addedInertiaPitch)
+    , addedInertiaYaw(other.addedInertiaYaw)
+    , radiation(std::move(other.radiation))
+    , propulsion(std::move(other.propulsion))
+    , rollDampingForm(other.rollDampingForm)
+    , rollCondition(other.rollCondition)
+    , rollDampingApplied(other.rollDampingApplied)
+    , externalForce(other.externalForce)
+    , externalMoment(other.externalMoment)
+    , state(other.state)
+    , waterPromoter_(std::move(other.waterPromoter_))
+    , activeWaterFields_(std::move(other.activeWaterFields_))
+    , cachedWaterplaneArea_(other.cachedWaterplaneArea_)
+    , cachedKRoll_(other.cachedKRoll_)
+    , cachedKPitch_(other.cachedKPitch_)
+    , stabilityRefreshCounter_(other.stabilityRefreshCounter_)
+{
+}
+
+Ship& Ship::operator=(Ship&& other) noexcept {
+    if (this != &other) {
+        // Clean up existing fields
+        for (auto& [idx, field] : activeWaterFields_) {
+            delete field;
+        }
+
+        hull = std::move(other.hull);
+        compartments = std::move(other.compartments);
+        openings = std::move(other.openings);
+        pumps = std::move(other.pumps);
+        lightshipMass = other.lightshipMass;
+        lightshipCog = other.lightshipCog;
+        gyradii = other.gyradii;
+        seaDensity = other.seaDensity;
+        deckEdgeZ = other.deckEdgeZ;
+        hullLo = other.hullLo;
+        hullHi = other.hullHi;
+        zetaHeave = other.zetaHeave;
+        zetaRoll = other.zetaRoll;
+        zetaPitch = other.zetaPitch;
+        addedMassSurge = other.addedMassSurge;
+        addedMassSway = other.addedMassSway;
+        addedMassHeave = other.addedMassHeave;
+        addedInertiaRoll = other.addedInertiaRoll;
+        addedInertiaPitch = other.addedInertiaPitch;
+        addedInertiaYaw = other.addedInertiaYaw;
+        radiation = std::move(other.radiation);
+        propulsion = std::move(other.propulsion);
+        rollDampingForm = other.rollDampingForm;
+        rollCondition = other.rollCondition;
+        rollDampingApplied = other.rollDampingApplied;
+        externalForce = other.externalForce;
+        externalMoment = other.externalMoment;
+        state = other.state;
+        waterPromoter_ = std::move(other.waterPromoter_);
+        activeWaterFields_ = std::move(other.activeWaterFields_);
+        cachedWaterplaneArea_ = other.cachedWaterplaneArea_;
+        cachedKRoll_ = other.cachedKRoll_;
+        cachedKPitch_ = other.cachedKPitch_;
+        stabilityRefreshCounter_ = other.stabilityRefreshCounter_;
+    }
+    return *this;
+}
+
 void Ship::initialise(const Sea& sea) {
     boundingBox(hull, hullLo, hullHi);
 
@@ -1179,6 +1352,14 @@ void Ship::step(double dt, const Sea& sea) {
     solveFlowNetwork(dt, sea);
     relaxGasToStructure(dt);
     updateInternalFreeSurfaces(sea);
+
+    // TODO: Water promotion review (periodic, like structural/gas reviews would be)
+    // - Call waterPromoter_.review(*this) at appropriate cadence
+    // - Handle promoted list: create flip::Field via promotion::promoteWater, store in activeWaterFields_
+    // - Handle demoted list: read state back via promotion::demoteWater, delete field, remove from map
+    // - Step active FLIP fields: for each in activeWaterFields_, create flip::Solver, call solver.step(dt)
+    // - Update compartment waterVolume from FLIP state when active
+
     integrateRigidBody(dt, sea);
 }
 

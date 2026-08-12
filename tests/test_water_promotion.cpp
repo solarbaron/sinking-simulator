@@ -450,7 +450,119 @@ void testBudgetAccountingAcrossReviews() {
 }
 
 // ===========================================================================
-// Section 4: Multiple Compartments
+// Section 4: State Transfer
+// ===========================================================================
+
+void testRoundTripMassConservation() {
+    std::printf("\n   round-trip mass conservation\n");
+
+    Ship ferry = ferryAfloat();
+    Compartment& forepeak = ferry.compartments[0];
+
+    // Set known water volume
+    const double initialVolume = 5.0;  // m³
+    forepeak.waterVolume = initialVolume;
+
+    WaterCriterion crit;
+
+    // Promote to FLIP
+    auto field = promoteWater(forepeak, ferry, crit);
+    expectTrue("field created", field != nullptr);
+
+    // Demote back to compartment
+    demoteWater(forepeak, std::move(field));
+
+    // Mass conservation: exact, not epsilon-based. The round trip is
+    // Compartment::waterVolume → mass = volume * density → particles with
+    // setTotalMass() → totalMass() → volume = mass / density. The density
+    // cancels, setTotalMass() is exact (§5), and totalMass() is compensated,
+    // so the volume returned is the volume sent, bit for bit.
+    expectNear("waterVolume conserved exactly", forepeak.waterVolume, initialVolume, 0.0);
+}
+
+void testEmptyCompartmentReturnsNull() {
+    std::printf("\n   empty compartment returns nullptr\n");
+
+    Ship ferry = ferryAfloat();
+    Compartment& forepeak = ferry.compartments[0];
+
+    // Empty compartment
+    forepeak.waterVolume = 0.0;
+
+    WaterCriterion crit;
+
+    auto field = promoteWater(forepeak, ferry, crit);
+    expectTrue("empty compartment returns nullptr", field == nullptr);
+}
+
+void testCentroidPreservation() {
+    std::printf("\n   centroid preservation\n");
+
+    Ship ferry = ferryAfloat();
+    Compartment& forepeak = ferry.compartments[0];
+
+    forepeak.waterVolume = 5.0;
+
+    WaterCriterion crit;
+
+    auto field = promoteWater(forepeak, ferry, crit);
+    expectTrue("field created", field != nullptr);
+
+    // Demote and check centroid is reasonable
+    demoteWater(forepeak, std::move(field));
+
+    // Centroid should be within compartment bounds
+    expectTrue("centroid x in bounds",
+               forepeak.waterCentroid.x >= forepeak.bboxLo.x &&
+               forepeak.waterCentroid.x <= forepeak.bboxHi.x);
+    expectTrue("centroid y in bounds",
+               forepeak.waterCentroid.y >= forepeak.bboxLo.y &&
+               forepeak.waterCentroid.y <= forepeak.bboxHi.y);
+    expectTrue("centroid z in bounds",
+               forepeak.waterCentroid.z >= forepeak.bboxLo.z &&
+               forepeak.waterCentroid.z <= forepeak.bboxHi.z);
+
+    std::printf("      (centroid at [%.3f, %.3f, %.3f] m)\n",
+                forepeak.waterCentroid.x, forepeak.waterCentroid.y, forepeak.waterCentroid.z);
+}
+
+void testSurfaceOffsetMatchesVolume() {
+    std::printf("\n   surface offset matches volume\n");
+
+    Ship ferry = ferryAfloat();
+    Compartment& forepeak = ferry.compartments[0];
+
+    const double initialVolume = 5.0;
+    forepeak.waterVolume = initialVolume;
+
+    WaterCriterion crit;
+
+    auto field = promoteWater(forepeak, ferry, crit);
+    expectTrue("field created", field != nullptr);
+
+    // Record the grid plan area before demoting
+    const double gridPlanArea = field->grid.planArea();
+
+    // Demote and check surface offset
+    demoteWater(forepeak, std::move(field));
+
+    // Surface offset should equal volume / gridPlanArea, where gridPlanArea is
+    // discretized to whole cells. The grid is constructed with ceil() so its
+    // area can differ from the bbox by up to h^2 per axis.
+    const double expectedOffset = forepeak.waterVolume / gridPlanArea;
+
+    // Tolerance accounts for grid discretization: h = 0.05 m, so one cell edge
+    // is a ~0.2% change in a ~25 m² compartment footprint, giving ~0.2% depth
+    // error. Use 1e-6 as conservative bound on the arithmetic error alone.
+    expectNear("surfaceOffset matches volume/planArea",
+               forepeak.surfaceOffset, expectedOffset, 1e-6);
+
+    std::printf("      (surfaceOffset %.6f m, grid planArea %.3f m²)\n",
+                forepeak.surfaceOffset, gridPlanArea);
+}
+
+// ===========================================================================
+// Section 5: Multiple Compartments
 // ===========================================================================
 
 void testMultipleCompartmentsRankedByScore() {
@@ -513,7 +625,7 @@ void testDifferentCompartmentsSeparateHysteresis() {
 }
 
 // ===========================================================================
-// Section 5: Cost and Performance Tracking
+// Section 6: Cost and Performance Tracking
 // ===========================================================================
 
 void testCostReporting() {
@@ -617,11 +729,17 @@ void runWaterPromotionTests() {
     testTileBudgetEnforcement();
     testBudgetAccountingAcrossReviews();
 
-    // Section 4: Multiple Compartments
+    // Section 4: State Transfer
+    testRoundTripMassConservation();
+    testEmptyCompartmentReturnsNull();
+    testCentroidPreservation();
+    testSurfaceOffsetMatchesVolume();
+
+    // Section 5: Multiple Compartments
     testMultipleCompartmentsRankedByScore();
     testDifferentCompartmentsSeparateHysteresis();
 
-    // Section 5: Cost and Performance
+    // Section 6: Cost and Performance
     testCostReporting();
     testCounters();
     testClearResetsState();
