@@ -11,10 +11,24 @@
 //     few hundred tonnes of water slides to the low side of a compartment.
 //   * air is a compressible species with its own mass, pressure and flow paths.
 //     A sealed compartment stops flooding when its air pressure balances the
-//     external head, which is why upside-down hulls float for hours.
+//     external head, which is why upside-down hulls float for hours -- and it
+//     does *not* stop when the opening is a horizontal one, because there the air
+//     has a way out the water is not blocking. See below.
 //   * every hole, door, hatch, vent and pipe is an orifice in one network. Water
 //     and air move through the same edges; which phase moves depends only on
-//     what is sitting at the opening on the high-pressure side.
+//     what is sitting at the opening on the high-pressure side -- except through a
+//     horizontal one, where both phases move at once and in opposite directions.
+//
+// **A horizontal opening is not a small vertical one.** Through a hatch in a deck
+// with the sea standing on it, water falls while air rises through the *same*
+// hole, driven by the density difference and not by any net pressure difference
+// at all. A model that takes one dp at the orifice centre is at rest in exactly
+// that case and moves nothing, which is the identical failure the fire work found
+// in a doorway: the steady state of a doorway is hot gas out of the top and cool
+// air into the bottom in equal mass flows, and a net-only model sees a still one.
+// `fire.cpp` fixed the doorway by integrating over its height. A hatch has no
+// height to integrate over, so `Ship::solveFlowNetwork` splits its *area* instead
+// -- see the derivation there.
 #pragma once
 
 #include "../core/geometry.hpp"
@@ -148,6 +162,35 @@ struct Opening {
     // Zero on a tick that moved water, or nothing.
     double lastGasMassFlow = 0;         // kg/s, positive means a -> b
     double lastGasDonorTemperature = 0; // K, the temperature the gas left at
+
+    // The enthalpy riding on that mass, in the kg*K units the network's own energy
+    // accumulator uses -- `gamma * T_donor * mdot`, positive a -> b.
+    //
+    // For every opening that moves one stream this is exactly
+    // `kGammaAir * lastGasDonorTemperature * lastGasMassFlow` and is redundant. It
+    // exists for the one that moves *two*: a horizontal opening exchanging gas
+    // both ways has two donors at two temperatures, and no single donor
+    // temperature describes it -- `lastGasDonorTemperature` is then zero and this
+    // is the only field that still adds up. An energy account should read this.
+    double lastGasEnthalpyFlow = 0;     // kg*K/s, positive means a -> b
+
+    // --- What a net rate cannot say ------------------------------------------
+    //
+    // Through a horizontal opening the heavy fluid falls while the light one rises
+    // through the same hole at once -- in *equal* volumes when nothing else is
+    // pushing, which is the case the mechanism exists for and is exactly the case a
+    // net rate calls a hatch at rest. Reporting only `lastFlow` would report a
+    // hatch doing nothing while a tonne a second went through it. These four say
+    // what actually crossed, and their difference is the net `lastFlow` carries.
+    //
+    // All zero on any opening that is not exchanging, which is every opening that
+    // is not a `Hatch` and every hatch whose stratification is stable or whose net
+    // head has already flushed it one way.
+    double lastExchangeDown = 0;        // m^3/s falling, out of the upper side
+    double lastExchangeUp = 0;          // m^3/s rising, out of the lower side
+    double lastExchangeMassDown = 0;    // kg/s falling
+    double lastExchangeMassUp = 0;      // kg/s rising
+    int    lastExchangeUpper = kSea;    // the endpoint the falling stream left, when one ran
 };
 
 // A bilge or ballast pump moving water out of a compartment, overboard.
@@ -469,8 +512,35 @@ private:
     struct SideState {
         double pressure = kPatm;
         bool   isWater = false;
+
+        // The density of that fluid, twice over, because the two uses of a density
+        // here are different questions.
+        //
+        // `flowDensity` is the real local density `p / (R T)`: what Torricelli
+        // divides by and what turns a volumetric rate into a mass one.
+        //
+        // `buoyancyDensity` is only ever read as a *difference across the opening*,
+        // and there it is deliberately `kPatm / (R T)` -- the same choice
+        // `gasBuoyancyHead` makes and for the same reason. Against a reference
+        // atmosphere the difference between two gas spaces at ambient temperature
+        // is exactly +0.0 whatever their pressures, so a cold ship gets no buoyant
+        // exchange at all rather than a small one that would have to be argued
+        // about. Two compartments at different *pressures* stratifying through a
+        // hatch is a real effect and a different one; see §1 of docs/02-simulation.
+        double flowDensity = kPatm / (kRAir * kTAmbient);
+        double buoyancyDensity = kPatm / (kRAir * kTAmbient);
     };
     SideState sideStateAt(int compartmentIndex, const Vec3& worldPos, const Sea& sea) const;
+
+    // Which end of a horizontal opening is the upper one, and how much of its area
+    // still faces up. Invalid for every opening that is not a horizontal one.
+    struct HorizontalSides {
+        bool   valid = false;
+        int    upper = kSea;
+        int    lower = kSea;
+        double area = 0;           // m^2, the opening projected on the horizontal
+    };
+    HorizontalSides horizontalSidesOf(const Opening& o, const Mat3& R) const;
 
     // Sinkage/attitude-only hydrostatic solve, used by the GZ sweep.
     double equilibriumDraftAt(const Quat& orientation, const Sea& sea, double targetMass) const;

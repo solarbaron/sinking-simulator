@@ -16,7 +16,9 @@ centroid (free-surface effect emergent, validated against ρ·i/Δ); compressibl
 trapped air per compartment carrying its own temperature, isothermal by default
 and thermodynamic when asked, with pressure-limited transfer;
 a single two-phase orifice network covering breaches, doors, hatches, vents,
-pipes and cross-flood ducts; bilge and ballast pumps with head-dependent output;
+pipes and cross-flood ducts, with buoyancy-driven counter-current exchange
+through the horizontal ones — water down and air up through the same hole;
+bilge and ballast pumps with head-dependent output;
 6-DOF rigid body with measured hydrostatic stiffness, added mass, quadratic drag
 and modal damping; damaged GZ curves computed by forced-heel sweep with the
 floodwater free to re-level.
@@ -251,7 +253,9 @@ at ambient, so the term vanishes by IEEE arithmetic rather than by being small.
 Note that `Opening` has a position and an area and **no height**, so one of them
 samples the pressure difference at exactly one elevation — at its own neutral
 plane it transports nothing at all. A doorway is therefore two openings, which is
-also how a two-layer fire model discretises the same doorway.
+also how a two-layer fire model discretises the same doorway. A *hatch* cannot be
+repaired that way, because both halves would be at the same height; see the next
+section but one.
 
 **Isothermal stays the default, and that is a measurement rather than a taste.**
 `Compartment::gasThermalTime` is the relaxation time to the structure; zero means
@@ -269,6 +273,219 @@ This is the idiom `radiation`, `propulsion` and `rollDampingForm` already use:
 the real model arrives alongside the lumped one and replaces it only where it is
 asked for. The cost is that a fire must set the relaxation time on the
 compartments the smoke travels through, or they will hold it at ambient.
+
+### Buoyancy through a horizontal opening — **implemented**
+
+The note above ends by observing that `Opening` has no height, so one of them
+samples the pressure difference at exactly one elevation, and that a doorway is
+therefore two openings. **A hatch cannot be fixed that way.** Through a hole in a
+deck with the sea standing on it, water falls while air rises through the *same*
+hole, in equal volumes, driven by the density difference and not by any net
+pressure difference at all. Splitting it into two openings one above the other is
+meaningless when both are at the same height, and a single Δp at the centre
+reports a hatch at rest while a tonne a second goes through it.
+
+That is the same failure the fire work found in a doorway — the steady state is
+hot gas out of the top and cool air into the bottom in *equal* mass flows, so a
+net-only model is at rest and moves nothing — and it is worth being explicit that
+it is the same one, because the fix is its sibling rather than a new invention.
+`fire.cpp` splits a doorway by **height** and integrates Torricelli up it. A hatch
+has no height to integrate over, so `Ship::solveFlowNetwork` splits its **area**.
+
+**The derivation, and it is two linear equations.** The heavy fluid falls through
+part of the hole while the light one rises through the rest, each at Torricelli
+speed on its own driving pressure — the buoyancy head drives them in opposite
+directions, so it *adds* to both:
+
+```
+dp_b = (rho_up - rho_lo) g D/2,   D = sqrt(4A/pi)
+v_dn = sqrt(2 (dp_net + dp_b) / rho_up)     the heavy fluid, falling
+v_up = sqrt(2 (dp_b - dp_net) / rho_lo)     the light one, rising
+
+A_dn + A_up           = Cd A     they share one hole
+A_dn v_dn - A_up v_up = q_net    and pass the net between them
+```
+
+where `q_net` is the single-orifice Torricelli on the net head over the whole
+area — exactly what the solve gives every other opening.
+
+**That second equation took a second try, and the first attempt is the more
+useful thing to record.** It required the two *volumes* to be equal, on the
+argument that neither space changes volume so what falls has to be let past by
+what rises. That is right at rest and wrong everywhere else: it drives the
+exchange to zero as the net head approaches `dp_b`, so the model reported a hole
+passing **nothing at all** in a window 0.7 mm of water deep and then jumped to
+2.3 m³/s the instant the net took over. The defect was found by sweeping the net
+head across the edge of the window and asking whether the two regimes met, which
+is now `testTheExchangeMeetsTheSingleOrificeSolveAtTheEdgeOfItsWindow` — no
+scenario would ever have shown it, because 0.7 mm of head is crossed in a step.
+
+Solved against the net instead, the limits are exact rather than approached. At
+`dp_b = 0` — equal densities, or light already lying on heavy — **the branch is
+simply not taken**, and the single-orifice solve beneath runs character for
+character as it always did, which is what keeps every non-hatch opening
+bit-identical. At `dp_net = 0` the net vanishes, the areas fall out as
+`A_dn : A_up = v_up : v_dn`, the two volumes are equal, and
+`Q = Cd A √(2 dp_b) / (√rho_up + √rho_lo)` each way with no net whatever — which
+is precisely the state a model reading one Δp calls a hatch at rest. And at
+`dp_net = dp_b`, `v_up` is zero, `A_dn` comes out at `Cd A/√2`, and `A_dn v_dn`
+is `q_net` **to the last bit**: past there the hole is flushed one way and the
+exchange has stopped of its own accord, which is Cooper's critical pressure
+difference falling out rather than being imposed.
+
+The two regimes meet in a square-root cusp rather than a corner, and that has a
+closed form of its own — the gap `eps` inside the edge is
+`Cd A (1 − 1/√2) √(2 eps / rho_lo)`, asserted at four values of `eps` spanning
+six decades with an O(`eps`) residual measured at 5.7e-3, 6.1e-5, 6.1e-7 and
+7e-9. It is the same square root with the infinite derivative that makes
+`fire.cpp` split its bands *at* the neutral plane rather than quadrature through
+it.
+
+**`D/2` is the one modelling choice in it, and it is a choice of length scale
+rather than a fitted coefficient.** An opening's own size is the only length in
+the problem, which is why every published correlation for this — Epstein, Cooper
+— reports a rate going as `√(g′) D^{5/2}`; the form above reproduces that exponent
+*exactly*, and half a diameter is the depth of the plug of fluid whose weight
+drives the overturning. In the ship's own limit, water over air with no net head,
+it collapses to `Q = Cd A √(g D)` each way — 2.3 m³/s through one square metre.
+The discharge coefficient stays the opening's own, so an author
+who wants a different constant has one to turn. What is **not** claimed is a
+calibration against Epstein's data: the structure is derived and asserted, the
+coefficient is a scale argument, and saying otherwise would be a citation nothing
+here can re-run.
+
+**Heel takes the hole away, and that is why the sense is decided in the world
+frame.** A hatch is in a deck, so its normal is the body's own +z; the flow area
+available to a *vertical* counterflow is that hole projected on the horizontal,
+`A|cos θ|`, and at ninety degrees a deck hatch is a scuttle in a wall with no
+height for a neutral plane to sit in, so zero is the honest limit for this
+struct. The hydraulic diameter is taken from the **unprojected** area, because it
+stands for the physical size of the hole and a hole does not get smaller when the
+ship heels. The *sign* of that cosine is what says which endpoint is above, so an
+inverted hull's deckhead correctly acquires the sea on top of it — the authored
+order of `a` and `b` never enters.
+
+**What it is worth on the ferry: nothing, and that is measured rather than
+hoped.** Every hatch she has is an escape trunk from an engine room to the vehicle
+deck, and both are shut in `ships/ferry.ship`, in `game/prototype/ferry.cpp` and
+in all three scenarios — so no published figure can move, and `check-figures.sh`
+confirms it: every tonnage, heel, draft, GM, trapped-air pressure, fill fraction
+and verdict is unchanged. Forced *open*, they still never fire. Instrumenting both
+trunks at every step of all three scenarios for 1800 s each — six runs — the
+unstable arrangement, dense fluid lying on light, occurs for **0.0 s**. The reason
+is geometric and worth recording: an escape trunk stands at the engine-room
+deckhead, which is the vehicle deck's floor, so the space *below* the hatch floods
+past it long before any water reaches the deck above. `escape_er_s` under
+`--scenario=doors` spends 152.6 s with air on both sides, 42.9 s with air lying on
+water — the stable order — and 1604.5 s with water on both sides.
+
+So the mechanism is dormant on this ship. It earns its place anyway, and the
+distinction matters: **this is a missing mechanism, not a small term.** When the
+window does open it is first-order — a single 1 m² escape trunk at rest passes
+over a tonne of water a second, against a model that reported the hatch as still —
+and `tests/test_ship.cpp` measures exactly that on the ferry's own compartments,
+with the deck given water and the port engine room left dry. A term that is either
+zero or enormous depending on where a hatch was authored is a different thing from
+a term that is a third of a percent.
+
+**What the tests assert.** Both stream rates against the closed form, and against
+the same pair obtained by **bisecting the defining equation** — which shares no
+arithmetic with the closed form at all, so a mis-*derivation* is caught and not
+only a mis-typing. Both defining equations re-derived from what the model
+*published*: each stream's area is its own rate over its own Torricelli velocity,
+the two sum to `Cd·A` to 1e-14, and their volumes differ by exactly the
+single-orifice net. The cusp at the edge of the window, at four values of `eps`.
+The tilt law against the ship's own deck normal at zero tolerance — not against
+`cos(heel)`, because `Quat::fromAxisAngle` carries a right angle as a half-angle
+pair and its matrix reports 2.2e-16 where `std::cos(π/2)` is 6.1e-17, and a
+tolerance loose enough to swallow that would swallow a broken projection too. Mass
+conserved to 1.9e-15 of the total and energy to 9.6e-16, both asserted at what
+they measure. And every null asserted as an **exact** zero in *both* directions,
+because they are exact by IEEE arithmetic and not merely small: two gas spaces at
+one temperature, light already lying on heavy, water on water, a hatch authored
+between two spaces at the same height, a hull rolled past ninety degrees so the
+water is now underneath, and each of the four opening kinds that is not a hatch.
+
+**The finding, and it is a behavioural one.** *Trapped air arrests a breach; it
+does not arrest a hatch.* The front page's "a sealed space stops flooding when its
+air pressure balances the outside head, which is why upside-down hulls float for
+hours" is a statement about **vertical** openings. Differentiating
+`p = m R T / (V0 − W)` gives `dp/dt = p (q_dn − q_up) / V_air`, so a glugging
+space's pressure is stationary exactly when the two volumes balance — which is
+where the net head is zero, and at zero net head the exchange is at its
+*strongest*. There is no second equation to pin the water level, so the steady
+state is water pouring in at the full at-rest rate with the pressure held at the
+outside head, and it persists until the space is full. Through a vertical opening
+the same condition, zero net head, is the condition for no flow at all. Measured
+on one barge with one 1 m² hole and 0.30 m of head over it: the breach takes
+31.2 m³ and has decelerated tenfold by 30 s; the hatch takes 123.1 m³ in the same
+minute and is still running at 1.935 m³/s against an at-rest closed form of
+1.928.
+
+**This is also the expectation that was wrong first, and it was wrong in an
+interesting direction.** The test predicted the hatch arresting too, only deeper —
+at the head *plus* the hole's own buoyancy head, where the net flow reverses. It
+does not arrest at all. Predicting an arrest at the point where the flow reverses
+confuses the condition for the *net* to change sign with the condition for the
+*pressure* to stop moving, and those are different equations.
+
+### The stack effect of an air pipe — **measured, and declined**
+
+A tall air pipe holding gas at a different density from the outside air carries a
+buoyancy head of its own, and this model does not have it: `gasBuoyancyDensity` is
+deliberately `kPatm/(R T)` and not `p/(R T)`, so at ambient temperature the head
+is exactly `+0.0` whatever pressure the compartment is at. The ferry's wing tanks
+arrest their own flooding at 1.2–1.5 atm behind 5.5 m of pipe between a deckhead
+and its gooseneck, which is the case worth sizing.
+
+**It is 15.5 Pa, and the ratio it enters as is a constant.** Over 900 s of
+`--scenario=doors`, the largest missing head on any of the ferry's twenty vents
+and pipes is 15.46 Pa, on `airpipe_wfs`, over a 2.91 m column, at a moment when
+that tank stood 44 818 Pa above atmosphere — **0.034% of the gauge pressure it
+would modify**, and 1.4e-3 of the pressure difference then driving that opening.
+The rest are smaller: 9.14 Pa on `airpipe_wms`, 8.46 Pa on `airpipe_was`, 3.27 Pa
+on `vent_fh_s`, 2.33 Pa on `vent_ah_s`.
+
+The reason it cannot grow is arithmetic rather than empirical. The head is
+`(p − p_atm)/(R T) · g L`, so as a fraction of the gauge pressure it modifies it
+is
+
+```
+dp_stack / p_gauge  =  rho_amb g L / p_atm  =  1.19e-4 per metre of column
+```
+
+— **independent of the pressure entirely**. The ferry's 2.91 m measures 3.45e-4,
+which is that constant to three figures. A ship would need a hundred metres of air
+pipe for this to reach one per cent, and 5.5 m of it is 6.5e-4.
+
+**And the submergence angles it might have been expected to move cannot move at
+all.** "Each vent goes under at its own angle — about 32° for the starboard wing
+tank's air pipe and 42° for the forward hold's" is a statement about where a
+gooseneck sits relative to the waterline. It is geometry. No pressure term inside
+the pipe can touch it.
+
+**Implemented end-to-end anyway, because a bound is not a measurement.** Swapping
+`gasBuoyancyDensity` for the compartment's own `p/(R T)` and re-running all three
+scenarios at 1800 s:
+
+| scenario | lines of the run that changed | largest change anywhere |
+|---|---|---|
+| `full` | 1 of 121 | heel at t+120 reads 6.34° for 6.33° |
+| `doors` | 2 of 121 | floodwater at t+690 reads 4386 t for 4385 t |
+| `none` | 12 of 121 | floodwater at t+1185 reads 3087 t for 3086 t |
+
+Every cell of the trapped-air table is identical — 20.6% / 127.7 kPa / 194 t,
+32.5% / 150.1 kPa / 35 t, 25.9% / 123.2 kPa / 311 t — as is every verdict, final
+heel, draft, GM and tonnage. The single largest movement in 5400 s of ferry is one
+part in four thousand on a mid-run tonnage and one millimetre on a GZ ordinate.
+
+So it is **not built**. The head is real, it is bounded by a constant times the
+length of pipe, and on this ship it is a thirtieth of one per cent of the pressure
+it would correct. Building it would add a pressure-dependent term to a density
+that is currently exactly `+0.0` for a cold ship — the property that keeps every
+flooding scenario bit-identical to the model that had no gas temperature in it —
+and would buy a last digit. If a future ship carries a genuinely tall vent riser,
+this section is the measurement to re-run rather than the conclusion to quote.
 
 ---
 

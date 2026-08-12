@@ -51,6 +51,7 @@ void runReductionTests();
 void runSolidShellTests();
 void runThermalTests();
 void runSerialiseTests();
+void runShipTests();
 void runShipFileTests();
 void runSmokeTests();
 void runSmokeRenderTests();

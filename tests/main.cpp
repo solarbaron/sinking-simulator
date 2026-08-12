@@ -51,6 +51,7 @@ int main() {
     runThermalTests();
     runPlasticityTests();
     runSerialiseTests();
+    runShipTests();
     runShipFileTests();
     runSmokeTests();
     runWorldIoTests();
