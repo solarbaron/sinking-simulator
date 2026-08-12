@@ -1449,8 +1449,99 @@ should be honest about that.
 
 ## Phase 5 — Fluids — *~9 em*
 
-- Sparse FLIP/APIC solver for interior water
-- Quiescent ↔ dynamic escalation with exact mass conservation
+- ✅ Sparse FLIP/APIC solver for interior water — `engine/sim/flip.{hpp,cpp}`.
+  Particles carrying mass and an affine velocity, a staggered pressure grid stored
+  as 4×4×4 tiles in a hash map, a Jacobi-preconditioned conjugate-gradient
+  projection with a voxelised free surface, and RK2 advection through the
+  extrapolated grid field. `tools/flip_probe` runs the studies; `tests/test_flip.cpp`
+  owns the closed forms.
+
+  **It is APIC, and the measurement rather than the citation says why.** All three
+  transfers are reachable from one code path (`Params::affine`, `Params::flipBlend`)
+  so the choice can be re-derived. On a 0.8 m cube in solid-body rotation, PIC
+  keeps **89.2%** of its angular momentum through ten particle→grid→particle
+  transfers and APIC **98.2%** — 1.08% against 0.18% per transfer, **6.1× less**.
+  In a sloshing tank the ordering reverses: FLIP carries **87.6%** particle-borne
+  velocity the grid never sees, APIC **1.3%**, and PIC damps the very mode it is
+  meant to measure, crossing the centreline three times in five seconds where APIC
+  crosses eight. On the period itself APIC comes out **+4.45%** against PIC's
+  +9.16% and FLIP's +9.81%. So APIC buys FLIP's conservation at a sixty-seventh of
+  FLIP's noise, and is twice as accurate as either on the one closed form
+  available.
+  The kernel is the **quadratic B-spline** because only there is APIC's `D_p` a
+  constant — `h²/4 I`, asserted directly to 3.2e-16 relative — where trilinear
+  weights make it *singular* whenever a particle lands on a node.
+
+  **What is asserted, and at what.** A hydrostatic column does not move at all:
+  after 25 steps **not one particle coordinate has changed**, because the residual
+  velocity is 6.2e-16 m/s and `x + v dt` at that size is a no-op — against 12.3 mm
+  and 0.49 m/s of unprojected free fall. Its pressure is `ρ g h (K − k)` **cell by
+  cell** to 2.6e-15 relative. The projection reproduces a discrete Helmholtz
+  decomposition — a MAC curl plus a discrete gradient half again its size — giving
+  the divergence-free part back to **8.8e-16** relative per face and the potential
+  back as the pressure to **9.4e-16** per cell, on a 7×5×6 grid so an index that
+  reads the wrong axis cannot survive. A block in free fall follows its
+  integrator's own closed form `−g dt² N(N+1)/2` to 1.1e-15, with **exactly zero**
+  sideways. Mass is not conserved to a tolerance, it is *exact*: `expectNear(...,
+  0.0, 0.0)` on the residual, with the particle count asserted as an integer
+  beside it, through a dam break that clamps 18 610 particles against walls.
+
+  **Sparsity is tested for what it is for.** An empty 400³-cell room — 64 million
+  cells, 7.4 GB dense at the 115 bytes a cell this structure costs — allocates
+  **zero tiles and zero bytes**. The same water in a 20³ room and a 400³ room
+  allocates the same 48 tiles and produces **bit-identical** particle positions
+  after fifty steps, which is the statement that the room's extent does not enter
+  the arithmetic at all. Arrival is the case sparse solvers fail at, so a single
+  particle is walked 6 m across six tile seams in 1 mm steps with the invariant
+  checked at every position: the face weights of each component sum to the particle
+  mass, to 1.8e-15 kg of 7. A halo one tile too small drops part of that sum and
+  nothing else notices.
+
+  **And the tile count is asserted against one derived by hand**, not against
+  another run: a 6×6×4-cell block dilated by the 3-cell halo is tiles 0…3, 0…3,
+  1…4, which is 64. That check is here because `Solver::tiles()` shipped returning
+  `tileKey_.size()` — three coordinates per tile — and reported **192**. Every
+  other tile assertion in the suite compares one count with another, equal in two
+  rooms or changed over a fall, and a factor of three is invisible to all of them.
+  Same shape as the half-bandwidth `reduction.cpp` reported and the suite believed.
+
+  **Sloshing, against `2π/√(g k tanh k d)`.** The first mode comes out **+5.66%**
+  on six cells of depth and **+3.97%** on nine, converging on about +3%, which is
+  the nonlinear correction at `a/d = 1/3` and does not go away with the grid. The
+  amplitude has to be a *couple of cells*: a voxelised free surface cannot
+  represent a sub-cell tilt and therefore has no restoring force to give, and the
+  first version of that test seeded a sixth of a cell, did not slosh at all, and
+  reported a period of zero.
+
+  **Shared with `les.cpp`, and deliberately not.** Shared: the staggered grid, the
+  all-Neumann compatibility discipline (a fully submerged compartment determines
+  its pressure only up to a constant, so the mean is removed — the same problem
+  `les.cpp` meets from the heating side), compensated summation on every conserved
+  total, and a substep controller that *publishes* when its budget binds. Not
+  shared: the linear solver. `les.cpp` uses red-black SOR because its answer must
+  commute with a reflection; this needs a residual at machine precision instead,
+  and on the same 24-cell column SOR at 1.7 takes **1 170 sweeps** to reach 1e-13
+  and does not reach 1e-15 in 200 000, where Jacobi-CG reaches **exact zero in 24
+  iterations**. Also not shared: the transported variable — mass is on the
+  particles here, which is why its conservation is an identity rather than a
+  residual.
+
+  **Not here, named rather than hidden:** solids are one axis-aligned box, so no
+  stair, girder or heeled deck; the free surface is voxelised, so first order and
+  no ghost-fluid pressure; no volume correction, so FLIP's usual particle
+  clumping is unopposed; no viscosity, surface tension or two-phase air; no moving
+  solids; single threaded. And it is **not wired into `sim::Ship`** — that is the
+  next item and doing it here would have made this untestable.
+- Quiescent ↔ dynamic escalation with exact mass conservation — **not built, and
+  the arithmetic it stands on is.** `flip::seedBox` plus `flip::setTotalMass` puts
+  a body of water on a lattice with *exactly* the mass asked for (the last particle
+  takes the remainder against a compensated sum of the others, the same trick
+  `fire.cpp`'s `layerSplit` uses), and `flip::quiescentLevel` returns the
+  still-water level it implies — `z_floor + M/(ρA)`, the closed form
+  `Compartment::waterVolume` already means. Seeding 2.7183 m and reading it back
+  returns **2.7183 m exactly**, 0.0 m of error, which is what makes the round trip
+  an identity rather than a tolerance. What is missing is the *criterion* and the
+  wiring, which is `promotion.hpp`'s shape applied to water.
 - SPH spray, jets from breaches, rain
 - Sloshing, green water on deck
 - Screen-space fluid rendering
