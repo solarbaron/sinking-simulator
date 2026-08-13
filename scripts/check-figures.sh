@@ -80,6 +80,7 @@
 set -u
 
 RAM=${RAM:-./build/ram_view}
+WATER=${WATER:-./build/water_probe}
 SECTION=${SECTION:-./build/section_probe}
 SECTION_DOC=docs/02-simulation.md
 RENDER_DOC=docs/03-renderer-audio.md
@@ -602,8 +603,8 @@ fi
 # that the failures are zero.
 if [ -x "$TESTS" ]; then
   suite=$("$TESTS" 2>&1 | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  check "closed-form validation checks in the suite" 198869 0 "$suite" \
-        "198869 validation checks" "$FRONT"
+  check "closed-form validation checks in the suite" 200336 0 "$suite" \
+        "200336 validation checks" "$FRONT"
 else
   echo "  - shipsim_tests not built, skipping the README's check count"
   skipped="$skipped shipsim_tests"
@@ -770,6 +771,48 @@ if [ -x "$RAM" ]; then
 else
   echo "  - ram_view not built, skipping the collision-milestone figures"
   skipped="$skipped ram_view"
+fi
+
+# --- what the water promoter sees, and the control that says it can see anything ---
+#
+# The roadmap's Phase 5 entry rests on a *pair* of runs, and the pair is the only
+# form in which either half means anything. "The flooding scenario promotes
+# nothing" is the claim that activating the promoter is safe for every figure
+# above, and on its own it is equally consistent with a criterion that is simply
+# dead -- which is the more likely of the two failures and the one that would
+# never announce itself. So the beam-sea control is gated beside it and has to
+# keep promoting.
+#
+# The same shape as the capsize-threshold pair and the `--no-interface-ties`
+# control: a figure that can only fail in the safe direction is not gated at all.
+#
+# ~25 s: 900 s of flooding at dt=0.01 and 300 s of beam sea.
+if [ -x "$WATER" ]; then
+  for h in "0.0042 rad/s of roll rate" "0.1525 rad/s, 3× over the threshold"; do
+    hint "$h" "$DOC"
+  done
+  # The flooding half: she must promote nothing, and the roll rate she gets
+  # nowhere near is the reason. Gating the promotion count alone would pass on a
+  # criterion that had been switched off.
+  wflood=$("$WATER" --duration=900 2>&1)
+  wroll=$(printf '%s\n' "$wflood" | sed -n 's/^ *peak roll rate seen *\([0-9.]*\).*/\1/p')
+  wprom=$(printf '%s\n' "$wflood" | sed -n 's/^ *promotions *\([0-9]*\).*/\1/p')
+  check "the flooding ferry's peak roll rate (rad/s)" 0.0042 0.0001 "$wroll" \
+        "0.0042 rad/s of roll rate" "$DOC"
+  check "and what it promotes" 0 0 "$wprom" "0.0042 rad/s of roll rate" "$DOC"
+
+  # The control: the same ship in a beam sea at her own roll period. If this ever
+  # reads zero promotions the block above has stopped being evidence of anything.
+  wsea=$("$WATER" --wave=2.0 --duration=300 2>&1)
+  searoll=$(printf '%s\n' "$wsea" | sed -n 's/^ *peak roll rate seen *\([0-9.]*\).*/\1/p')
+  seaprom=$(printf '%s\n' "$wsea" | sed -n 's/^ *promotions *\([0-9]*\).*/\1/p')
+  check "the beam-sea control's peak roll rate (rad/s)" 0.1525 0.002 "$searoll" \
+        "0.1525 rad/s, 3× over the threshold" "$DOC"
+  check "and that it does promote" 1 0 "$seaprom" \
+        "0.1525 rad/s, 3× over the threshold" "$DOC"
+else
+  echo "  - water_probe not built, skipping the promoter's figures"
+  skipped="$skipped water_probe"
 fi
 
 # --- the section mesher's reach ---------------------------------------------------

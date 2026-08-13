@@ -58,9 +58,27 @@ void setRollRate(Ship& ship, double radPerSec) {
     ship.state.angularVelocity.x = radPerSec;
 }
 
-// Set ship lateral acceleration magnitude (proxy via velocity).
+// Lateral acceleration is a *difference* between two reviews, not a state the
+// ship carries, so producing one takes two samples and the time between them.
+// This drives a promoter through the first review at rest and returns the dt the
+// caller should pass to the second, at which point the velocity below has
+// arrived and the acceleration is `mPerSec2` exactly.
+//
+// **The helper this replaced set `state.velocity = {0, a, 0}` and called it an
+// acceleration**, which is how every test in this file passed against an
+// implementation that compared a speed in m/s against a threshold in m/s^2.
+// A test that shares the code's misconception cannot see it: the units error was
+// in the harness and in the thing being tested, agreeing with each other.
+constexpr double kAccelDt = 0.5;   // s between the two reviews
+
+void primeAccel(WaterPromoter& promoter, Ship& ship) {
+    ship.state.velocity = Vec3{};
+    promoter.review(ship, kAccelDt);
+}
+
 void setLateralAccel(Ship& ship, double mPerSec2) {
-    ship.state.velocity = Vec3{0, mPerSec2, 0};
+    // Velocity after kAccelDt of that acceleration, from rest.
+    ship.state.velocity = Vec3{0, mPerSec2 * kAccelDt, 0};
 }
 
 // ===========================================================================
@@ -126,6 +144,46 @@ void testMotionBelowThresholdPromotesNothing() {
     expectEqual("no promotions", static_cast<int>(rev.promoted.size()), 0);
 }
 
+// Roll is rotation about the ship's own axis, and the criterion is read at
+// attitudes where that axis is nowhere near the world's. A ship heeled 90
+// degrees has her bow axis along world x still -- heel rotates *about* it -- so
+// the case that separates the two frames is **pitch**: at 90 degrees of trim the
+// bow points at the sky, and a rotation about world x is then pure yaw as the
+// ship experiences it, with no roll in it at all.
+//
+// Against the implementation this replaced -- `abs(angularVelocity.x)` -- this
+// reads a full 0.2 rad/s of roll rate on a ship that is not rolling.
+void testRollRateIsBodyFrame() {
+    std::printf("\n   roll rate is read in the body frame\n");
+
+    Ship ferry = ferryAfloat();
+    floodCompartment(ferry, 0, 5.0);
+
+    // Bow up: rotate 90 degrees about the transverse (y) axis.
+    ferry.state.orientation = Quat::fromAxisAngle(Vec3{0, 1, 0}, kPi / 2.0);
+    ferry.state.angularVelocity = Vec3{0.2, 0, 0};   // world x, 4x the threshold
+
+    WaterCriterion crit;
+    WaterPromoter promoter(crit);
+    WaterReview rev = promoter.review(ferry);
+
+    expectTrue("the ship is considered", rev.considered.size() > 0);
+    // Her bow axis is world +z here, and the angular velocity is along world x,
+    // so the roll component is exactly zero.
+    expectNear("rotation about world x is not roll when the bow points up",
+               rev.considered[0].rollRate, 0.0, 1e-12);
+    expectTrue("so nothing qualifies on it", rev.considered[0].score == 0.0);
+
+    // The control: the *same* rate about the axis that really is her bow reads
+    // in full. Without this the test above would pass on an implementation that
+    // returned zero unconditionally.
+    ferry.state.angularVelocity = Vec3{0, 0, 0.2};   // world z == her bow now
+    WaterPromoter upright(crit);
+    WaterReview rolling = upright.review(ferry);
+    expectNear("but rotation about her own bow axis is",
+               rolling.considered[0].rollRate, 0.2, 1e-12);
+}
+
 void testRollRateAloneQualifies() {
     std::printf("\n   roll rate alone qualifies\n");
 
@@ -154,16 +212,28 @@ void testLateralAccelAloneQualifies() {
 
     // Accel above threshold, roll below
     setRollRate(ferry, 0.02);   // Below rollRatePromote
-    setLateralAccel(ferry, 3.0); // 1.5x accelPromote
 
     WaterCriterion crit;
     WaterPromoter promoter(crit);
+    primeAccel(promoter, ferry);
+    setLateralAccel(ferry, 3.0); // 1.5x accelPromote
 
-    WaterReview rev = promoter.review(ferry);
+    WaterReview rev = promoter.review(ferry, kAccelDt);
 
     expectTrue("lateral accel alone produces candidates", rev.considered.size() > 0);
     expectTrue("with positive score", rev.considered[0].score > 0.0);
     expectNear("score matches accel ratio", rev.considered[0].score, 3.0 / 2.0, 1e-6);
+
+    // **The negative control for the units, and it is the whole point of the
+    // rewrite.** The same ship reviewed with no time between samples has no
+    // acceleration, so a criterion reading a genuine difference scores 0 while
+    // one reading `length(velocity)` scores 1.5/... whatever dt it was given.
+    // Against the implementation this replaced, this assertion fails.
+    WaterPromoter noTime(crit);
+    noTime.review(ferry);                       // seeds, dt defaults to 0
+    WaterReview flat = noTime.review(ferry, 0); // no elapsed time
+    expectTrue("with no elapsed time there is no acceleration to read",
+               flat.considered[0].score == 0.0);
 }
 
 void testBothTriggersScoreIsWeaker() {
@@ -174,12 +244,13 @@ void testBothTriggersScoreIsWeaker() {
 
     // Both above threshold, roll stronger
     setRollRate(ferry, 0.15);   // 3x rollRatePromote
-    setLateralAccel(ferry, 4.0); // 2x accelPromote
 
     WaterCriterion crit;
     WaterPromoter promoter(crit);
+    primeAccel(promoter, ferry);
+    setLateralAccel(ferry, 4.0); // 2x accelPromote
 
-    WaterReview rev = promoter.review(ferry);
+    WaterReview rev = promoter.review(ferry, kAccelDt);
 
     expectTrue("both triggers produce candidates", rev.considered.size() > 0);
     // Score should be min(3.0, 2.0) = 2.0
@@ -575,12 +646,17 @@ void testMultipleCompartmentsRankedByScore() {
 
     // Set different motion levels
     setRollRate(ferry, 0.15);    // 3x threshold
-    setLateralAccel(ferry, 3.0); // 1.5x threshold
 
     WaterCriterion crit;
     WaterPromoter promoter(crit);
+    // The acceleration is a difference between reviews, so it takes two of them
+    // and the dt between. Reviewing once leaves it at zero and the score falls
+    // back to the roll ratio -- which is a correct answer to a different
+    // question, and would make the 1.5 below unreachable.
+    primeAccel(promoter, ferry);
+    setLateralAccel(ferry, 3.0); // 1.5x threshold
 
-    WaterReview rev = promoter.review(ferry);
+    WaterReview rev = promoter.review(ferry, kAccelDt);
 
     // All three should qualify with same score (weaker trigger)
     expectTrue("three candidates", rev.considered.size() >= 3);
@@ -714,6 +790,7 @@ void runWaterPromotionTests() {
     testShipAtRestPromotesNothing();
     testShallowPuddlePromotesNothing();
     testMotionBelowThresholdPromotesNothing();
+    testRollRateIsBodyFrame();
     testRollRateAloneQualifies();
     testLateralAccelAloneQualifies();
     testBothTriggersScoreIsWeaker();

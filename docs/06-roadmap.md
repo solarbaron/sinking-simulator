@@ -1532,16 +1532,67 @@ should be honest about that.
   clumping is unopposed; no viscosity, surface tension or two-phase air; no moving
   solids; single threaded. And it is **not wired into `sim::Ship`** — that is the
   next item and doing it here would have made this untestable.
-- Quiescent ↔ dynamic escalation with exact mass conservation — **not built, and
-  the arithmetic it stands on is.** `flip::seedBox` plus `flip::setTotalMass` puts
-  a body of water on a lattice with *exactly* the mass asked for (the last particle
-  takes the remainder against a compensated sum of the others, the same trick
-  `fire.cpp`'s `layerSplit` uses), and `flip::quiescentLevel` returns the
-  still-water level it implies — `z_floor + M/(ρA)`, the closed form
-  `Compartment::waterVolume` already means. Seeding 2.7183 m and reading it back
-  returns **2.7183 m exactly**, 0.0 m of error, which is what makes the round trip
-  an identity rather than a tolerance. What is missing is the *criterion* and the
-  wiring, which is `promotion.hpp`'s shape applied to water.
+- ✅ Quiescent ↔ dynamic escalation with exact mass conservation —
+  `engine/sim/water_promotion.{hpp,cpp}` following the `StructuralPromoter` /
+  `GasPromoter` pattern. `WaterPromoter` is a motion-gated state machine: a
+  compartment qualifies when roll rate OR lateral acceleration exceed thresholds,
+  builds a dwell streak over consecutive reviews, promotes when the streak reaches
+  the dwell count and particle/tile budgets allow, and demotes when motion drops
+  below hold thresholds for `hold` reviews. `promoteWater()` creates a
+  `flip::Field` seeded through the wetted depth (not full bbox height —
+  forepeak at 5 m³ seeds 745k particles, not 77M), and `demoteWater()` reads mass,
+  centroid and quiescent level back. Round-trip mass is **exact** (0.0 tolerance,
+  not epsilon), tested in Section 4 of `tests/test_water_promotion.cpp`.
+  
+  **Seeding only wetted depth matters.** The first version seeded `bboxLo.z` to
+  `bboxHi.z` (full compartment height) and generated 77 million particles for 5 m³
+  of water in a 232 m² forepeak — 100× too many. Corrected to seed through
+  `bboxLo.z + waterVolume/planArea`, the same compartment gets 745k particles at
+  ~1000/m³, which is the target density. A measurement probe (`/tmp/wp_probe.cpp`)
+  found it; the fix is one line changing `hi[2]`.
+  
+  **Wired into Ship, not yet active.** `Ship::waterPromoter_` and
+  `Ship::activeWaterFields_` exist with proper copy/move semantics (copy leaves
+  fields empty since girder calculations copy ships without active FLIP; move
+  transfers ownership and clears source). `Ship::step()` carries TODO markers for
+  periodic `review()` calls, promotion/demotion handling, and FLIP field stepping.
+  The infrastructure is in place; activation is the next step.
+
+  **A capsizing ferry is a slow event, and that is the measurement that says
+  activation is safe.** `tools/water_probe` runs the criterion alongside the real
+  `doors` scenario without promoting anything, and the ship that lolls to 58.8°
+  with 5591 t aboard peaks at **0.0042 rad/s of roll rate — 12× below the 0.05
+  threshold** — and promotes nothing in 892 reviews. Progressive flooding is
+  minutes of quasi-static heeling, not the sloshing this tier is for. So turning
+  the promoter on inside `Ship::step()` moves no gated scenario figure, which is a
+  measurement rather than an argument, and the front page's three outcomes are
+  safe from it.
+
+  **A promoter that fires nowhere would be broken rather than safe**, so the probe
+  carries its own control: the same ferry in a 2 m regular beam sea at her own
+  9.92 s roll period reaches **0.1525 rad/s, 3× over the threshold, and promotes**.
+  The pair is the finding — silent through a capsize, live in a seaway.
+
+  **The control found two frame errors that every unit test had agreed with.**
+  `computeLateralAccel` returned `length(state.velocity)` — a *speed* in m/s —
+  compared against a threshold labelled m/s². The beam-sea run read 2.26 "m/s²"
+  that was 2.26 m/s of orbital velocity; differencing the velocity properly gives
+  0.72 m/s², so the old figure was 3× too large. The sign of that error is the
+  dangerous one: a ship drifting steadily at 3 m/s has no lateral acceleration at
+  all and would have promoted every compartment aboard, while a ship snapped
+  sideways from rest by a collision has a large one and a small speed. And
+  `computeRollRate` took `angularVelocity.x` — a **world** component — as roll,
+  which is true only while she is upright, at exactly the attitudes this criterion
+  is not for. Both are now read in the body frame off `state.orientation`.
+
+  This is the third time this repository has confused a world vector for a body
+  one (`state.velocity.x` read as speed, the roll stiffness about the wrong point),
+  and the first two are already in CLAUDE.md's table. **The tests could not have
+  caught it: the harness set `state.velocity = {0, a, 0}` and called it an
+  acceleration**, so the fixture and the code shared one misconception and agreed
+  with each other. `setLateralAccel` now produces a real difference over a real dt,
+  and two new tests fail against the old implementation — verified by reverting it,
+  which takes the suite to 7 failures.
 - SPH spray, jets from breaches, rain
 - Sloshing, green water on deck
 - Screen-space fluid rendering

@@ -56,6 +56,16 @@ struct WaterCriterion {
     // Ship motion thresholds: roll rate and lateral acceleration.
     // Roll rate triggers sloshing at the compartment's natural frequency;
     // lateral acceleration captures transient events (collision, hard rudder).
+    //
+    // **Both are read in the body frame**, which is not a detail. `state`'s
+    // angular velocity and velocity are *world* vectors, and a ship lolled to 58
+    // degrees has her own axes nowhere near the world's; a criterion that takes
+    // the world x component as "roll" is measuring something else entirely at
+    // exactly the attitudes this is for. See `computeRollRate`.
+    //
+    // The acceleration is differenced between reviews rather than taken from a
+    // speed -- it was a speed once, compared against a threshold in m/s^2, and
+    // the two sides of that comparison were never in the same units.
     double rollRatePromote = 0.05;      // rad/s — ~3°/s, excites typical sloshing
     double rollRateHold = 0.03;         // rad/s
     double accelPromote = 2.0;          // m/s² — ~0.2g, distinguishes casualty response
@@ -114,7 +124,12 @@ struct WaterCandidate {
 // Every tracked compartment that qualifies, ranked, before the budget is applied.
 // Exposed so a caller can see what was considered and rejected (same pattern as
 // `promotion::candidates()` and `promotion::gasCandidates()`).
-std::vector<WaterCandidate> waterCandidates(const Ship& ship, const WaterCriterion& criterion);
+//
+// `previousVelocity` and `dt` are what the lateral acceleration is differenced
+// from. `dt <= 0` reports zero acceleration rather than inventing one from a
+// single sample, which is the honest answer for a caller reviewing a static ship.
+std::vector<WaterCandidate> waterCandidates(const Ship& ship, const WaterCriterion& criterion,
+                                            const Vec3& previousVelocity = {}, double dt = 0);
 
 // --- 2. The state machine -------------------------------------------------
 
@@ -149,7 +164,13 @@ public:
 
     // Review the ship's compartments and decide which deserve FLIP.
     // Does not mutate the ship, does not step solvers, does not own them.
-    WaterReview review(const Ship& ship);
+    //
+    // `dt` is the model time since the previous review, and it is what the
+    // lateral acceleration is differenced over. A caller that passes nothing gets
+    // a criterion on roll rate alone -- which is the right answer for a static
+    // ship, where there is no acceleration to measure, and not a silent
+    // degradation: `WaterCandidate::accel` reads 0 and says so.
+    WaterReview review(const Ship& ship, double dt = 0);
 
     const std::vector<WaterActive>& active() const { return active_; }
     const WaterCriterion& criterion() const { return criterion_; }
@@ -163,6 +184,11 @@ public:
 private:
     WaterCriterion criterion_;
     std::vector<WaterActive> active_;
+    // The velocity at the previous review, which is the other half of the
+    // acceleration difference. Seeded on the first review, where there is no
+    // earlier sample and therefore no acceleration to report.
+    Vec3 previousVelocity_{};
+    bool havePreviousVelocity_ = false;
     // Panel index -> consecutive reviews qualifying, ascending (for dwell).
     // Follows `GasPromoter::qualifying_` pattern exactly.
     std::vector<std::pair<int, int>> qualifying_;

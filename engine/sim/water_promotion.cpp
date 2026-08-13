@@ -13,19 +13,48 @@ namespace promotion {
 
 // --- Helpers --------------------------------------------------------------
 
+// Roll is rotation about the ship's *own* longitudinal axis, and
+// `state.angularVelocity` is a world vector. Taking its x component treats the
+// two frames as the same, which they are only while the ship is upright -- and
+// the whole point of this criterion is the case where she is not. A ferry lolled
+// to 58 degrees has her bow axis nowhere near world x.
+//
+// The same confusion, one frame further out, is already in CLAUDE.md's table:
+// `state.velocity.x` read as "speed" when it is a world vector.
 static double computeRollRate(const Ship& ship) {
-    // Roll is rotation about the longitudinal (x) axis in body frame.
-    // Ship::state.angularVelocity is in world frame, so we need to transform
-    // it to body frame to extract the roll component.
-    // For now, assume small angles and take the x component magnitude.
-    return std::abs(ship.state.angularVelocity.x);
+    const Mat3 R = ship.state.orientation.toMat3();   // body -> world
+    // The body x axis expressed in world coordinates; the roll rate is the
+    // component of the world angular velocity along it.
+    const Vec3 bowAxis{R.m[0], R.m[3], R.m[6]};
+    return std::abs(dot(ship.state.angularVelocity, bowAxis));
 }
 
-static double computeLateralAccel(const Ship& ship) {
-    // Lateral acceleration is transverse (y-axis in body frame).
-    // For now, use world-frame velocity magnitude as a proxy.
-    // TODO: proper body-frame transformation and time derivative.
-    return length(ship.state.velocity);
+// Lateral acceleration, differenced from the velocity the caller last saw.
+//
+// **This was `length(state.velocity)` compared against a threshold in m/s^2** --
+// a speed standing in for an acceleration, so the units on the two sides of the
+// comparison never matched. `water_probe`'s beam-sea control read 2.26 "m/s2" at
+// 2 m of wave, which was 2.26 m/s of orbital speed: the criterion was firing on
+// how fast the ship was moving rather than on how hard she was being thrown.
+//
+// A ship drifting steadily at 3 m/s has no lateral acceleration at all and would
+// have promoted every compartment aboard; a ship snapped sideways from rest by a
+// collision has a large one and, at the instant it matters most, a small speed.
+// The sign of that error is the dangerous one -- it fires when nothing is
+// happening and stays quiet when something is.
+//
+// `dt <= 0` means the caller cannot say how much time passed, which is the case
+// for every test that reviews a static ship. There is no acceleration to be had
+// from a single sample, so it reports zero rather than inventing one.
+static double computeLateralAccel(const Ship& ship, const Vec3& previousVelocity,
+                                  double dt) {
+    if (dt <= 0) return 0;
+    const Vec3 dv = ship.state.velocity - previousVelocity;
+    const Mat3 R = ship.state.orientation.toMat3();
+    // Body y (to port) in world coordinates: the transverse direction, which is
+    // the one water sloshes along and the one a ro-pax capsizes about.
+    const Vec3 portAxis{R.m[1], R.m[4], R.m[7]};
+    return std::abs(dot(dv, portAxis)) / dt;
 }
 
 // Mean depth if the water were spread flat over the compartment's whole
@@ -80,11 +109,12 @@ void estimateFlipCost(const Compartment& comp, const WaterCriterion& /*criterion
     tiles = std::max(1, static_cast<int>(tilesExact));
 }
 
-std::vector<WaterCandidate> waterCandidates(const Ship& ship, const WaterCriterion& criterion) {
+std::vector<WaterCandidate> waterCandidates(const Ship& ship, const WaterCriterion& criterion,
+                                            const Vec3& previousVelocity, double dt) {
     std::vector<WaterCandidate> candidates;
 
     double rollRate = computeRollRate(ship);
-    double accel = computeLateralAccel(ship);
+    double accel = computeLateralAccel(ship, previousVelocity, dt);
 
     for (size_t i = 0; i < ship.compartments.size(); ++i) {
         const auto& comp = ship.compartments[i];
@@ -159,18 +189,28 @@ std::vector<WaterCandidate> waterCandidates(const Ship& ship, const WaterCriteri
 WaterPromoter::WaterPromoter(WaterCriterion criterion)
     : criterion_(std::move(criterion)) {}
 
-WaterReview WaterPromoter::review(const Ship& ship) {
+WaterReview WaterPromoter::review(const Ship& ship, double dt) {
     auto t0 = std::chrono::steady_clock::now();
 
+    // The first review has no earlier velocity to difference against, so it
+    // reports no acceleration however large dt is. Promoting on the strength of
+    // a difference taken from a default-constructed zero would read the ship's
+    // whole speed as one review's worth of acceleration -- the same units error
+    // this replaced, arriving once per promoter rather than once per review.
+    const double accelDt = havePreviousVelocity_ ? dt : 0.0;
+
     WaterReview result;
-    result.considered = waterCandidates(ship, criterion_);
+    result.considered = waterCandidates(ship, criterion_, previousVelocity_, accelDt);
 
     reviews_++;
 
     // --- Step 1: Check active compartments for demotion ---
 
     double rollRate = computeRollRate(ship);
-    double accel = computeLateralAccel(ship);
+    double accel = computeLateralAccel(ship, previousVelocity_, accelDt);
+
+    previousVelocity_ = ship.state.velocity;
+    havePreviousVelocity_ = true;
 
     std::vector<WaterActive> stillActive;
 
@@ -283,6 +323,8 @@ WaterReview WaterPromoter::review(const Ship& ship) {
 void WaterPromoter::clear() {
     active_.clear();
     qualifying_.clear();
+    previousVelocity_ = Vec3{};
+    havePreviousVelocity_ = false;
     reviews_ = 0;
     promotions_ = 0;
     demotions_ = 0;

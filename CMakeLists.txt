@@ -133,6 +133,14 @@ target_include_directories(flip_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(flip_tests PRIVATE shipsim_engine)
 target_compile_options(flip_tests PRIVATE -Wall -Wextra)
 
+# What `WaterPromoter` decides on a real flooding ferry, as opposed to on the
+# synthetic ship the unit tests drive it with. It promotes nothing and changes no
+# compartment: it runs the criterion alongside the scenario and reports what it
+# saw, which is what says whether activating it would move a published figure.
+add_executable(water_probe tools/water_probe/main.cpp game/prototype/ferry.cpp)
+target_link_libraries(water_probe PRIVATE shipsim_engine)
+target_compile_options(water_probe PRIVATE -Wall -Wextra)
+
 add_executable(section_probe tools/section_probe/main.cpp game/prototype/ferry.cpp)
 target_link_libraries(section_probe PRIVATE shipsim_engine)
 target_compile_options(section_probe PRIVATE -Wall -Wextra)
