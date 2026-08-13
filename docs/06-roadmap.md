@@ -1573,6 +1573,38 @@ should be honest about that.
   9.92 s roll period reaches **0.1525 rad/s, 3× over the threshold, and promotes**.
   The pair is the finding — silent through a capsize, live in a seaway.
 
+  **The two budgets were set independently and are not independent, which made
+  the whole tier unreachable.** `estimateFlipCost` puts 1000 particles and
+  `1/(64h³)` = 125 tiles in every m³ of water, so each budget states a *volume*:
+  100 000 particles is 100 m³, and 2000 tiles was **16 m³**. The tile budget
+  therefore bound 6.25× sooner and the particle budget could never be reached at
+  all — while the header called particles "the memory bottleneck", which at 115
+  bytes a cell they are not: a tile is 7.4 kB against a particle's 80 bytes, so
+  tiles are 92% of the footprint and the comment named the wrong one.
+
+  The consequence was not a tuning matter. **Any compartment over 16 m³ was
+  refused outright**, however hard she rolled, on a ship whose compartments run to
+  1232 m³. The probe seeded the vehicle deck — 462 m³, the largest free surface a
+  ro-pax has and the reason this tier exists at all — and watched it refused 154
+  times while a 1 m³ trickle in a forward hold was promoted instead. **The
+  refusals were silent**, because nothing read `WaterReview::problems`; a
+  criterion qualifying 2525 times and promoting once looks exactly like
+  hysteresis working until something prints the reason.
+
+  16 m³ is 16 MB and 462 m³ would be 462 MB, so the number was defensible and the
+  way it was expressed was not. The budgets now agree at 100 m³ — measured to
+  1.00× rather than asserted — and a compartment past `maxVolumePerCompartment`
+  is rejected with *its own reason* rather than as a transient budget condition,
+  because a vehicle deck that cannot be afforded is a finding about this tier and
+  not a passing shortage. With that, the beam-sea control promotes **7**
+  compartments — both engine rooms, three wing tanks and two holds — where it
+  promoted one. A vehicle deck still needs a coarser grid than h = 0.05, which is
+  the next question this tier has to answer.
+
+  `testBudgetsAdmitTheSameVolume` asserts the agreement against the arithmetic
+  rather than against the constants, so it fails when one number is edited and
+  not the other — which is exactly how it broke.
+
   **The control found two frame errors that every unit test had agreed with.**
   `computeLateralAccel` returned `length(state.velocity)` — a *speed* in m/s —
   compared against a threshold labelled m/s². The beam-sea run read 2.26 "m/s²"

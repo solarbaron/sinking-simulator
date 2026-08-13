@@ -136,6 +136,7 @@ most useful thing to know about this codebase:
 | A tool reporting `no usable GPU` **with a card present** passing as a skip, on four tools | classifying from outside the tool: an ICD and a device node exist, so a skip is a failure |
 | A boundary relaxation using `c_p` where `c_v` belongs, invisible to every existing test because they all stepped short enough that `C(1−e^{−rΔt/C}) → rΔt` **whatever `C` is** | asking the question at a step long enough for the exponential to bend |
 | A promotion criterion comparing `length(state.velocity)` — a **speed** — against a threshold in m/s², and taking world `angularVelocity.x` as roll on a ship at 58° of loll. Every test agreed, because the fixture set a velocity and *called* it an acceleration | running the criterion on the real ferry next to a beam-sea control, rather than on the synthetic ship the tests drive it with |
+| Two budgets for one cost model, set independently: 2000 tiles admitted 16 m³ where 100 000 particles admitted 100, so **no compartment over 16 m³ could ever be promoted** and the tier could not reach the vehicle deck it exists for. The 154 refusals were silent — nothing read `problems` — and read exactly like hysteresis working | seeding the compartment the tier is *for* and asking why it never promoted, then printing the refusal the review had been returning all along |
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct. **Nothing at all tests a comment** — three documents here repeated a

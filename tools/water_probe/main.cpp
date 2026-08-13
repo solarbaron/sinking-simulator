@@ -130,7 +130,15 @@ int main(int argc, char** argv) {
     double maxRollAt = 0, maxAccelAt = 0;
     int reviews = 0, everQualified = 0;
     double firstPromotionAt = -1;
-    int peakActive = 0, peakParticles = 0;
+    int peakActive = 0, peakParticles = 0, peakTiles = 0;
+    // **A review that refuses to promote says so in `problems`, and nothing was
+    // reading it.** A criterion that qualifies 2525 times and promotes once is
+    // either dwelling or being refused, and those are opposite findings: the
+    // first is the hysteresis working, the second is a budget too small to run
+    // the thing it is budgeting for. Without this the two are indistinguishable
+    // from the outside, which is the silent-failure shape this repo keeps
+    // finding.
+    int budgetRefusals = 0;
     // Every compartment that was ever promoted, and how many reviews it held.
     std::vector<std::pair<std::string, int>> promotedEver;
 
@@ -164,6 +172,9 @@ int main(int argc, char** argv) {
         if (static_cast<int>(promoter.active().size()) > peakActive)
             peakActive = static_cast<int>(promoter.active().size());
         if (r.particlesActive > peakParticles) peakParticles = r.particlesActive;
+        if (r.tilesActive > peakTiles) peakTiles = r.tilesActive;
+        for (const auto& p : r.problems)
+            if (p.find("budget") != std::string::npos) budgetRefusals++;
     }
 
     const Diagnostics d = ship.diagnostics(sea);
@@ -183,6 +194,29 @@ int main(int argc, char** argv) {
     std::printf("    peak compartments active              %8d\n", peakActive);
     std::printf("    peak particles active                 %8d   (budget %d)\n",
                 peakParticles, crit.particleBudget);
+    std::printf("    peak tiles active                     %8d   (budget %d)\n",
+                peakTiles, crit.tileBudget);
+    std::printf("    reviews that refused on budget        %8d\n", budgetRefusals);
+
+    // **Which budget binds, at the cost model the promoter actually uses.** The
+    // two are set independently and are not independent: `estimateFlipCost` puts
+    // 1000 particles and 1/(64 h^3) = 125 tiles in every cubic metre, so the
+    // volume each budget admits is fixed and one of them is always the smaller.
+    // A budget that can never bind is not a limit, it is a number in a header --
+    // and the particle count is the one the comment calls "the memory
+    // bottleneck".
+    {
+        const double h = 0.05;
+        const double m3PerParticleBudget = crit.particleBudget / 1000.0;
+        const double m3PerTileBudget = crit.tileBudget * (64.0 * h * h * h);
+        std::printf("\n    the particle budget admits %.1f m3; the tile budget admits %.1f m3\n",
+                    m3PerParticleBudget, m3PerTileBudget);
+        std::printf("    so %s binds first, by %.2fx -- the other cannot ever be reached\n",
+                    m3PerTileBudget < m3PerParticleBudget ? "the TILE budget" : "the PARTICLE budget",
+                    m3PerParticleBudget > m3PerTileBudget
+                        ? m3PerParticleBudget / m3PerTileBudget
+                        : m3PerTileBudget / m3PerParticleBudget);
+    }
 
     if (!promotedEver.empty()) {
         std::printf("\n    compartments promoted at least once:\n");

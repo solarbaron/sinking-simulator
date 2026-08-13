@@ -92,8 +92,40 @@ struct WaterCriterion {
     // Budget: shared across all active compartments.
     // Particles determine memory (Vec3 x, Vec3 v, Mat3 C, double m = ~80 bytes).
     // Tiles scale with wetted volume (4×4×4 cells, sparse hash map).
-    int particleBudget = 100000;        // total, all compartments
-    int tileBudget = 2000;              // 4×4×4 tiles
+    //
+    // **These two are not independent, and setting them as though they were made
+    // one of them unreachable.** `estimateFlipCost` puts 1000 particles and
+    // `1/(64 h³)` = 125 tiles in every cubic metre of water, so each budget
+    // states a volume: 100 000 particles is 100 m³ and 2000 tiles is **16 m³**.
+    // The tile budget therefore binds 6.25× sooner and the particle budget can
+    // never be reached at all -- while the comment above calls particles the
+    // memory bottleneck, which at 115 bytes a cell they are not: a tile is 7.4 kB
+    // and a particle is 80 bytes, so tiles are 92% of the footprint.
+    //
+    // The consequence was not a tuning matter. Any compartment over 16 m³ was
+    // refused outright, however hard she rolled, so the tier could not reach a
+    // single compartment that matters: `water_probe` seeded the vehicle deck --
+    // 462 m³, the largest free surface a ro-pax has and the reason this tier
+    // exists -- and watched it be refused 154 times while a 1 m³ trickle in a
+    // forward hold was promoted instead. The refusals were silent, because
+    // nothing read `WaterReview::problems`.
+    //
+    // 16 m³ is 16 MB and 462 m³ would be 462 MB, so the *number* was defensible
+    // and the way it was expressed was not. Both are kept, in agreement, and
+    // `maxVolumePerCompartment` states the real limit in the units the decision
+    // is actually made in.
+    int particleBudget = 100000;        // total, all compartments == 100 m³
+    int tileBudget = 12500;             // 4×4×4 tiles, == the same 100 m³
+
+    // The largest single compartment worth promoting, m³. A compartment past this
+    // is not refused silently as "over budget" -- it is rejected with a reason,
+    // because a vehicle deck that cannot be afforded is a finding about this tier
+    // and not a transient budget condition.
+    //
+    // 100 m³ at h = 0.05 is ~100 MB and ~1.7 core-seconds per simulated second.
+    // A larger compartment needs a coarser grid rather than a bigger budget; see
+    // the roadmap's Phase 5 entry.
+    double maxVolumePerCompartment = 100.0;
 
     // Core-seconds per simulated second per compartment, for cost reporting.
     // Measured rather than assumed, on the same terms as structural/gas tiers.

@@ -146,6 +146,18 @@ std::vector<WaterCandidate> waterCandidates(const Ship& ship, const WaterCriteri
         estimateFlipCost(comp, criterion, cand.particles, cand.tiles);
         cand.cost = criterion.coreSecondsPerCompartment;
 
+        // Too large to resolve at this grid spacing, and that is a property of
+        // the compartment rather than of how busy the budget happens to be. It
+        // gets its own reason: a vehicle deck refused because it cannot be
+        // afforded is a finding about this tier, and it read as a transient
+        // "budget exhausted" for as long as the two were the same branch.
+        if (comp.waterVolume > criterion.maxVolumePerCompartment) {
+            cand.score = 0;
+            cand.why = "too large to resolve at this grid spacing";
+            candidates.push_back(cand);
+            continue;
+        }
+
         // Check motion thresholds
         bool rollQualifies = rollRate >= criterion.rollRatePromote;
         bool accelQualifies = accel >= criterion.accelPromote;

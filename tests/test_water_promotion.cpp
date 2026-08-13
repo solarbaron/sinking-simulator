@@ -403,6 +403,46 @@ void testAntiChatterWithHysteresis() {
 // Section 3: Budget Enforcement
 // ===========================================================================
 
+// The two budgets state the same volume, and that is an invariant rather than a
+// coincidence: `estimateFlipCost` derives both from the wetted volume, so a
+// budget pair that disagrees makes the larger of the two unreachable. It
+// disagreed by 6.25x once -- 2000 tiles admitting 16 m3 against 100 000
+// particles admitting 100 -- and the consequence was that no compartment over
+// 16 m3 could be promoted at all, on a ship whose compartments run to 1232.
+//
+// Asserted against the arithmetic rather than against the constants, so it fails
+// when someone edits one number and not the other, which is exactly how it broke.
+void testBudgetsAdmitTheSameVolume() {
+    std::printf("\n   the two budgets admit the same volume\n");
+
+    WaterCriterion crit;
+
+    // What each budget admits, at the cost model the promoter actually uses.
+    const double h = 0.05;                       // m, estimateFlipCost's cell size
+    const double particlesPerM3 = 1000.0;
+    const double tilesPerM3 = 1.0 / (64.0 * h * h * h);   // 4x4x4 cells per tile
+
+    const double m3FromParticles = crit.particleBudget / particlesPerM3;
+    const double m3FromTiles = crit.tileBudget / tilesPerM3;
+
+    std::printf("      particles admit %.1f m3, tiles admit %.1f m3\n",
+                m3FromParticles, m3FromTiles);
+
+    expectNear("the particle and tile budgets admit the same volume",
+               m3FromParticles, m3FromTiles, 1e-9);
+
+    // And the guard against a vacuous version of the test above: if either
+    // budget were zero they would agree trivially and admit nothing.
+    expectTrue("and it is not zero", m3FromParticles > 1.0);
+
+    // The per-compartment ceiling is the one the decision is really made on, and
+    // it must not exceed what the shared budget can hold -- a compartment that
+    // passes the volume gate and is then refused by the budget is the silent
+    // rejection this pair replaced.
+    expectTrue("the per-compartment ceiling fits inside the shared budget",
+               crit.maxVolumePerCompartment <= m3FromParticles);
+}
+
 void testParticleBudgetEnforcement() {
     std::printf("\n   particle budget enforcement\n");
 
@@ -802,6 +842,7 @@ void runWaterPromotionTests() {
     testAntiChatterWithHysteresis();
 
     // Section 3: Budget
+    testBudgetsAdmitTheSameVolume();
     testParticleBudgetEnforcement();
     testTileBudgetEnforcement();
     testBudgetAccountingAcrossReviews();

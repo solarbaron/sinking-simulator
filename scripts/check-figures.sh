@@ -808,7 +808,7 @@ if [ -x "$WATER" ]; then
   seaprom=$(printf '%s\n' "$wsea" | sed -n 's/^ *promotions *\([0-9]*\).*/\1/p')
   check "the beam-sea control's peak roll rate (rad/s)" 0.1525 0.002 "$searoll" \
         "0.1525 rad/s, 3× over the threshold" "$DOC"
-  check "and that it does promote" 1 0 "$seaprom" \
+  check "and that it does promote" 7 0 "$seaprom" \
         "0.1525 rad/s, 3× over the threshold" "$DOC"
 else
   echo "  - water_probe not built, skipping the promoter's figures"
