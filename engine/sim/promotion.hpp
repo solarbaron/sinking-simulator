@@ -47,9 +47,11 @@
 //
 // --- 1. Cost is the whole design ----------------------------------------------
 //
-// A Tier-2 element costs `4.0 x elementCount` core-seconds per simulated second
-// (`zone.hpp` §1), and that is **linear in the number of elements and therefore
-// linear in the number of zones**. There is no economy of scale to hide behind:
+// A Tier-2 element costs `1.7 x elementCount` core-seconds per simulated second
+// (`zone.hpp` §1 -- it read 4.0 here until the constant was measured, which is the
+// pre-`cacheRestForms` figure `zone.hpp` itself warns is 2.4x pessimistic), and
+// that is **linear in the number of elements and therefore linear in the number
+// of zones**. There is no economy of scale to hide behind:
 // promoting ten patches costs ten times one patch, exactly, and
 // `tests/test_promotion.cpp` measures that rather than assuming it.
 //
@@ -669,7 +671,7 @@ StructuralMesh reduce(const StructuralMesh& structure, const SectionReduction& r
 // 100 x 19 m vehicle deck (14.8) do not.
 //
 // **Cost here is not linear in the resolution, and that is the difference from §1.**
-// A Tier-2 zone costs `4.0 x elements` core-seconds per simulated second, exactly,
+// A Tier-2 zone costs `1.7 x elements` core-seconds per simulated second, exactly,
 // because the step is fixed. Halving this model's cell size multiplies the cells by
 // eight *and* halves the advective step *and* lengthens the pressure solve, so the
 // measured cost per cell per simulated second **rises** with refinement: 1.5e-6 at

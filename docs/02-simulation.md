@@ -2344,7 +2344,7 @@ not.** A 3D shell model of a region, condensed by **Craig–Bampton component mo
 synthesis**: retain the interface DOF plus the lowest few fixed-interface normal
 modes, discard the rest — `engine/sim/reduction.{hpp,cpp}`, below. Two figures in
 the plan this paragraph used to state are now measured and both were optimistic.
-The cost saving on the same patch of the ferry's side is **2800×**, not 10⁻⁵, and
+The cost saving on the same patch of the ferry's side is **1200×**, not 10⁻⁵, and
 "a few percent for the frequency range that matters" needs the frequency range
 named: the standard cutoff at twice the band of interest buys **0.6% inside the
 10 Hz hull-girder band and 8% up to 20 Hz**, and five or six times the band is
@@ -2732,11 +2732,18 @@ ZoneDamage indent(const StructuralMesh&, const Vec3&, const MeshParams&, const S
 
 The stable step is `t / c_p` — thickness governed, flat in the in-plane element
 size — so for 12 mm plating it is 1.8 µs and 5.5 × 10⁵ steps buy one simulated
-second. At 7.3 µs per elastoplastic element that is
+second. At **3.1 µs** per elastoplastic element that is
 
 ```
-core-seconds per simulated second = 4.0 x elementCount
+core-seconds per simulated second = 1.7 x elementCount
 ```
+
+**This read `7.3 µs` and `4.0` until it was re-derived.** Those are the figures
+from before `SolveParams::cacheRestForms` stopped rebuilding the step-invariant
+element forms every step — the change `zone.hpp` §1 calls the single largest cost
+decision in that file, and whose own note says every figure predating it is 2.4×
+pessimistic per element. Four other sites carried the same stale constant, each
+quoting the last rather than the measurement.
 
 and **the zone is bounded by element count, not by area**. Since the step does not
 care about the in-plane size, area and resolution trade as `elements = area / h²`:
@@ -3470,7 +3477,7 @@ not transfer.
 
 #### The criterion: what Tier-2 adds, not what is worst
 
-The cost is `4.0 × elementCount` core-seconds per simulated second and it is
+The cost is `1.7 × elementCount` core-seconds per simulated second and it is
 **linear in the number of zones** — measured, not assumed: two zones take
 2.00× one zone of the same size. So "promote where utilisation is high" is not
 usable. A ship at 0.9 of her buckling capacity everywhere is a *well* designed
@@ -3748,7 +3755,7 @@ equivalent.
 `engine/sim/reduction.{hpp,cpp}`, checked by `tests/test_reduction.cpp`. The
 missing middle: Tier 0 is the whole ship as a beam and knows nothing about where
 stress goes within a section; Tier 2 is solid-shell elements over a patch at
-`4.0 × elementCount` core-seconds per simulated second. Nothing could give a
+`1.7 × elementCount` core-seconds per simulated second. Nothing could give a
 structural answer for a whole hold, a superstructure, or the region between two
 bulkheads. This is what fills that gap.
 
@@ -3974,9 +3981,9 @@ even when zero modes are kept, so "no modes were needed" is a number.
 |---|---|---|---|
 | **Tier 0** | the whole ship, as a beam | — | **0.10** (`hullGirder` 0.995 ms at 100 Hz) |
 | **Tier 1** | this patch, linear | 0.11 s to reduce (1.5 s at 47 modes) + 0.01 s to factor | **0.35–0.41** (1 ms implicit steps, 528–575 DOF) |
-| **Tier 2** | this patch, nonlinear | 8 ms to mesh | **1155** (`4.0 × elementCount`, 1.72 µs explicit steps) |
+| **Tier 2** | this patch, nonlinear | 8 ms to mesh | **490** (`1.7 × elementCount`, 1.72 µs explicit steps) |
 
-**Tier 1 is 2800× cheaper than Tier 2 on the same plating** and about four times
+**Tier 1 is 1200× cheaper than Tier 2 on the same plating** and about four times
 the cost of the beam that covers the entire ship. The explicit step is 1.72 µs and
 thickness-governed, so Tier 2 takes 580 000 steps where a linear implicit model
 takes a thousand — that ratio, not the matrix size, is where the three orders of

@@ -5,7 +5,7 @@
 //
 // `girder.hpp` is the whole ship as a beam: 200 DOF, microseconds, and it knows
 // nothing about where stress goes *within* a section. `zone.hpp` is solid-shell
-// elements with plasticity over a patch: uncompromised, and `4.0 x elementCount`
+// elements with plasticity over a patch: uncompromised, and `1.7 x elementCount`
 // core-seconds per simulated second with a hard ceiling at ~8000 elements, where
 // the per-element stiffness store leaves L3 and the parallel speedup falls off a
 // cliff (`02-simulation.md` §3). Between "the ship is a beam" and "twenty-four

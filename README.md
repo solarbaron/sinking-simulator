@@ -237,7 +237,7 @@ static condensation is exact at the interface for *any* load (2 × 10⁻¹⁰ m 
 six zero eigenvalues, and the reduced frequencies come down **from above**,
 monotonically, because a reduction can only stiffen. On the same patch of the
 ferry's side it costs 0.4 core-seconds per simulated second against Tier 2's 1155
-— 2800× — and what it buys with that is nothing nonlinear at all: it cannot yield,
+— 1200× — and what it buys with that is nothing nonlinear at all: it cannot yield,
 tear, buckle or rotate, so it also reports when it has stopped being valid and the
 region has to be promoted. Three published figures in the plan turned out to be
 optimistic and are corrected there.
