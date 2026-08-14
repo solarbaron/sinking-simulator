@@ -702,6 +702,29 @@ struct GasCriterion {
     // Cells across every resolved compartment at once. One compartment at 0.5 m on
     // a machinery space is a few thousand, so this is a statement about how many
     // compartments may be resolved rather than about how fine any of them is.
+    //
+    // **On the real ferry that statement resolves to "one", and `gas_probe` is
+    // what says so.** Her machinery spaces come out at 7 670 cells each and the
+    // vehicle deck at 11 322, against a budget of 12 000 — so the first
+    // compartment to promote consumes 64% of the total and *nothing can ever join
+    // it*. A 4 MW fire in `engine_room_s` promotes that compartment at t = 112 s
+    // and then refuses on budget **35 times** over the next eight minutes, which
+    // is the port engine room asking to be resolved and being turned away because
+    // the starboard one already is. Fire spreading between the two is the case
+    // this tier exists for.
+    //
+    // This is the water tier's defect in a different unit: `cellBudget` and
+    // `grid.maxCells` are both denominated in cells and both default to 12 000, so
+    // the per-compartment ceiling *is* the global budget and the two cannot
+    // disagree about one compartment while being unable to admit two. The
+    // refusals were silent for the same reason they were there -- nothing read
+    // `GasReview::problems`.
+    //
+    // Left at 12 000 rather than raised on the spot: what the right number is
+    // depends on how many compartments a caller means to resolve at once and on
+    // `coreSecondsPerCell`, which is itself a one-point extrapolation nothing
+    // asserts. Raising it without measuring would replace a known limit with an
+    // unknown one.
     int cellBudget = 12000;
 
     // Core-seconds of wall time per simulated second per cell, for reporting only,

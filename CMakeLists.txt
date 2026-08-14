@@ -141,6 +141,14 @@ add_executable(water_probe tools/water_probe/main.cpp game/prototype/ferry.cpp)
 target_link_libraries(water_probe PRIVATE shipsim_engine)
 target_compile_options(water_probe PRIVATE -Wall -Wextra)
 
+# The same instrument for the gas tier, which had none. `GasPromoter` was
+# exercised by one test file and by nothing else, so every compartment it had
+# ever judged was built by a test to have the property under test -- which is
+# exactly how the water tier's defects stayed invisible while its suite was green.
+add_executable(gas_probe tools/gas_probe/main.cpp game/prototype/ferry.cpp)
+target_link_libraries(gas_probe PRIVATE shipsim_engine)
+target_compile_options(gas_probe PRIVATE -Wall -Wextra)
+
 add_executable(section_probe tools/section_probe/main.cpp game/prototype/ferry.cpp)
 target_link_libraries(section_probe PRIVATE shipsim_engine)
 target_compile_options(section_probe PRIVATE -Wall -Wextra)

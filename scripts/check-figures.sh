@@ -81,6 +81,8 @@ set -u
 
 RAM=${RAM:-./build/ram_view}
 WATER=${WATER:-./build/water_probe}
+GAS=${GAS:-./build/gas_probe}
+GASDOC=engine/sim/promotion.hpp
 SECTION=${SECTION:-./build/section_probe}
 SECTION_DOC=docs/02-simulation.md
 RENDER_DOC=docs/03-renderer-audio.md
@@ -846,6 +848,40 @@ if [ -x "$WATER" ]; then
 else
   echo "  - water_probe not built, skipping the promoter's figures"
   skipped="$skipped water_probe"
+fi
+
+# --- the gas tier's budget, which admits exactly one compartment -------------------
+#
+# `gas_probe` is the gas tier's `water_probe`, and it exists because `GasPromoter`
+# had been exercised by one test file and nothing else -- so every compartment it
+# had ever judged was built by a test to have the property under test. Run against
+# the real ferry it reproduced the water tier's defect in a different unit: the
+# machinery spaces are 7 670 cells each against a 12 000-cell budget, so the first
+# to promote takes 64% and the second is refused however hard it qualifies.
+#
+# **The refusal count is the figure, not the promotion count.** One promotion on
+# its own is consistent with a criterion that is simply quiet; 35 refusals in the
+# same run is what says the tier is budget-bound rather than idle, and it is the
+# number that would move if either limit were retuned. Both are gated, as a pair.
+#
+# ~20 s: 600 s of fire at 2 s steps.
+if [ -x "$GAS" ]; then
+  for h in "7 670 cells each and the" "**35 times**"; do
+    hint "$h" "$GASDOC"
+  done
+  gasrun=$("$GAS" --duration=600 2>&1)
+  gasprom=$(printf '%s\n' "$gasrun" | sed -n 's/^ *promotions *\([0-9]*\).*/\1/p')
+  gasref=$(printf '%s\n' "$gasrun" | sed -n 's/^ *reviews that refused on budget *\([0-9]*\).*/\1/p')
+  gascells=$(printf '%s\n' "$gasrun" | sed -n 's/^ *engine_room_s *\([0-9]*\) *[0-9.]*.*/\1/p' | tail -1)
+  check "the gas tier promotes one compartment" 1 0 "$gasprom" \
+        "7 670 cells each and the" "$GASDOC"
+  check "and refuses the other on budget, repeatedly" 35 2 "$gasref" \
+        "**35 times**" "$GASDOC"
+  check "a machinery space's resolved cell count" 7670 0 "$gascells" \
+        "7 670 cells each and the" "$GASDOC"
+else
+  echo "  - gas_probe not built, skipping the gas tier's budget figures"
+  skipped="$skipped gas_probe"
 fi
 
 # --- the section mesher's reach ---------------------------------------------------
