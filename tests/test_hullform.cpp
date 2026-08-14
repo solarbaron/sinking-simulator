@@ -211,8 +211,40 @@ void testMeasuredCoefficientsAreSelfConsistent() {
     const TriMesh hull = makeHullFromParticulars(p);
     const HullCoefficients c = measureHull(hull, p.draft, p.lengthPp, p.beam);
 
-    expectNear("Cp equals Cb over Cm as measured", c.prismaticCoefficient,
-               c.blockCoefficient / c.midshipCoefficient, 1e-9);
+    // **`Cp == Cb/Cm` was asserted here and is gone: `measureHull` *defines*
+    // `prismaticCoefficient` as that division** (`hullform.cpp`), so the test
+    // recomputed one line of the code under test from the same struct's own
+    // fields. Measured residual: exactly 0.000e+00, for any hull, correct or
+    // broken — while the comment above claimed it checked the identity "as
+    // measured, not merely as requested".
+    //
+    // What checks that is the mesh against something the mesh did not produce.
+    // `AreaCurve::prismaticCoefficient()` is analytic — it integrates the fitted
+    // exponents, not the triangles — so comparing it to `measureHull`'s value
+    // closes the loop the old assertion only appeared to: the curve was asked
+    // for a Cp, the hull was built from the curve, and the hull is now measured
+    // back. Two independent paths, one number.
+    std::vector<std::string> curveProblems;
+    // The particulars carry Cb and Cm; Cp is what the hull builder derives from
+    // them and hands the curve, so that derivation is the input here, not an
+    // output being checked against itself.
+    const double targetCp = p.blockCoefficient / p.midshipCoefficient;
+    const AreaCurve curve = solveAreaCurve(targetCp, p.lcbFraction,
+                                           p.transomFraction, p.stemFraction,
+                                           p.parallelMiddleBodyFraction, &curveProblems);
+    expectTrue("the area curve met its targets without clamping", curveProblems.empty());
+
+    const double analytic = curve.prismaticCoefficient();
+    std::printf("     Cp: analytic curve %.6f, measured off the mesh %.6f (%.3f%%)\n",
+                analytic, c.prismaticCoefficient,
+                100.0 * (c.prismaticCoefficient / analytic - 1.0));
+    expectNear("the mesh's prismatic coefficient is the curve's, to tessellation",
+               c.prismaticCoefficient, analytic, 0.01 * analytic);
+
+    // The guard that stops the above passing on two numbers that are equal for
+    // an uninteresting reason: a Cp of zero, or a mesh that clipped to nothing.
+    expectTrue("and both are a real prismatic coefficient",
+               analytic > 0.5 && analytic < 1.0);
     expectNear("displacement equals Cb L B T", c.displacedVolume,
                c.blockCoefficient * p.lengthPp * p.beam * p.draft,
                1e-9 * c.displacedVolume);

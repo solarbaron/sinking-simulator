@@ -47,9 +47,17 @@
 //
 // Put together, at the resolution `MeshParams::subdivision = 4` delivers on the
 // reference ferry (0.6 m x 0.175 m elements, four across the 0.70 m between
-// longitudinals), a fourteen-panel zone is 224 elements at 900 core-seconds per
-// simulated second, and driving a punch 0.23 m into her takes 0.04 s of simulated
-// time -- **4.5 s of wall time on 23 workers**, against 15.4 s on one; the speedup
+// longitudinals), a fourteen-panel zone is 224 elements at **380** core-seconds
+// per simulated second, and driving a punch 0.23 m into her takes 0.04 s of
+// simulated time -- **4.5 s of wall time on 23 workers**, against 15.4 s on one;
+//
+// **That figure read 900 until it was checked against the sentence it is in.**
+// 900 is `224 x 5.5e5 x 7.3 us` -- the pre-`cacheRestForms` cost, the one §1
+// above declares superseded and says every figure below it is 2.4x pessimistic.
+// The measurement eight words later refutes it without leaving the line: 15.4
+// core-seconds over 0.04 s of simulated time is **385**, which is the live 3.1 us
+// to within 1%. A prediction and its own measurement, adjacent and 2.36x apart.
+// the speedup
 // saturates at 3.4x because a step is a barrier and the zone is small, not because
 // the element loop fails to thread. Measured, not extrapolated. The same
 // 24 m^2 at 50 mm elements is 9 600 elements and forty times that. `Solver`

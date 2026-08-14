@@ -944,7 +944,7 @@ void Solver::computeForces() {
         if (plastic_[e].torn) {
             // Output-identical to letting the update run -- every point has failed, so
             // `plasticity::update` returns no stress and no dissipation -- and it
-            // saves the whole 7 µs for the rest of a dead element's life. The same
+            // saves the whole 3.1 µs for the rest of a dead element's life. The same
             // argument as `solid_shell.cpp`'s pre-loop check for a degraded element.
             std::fill(out, out + kDof, 0.0);
             double* stress = elementStress_.data() + e * kGauss * 6;

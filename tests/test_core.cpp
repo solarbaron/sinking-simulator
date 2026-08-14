@@ -117,6 +117,72 @@ void testMeshesAreWatertight() {
 // The capped solid produced by clipByPlane() must enclose exactly the volume the
 // cap-free integrator reports for the same half-space. If the cap leaks, or is
 // wound backwards, or a loop is dropped, these disagree immediately.
+// The buoyancy force and the reported diagnostics use *different* implementations
+// of one integral, and nothing compared them.
+//
+// `integrateBelowPlane` and `PlaneSweep::below` carry the same contract, word for
+// word — "volume and centroid of the region satisfying dot(n, x) <= offset" — and
+// `ship.cpp` splits between them: the force path (`integrateRigidBody`, the
+// floodwater centroid, the cached waterplane area, the roll/pitch stiffness) goes
+// through `PlaneSweep`, while `diagnostics` and `rightingArmAtHeel` call the free
+// function. No test constructed a `PlaneSweep` at all.
+//
+// They agree to the bit on a unit normal, which is what makes the assertion below
+// tight rather than tolerant. **They do not agree otherwise**, and that is the
+// point of the second half: `PlaneSweep` normalises in its constructor and
+// `integrateBelowPlane` does not, so `offset` means "distance along the unit
+// normal" to one and "dot(n,x) with the caller's own n" to the other. Neither
+// header states a precondition. At |n| = 0.5 they return answers 1.7x apart; at
+// |n| = 10 the free function reports eighteen times the hull's entire volume,
+// with no error and no assert.
+//
+// No live caller is broken — every one passes a unit normal or a rotation of one.
+// This pins the agreement where it is relied on and states the divergence where it
+// is not, so the next caller to pass an unnormalised vector finds out here.
+void testTheTwoPlaneIntegralsAgree() {
+    const TriMesh hull = testHull();
+    const Vec3 normals[] = {{0, 0, 1}, {1, 0, 0},
+                            normalize(Vec3{0.3, -0.8, 0.5}),
+                            normalize(Vec3{0, std::sin(0.6), std::cos(0.6)})};
+    const double offsets[] = {-20.0, 0.0, 3.7, 5.5, 12.0, 40.0};
+
+    double worstVolume = 0, worstCentroid = 0, largest = 0;
+    for (const Vec3& n : normals) {
+        const PlaneSweep sweep(hull, n);
+        for (double off : offsets) {
+            const VolumeIntegral loose = integrateBelowPlane(hull, n, off);
+            const VolumeIntegral cached = sweep.below(off);
+            worstVolume = std::max(worstVolume, std::abs(loose.volume - cached.volume));
+            largest = std::max(largest, std::abs(loose.volume));
+            if (loose.volume > 1e-9)
+                worstCentroid = std::max(worstCentroid,
+                                         length(loose.centroid - cached.centroid));
+        }
+    }
+    std::printf("     the two plane integrals: worst volume %.3e m3, worst centroid %.3e m\n",
+                worstVolume, worstCentroid);
+
+    // Bit-identical on a unit normal but for the ULP `normalize` introduces, so
+    // this is asserted at what was measured rather than at a comfortable band.
+    expectTrue("the cached sweep and the free integral agree on volume",
+               worstVolume <= 1e-14 * std::max(largest, 1.0));
+    expectTrue("and on centroid", worstCentroid <= 1e-12);
+    // The guard: a hull that clipped to nothing would satisfy both trivially.
+    expectTrue("and there was a real volume to compare", largest > 1e3);
+
+    // The divergence, stated rather than merely known. `PlaneSweep` normalises and
+    // `integrateBelowPlane` does not, so on a non-unit normal the same arguments
+    // describe different planes — and the free function's reference point
+    // `o = n * offset` stops lying on `dot(n,x) == offset`, which is the whole
+    // reason its cap tetrahedra are supposed to vanish.
+    const Vec3 half{0, 0, 0.5};
+    const VolumeIntegral looseHalf = integrateBelowPlane(hull, half, 2.5);
+    const VolumeIntegral sweepHalf = PlaneSweep(hull, half).below(2.5);
+    expectTrue("a non-unit normal makes the two disagree, which is why callers"
+               " must pass a unit one",
+               std::abs(looseHalf.volume - sweepHalf.volume) > 0.1 * sweepHalf.volume);
+}
+
 void testClipMatchesIntegral() {
     const TriMesh hull = testHull();
     const Vec3 normals[] = {{1, 0, 0}, {0, 0, 1}, {0, 1, 0},
@@ -2311,6 +2377,7 @@ void runCoreTests() {
     testTiltedClipAgainstAlgebra();
     testVolumeSolveRoundTrip();
     testMeshesAreWatertight();
+    testTheTwoPlaneIntegralsAgree();
     testClipMatchesIntegral();
     testSubdivisionTiles();
     testClippedCompartmentStaysInsideHull();
