@@ -7,6 +7,7 @@
 // counters that reset so a destroyed entity comes back to life, a component this
 // build does not know taking the rest of the entity down with it, and a
 // truncated file loading "successfully" into a half-populated world.
+#include <cstring>
 #include "engine/core/ecs.hpp"
 #include "engine/core/reflect.hpp"
 #include "engine/core/serialise.hpp"
@@ -199,7 +200,13 @@ void testTruncatedSaveIsRejected() {
     const std::vector<std::byte> full(writer.bytes());
 
     int accepted = 0, leftPopulated = 0;
-    for (std::size_t length = 0; length < full.size(); length += 7) {
+    // **Every truncation, which is what the comment above and CLAUDE.md both
+    // claim.** This stepped by 7 and so fed the loader 604 of 4224 lengths —
+    // 86% of them never tried — while asserting "no truncation of a valid save
+    // is accepted". The stride arrived in the very commit whose lesson was to
+    // sweep exhaustively; `test_serialise.cpp` and `test_shipfile.cpp` both do
+    // it a byte at a time, and an in-memory loader over 4 kB costs nothing.
+    for (std::size_t length = 0; length < full.size(); ++length) {
         World target;
         ByteReader reader(std::span<const std::byte>(full.data(), length));
         if (target.load(reader)) {
@@ -218,6 +225,82 @@ void testTruncatedSaveIsRejected() {
     World target;
     ByteReader reader(wrongMagic);
     expectTrue("a foreign file is refused", !target.load(reader));
+}
+
+// **A well-formed file with a wrong number in it, which truncation cannot
+// reach.** Every case above cuts the stream short; this one is the right length,
+// the right magic and the right version, and lies about a single index.
+//
+// The loader validated the free list's *length* against the bytes behind it and
+// then read the indices without looking at them, while the entity loop twenty
+// lines below had always bounds-checked its own. A save declaring four records
+// and one free index of 0xFFFFFFF0 loaded successfully, and the next `create()`
+// popped that index and used it to subscript `records_` — caught here only
+// because libstdc++'s assertions are on; with them off it is a wild write.
+//
+// The layout is computed rather than searched for: magic, version, recordCount,
+// then one generation per record, then the free count. An earlier version of
+// this probe scanned for the byte pattern `(4, 0)` and matched `recordCount`
+// followed by the first generation instead — it spliced into the wrong field and
+// "proved" the bug against a stream that was merely malformed.
+void testACorruptFreeListIsRefused() {
+    World source;
+    for (int i = 0; i < 4; ++i) source.create();
+    ByteWriter writer;
+    source.save(writer);
+    const std::vector<std::byte> full(writer.bytes());
+
+    const std::size_t freeCountOffset = 12 + 4 * sizeof(std::uint32_t);
+    std::uint32_t freeCount = 1;
+    std::memcpy(&freeCount, full.data() + freeCountOffset, sizeof(freeCount));
+    expectEqual("the save layout is what this test assumes",
+                static_cast<int>(freeCount), 0);
+
+    // Splice in a free list of one out-of-range index.
+    const auto spliced = [&](std::uint32_t index) {
+        std::vector<std::byte> bytes(full.begin(), full.begin() + freeCountOffset);
+        const std::uint32_t one = 1;
+        const auto* onep = reinterpret_cast<const std::byte*>(&one);
+        const auto* idxp = reinterpret_cast<const std::byte*>(&index);
+        bytes.insert(bytes.end(), onep, onep + 4);
+        bytes.insert(bytes.end(), idxp, idxp + 4);
+        bytes.insert(bytes.end(), full.begin() + freeCountOffset + 4, full.end());
+        return bytes;
+    };
+
+    for (const std::uint32_t wild : {0xFFFFFFF0u, 4u, 0x7FFFFFFFu}) {
+        const std::vector<std::byte> bad = spliced(wild);
+        World victim;
+        ByteReader in(bad);
+        expectTrue("a free index outside the record table is refused",
+                   !victim.load(in));
+        expectEqual("and the refused load leaves no world behind",
+                    static_cast<int>(victim.entityCount()), 0);
+    }
+
+    // A free index that is *in* range but names a live entity is refused too:
+    // it would hand the next `create()` a record another entity already holds.
+    // Index 0 is live in this save — nothing was destroyed.
+    const std::vector<std::byte> aliased = spliced(0u);
+    World victim;
+    ByteReader in(aliased);
+    expectTrue("a free index that aliases a live entity is refused",
+               !victim.load(in));
+
+    // The vacuity guard: the same splice with a *legitimate* free index must
+    // still load, or the four assertions above would hold on a loader that
+    // refused every save with a non-empty free list.
+    World destroyed;
+    const Entity a = destroyed.create();
+    for (int i = 0; i < 3; ++i) destroyed.create();
+    destroyed.destroy(a);
+    ByteWriter w2;
+    destroyed.save(w2);
+    World reloaded;
+    ByteReader in2(w2.bytes());
+    expectTrue("but a save with a real free list still loads", reloaded.load(in2));
+    expectEqual("with its live entities intact",
+                static_cast<int>(reloaded.entityCount()), 3);
 }
 
 // Saving is a pure function of world state, and loading must not perturb it:
@@ -278,6 +361,7 @@ void runWorldIoTests() {
     testHandleStalenessSurvives();
     testUnknownComponentIsSkipped();
     testTruncatedSaveIsRejected();
+    testACorruptFreeListIsRefused();
     testSaveIsStableUnderRoundTrip();
     testLoadReplacesExistingContents();
 }

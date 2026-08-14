@@ -355,12 +355,40 @@ bool World::loadImpl(ByteReader& reader) {
         records_[i].alive = false;
     }
 
+    // **The free list's *values* are bounds-checked, not just its length.**
+    //
+    // This validated `freeCount` against the bytes remaining and then read the
+    // indices without looking at them, while the entity loop twenty lines below
+    // has always checked `index >= recordCount`, rejected a generation mismatch
+    // and rejected a repeated index. The asymmetry was the bug: a save declaring
+    // four records and one free index of 0xFFFFFFF0 **loaded successfully**, and
+    // the next `World::create()` took that index off the back of the list and
+    // used it to subscript `records_` — a read at `records_[0xFFFFFFF0]` and then
+    // a write to `.alive`.
+    //
+    // It does not crash, which is what makes it worse than a crash: the index
+    // lands inside the vector's own heap block, so **ASan does not trap** and
+    // `create()` returns normally onto a corrupted entity table. That is the
+    // "failed open" shape this loader was once fixed for, reached through a door
+    // the fix did not cover — the hardening was against *truncation*, and this
+    // takes a well-formed file with a wrong number in it.
+    //
+    // A duplicate is refused for the same reason a repeated entity index is: two
+    // entities would be handed one `Record`, and the second `create()` would
+    // silently alias the first.
     std::uint32_t freeCount = 0;
     if (!reader.readU32(freeCount)) return false;
     if (freeCount > reader.remaining() / sizeof(std::uint32_t)) return false;
+    if (freeCount > recordCount) return false;  // cannot free more than exist
     freeIndices_.resize(freeCount);
-    for (std::uint32_t i = 0; i < freeCount; ++i)
+    std::vector<bool> freed(recordCount, false);
+    for (std::uint32_t i = 0; i < freeCount; ++i) {
         if (!reader.readU32(freeIndices_[i])) return false;
+        const std::uint32_t index = freeIndices_[i];
+        if (index >= recordCount) return false;  // would subscript out of range
+        if (freed[index]) return false;          // the same index twice
+        freed[index] = true;
+    }
 
     std::uint32_t entityCount = 0;
     if (!reader.readU32(entityCount)) return false;
@@ -375,6 +403,11 @@ bool World::loadImpl(ByteReader& reader) {
         if (index >= recordCount) return false;
         if (records_[index].generation != generation) return false;
         if (records_[index].alive) return false;  // the same index twice
+        // ...and not one the free list has already claimed. Without this a
+        // well-formed-looking save can put an index in both lists: the entity
+        // loads live, and the next `create()` pops the same index off the free
+        // list and hands a second entity the same `Record`.
+        if (freed[index]) return false;
         // Each component costs at least its 13-byte header.
         if (componentCount > reader.remaining() / 13 + 1) return false;
 
