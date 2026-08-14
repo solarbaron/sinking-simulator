@@ -579,6 +579,69 @@ void testCandidatesAreRankedByHowFarPastTheirOwnThresholdTheyAre() {
 
 // --- 3. Idempotence and determinism -------------------------------------------
 
+// `meshFor` is the hand-off from the decision to the mesher, and nothing called
+// it -- not a test, not a tool, not the engine. It is the one function on this
+// class whose output another subsystem consumes, and it was dead.
+//
+// What it must do is carry the criterion's mesh through unchanged except for the
+// role, which comes from the panel that was actually chosen. A `role` that did
+// not travel would mesh a bulkhead as shell plating.
+void testMeshForCarriesTheCriterionAndTheChosenPanelsRole() {
+    std::printf("\n   meshFor hands the mesher the criterion's mesh and the panel's role\n");
+
+    const StructuralMesh& structure = ferryStructure();
+
+    // A *peaked* buckling profile, because the criterion wants local excess above
+    // the ship's own median and a uniformly scaled one has none by construction --
+    // that is the flat-ship guard doing its job, and scaling everything by six was
+    // my first attempt at this fixture and produced no candidate at all.
+    const std::vector<double> x = stationsAlong(-45.0, 45.0, 31);
+    std::vector<double> peaked;
+    for (double station : x)
+        peaked.push_back(0.95 * std::exp(-((station - 12.0) * (station - 12.0)) /
+                                         (2.0 * 12.0 * 12.0)));
+    const promotion::TierZero tier = syntheticBuckling(x, peaked);
+
+    promotion::Criterion criterion;
+    criterion.mesh.radius = 3.0;
+    criterion.mesh.subdivision = 6;         // a value nothing else would produce
+    promotion::Promoter promoter(criterion);
+    const promotion::Review review = promoter.review(structure, tier);
+
+    expectTrue("the bent ship produced a candidate", !review.considered.empty());
+    if (review.considered.empty()) return;
+
+    const promotion::Candidate& chosen = review.considered.front();
+    const zone::MeshParams mesh = promoter.meshFor(chosen);
+
+    // The criterion's own parameters travel untouched.
+    expectNear("the mesh radius is the criterion's", mesh.radius, criterion.mesh.radius, 0.0);
+    testing::expectEqual("and the subdivision, unmodified",
+                mesh.subdivision, criterion.mesh.subdivision);
+
+    // The role is the candidate's, not the criterion's default.
+    expectTrue("the role is the chosen panel's", mesh.role == chosen.role);
+
+    // **The vacuity guard.** If the criterion's default role happened to equal
+    // the candidate's, the assertion above would hold on a `meshFor` that never
+    // touched `role` at all. Ask a candidate with the *other* role and check it
+    // travels too -- constructed here rather than hunted for, because which roles
+    // the ferry's own panels carry is not this test's subject.
+    promotion::Candidate other = chosen;
+    other.role = (chosen.role == PanelRole::Shell) ? PanelRole::Bulkhead
+                                                   : PanelRole::Shell;
+    const zone::MeshParams otherMesh = promoter.meshFor(other);
+    expectTrue("and a different role gives a different mesh role",
+               otherMesh.role == other.role && otherMesh.role != mesh.role);
+
+    // `outward` is left at zero deliberately: `zone::buildPatch` reads that as
+    // "derive it", and does, from the struck panel's normal against the
+    // structure's area-weighted centroid. The header used to claim `meshFor` set
+    // it. Asserting the zero is what keeps the corrected comment honest.
+    expectNear("outward is left for the mesher to derive",
+               length2(otherMesh.outward), 0.0, 0.0);
+}
+
 void testPromotionIsIdempotentAndDeterministic() {
     std::printf("\n   the same loads promote the same patches\n");
     const StructuralMesh& structure = ferryStructure();
@@ -3596,6 +3659,7 @@ void runPromotionTests() {
     testTheBackgroundIsAMedianAndTheThresholdIsWhereItSays();
     testTheZoneLandsOnTheFibreThatIsInTrouble();
     testCandidatesAreRankedByHowFarPastTheirOwnThresholdTheyAre();
+    testMeshForCarriesTheCriterionAndTheChosenPanelsRole();
     testPromotionIsIdempotentAndDeterministic();
     testHysteresisAndDwellPreventChatter();
     testTheTwoCostEstimatorsAgree();

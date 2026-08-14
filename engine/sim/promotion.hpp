@@ -533,8 +533,17 @@ public:
     double activeCost() const;
     void clear();
 
-    // The mesh parameters a candidate's zone gets: the criterion's, with the role
-    // and the outward direction taken from the panel that was chosen.
+    // The mesh parameters a candidate's zone gets: the criterion's, with the
+    // **role** taken from the panel that was chosen.
+    //
+    // This said "the role and the outward direction", and it sets only the role.
+    // The outward direction is left at `{0,0,0}`, which is not an omission --
+    // `zone::buildPatch` reads a zero `outward` as "decide for me" and derives it
+    // from the struck panel's normal against the structure's own area-weighted
+    // centroid, which is the right answer for shell plating and the only
+    // available one for a bulkhead. So the behaviour the old comment described
+    // does happen; it happens one call later, in the mesher. A caller who knows
+    // better sets `outward` and the mesher honours the sign.
     zone::MeshParams meshFor(const Candidate& candidate) const;
 
 private:
