@@ -935,14 +935,30 @@ void testSurfaceOffsetMatchesVolume() {
     // Demote and check surface offset
     demoteWater(forepeak, std::move(field));
 
-    // Surface offset should equal volume / gridPlanArea, where gridPlanArea is
-    // discretized to whole cells. The grid is constructed with ceil() so its
-    // area can differ from the bbox by up to h^2 per axis.
-    const double expectedOffset = forepeak.waterVolume / gridPlanArea;
+    // **Both operands rebuilt from the compartment, not read back from the
+    // demote path.** This asserted `forepeak.waterVolume / gridPlanArea` where
+    // the volume had just been *written* by `demoteWater` and the area came from
+    // the engine's own grid -- the demote path's arithmetic checked against the
+    // demote path's own outputs, which cannot fail however wrong either is.
+    //
+    // The grid is built with `ceil((hi - lo) / h)` cells per axis at the cell
+    // size `promoteWater` uses, so its plan area is reconstructible from the
+    // compartment's bounding box alone. And the volume to divide is the one the
+    // test *set*, which also closes the round trip: a demote that lost mass now
+    // fails here as well as in the mass test.
+    const double h = 0.05;   // m, `promoteWater`'s cell size
+    const double nx = std::ceil((forepeak.bboxHi.x - forepeak.bboxLo.x) / h);
+    const double ny = std::ceil((forepeak.bboxHi.y - forepeak.bboxLo.y) / h);
+    const double rebuiltPlanArea = nx * ny * h * h;
 
-    // Tolerance accounts for grid discretization: h = 0.05 m, so one cell edge
-    // is a ~0.2% change in a ~25 m² compartment footprint, giving ~0.2% depth
-    // error. Use 1e-6 as conservative bound on the arithmetic error alone.
+    expectNear("the grid's plan area is the compartment's box, discretised",
+               gridPlanArea, rebuiltPlanArea, 1e-9);
+
+    const double expectedOffset = initialVolume / rebuiltPlanArea;
+
+    // 1e-6 m on an offset of ~0.02 m is a bound on the arithmetic, not on the
+    // discretisation -- the cell count is reconstructed exactly above, so there
+    // is no discretisation error left to absorb.
     expectNear("surfaceOffset matches volume/planArea",
                forepeak.surfaceOffset, expectedOffset, 1e-6);
 
