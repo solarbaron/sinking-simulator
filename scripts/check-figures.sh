@@ -601,10 +601,28 @@ fi
 # that a *test* changes rather than the physics. 112 s, and it is the only thing in
 # the repository that re-derives it: `verify.sh` prints the count and asserts only
 # that the failures are zero.
+#
+# **The pointer is derived from the figure rather than written beside it**, and it
+# is the only call here that needs to be. Every other figure is a physical result
+# that moves when the physics moves; this one moves whenever *anyone adds a test*,
+# which in practice means it goes stale on the same commit that changes it. Held
+# as two independent copies of one number it then failed twice -- once as the
+# figure and once as the pointer string that no longer occurred in the README --
+# and that happened three times in this session alone, each time to whoever had
+# just added a test. One `expected` variable cannot disagree with itself.
 if [ -x "$TESTS" ]; then
   suite=$("$TESTS" 2>&1 | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  check "closed-form validation checks in the suite" 200336 0 "$suite" \
-        "200336 validation checks" "$FRONT"
+  expected=200339
+  check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
+        "$expected validation checks" "$FRONT"
+  # **The roadmap publishes the same count in a different format**, and it was
+  # 198 869 while the README said 200 336 -- stale by two commits and invisible to
+  # every grep aimed at the README's spelling, because this one is written with a
+  # thin space. A figure gated in one document and loose in another is the drift
+  # the whole script exists to stop; the count is derived from the same
+  # `$expected` so the two cannot part company.
+  hint "$(printf '%s %s closed-form validation checks' \
+          "${expected%???}" "${expected#${expected%???}}")" "$DOC"
 else
   echo "  - shipsim_tests not built, skipping the README's check count"
   skipped="$skipped shipsim_tests"
