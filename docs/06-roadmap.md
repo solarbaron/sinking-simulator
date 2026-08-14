@@ -1591,8 +1591,14 @@ should be honest about that.
   criterion qualifying 2525 times and promoting once looks exactly like
   hysteresis working until something prints the reason.
 
-  16 m³ is 16 MB and 462 m³ would be 462 MB, so the number was defensible and the
-  way it was expressed was not. The budgets now agree at 100 m³ — measured to
+  The old ceiling was ~97 MB and the deck it refused would have been 2.8 GB, so
+  the number was defensible and the way it was expressed was not. **Those
+  megabytes are at the solver's real seeding and not the estimator's**:
+  `estimateFlipCost` bills 1000 particles per m³ while `flip::seedBox` at 2³ per
+  cell puts 64 000 there, so a memory figure read off the budget arithmetic is 64×
+  light — including, at first, the ones in this entry. The budget is denominated
+  in the estimate and is self-consistent; any sentence about bytes has to use the
+  other number. The budgets now agree at 100 m³ — measured to
   1.00× rather than asserted — and a compartment past `maxVolumePerCompartment`
   is rejected with *its own reason* rather than as a transient budget condition,
   because a vehicle deck that cannot be afforded is a finding about this tier and
@@ -1604,6 +1610,28 @@ should be honest about that.
   `testBudgetsAdmitTheSameVolume` asserts the agreement against the arithmetic
   rather than against the constants, so it fails when one number is edited and
   not the other — which is exactly how it broke.
+
+  **And the vehicle deck cannot be bought with a coarser grid, which is a
+  finding rather than a budget.** The obvious answer to "462 m³ costs too much at
+  h = 0.05" is to coarsen until it fits: the deck needs 57 750 tiles and 29.6
+  million particles at 2³ seeding per cell — **2.8 GB**, not the 462 MB a
+  1000-particles/m³ estimate suggests — and at h = 0.20 the same water is 902
+  tiles and 43.6 MB, which is affordable outright. But the deck floods *shallow
+  and wide*: 462 m³ over its own 1868.4 m² is **0.247 m deep**, so h = 0.20 puts
+  **1.2 cells across the entire depth** where `flip_probe`'s own sloshing study
+  requires about two cells of *amplitude* before a voxelised free surface has any
+  restoring force at all. Coarsening to afford the memory destroys the physics
+  the tier exists for, and it would do it quietly — the run would complete, the
+  mass would still be exact, and the deck would simply not slosh.
+
+  So the vehicle deck is not a promotion candidate at any cell size this solver
+  currently offers, and `maxVolumePerCompartment` says so as a limit rather than
+  leaving it to be discovered as a silent refusal. What it needs is a different
+  model — a shallow-water or depth-averaged treatment, where the small dimension
+  is integrated out rather than resolved — and that is a Phase 5 item in its own
+  right, not a parameter of this one. The compartments this tier *can* serve are
+  the deep narrow ones it now reaches: engine rooms, holds and wing tanks, where
+  the water stands metres deep against a bulkhead.
 
   **The control found two frame errors that every unit test had agreed with.**
   `computeLateralAccel` returned `length(state.velocity)` — a *speed* in m/s —

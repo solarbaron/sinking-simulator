@@ -110,10 +110,16 @@ struct WaterCriterion {
     // forward hold was promoted instead. The refusals were silent, because
     // nothing read `WaterReview::problems`.
     //
-    // 16 m³ is 16 MB and 462 m³ would be 462 MB, so the *number* was defensible
-    // and the way it was expressed was not. Both are kept, in agreement, and
-    // `maxVolumePerCompartment` states the real limit in the units the decision
-    // is actually made in.
+    // The old ceiling was ~97 MB and the vehicle deck would have been 2.8 GB, so
+    // the *number* was defensible and the way it was expressed was not. Both are
+    // kept, in agreement, and `maxVolumePerCompartment` states the real limit in
+    // the units the decision is actually made in.
+    //
+    // **Those megabytes are at the solver's real seeding, not the estimator's.**
+    // `estimateFlipCost` bills 1000 particles per m³; `flip::seedBox` at 2³ per
+    // cell puts `8/h³` = 64 000 there, so a memory figure taken off the estimate
+    // is 64× light. The estimate is what the *budget* is denominated in and it is
+    // self-consistent, but any sentence about bytes has to use the other number.
     int particleBudget = 100000;        // total, all compartments == 100 m³
     int tileBudget = 12500;             // 4×4×4 tiles, == the same 100 m³
 
@@ -122,9 +128,16 @@ struct WaterCriterion {
     // because a vehicle deck that cannot be afforded is a finding about this tier
     // and not a transient budget condition.
     //
-    // 100 m³ at h = 0.05 is ~100 MB and ~1.7 core-seconds per simulated second.
-    // A larger compartment needs a coarser grid rather than a bigger budget; see
-    // the roadmap's Phase 5 entry.
+    // 100 m³ at h = 0.05 is 12 500 tiles and 6.4 M particles — ~604 MB, which is
+    // the largest single body of water worth resolving on one core.
+    //
+    // A larger compartment does **not** simply need a coarser grid. The vehicle
+    // deck floods shallow and wide — 462 m³ over 1868 m² is 0.247 m deep — so the
+    // h = 0.20 that would make it affordable puts 1.2 cells across the whole
+    // depth, and `flip_probe`'s sloshing study wants ~2 cells of amplitude before
+    // a voxelised surface has any restoring force. It would run, conserve mass
+    // exactly, and not slosh. That compartment wants a depth-averaged model
+    // rather than a bigger budget; see the roadmap's Phase 5 entry.
     double maxVolumePerCompartment = 100.0;
 
     // Core-seconds per simulated second per compartment, for cost reporting.
