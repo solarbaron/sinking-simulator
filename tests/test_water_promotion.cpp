@@ -426,6 +426,54 @@ void testAntiChatterWithHysteresis() {
 // The two halves are one invariant and this asserts them together, because the
 // version that copied the promoter and dropped the fields passed every test in
 // this file.
+// `minDepth` is declared and deliberately not enforced, and this is the
+// assertion that says so out loud.
+//
+// The only depth available is the mean over the compartment's whole bounding-box
+// footprint, which on a ship whose compartments are tens of metres a side reads
+// ~0.02 m for water that stands well over half a metre against a bulkhead under
+// heel. Gating on it filtered *every* compartment aboard and returned an empty
+// candidate list from every review -- so the field stays as documentation of the
+// threshold the real free-surface calculation will be compared against, and
+// `minVolume` is the only geometric guard.
+//
+// **An unenforced parameter that silently starts being enforced is a trap**, and
+// this one is primed: the header invites re-enabling it. This test names the
+// current state so the change is visible rather than mysterious.
+//
+// **What it cannot do is be the thing that catches it.** Enforcing `minDepth` was
+// tried as a deliberate mutation, and the suite did not report a failure -- it
+// *hung*, output stopping mid-line in a later suite, which on a first reading
+// looked like a clean pass with zero failures. That is the characteristic kill in
+// this codebase and the reason a mutation harness here needs a time bound rather
+// than a pass/fail read; see CLAUDE.md. So the assertions below document the
+// state, and the hang is what would actually announce the change. Both are worth
+// having and neither substitutes for the other.
+void testMinDepthIsNotEnforced() {
+    std::printf("\n   minDepth is declared and deliberately not enforced\n");
+
+    Ship ferry = ferryAfloat();
+    floodCompartment(ferry, 0, 5.0);
+    setRollRate(ferry, 0.15);
+
+    WaterCriterion crit;
+    WaterPromoter promoter(crit);
+    const WaterReview rev = promoter.review(ferry);
+
+    expectTrue("the compartment is considered", rev.considered.size() > 0);
+
+    // The guard that makes this non-vacuous: the depth really is far below the
+    // threshold, so a criterion that enforced it would certainly reject this.
+    expectTrue("and its mean depth is well under minDepth",
+               rev.considered[0].depth < crit.minDepth);
+    std::printf("      (depth %.4f m against minDepth %.2f m)\n",
+                rev.considered[0].depth, crit.minDepth);
+
+    // ...and it qualifies anyway.
+    expectTrue("yet it qualifies, because only minVolume gates promotion",
+               rev.considered[0].score > 0.0);
+}
+
 void testCopiedShipHasNoPromotedWater() {
     std::printf("\n   a copied ship has no promoted water, promoter included\n");
 
@@ -808,14 +856,35 @@ void testCostReporting() {
 
     WaterCriterion crit;
     crit.dwell = 1;
-    crit.coreSecondsPerCompartment = 5.0;
     WaterPromoter promoter(crit);
 
     WaterReview rev = promoter.review(ferry);
 
     expectEqual("two promoted", static_cast<int>(rev.promoted.size()), 2);
-    expectNear("cost is sum", rev.costActive, 10.0, 1e-6);
+    expectNear("cost is the sum over active compartments",
+               rev.costActive, 2.0 * crit.coreSecondsPerCompartment, 1e-6);
     expectTrue("review time measured", rev.microseconds > 0.0);
+
+    // **What this test does not assert, stated so the gap is visible.**
+    //
+    // The two compartments hold 5 m³ and 3 m³ and are billed identically,
+    // because `cand.cost = criterion.coreSecondsPerCompartment` is a
+    // per-compartment constant. `water_probe --cost` measured the truth as
+    // 27.9 core-s/sim-s at 1 m³ and 3030 at 100 -- it scales with the water,
+    // steeply -- so the cost model is not merely mis-valued but the wrong shape,
+    // and this test asserts additivity over a term that should not be uniform.
+    //
+    // It is left asserting what the code does rather than what is true, because
+    // changing `cost` to scale with volume is a change to the promoter's
+    // behaviour and not to a test. The earlier version of this test pinned
+    // `coreSecondsPerCompartment = 5.0` -- the refuted value -- which made it
+    // pass regardless of the field it was ostensibly testing; it now reads the
+    // criterion's own default so that a change to that default is at least
+    // visible here.
+    expectNear("the two sizes are billed the same, which is the known defect",
+               rev.promoted[0].cost, rev.promoted[1].cost, 0.0);
+    expectTrue("and the compartments really are different sizes, or the line above proves nothing",
+               std::abs(rev.promoted[0].volume - rev.promoted[1].volume) > 1.0);
 }
 
 void testCounters() {
@@ -895,6 +964,7 @@ void runWaterPromotionTests() {
     testAntiChatterWithHysteresis();
 
     // Section 3: Budget
+    testMinDepthIsNotEnforced();
     testCopiedShipHasNoPromotedWater();
     testBudgetsAdmitTheSameVolume();
     testParticleBudgetEnforcement();

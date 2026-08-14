@@ -10,9 +10,11 @@
 // **Why this exists:** A quiescent model treats water as a scalar volume with a
 // flat free surface. That is right when the ship is at rest and wrong when she
 // rolls: sloshing, green water, and the dynamic free-surface forces that capsized
-// ships in beam seas are invisible to a volume. FLIP gives the answer, at 1-10
-// core-seconds per simulated second per active compartment, so the decision is
-// when to pay that cost.
+// ships in beam seas are invisible to a volume. FLIP gives the answer, at a
+// measured 27.9 core-seconds per simulated second for one cubic metre and 3030
+// for a hundred (`water_probe --cost`), so the decision is when to pay that cost
+// -- and at present the answer is that it cannot be paid at all. The `1-10`
+// this line used to claim was the estimate the measurement refuted.
 //
 // **The criterion (§2):** Ship motion (roll rate, lateral acceleration) crossed
 // with geometric guards (minimum depth, minimum volume). Hysteresis and dwell
@@ -98,9 +100,15 @@ struct WaterCriterion {
     // `1/(64 h³)` = 125 tiles in every cubic metre of water, so each budget
     // states a volume: 100 000 particles is 100 m³ and 2000 tiles is **16 m³**.
     // The tile budget therefore binds 6.25× sooner and the particle budget can
-    // never be reached at all -- while the comment above calls particles the
-    // memory bottleneck, which at 115 bytes a cell they are not: a tile is 7.4 kB
-    // and a particle is 80 bytes, so tiles are 92% of the footprint.
+    // never be reached at all.
+    //
+    // **An earlier version of this comment said the "particles are the memory
+    // bottleneck" line above was wrong, and it was the correction that was
+    // wrong.** It put tiles at 92% of the footprint, computed at the estimator's
+    // 1000 particles/m³ -- a byte claim taken from the density the paragraph
+    // below forbids using for byte claims, in the same comment block. At the
+    // solver's real 8/h³ = 64 000/m³ a cubic metre is 920 kB of tiles against
+    // 5.12 MB of particles, so **tiles are 15%** and the original line was right.
     //
     // The consequence was not a tuning matter. Any compartment over 16 m³ was
     // refused outright, however hard she rolled, so the tier could not reach a
@@ -175,7 +183,7 @@ struct WaterCriterion {
 struct WaterCandidate {
     int compartment = -1;               // index into Ship::compartments
     std::string name;
-    double rollRate = 0;                // rad/s, abs(angularVelocity.x) in roll axis
+    double rollRate = 0;                // rad/s, about the ship's own bow axis
     double accel = 0;                   // m/s², lateral acceleration magnitude
     double depth = 0;                   // m, current water depth
     double volume = 0;                  // m³, Compartment::waterVolume

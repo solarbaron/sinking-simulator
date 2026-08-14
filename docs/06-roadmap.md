@@ -29,7 +29,7 @@ Numerical core, flooding, air, damaged stability, validation harness.
 - Mesh boolean (clip, weld, cap by ear clipping) so compartments are carved out
   of the hull form rather than authored as boxes
 - Watertightness checking and load-time ship definition validation
-- 200 346 closed-form validation checks
+- 200 351 closed-form validation checks
 - A 120 m ferry that lolls over or capsizes depending on what you do — and, since
   GM stopped being sampled at a fixed ±0.03 rad, does not survive any of the three
 - Explicit co-rotational tet FEM, CPU reference plus a Vulkan compute back-end,
@@ -1578,9 +1578,17 @@ should be honest about that.
   `1/(64h³)` = 125 tiles in every m³ of water, so each budget states a *volume*:
   100 000 particles is 100 m³, and 2000 tiles was **16 m³**. The tile budget
   therefore bound 6.25× sooner and the particle budget could never be reached at
-  all — while the header called particles "the memory bottleneck", which at 115
-  bytes a cell they are not: a tile is 7.4 kB against a particle's 80 bytes, so
-  tiles are 92% of the footprint and the comment named the wrong one.
+  all.
+
+  **This entry then said the header's "particles are the memory bottleneck" was
+  wrong, and the correction was the thing that was wrong.** It put tiles at 92% of
+  the footprint — computed at the estimator's 1000 particles/m³, which is a byte
+  claim taken from the density that the very next paragraph forbids using for byte
+  claims. At the solver's real 8/h³ = 64 000/m³ a cubic metre is 920 kB of tiles
+  against 5.12 MB of particles: **tiles are 15%**, and the original line was
+  right. Two paragraphs of one entry, contradicting each other, both written in
+  the same sitting — the 64× correction was applied to the figures it was derived
+  for and not to the sentence sitting beside them.
 
   The consequence was not a tuning matter. **Any compartment over 16 m³ was
   refused outright**, however hard she rolled, on a ship whose compartments run to
@@ -1662,9 +1670,19 @@ should be honest about that.
   leaving it to be discovered as a silent refusal. What it needs is a different
   model — a shallow-water or depth-averaged treatment, where the small dimension
   is integrated out rather than resolved — and that is a Phase 5 item in its own
-  right, not a parameter of this one. The compartments this tier *can* serve are
-  the deep narrow ones it now reaches: engine rooms, holds and wing tanks, where
-  the water stands metres deep against a bulkhead.
+  right, not a parameter of this one.
+
+  **This paragraph used to end by saying the tier "can serve the deep narrow ones
+  — engine rooms, holds and wing tanks", and the measurement says otherwise.** At
+  a fixed 20 m³, `water_probe --cost` gives **665** core-s/sim-s for a 1 × 1 × 20 m
+  tank, **586** for the 2:1 hold and **535** for a 0.25 m-deep deck: the deep
+  narrow shape is the *most* expensive of the three, not the least. Cost follows
+  the water's own extent, and a tall column touches more tiles per cubic metre
+  than a flat sheet does. So the consolation prize this entry awarded itself was
+  written without measuring — inside an entry whose entire subject is a cost that
+  had never been measured. **There is no compartment shape at this cell size that
+  this tier can afford**, and the honest statement of scope is that it serves
+  nothing on this ship today.
 
   **The control found two frame errors that every unit test had agreed with.**
   `computeLateralAccel` returned `length(state.velocity)` — a *speed* in m/s —

@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -59,26 +60,27 @@ void applyDamageControl(Ship& s, double t, double dt) {
 // What a promoted compartment actually costs to step, in core-seconds per
 // simulated second.
 //
-// **`coreSecondsPerCompartment` is 5.0 and is marked "estimate, will be
-// measured".** It is the number the whole tier's affordability rests on, and it
-// has never been run: at 5.0 the seven compartments the beam-sea control
-// promotes would cost 35 core-seconds per simulated second, which is 35x slower
-// than realtime and would settle the activation question on its own. So it is
-// measured here, at the sizes the promoter actually admits, before anything is
-// wired into `Ship::step()`.
+// `coreSecondsPerCompartment` was 5.0 and marked "estimate, will be measured".
+// It is the number the whole tier's affordability rests on and it had never been
+// run; this is what ran it. The measured answer is 27.9 at 1 m³ rising to 3030 at
+// 100 m³, so the estimate was low by 5.6x to 606x and -- worse -- was a
+// per-compartment *constant* where the truth scales with the water.
+//
+// **This comment described the pre-measurement state for one commit after the
+// measurement existed**, which is the "each document quoted the previous one"
+// failure in the instrument that did the measuring. It says what is true now.
 //
 // The compartment is a box of the given volume at the ferry's own proportions
 // rather than a cube: a hold is wide and shallow, and the cell count -- which is
 // what the projection actually costs -- follows the shape and not just the
 // volume.
-void measureStepCost(double dt) {
+void measureStepCost(double dt, double h) {
     std::printf("--- what a promoted compartment costs to step ---\n");
-    std::printf("    dt = %g s, h = %g m, %s\n\n", dt, 0.05,
+    std::printf("    dt = %g s, h = %g m, %s\n\n", dt, h,
                 "cost is core-seconds per simulated second");
     std::printf("      %8s %9s %8s %10s %12s %10s\n",
                 "volume", "particles", "tiles", "ms/step", "core-s/sim-s", "substeps");
 
-    const double h = 0.05;
     for (double vol : {1.0, 5.0, 20.0, 50.0, 100.0}) {
         flip::Field field;
         // A compartment 2:1 in plan and shallow, which is a hold rather than a
@@ -129,6 +131,61 @@ void measureStepCost(double dt) {
     std::printf("\n    Cost per simulated second is flat in dt -- doubling dt doubles the\n"
                 "    substeps and the wall time together, because the CFL condition sets\n"
                 "    the work. `coreSecondsPerCompartment` defaults to the 1 m3 figure.\n");
+
+    // **The same volume in a different shape, because the claim under test is
+    // that this tier can serve "deep narrow compartments".** Every row above is
+    // one aspect ratio (2:1 in plan, shallow), and a cost model that only ever
+    // saw one shape cannot distinguish "cost follows volume" from "cost follows
+    // the shape I happened to pick". A tall narrow tank and a shallow wide deck
+    // of equal volume hold the same water and are not the same problem.
+    std::printf("\n      the same 20 m3 in three shapes -- volume alone does not set the cost\n");
+    std::printf("      %-22s %9s %8s %10s %12s\n", "shape", "particles", "tiles",
+                "ms/step", "core-s/sim-s");
+    struct Shape { const char* name; double x, y, z; };
+    const double v = 20.0;
+    const Shape shapes[] = {
+        // A wing tank: tall, narrow, deep. What the tier claims to serve.
+        {"deep narrow (1x1x20)",  std::sqrt(v / 20.0), std::sqrt(v / 20.0), 20.0},
+        // The probe's own default, for comparison against the table above.
+        {"hold (2:1, shallow)",   2.0 * std::cbrt(2.0 * v) / 2.0 * 2.0 / 2.0, 0, 0},
+        // A vehicle deck: shallow and very wide. What it cannot.
+        {"deck-like (0.25 deep)", 0, 0, 0.25},
+    };
+    for (const Shape& s : shapes) {
+        double ex = s.x, ey = s.y, ez = s.z;
+        if (std::strcmp(s.name, "hold (2:1, shallow)") == 0) {
+            const double b = std::cbrt(2.0 * v);
+            ex = 2.0 * b; ey = b; ez = v / (2.0 * b * b);
+        } else if (std::strcmp(s.name, "deck-like (0.25 deep)") == 0) {
+            // 2:1 in plan at a fixed 0.25 m depth.
+            const double area = v / 0.25;
+            ey = std::sqrt(area / 2.0); ex = 2.0 * ey; ez = 0.25;
+        }
+
+        flip::Field field;
+        const double lo[3] = {0, 0, 0};
+        const double hi[3] = {ex, ey, ez};
+        field.grid.h = h;
+        field.grid.lo[0] = 0; field.grid.lo[1] = 0; field.grid.lo[2] = 0;
+        for (int a = 0; a < 3; ++a)
+            field.grid.n[a] = std::max(1, static_cast<int>(std::ceil((hi[a] - lo[a]) / h)));
+        flip::seedBox(field, lo, hi, 2, kRhoSeawater);
+        flip::setTotalMass(field, v * kRhoSeawater);
+
+        flip::Params params;
+        flip::Solver solver;
+        flip::Account account;
+        solver.step(field, dt, params, account);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 3; ++i) solver.step(field, dt, params, account);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double msPerStep =
+            std::chrono::duration<double, std::milli>(t1 - t0).count() / 3.0;
+
+        std::printf("      %-22s %9d %8d %10.2f %12.2f\n", s.name,
+                    static_cast<int>(field.particles.size()), solver.tiles(),
+                    msPerStep, (msPerStep / 1000.0) / dt);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -142,6 +199,10 @@ int main(int argc, char** argv) {
     double waveAmplitude = 0;   // m; 0 means flat water, the flooding scenario
     double wavePeriod = 0;      // s; 0 means take the ship's own roll period
     bool costOnly = false;      // --cost: measure the step cost and nothing else
+    // The cell size the cost is measured at. `promoteWater` uses 0.05 and that is
+    // where the tier is unaffordable, so the question this answers is whether any
+    // coarser h is affordable *and* still resolves anything -- see --cost.
+    double cellSize = 0.05;     // m
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -151,12 +212,13 @@ int main(int argc, char** argv) {
         else if (a.starts_with("--wave=")) waveAmplitude = std::atof(a.c_str() + 7);
         else if (a.starts_with("--period=")) wavePeriod = std::atof(a.c_str() + 9);
         else if (a == "--cost") costOnly = true;
+        else if (a.starts_with("--h=")) cellSize = std::atof(a.c_str() + 4);
     }
     // After the whole argument list, not during it: `--cost` acted immediately
     // once, so `--cost --dt=0.02` measured at the default 0.01 and printed a
     // header saying so. An option whose meaning depends on where it appears in
     // the line is a trap.
-    if (costOnly) { measureStepCost(dt); return 0; }
+    if (costOnly) { measureStepCost(dt, cellSize); return 0; }
 
     Ship ship = game::buildFerry();
     ship.initialise(0.0);

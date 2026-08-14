@@ -1,6 +1,29 @@
 # FLIP Escalation Design
 
-## Status: DRAFT — awaiting agent findings
+## Status: SUPERSEDED — kept as the record of what was planned, not what is true
+
+**Read `docs/06-roadmap.md`'s Phase 5 entry instead.** This document was written
+before any of it was built or measured, and measurement contradicted it on every
+number that mattered. It is left in place because the *reasoning* is still worth
+reading next to the outcome, and deleting it would hide how far a plausible design
+sat from the measured answer. But nothing here is current, and no figure in it is
+gated — which is itself part of the record: an ungated document drifts, and this
+one drifted the moment the code was written.
+
+Specifically superseded:
+
+| This document says | Measured / built |
+|---|---|
+| `tileBudget = 2000` | 12 500 — 2000 admitted 16 m³ against the particle budget's 100, so no compartment over 16 m³ could be promoted at all |
+| `1–10 core-s/sim-s per compartment`, "affordable if promotions are rare" | **27.9** at 1 m³ rising to **3030** at 100 m³, and not a per-compartment constant at all |
+| `5 compartments at once = 5–50 core-s/sim-s` | ~1000 core-s/sim-s for the seven the beam-sea control promotes |
+| `WaterReview review(const Ship&)` | takes a `dt`; without it the lateral acceleration was a *speed* compared against an m/s² threshold |
+| `solver->setSolid`, `setInitialVelocity`, `flip::quiescentLevel(comp, mass)` | none of these exist; the shipped API is `Solver::step(Field&, dt, Params&, Account&)` |
+| `200,249 checks, 0 failures` | a test count nothing re-derives; the gated one lives in `README.md` |
+
+The one claim it got right and this repo then leaned on too hard: that roll rate
+would be the trigger that fires. It is — the acceleration branch has never fired
+on a real ship in any run made here.
 
 ## Overview
 
