@@ -29,7 +29,7 @@ Numerical core, flooding, air, damaged stability, validation harness.
 - Mesh boolean (clip, weld, cap by ear clipping) so compartments are carved out
   of the hull form rather than authored as boxes
 - Watertightness checking and load-time ship definition validation
-- 200 351 closed-form validation checks
+- 200 356 closed-form validation checks
 - A 120 m ferry that lolls over or capsizes depending on what you do — and, since
   GM stopped being sampled at a fixed ±0.03 rad, does not survive any of the three
 - Explicit co-rotational tet FEM, CPU reference plus a Vulkan compute back-end,
@@ -1585,8 +1585,10 @@ should be honest about that.
   the footprint — computed at the estimator's 1000 particles/m³, which is a byte
   claim taken from the density that the very next paragraph forbids using for byte
   claims. At the solver's real 8/h³ = 64 000/m³ a cubic metre is 920 kB of tiles
-  against 5.12 MB of particles: **tiles are 15%**, and the original line was
-  right. Two paragraphs of one entry, contradicting each other, both written in
+  against **8.19 MB** of particles: **tiles are 10%**, and the original line was
+  right. (That correction first said 15%, off a "~80 bytes" a particle that the
+  field comment stated while itemising the sixteen doubles — 128 B — that
+  contradict it. A correction of a correction, each one closer.) Two paragraphs of one entry, contradicting each other, both written in
   the same sitting — the 64× correction was applied to the figures it was derived
   for and not to the sentence sitting beside them.
 
@@ -1599,12 +1601,14 @@ should be honest about that.
   criterion qualifying 2525 times and promoting once looks exactly like
   hysteresis working until something prints the reason.
 
-  The old ceiling was ~97 MB and the deck it refused would have been 2.8 GB, so
+  The old ceiling was ~146 MB and the deck it refused would have been 4.2 GB, so
   the number was defensible and the way it was expressed was not. **Those
   megabytes are at the solver's real seeding and not the estimator's**:
   `estimateFlipCost` bills 1000 particles per m³ while `flip::seedBox` at 2³ per
-  cell puts 64 000 there, so a memory figure read off the budget arithmetic is 64×
-  light — including, at first, the ones in this entry. The budget is denominated
+  cell puts 64 000 there, so a memory figure read off the budget arithmetic is
+  **8.7×** light — including, at first, the ones in this entry, which said 64×.
+  The particle *count* is 64× light; tiles are geometric and do not move with the
+  seeding, so the total is not, and the two are not interchangeable. The budget is denominated
   in the estimate and is self-consistent; any sentence about bytes has to use the
   other number. The budgets now agree at 100 m³ — measured to
   1.00× rather than asserted — and a compartment past `maxVolumePerCompartment`
@@ -1655,9 +1659,9 @@ should be honest about that.
   **And the vehicle deck cannot be bought with a coarser grid, which is a
   finding rather than a budget.** The obvious answer to "462 m³ costs too much at
   h = 0.05" is to coarsen until it fits: the deck needs 57 750 tiles and 29.6
-  million particles at 2³ seeding per cell — **2.8 GB**, not the 462 MB a
+  million particles at 2³ seeding per cell — **4.2 GB**, not the 484 MB a
   1000-particles/m³ estimate suggests — and at h = 0.20 the same water is 902
-  tiles and 43.6 MB, which is affordable outright. But the deck floods *shallow
+  tiles and 66 MB, which is affordable outright. But the deck floods *shallow
   and wide*: 462 m³ over its own 1868.4 m² is **0.247 m deep**, so h = 0.20 puts
   **1.2 cells across the entire depth** where `flip_probe`'s own sloshing study
   requires about two cells of *amplitude* before a voxelised free surface has any

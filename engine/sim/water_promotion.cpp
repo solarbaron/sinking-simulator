@@ -97,16 +97,30 @@ static double computeWaterDepth(const Compartment& comp) {
 void estimateFlipCost(const Compartment& comp, const WaterCriterion& /*criterion*/,
                       int& particles, int& tiles) {
     // Heuristic: ~1000 particles per m³ for reasonable resolution.
-    particles = static_cast<int>(comp.waterVolume * 1000.0);
+    //
+    // Rounded on the same terms as the tile count below. A multiplication by
+    // 1000 happens to be exact for the volumes tried here where the tile
+    // division is not, so this one loses nothing today -- which is a fact about
+    // the arithmetic and not a property worth depending on.
+    particles = static_cast<int>(std::llround(comp.waterVolume * 1000.0));
 
     // Tiles: 4×4×4 cells each, cell size from criterion.solver default grid.
     // We don't have a grid yet, so use a reasonable default cell size.
     // FLIP typically uses h = 0.05 m (5 cm cells) as the default.
     // Wetted volume / (64 * h³) gives approximate tile count.
+    //
+    // **Rounded rather than truncated, and the difference is not cosmetic.**
+    // `10.0 / (64 * 0.05³)` is 1249.9999999999998 in binary floating point, not
+    // 1250, so a `static_cast<int>` threw a whole tile away on an exact-looking
+    // input -- and the budget derived from it then admitted 100.08 m³ where the
+    // particle budget admitted 100.00. That 0.08% disagreement is the same defect
+    // shape as the 6.25× one this pair already had, arriving through a cast
+    // instead of through a constant. `testBudgetsAdmitTheSameVolume` only saw it
+    // once it asked `estimateFlipCost` for the rate instead of re-typing it.
     double h = 0.05;  // m, typical FLIP cell edge length
     double cellVolume = h * h * h;
     double tilesExact = comp.waterVolume / (64.0 * cellVolume);
-    tiles = std::max(1, static_cast<int>(tilesExact));
+    tiles = std::max(1, static_cast<int>(std::llround(tilesExact)));
 }
 
 std::vector<WaterCandidate> waterCandidates(const Ship& ship, const WaterCriterion& criterion,

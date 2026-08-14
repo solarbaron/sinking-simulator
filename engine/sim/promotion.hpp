@@ -391,13 +391,30 @@ struct Criterion {
     // struck bay's plastic collapse pressure. One is the plating hinging.
     double contactPressure = 1.0, contactHold = 0.70;
 
-    // Core-seconds of simulated second per element, for reporting only: 4.0 is the
-    // measured figure for 12 mm plating (`zone.hpp` §1), and it scales as
+    // Core-seconds of simulated second per element, for reporting only: 1.7 is
+    // the measured figure for 12 mm plating (`zone.hpp` §1), and it scales as
     // `costThickness / t` because the stable step does. The **budget is in
     // elements**, which is what the zone is actually bounded by; this is the
     // conversion a caller wants printed and `zone::estimatedCost` is the exact
     // answer once a patch exists.
-    double coreSecondsPerElement = 4.0;
+    //
+    // **This was 4.0, and 4.0 is the figure `zone.hpp` §1 warns about by name.**
+    // An elastoplastic element cost 7.3 µs per step until `cacheRestForms`
+    // stopped rebuilding the step-invariant element forms every step; at 5.5e5
+    // steps per simulated second that is 4.0 core-seconds per element, and it is
+    // what this field held while citing as its source the very paragraph that
+    // says "every figure below that predates it is 2.4x pessimistic per element".
+    // The live cost is `kPlasticMicroseconds = 3.1` µs (`zone.cpp:27`), so
+    // 3.1e-6 x 5.5e5 = 1.7.
+    //
+    // Nothing caught it because nothing reads this field outside its own
+    // arithmetic: `grep coreSecondsPerElement tests/ tools/` is empty, and the
+    // one cost assertion in the suite checks `activeCost() > 0`. The tier has a
+    // second, independent cost estimator in `zone::estimatedCost` (`zone.cpp:644`)
+    // which computes off `kPlasticMicroseconds` and the patch's own critical
+    // timestep -- so the two disagreed by 2.35x, `zone_probe` printed both on the
+    // same run, and no one had read them side by side.
+    double coreSecondsPerElement = 1.7;
     double costThickness = 0.012;  // m
 
     // Consecutive reviews a candidate must qualify for before it is promoted, and
@@ -406,9 +423,10 @@ struct Criterion {
     int dwell = 2;
     int hold = 3;
 
-    // Elements across every zone at once. 4000 is 16 000 core-seconds per
+    // Elements across every zone at once. 4000 is ~6 800 core-seconds per
     // simulated second, so it is a statement about how much wall time a caller
-    // will spend, not about how much memory it has.
+    // will spend, not about how much memory it has. (It read 16 000 while
+    // `coreSecondsPerElement` was the stale 4.0; the budget itself has not moved.)
     int elementBudget = 4000;
 
     // Minimum separation between two zones, in multiples of the zone radius. Two

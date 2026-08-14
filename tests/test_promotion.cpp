@@ -706,6 +706,63 @@ void testHysteresisAndDwellPreventChatter() {
 
 // --- 5. Cost: linear in the number of zones, and bounded ------------------------
 
+// The tier carries **two** cost estimators, and nothing compared them.
+//
+// `Criterion::coreSecondsPerElement` (`promotion.hpp`) is the cheap one the
+// promoter reports before a patch exists; `zone::estimatedCost` (`zone.cpp`) is
+// the exact one, off `kPlasticMicroseconds` and the patch's own critical
+// timestep. They are two answers to one question, and they disagreed by 2.35x:
+// the criterion held 4.0, which is 7.3 µs x 5.5e5 steps -- the per-element cost
+// from *before* `cacheRestForms` stopped rebuilding the step-invariant element
+// forms every step. `zone.hpp` §1 names that exact figure as the one to distrust
+// ("every figure below that predates it is 2.4x pessimistic per element") and
+// `promotion.hpp` cited that same paragraph as its source.
+//
+// `zone_probe` printed both numbers on the same run, on the same ferry, for as
+// long as they disagreed. Nobody read them side by side. This does.
+void testTheTwoCostEstimatorsAgree() {
+    std::printf("\n   the promoter's cost estimate agrees with the zone solver's\n");
+
+    // The criterion's estimate for one element of its own reference thickness:
+    // the thickness ratio is 1 there by construction, so this is the constant.
+    sim::promotion::Criterion criterion;
+    const double perElementFromCriterion = criterion.coreSecondsPerElement;
+
+    // The zone solver's, through its own `estimatedCost` on a patch whose
+    // critical timestep is the one `zone.hpp` §1 quotes for 12 mm plating. That
+    // routine is the exact answer the criterion is approximating, and driving it
+    // rather than re-deriving its arithmetic is the point -- a test that
+    // recomputed `elements * steps * microseconds` by hand would agree with a
+    // broken `estimatedCost` and disagree with nothing.
+    //
+    // **Nothing here is timed.** `zone.hpp:845-847` says the measured figures are
+    // "for printing and for `estimatedCost`, never for asserting on", and a
+    // wall-clock assertion on a shared box has already produced false kills in
+    // this repo. This compares two published constants.
+    zone::Patch patch;
+    patch.criticalTimestep = 1.8e-6;    // s, `zone.hpp` §1 for 12 mm plating
+    patch.mesh.index.assign(8, 0);      // one solid-shell hex: 8 indices
+    const double perElementFromZone = zone::estimatedCost(patch, true);
+
+    testing::expectEqual("the probe patch really is one element",
+                static_cast<int>(patch.elementCount()), 1);
+
+    std::printf("      criterion %.3f core-s/element-s, zone solver %.3f (step %.3g s)\n",
+                perElementFromCriterion, perElementFromZone, patch.criticalTimestep);
+
+    // 5% rather than an exact match: the criterion's figure is a published round
+    // number and the zone solver's comes off the material constants, so they are
+    // the same measurement quoted to different precision. What must not happen is
+    // the 2.35x they stood apart at.
+    expectNear("the two per-element costs agree to 5%",
+               perElementFromCriterion / perElementFromZone, 1.0, 0.05);
+
+    // The guard against a vacuous version of the above: the stale value must
+    // actually fail it, or this test would pass on any pair of numbers.
+    expectTrue("and the value this replaced would not have",
+               std::abs(4.0 / perElementFromZone - 1.0) > 0.05);
+}
+
 void testCostIsLinearInTheNumberOfZones() {
     std::printf("\n   cost: n patches cost n times one patch\n");
     // The prediction first, because it is what the budget is spent against.
@@ -3521,6 +3578,7 @@ void runPromotionTests() {
     testCandidatesAreRankedByHowFarPastTheirOwnThresholdTheyAre();
     testPromotionIsIdempotentAndDeterministic();
     testHysteresisAndDwellPreventChatter();
+    testTheTwoCostEstimatorsAgree();
     testCostIsLinearInTheNumberOfZones();
     testTheDecisionIsCheapAndTheTierZeroAnswerIsNot();
     testAPreLoadedPatchCarriesTheStressItWasHanded();

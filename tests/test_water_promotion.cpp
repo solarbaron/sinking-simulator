@@ -518,10 +518,25 @@ void testBudgetsAdmitTheSameVolume() {
 
     WaterCriterion crit;
 
-    // What each budget admits, at the cost model the promoter actually uses.
-    const double h = 0.05;                       // m, estimateFlipCost's cell size
-    const double particlesPerM3 = 1000.0;
-    const double tilesPerM3 = 1.0 / (64.0 * h * h * h);   // 4x4x4 cells per tile
+    // **Asked of `estimateFlipCost` rather than re-typed from it.** The first
+    // version of this test wrote out `particlesPerM3 = 1000.0` and `h = 0.05` by
+    // hand, which made it blind to exactly the edit it existed to catch: change
+    // the density or the cell size in `estimateFlipCost` and the two budgets
+    // silently stop agreeing while this test goes on comparing its own copy of
+    // the model against itself. It caught edits to the two budget *fields* only.
+    //
+    // A probe compartment of known volume turns the estimator into the two rates.
+    Compartment probe;
+    probe.waterVolume = 10.0;                 // m³, large enough that the tile
+                                              // count is not floored at 1
+    int probeParticles = 0, probeTiles = 0;
+    estimateFlipCost(probe, crit, probeParticles, probeTiles);
+
+    const double particlesPerM3 = probeParticles / probe.waterVolume;
+    const double tilesPerM3 = probeTiles / probe.waterVolume;
+
+    expectTrue("the estimator reports a non-zero particle rate", particlesPerM3 > 0);
+    expectTrue("and a non-zero tile rate", tilesPerM3 > 0);
 
     const double m3FromParticles = crit.particleBudget / particlesPerM3;
     const double m3FromTiles = crit.tileBudget / tilesPerM3;

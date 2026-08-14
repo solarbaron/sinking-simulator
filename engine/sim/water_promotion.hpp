@@ -92,7 +92,12 @@ struct WaterCriterion {
     int hold = 3;
 
     // Budget: shared across all active compartments.
-    // Particles determine memory (Vec3 x, Vec3 v, Mat3 C, double m = ~80 bytes).
+    //
+    // Particles determine memory: `flip::Particle` is `double position[3]`,
+    // `velocity[3]`, `affine[9]` and `mass` -- sixteen doubles, **128 bytes**,
+    // confirmed with `sizeof`. This line said "~80 bytes" while itemising the
+    // very fields that add to 128, so it contradicted itself in its own
+    // parenthesis, and every megabyte figure in this tier was built on it.
     // Tiles scale with wetted volume (4×4×4 cells, sparse hash map).
     //
     // **These two are not independent, and setting them as though they were made
@@ -107,8 +112,11 @@ struct WaterCriterion {
     // wrong.** It put tiles at 92% of the footprint, computed at the estimator's
     // 1000 particles/m³ -- a byte claim taken from the density the paragraph
     // below forbids using for byte claims, in the same comment block. At the
-    // solver's real 8/h³ = 64 000/m³ a cubic metre is 920 kB of tiles against
-    // 5.12 MB of particles, so **tiles are 15%** and the original line was right.
+    // solver's real 8/h³ = 64 000/m³ and the measured 128 B a particle, a cubic
+    // metre is 920 kB of tiles against **8.19 MB** of particles: **tiles are
+    // 10%**, and the original line was right. (That correction first said 15%,
+    // computed off the phantom 80 B the field comment above used to claim -- a
+    // correction of a correction, each one closer.)
     //
     // The consequence was not a tuning matter. Any compartment over 16 m³ was
     // refused outright, however hard she rolled, so the tier could not reach a
@@ -118,7 +126,7 @@ struct WaterCriterion {
     // forward hold was promoted instead. The refusals were silent, because
     // nothing read `WaterReview::problems`.
     //
-    // The old ceiling was ~97 MB and the vehicle deck would have been 2.8 GB, so
+    // The old ceiling was ~146 MB and the vehicle deck would have been 4.2 GB, so
     // the *number* was defensible and the way it was expressed was not. Both are
     // kept, in agreement, and `maxVolumePerCompartment` states the real limit in
     // the units the decision is actually made in.
@@ -126,7 +134,9 @@ struct WaterCriterion {
     // **Those megabytes are at the solver's real seeding, not the estimator's.**
     // `estimateFlipCost` bills 1000 particles per m³; `flip::seedBox` at 2³ per
     // cell puts `8/h³` = 64 000 there, so a memory figure taken off the estimate
-    // is 64× light. The estimate is what the *budget* is denominated in and it is
+    // is 8.7× light -- the particle *count* is 64× light, but tiles are geometric
+    // and do not move with the seeding, so the total is not.
+    // The estimate is what the *budget* is denominated in and it is
     // self-consistent, but any sentence about bytes has to use the other number.
     int particleBudget = 100000;        // total, all compartments == 100 m³
     int tileBudget = 12500;             // 4×4×4 tiles, == the same 100 m³
@@ -136,7 +146,8 @@ struct WaterCriterion {
     // because a vehicle deck that cannot be afforded is a finding about this tier
     // and not a transient budget condition.
     //
-    // 100 m³ at h = 0.05 is 12 500 tiles and 6.4 M particles — ~604 MB, which is
+    // 100 m³ at h = 0.05 is 6.4 M particles and, by the solver's own count rather
+    // than the estimator's 12 500, 17 019 tiles — **~944 MB**, which is
     // the largest single body of water worth resolving on one core.
     //
     // A larger compartment does **not** simply need a coarser grid. The vehicle
