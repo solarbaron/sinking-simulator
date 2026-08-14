@@ -138,7 +138,21 @@ most useful thing to know about this codebase:
 | A promotion criterion comparing `length(state.velocity)` — a **speed** — against a threshold in m/s², and taking world `angularVelocity.x` as roll on a ship at 58° of loll. Every test agreed, because the fixture set a velocity and *called* it an acceleration | running the criterion on the real ferry next to a beam-sea control, rather than on the synthetic ship the tests drive it with |
 | Two budgets for one cost model, set independently: 2000 tiles admitted 16 m³ where 100 000 particles admitted 100, so **no compartment over 16 m³ could ever be promoted** and the tier could not reach the vehicle deck it exists for. The 154 refusals were silent — nothing read `problems` — and read exactly like hysteresis working | seeding the compartment the tier is *for* and asking why it never promoted, then printing the refusal the review had been returning all along |
 | A cost estimate of `5.0 core-s/sim-s per compartment` that was low by **5.6× to 606×**, and was the wrong *shape*: a per-compartment constant where the real cost scales with the water. It had carried `// estimate, will be measured` for as long as it existed | running it — the comment naming the measurement as outstanding is not the measurement, and the whole tier's affordability rested on it |
-| A correction that was itself the error: "tiles are **92%** of the footprint" computed at the estimator's 1000 particles/m³, in the same comment block that had just established byte claims must use the solver's real 64 000/m³. At the real density tiles are **15%** and the line it "corrected" was right | an audit asking which claims in the subsystem nothing measures — the contradiction was two paragraphs apart in one entry, written in one sitting |
+| A correction that was itself the error: "tiles are **92%** of the footprint" computed at the estimator's 1000 particles/m³, in the same comment block that had just established byte claims must use the solver's real 64 000/m³. At the real density tiles are **10%** and the line it "corrected" was right | an audit asking which claims in the subsystem nothing measures — the contradiction was two paragraphs apart in one entry, written in one sitting |
+| `flip::Particle` documented as "~80 bytes" in a comment that **itemises the sixteen doubles adding to 128** — every megabyte figure in the tier was built on it | `sizeof`, once someone asked. The parenthesis had contradicted itself since it was written |
+| `coreSecondsPerElement = 4.0` in `promotion.hpp`, citing as its source the `zone.hpp` paragraph that names 4.0 as the pre-`cacheRestForms` figure and says "every figure below that predates it is **2.4x pessimistic**" | asking whether the tier's *two* cost estimators agree. They stood 2.35× apart, `zone_probe` printed both on the same run, and nobody had read them side by side |
+
+**Two estimators for one quantity will disagree, and printing both is not
+comparing them.** Three separate instances here: the water tier's particle and
+tile budgets (6.25× apart, making the tier unreachable), the structural tier's
+`coreSecondsPerElement` against `zone::estimatedCost` (2.35×), and
+`estimateFlipCost`'s truncation against its own exact form (0.08%, from
+`10.0/(64·0.05³)` landing on 1249.9999999999998). Each was visible in output
+nobody read as a pair. **When a second way to compute something exists, assert
+they agree** — and drive the real one rather than re-deriving its arithmetic, because
+a test that recomputes the model by hand agrees with a broken model and disagrees
+with nothing. The water tier's budget test claimed in its own comment to assert
+"against the arithmetic rather than the constants" while doing exactly that.
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct. **Nothing at all tests a comment** — three documents here repeated a
