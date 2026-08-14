@@ -290,15 +290,44 @@ inline constexpr AgentSpecies kArgon{.molarMass = 0.039948,
                                      .sublimationTemperature = 87.30,
                                      .incapacitatingFraction = 1.0,
                                      .lethalFraction = 1.0};
+// **The blends' `gamma` is derived from their components, not quoted.**
+//
+// Both of these carried a hard-coded gamma -- 1.52 and 1.51 -- two lines under a
+// comment saying the blends are the mole-weighted mean of their components, and
+// beside a `molarMass` that really is one. For an ideal-gas mixture the *molar*
+// c_v is what mole-weights, so gamma follows from
+//
+//     1 / (gamma_mix - 1) = sum_i x_i / (gamma_i - 1)
+//
+// which gives 1.5001 for IG-55 and 1.4594 for IG-541 against the 1.52 and 1.51
+// that were written here. The second is the one that matters: `cv()` is
+// `R / (gamma - 1)`, so a gamma 3.5% high is a c_v **9.9% low**, and c_v is what
+// `Layer::heatCapacity` and `Layer::excessEnergy` are built on -- the latter
+// feeding `GasCompartment::pressure()` and the `layerSplit` volume closure.
+//
+// The self-contained argument needs no reference book: adding 8% CO2, whose
+// gamma of 1.289 is the lowest in this file, must pull the blend's gamma *down*
+// from IG-55's. The old pair moved it down by 0.01; the components say 0.041.
+//
+// Nothing caught it because the only functional test of either blend discharges
+// them isothermally, where the wrong c_v appears in the injected energy and in
+// the receiving heat capacity and cancels exactly.
+inline constexpr double mixtureGamma(double xa, double ga, double xb, double gb,
+                                     double xc = 0.0, double gc = 1.4) {
+    return 1.0 + 1.0 / (xa / (ga - 1.0) + xb / (gb - 1.0) +
+                        (xc > 0.0 ? xc / (gc - 1.0) : 0.0));
+}
+
 inline constexpr AgentSpecies kIG55{.molarMass = 0.5 * 0.0280134 + 0.5 * 0.039948,
-                                    .gamma = 1.52,
+                                    .gamma = mixtureGamma(0.5, kNitrogen.gamma, 0.5, kArgon.gamma),
                                     .sublimationHeat = 0.0,
                                     .sublimationTemperature = 0.0,
                                     .incapacitatingFraction = 1.0,
                                     .lethalFraction = 1.0};
 inline constexpr AgentSpecies kIG541{
     .molarMass = 0.52 * 0.0280134 + 0.40 * 0.039948 + 0.08 * 0.0440095,
-    .gamma = 1.51,
+    .gamma = mixtureGamma(0.52, kNitrogen.gamma, 0.40, kArgon.gamma,
+                          0.08, kCarbonDioxide.gamma),
     .sublimationHeat = 0.0,
     .sublimationTemperature = 0.0,
     // 8% CO2 in the blend, so the atmosphere's CO2 reaches 8% of the agent

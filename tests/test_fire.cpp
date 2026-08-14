@@ -3919,10 +3919,49 @@ void testTheAgentConstantsAreDerivedAndNotQuoted() {
                    n.molarMass, 1e-9);
         expectNear(std::string(n.name) + ": R is R_u / M", r, fire::kUniversalGas / n.s.molarMass,
                    1e-12 * r);
-        expectNear(std::string(n.name) + ": c_p - c_v is exactly R", n.s.cp() - n.s.cv(), r,
-                   1e-12 * r);
-        expectNear(std::string(n.name) + ": c_p / c_v is exactly gamma", n.s.cp() / n.s.cv(),
-                   n.s.gamma, 1e-14 * n.s.gamma);
+        // **`c_p - c_v == R` and `c_p / c_v == gamma` used to be asserted here and
+        // are gone, because `cp()` is *defined* as `cv() + gasConstant()` and
+        // `cv()` as `R / (gamma - 1)`.** Both expand to identities on two
+        // one-line accessors -- `(cv + R) - cv` and `1 + R/(R/(g-1))` -- which
+        // the compiler already guarantees; they could not fail while the
+        // accessors are written that way, and they were the only assertions the
+        // blends' thermodynamics had.
+        //
+        // What replaces them is the check they were standing in for: a *blend's*
+        // gamma against the components it is made of. `kIG55.gamma` and
+        // `kIG541.gamma` were hard-coded at 1.52 and 1.51 where the mixture rule
+        // gives 1.5001 and 1.4594 -- the second is a c_v 9.9% low, on the
+        // quantity `Layer::heatCapacity` and `GasCompartment::pressure()` are
+        // built from. Nothing moved when they were corrected, which is exactly
+        // why this assertion has to exist.
+    }
+
+    // For an ideal-gas mixture the molar c_v is mole-weighted, so
+    // `1/(gamma-1) = sum x_i/(gamma_i-1)`. Asserted from the component species
+    // rather than from a retyped constant: a test that wrote 1.4594 by hand
+    // would agree with a header that also wrote it by hand, and neither would
+    // notice the components changing underneath.
+    {
+        const auto molarCv = [](const fire::AgentSpecies& s) {
+            return 1.0 / (s.gamma - 1.0);   // in units of R_u
+        };
+        const double ig55 =
+            0.5 * molarCv(fire::kNitrogen) + 0.5 * molarCv(fire::kArgon);
+        const double ig541 = 0.52 * molarCv(fire::kNitrogen) +
+                             0.40 * molarCv(fire::kArgon) +
+                             0.08 * molarCv(fire::kCarbonDioxide);
+        expectNear("IG-55's gamma is its components', mole-weighted",
+                   molarCv(fire::kIG55), ig55, 1e-12);
+        expectNear("IG-541's gamma is its components', mole-weighted",
+                   molarCv(fire::kIG541), ig541, 1e-12);
+
+        // The guard that makes those two mean something: adding 8% CO2, the
+        // lowest gamma in the file, must pull IG-541's gamma below IG-55's by
+        // more than the 0.01 the hard-coded pair used to differ by.
+        expectTrue("and the CO2 in IG-541 really does lower it",
+                   fire::kIG541.gamma < fire::kIG55.gamma - 0.03);
+        std::printf("     IG-55 gamma %.4f, IG-541 gamma %.4f (was 1.52 and 1.51)\n",
+                    fire::kIG55.gamma, fire::kIG541.gamma);
     }
 
     // The direction a flooding agent stratifies is a consequence of its molar mass
