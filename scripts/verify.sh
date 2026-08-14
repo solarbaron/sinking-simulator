@@ -139,8 +139,28 @@ diagnose() {
   fi
   # -a because a crashed process can leave NUL bytes in the log, and grep then
   # says "binary file matches" and prints not one line of the diagnosis.
-  grep -aE 'error:|ERROR: .*Sanitizer|SUMMARY: .*Sanitizer|runtime error:|^  FAIL|Killed|No space left|Cannot allocate|cannot open|fatal error|ninja: build stopped|Assertion .* failed' \
-       "$log" | head -10
+  # The marker list, and then the thing the marker list cannot know about.
+  #
+  # **`check-figures.sh` reports a drift with a line beginning `  ✗` and the word
+  # "publishes", and matched not one pattern here** -- so a drifted figure printed
+  # its diagnosis into the log and the reader got `--- last lines ---` and eight
+  # lines of the passing tail, twice in one session. That is `expect_ok`'s own
+  # recorded defect ("a failure path that only reports the failures it already
+  # anticipated is not a failure path") in the function written to fix it.
+  #
+  # `✗` is added to the markers, and the tail is no longer the only fallback: when
+  # nothing matches at all, the *first* lines are shown too, because a report that
+  # fails early and then prints two hundred successes hides its own verdict behind
+  # `tail`.
+  local matched
+  matched=$(grep -aE '✗|error:|ERROR: .*Sanitizer|SUMMARY: .*Sanitizer|runtime error:|^  FAIL|Killed|No space left|Cannot allocate|cannot open|fatal error|ninja: build stopped|Assertion .* failed' \
+                 "$log" | head -10)
+  if [ -n "$matched" ]; then
+    printf '%s\n' "$matched"
+  else
+    printf '      %s(nothing matched the failure markers; showing the head)%s\n' "$dim" "$off"
+    head -8 "$log"
+  fi
   printf '      %s--- last lines ---%s\n' "$dim" "$off"
   tail -8 "$log"
 }
@@ -416,6 +436,15 @@ selftest() {
           expect_ok ctl '' sh -c 'exit 3'
   control "a step killed by a signal" 'signal 11' \
           expect_ok ctl '' sh -c 'kill -SEGV $$'
+  # `check-figures.sh` reports a drift as `  ✗ <label>: <doc> publishes X, the
+  # tool now says Y` and matched none of `diagnose`'s markers, so a real drift
+  # came out as `--- last lines ---` and eight lines of the passing tail. Twice.
+  # This drives the same shape: a failure whose only evidence is a ✗ line, buried
+  # under enough successes that `tail -8` cannot reach it.
+  control "a failure whose only marker is a drift line, buried under successes" 'publishes' \
+          expect_ok ctl '^ok' sh -c \
+          'printf "  ✗ a figure: README.md publishes 41, the tool now says 42\n"; \
+           for i in $(seq 20); do printf "  ✓ something else = %s\n" "$i"; done; exit 1'
   local saved_step=$STEP_TIMEOUT
   STEP_TIMEOUT=1
   control "a step that hangs" 'HUNG' expect_ok ctl '' sleep 30
