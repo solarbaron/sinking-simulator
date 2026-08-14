@@ -3215,14 +3215,34 @@ void testAGasPromotionNeedsBothOfItsTriggers() {
         expectTrue("and it really does have fifteen times", found[1].rise > 10.0 * found[0].rise);
         expectTrue("so raw temperature would have ranked them the other way round",
                    found[1].rise > found[0].rise);
+        // **The rise comes from the fixture, not from the candidate.** These two
+        // assertions read `found[i].spread` and `found[i].rise` back out of the
+        // engine and recombined them with the engine's own formula, so both
+        // sides were `promotion.cpp`'s scoring line evaluated on its own outputs
+        // -- a candidate whose `rise` was populated from the wrong compartment
+        // would have scored "correctly" against its own wrong number.
+        //
+        // `gasStratified(lengthX, lengthY, height, depth, hot, floorZ)` sets the
+        // upper layer to `hot` and the lower to `kTAmbient`, so the rise is
+        // `hot - kTAmbient` from the fixture's own arguments -- 900 and 330 here,
+        // with 2.5 being the floor height and not a temperature. The spread stays
+        // the engine's: it comes out of Alpert's correlation on the compartment's
+        // geometry and there is no second way to get it here. Pinning one of the
+        // two operands is what makes the `min` mean something.
+        const double hotRise = 900.0 - kTAmbient;
+        const double mildRise = 330.0 - kTAmbient;
+        expectNear("the mild room's rise is the fixture's, not a derived quantity",
+                   found[0].rise, mildRise, 1e-9);
+        expectNear("and the hot room's", found[1].rise, hotRise, 1e-9);
+
         expectNear("the score is the weaker of the two triggers and nothing else",
                    found[0].score,
                    std::min(found[0].spread / criterion.spreadPromote,
-                            found[0].rise / criterion.risePromote),
+                            mildRise / criterion.risePromote),
                    1e-12);
         expectNear("for the other one too", found[1].score,
                    std::min(found[1].spread / criterion.spreadPromote,
-                            found[1].rise / criterion.risePromote),
+                            hotRise / criterion.risePromote),
                    1e-12);
     }
 }

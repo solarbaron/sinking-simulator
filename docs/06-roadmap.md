@@ -29,7 +29,7 @@ Numerical core, flooding, air, damaged stability, validation harness.
 - Mesh boolean (clip, weld, cap by ear clipping) so compartments are carved out
   of the hull form rather than authored as boxes
 - Watertightness checking and load-time ship definition validation
-- 200 378 closed-form validation checks
+- 200 380 closed-form validation checks
 - A 120 m ferry that lolls over or capsizes depending on what you do — and, since
   GM stopped being sampled at a fixed ±0.03 rad, does not survive any of the three
 - Explicit co-rotational tet FEM, CPU reference plus a Vulkan compute back-end,
