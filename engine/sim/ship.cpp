@@ -142,14 +142,15 @@ Ship::Ship(const Ship& other)
     , externalForce(other.externalForce)
     , externalMoment(other.externalMoment)
     , state(other.state)
-    , waterPromoter_(other.waterPromoter_)
     , cachedWaterplaneArea_(other.cachedWaterplaneArea_)
     , cachedKRoll_(other.cachedKRoll_)
     , cachedKPitch_(other.cachedKPitch_)
     , stabilityRefreshCounter_(other.stabilityRefreshCounter_)
 {
-    // activeWaterFields_ left empty - deep copy not needed for current use cases
-    // (girder calculations happen on ships without active FLIP fields)
+    // `activeWaterFields_` is left empty and `waterPromoter_` is left
+    // default-constructed, deliberately and together. See ship.hpp: a copy is a
+    // ship with no promoted water, and copying the promoter while dropping the
+    // fields would leave the two disagreeing about what is active.
 }
 
 Ship& Ship::operator=(const Ship& other) {
@@ -188,7 +189,9 @@ Ship& Ship::operator=(const Ship& other) {
         externalForce = other.externalForce;
         externalMoment = other.externalMoment;
         state = other.state;
-        waterPromoter_ = other.waterPromoter_;
+        // Cleared, not copied, and paired with the empty field map above: see
+        // the copy constructor and ship.hpp.
+        waterPromoter_.clear();
         cachedWaterplaneArea_ = other.cachedWaterplaneArea_;
         cachedKRoll_ = other.cachedKRoll_;
         cachedKPitch_ = other.cachedKPitch_;

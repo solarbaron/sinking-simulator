@@ -29,7 +29,7 @@ Numerical core, flooding, air, damaged stability, validation harness.
 - Mesh boolean (clip, weld, cap by ear clipping) so compartments are carved out
   of the hull form rather than authored as boxes
 - Watertightness checking and load-time ship definition validation
-- 200 339 closed-form validation checks
+- 200 346 closed-form validation checks
 - A 120 m ferry that lolls over or capsizes depending on what you do — and, since
   GM stopped being sampled at a fixed ±0.03 rad, does not survive any of the three
 - Explicit co-rotational tet FEM, CPU reference plus a Vulkan compute back-end,
@@ -1610,6 +1610,39 @@ should be honest about that.
   `testBudgetsAdmitTheSameVolume` asserts the agreement against the arithmetic
   rather than against the constants, so it fails when one number is edited and
   not the other — which is exactly how it broke.
+
+  **And then the cost was measured, which settles activation on its own.**
+  `coreSecondsPerCompartment` was 5.0, marked *"estimate, will be measured"*, and
+  it is the number the tier's affordability rests on. `water_probe --cost` steps a
+  real `flip::Solver` at h = 0.05:
+
+  | volume | particles | tiles | ms/step | core-s/sim-s | × the estimate |
+  |---:|---:|---:|---:|---:|---:|
+  | 1 m³ | 65 650 | 525 | 279 | **27.9** | 5.6× |
+  | 5 m³ | 325 424 | 1 560 | 1 462 | **146.2** | 29× |
+  | 20 m³ | 1 276 292 | 4 104 | 5 616 | **561.6** | 112× |
+  | 100 m³ | 6 351 696 | 17 019 | 30 304 | **3030.4** | 606× |
+
+  The estimate was not merely low, it was the **wrong shape**: a per-compartment
+  constant where the true cost scales with the water. So the seven compartments
+  the beam-sea control promotes would cost **~1000 core-seconds per simulated
+  second** if each held only 5 m³, against the 1.0 that realtime needs.
+
+  **It cannot be stepped around.** At the production dt = 0.02 the substeps double
+  from 2 to 4 and the wall time doubles with them, leaving core-s/sim-s within 4%
+  of the dt = 0.01 figures: the CFL condition sets the work, not the timestep. The
+  cause is the same 64× that made the memory figures wrong — `flip::seedBox` at 2³
+  per cell puts 64 000 particles in a cubic metre at this `h`, and every one is
+  scanned per substep.
+
+  So **activation is blocked on cell size, not on wiring**, and that is the third
+  independent finding pointing at the same place: the deck needs a coarser grid
+  the physics will not allow, the budget admits volumes the clock cannot afford,
+  and the estimate that hid both was never run. `Ship::step()` keeps its TODO
+  markers deliberately — wiring a tier that costs 1000× realtime would be a
+  working feature nobody could switch on, and the honest state is a measured
+  ceiling with the integration left until there is something affordable to
+  integrate.
 
   **And the vehicle deck cannot be bought with a coarser grid, which is a
   finding rather than a budget.** The obvious answer to "462 m³ costs too much at

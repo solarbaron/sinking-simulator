@@ -141,8 +141,32 @@ struct WaterCriterion {
     double maxVolumePerCompartment = 100.0;
 
     // Core-seconds per simulated second per compartment, for cost reporting.
-    // Measured rather than assumed, on the same terms as structural/gas tiers.
-    double coreSecondsPerCompartment = 5.0;  // estimate, will be measured
+    //
+    // **This was 5.0 and marked "estimate, will be measured". It has now been
+    // measured, and it is not a constant.** `water_probe --cost` steps a real
+    // `flip::Solver` at h = 0.05 and dt = 0.01:
+    //
+    //     volume   particles    tiles   ms/step   core-s/sim-s
+    //       1 m³      65 650      525    279.1          27.9
+    //       5 m³     325 424    1 560   1461.8         146.2
+    //      20 m³   1 276 292    4 104   5615.5         561.6
+    //     100 m³   6 351 696   17 019  30304.3        3030.4
+    //
+    // So the estimate was low by 5.6x at 1 m³ and by 606x at the budget ceiling,
+    // and the error is not a constant factor because the true cost scales with
+    // the water while the estimate did not scale at all. The seven compartments
+    // `water_probe`'s beam-sea control promotes would cost ~1000 core-seconds per
+    // simulated second if each held only 5 m³, against the 1.0 realtime needs.
+    //
+    // The cause is the seeding density, the same 64x that made the memory figures
+    // wrong: `flip::seedBox` at 2³ per cell puts 64 000 particles in a cubic metre
+    // at h = 0.05, and every one is scanned per substep. **A promoted compartment
+    // is not affordable at this cell size**, which is a finding about the tier and
+    // not a number to be tuned -- see the roadmap's Phase 5 entry.
+    //
+    // Kept as a field because a coarser future cell size makes it meaningful
+    // again, and the default is now the measured 1 m³ figure rather than a guess.
+    double coreSecondsPerCompartment = 27.9;  // measured, h=0.05, 1 m³
 
     // FLIP solver parameters for all promoted compartments.
     flip::Params solver;

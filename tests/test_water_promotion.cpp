@@ -412,6 +412,59 @@ void testAntiChatterWithHysteresis() {
 //
 // Asserted against the arithmetic rather than against the constants, so it fails
 // when someone edits one number and not the other, which is exactly how it broke.
+// A copied ship has no promoted water, and its promoter must agree.
+//
+// `rightingArmAtHeel`, `diagnostics` and `girder.cpp` all take a ship copy to ask
+// a hydrostatic question, and none of them wants a live particle field -- they
+// want the scalar `waterVolume` every one of their readers understands. So the
+// copy drops `activeWaterFields_`, which was already true, and it must clear
+// `waterPromoter_` **with** it: copying the promoter while dropping the fields
+// leaves a copy whose promoter believes compartments are active and whose map is
+// empty, and the next review on that copy would demote compartments whose state
+// had never been transferred anywhere.
+//
+// The two halves are one invariant and this asserts them together, because the
+// version that copied the promoter and dropped the fields passed every test in
+// this file.
+void testCopiedShipHasNoPromotedWater() {
+    std::printf("\n   a copied ship has no promoted water, promoter included\n");
+
+    Ship ferry = ferryAfloat();
+    floodCompartment(ferry, 0, 5.0);
+
+    // Drive the original to a genuine promotion so there is something to lose.
+    WaterCriterion crit;
+    WaterPromoter promoter(crit);
+    setRollRate(ferry, 0.15);
+    promoter.review(ferry);
+    const WaterReview rev = promoter.review(ferry);
+
+    expectTrue("the original promoted something to copy away",
+               promoter.active().size() > 0);
+    expectEqual("and it promoted this review", static_cast<int>(rev.promoted.size()),
+                static_cast<int>(promoter.active().size()));
+
+    // The ship's own promoter is the one the copy carries; drive it too.
+    ferry.waterPromoter_.review(ferry);
+    ferry.waterPromoter_.review(ferry);
+    expectTrue("the ship's own promoter has active compartments",
+               ferry.waterPromoter_.active().size() > 0);
+
+    const Ship copy = ferry;
+
+    expectEqual("the copy has no FLIP fields",
+                static_cast<int>(copy.activeWaterFields_.size()), 0);
+    expectEqual("and its promoter agrees that nothing is active",
+                static_cast<int>(copy.waterPromoter_.active().size()), 0);
+    expectEqual("and its review count is reset, not inherited",
+                copy.waterPromoter_.reviews(), 0);
+
+    // The control: the *original* still has its promotions. Without this the
+    // assertions above would pass on a copy constructor that cleared the source.
+    expectTrue("while the original still has its own",
+               ferry.waterPromoter_.active().size() > 0);
+}
+
 void testBudgetsAdmitTheSameVolume() {
     std::printf("\n   the two budgets admit the same volume\n");
 
@@ -842,6 +895,7 @@ void runWaterPromotionTests() {
     testAntiChatterWithHysteresis();
 
     // Section 3: Budget
+    testCopiedShipHasNoPromotedWater();
     testBudgetsAdmitTheSameVolume();
     testParticleBudgetEnforcement();
     testTileBudgetEnforcement();

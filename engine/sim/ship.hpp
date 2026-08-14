@@ -444,8 +444,22 @@ public:
     Ship() = default;
     ~Ship();
 
-    // Copy/move: activeWaterFields_ contains raw pointers that must be deep-copied.
-    // Move leaves the source empty (nullptr fields cleared).
+    // Copy/move exist because `activeWaterFields_` holds raw pointers.
+    //
+    // **A copy does not carry the FLIP fields, and it clears the promoter with
+    // them.** Copying a live particle field is not what any caller here wants:
+    // `rightingArmAtHeel`, `diagnostics` and `girder.cpp` take a ship copy to ask
+    // a hydrostatic question at a trial attitude, and they want the water as the
+    // scalar `waterVolume` that every one of their readers already understands.
+    //
+    // The promoter is cleared rather than copied for the reason the first version
+    // of this got wrong: copying `waterPromoter_` while dropping the fields left a
+    // copy whose promoter believed compartments were active and whose field map
+    // was empty, so the next `review()` on that copy would demote compartments
+    // whose state had never been transferred. A copy is a ship with no promoted
+    // water, and the promoter has to agree with the map it is paired with.
+    //
+    // Move transfers both and leaves the source empty.
     Ship(const Ship& other);
     Ship& operator=(const Ship& other);
     Ship(Ship&& other) noexcept;

@@ -21,6 +21,8 @@
 #include "../../engine/sim/waves.hpp"
 #include "../../game/prototype/ferry.hpp"
 
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -54,6 +56,81 @@ void applyDamageControl(Ship& s, double t, double dt) {
 
 }  // namespace
 
+// What a promoted compartment actually costs to step, in core-seconds per
+// simulated second.
+//
+// **`coreSecondsPerCompartment` is 5.0 and is marked "estimate, will be
+// measured".** It is the number the whole tier's affordability rests on, and it
+// has never been run: at 5.0 the seven compartments the beam-sea control
+// promotes would cost 35 core-seconds per simulated second, which is 35x slower
+// than realtime and would settle the activation question on its own. So it is
+// measured here, at the sizes the promoter actually admits, before anything is
+// wired into `Ship::step()`.
+//
+// The compartment is a box of the given volume at the ferry's own proportions
+// rather than a cube: a hold is wide and shallow, and the cell count -- which is
+// what the projection actually costs -- follows the shape and not just the
+// volume.
+void measureStepCost(double dt) {
+    std::printf("--- what a promoted compartment costs to step ---\n");
+    std::printf("    dt = %g s, h = %g m, %s\n\n", dt, 0.05,
+                "cost is core-seconds per simulated second");
+    std::printf("      %8s %9s %8s %10s %12s %10s\n",
+                "volume", "particles", "tiles", "ms/step", "core-s/sim-s", "substeps");
+
+    const double h = 0.05;
+    for (double vol : {1.0, 5.0, 20.0, 50.0, 100.0}) {
+        flip::Field field;
+        // A compartment 2:1 in plan and shallow, which is a hold rather than a
+        // cube: volume = 2b * b * d with d = b/4 gives b = (2 vol)^(1/3).
+        const double b = std::cbrt(2.0 * vol);
+        const double lo[3] = {0, 0, 0};
+        const double hi[3] = {2.0 * b, b, vol / (2.0 * b * b)};
+
+        field.grid.h = h;
+        field.grid.lo[0] = lo[0]; field.grid.lo[1] = lo[1]; field.grid.lo[2] = lo[2];
+        for (int a = 0; a < 3; ++a)
+            field.grid.n[a] = std::max(1, static_cast<int>(std::ceil((hi[a] - lo[a]) / h)));
+
+        flip::seedBox(field, lo, hi, 2, kRhoSeawater);
+        flip::setTotalMass(field, vol * kRhoSeawater);
+
+        flip::Params params;
+        flip::Solver solver;
+        flip::Account account;
+
+        // One step to build the sparse structure, so the timing measures steady
+        // state rather than first-touch allocation.
+        solver.step(field, dt, params, account);
+
+        const int steps = 5;
+        const auto t0 = std::chrono::steady_clock::now();
+        int substeps = 0;
+        for (int i = 0; i < steps; ++i)
+            substeps += solver.step(field, dt, params, account).substeps;
+        const auto t1 = std::chrono::steady_clock::now();
+
+        const double msPerStep =
+            std::chrono::duration<double, std::milli>(t1 - t0).count() / steps;
+        // Core-seconds of work per second of simulated time: a step covers dt of
+        // model time, so the ratio is the wall time over dt.
+        const double coreSecondsPerSimSecond = (msPerStep / 1000.0) / dt;
+
+        std::printf("      %6.0f m3 %9d %8d %9.2f %12.2f %10.1f\n",
+                    vol, static_cast<int>(field.particles.size()), solver.tiles(),
+                    msPerStep, coreSecondsPerSimSecond,
+                    static_cast<double>(substeps) / steps);
+    }
+    // **The cost per simulated second is flat in dt, and that is the point.**
+    // Doubling dt to the production 0.02 doubles the substeps (2 -> 4) and the
+    // wall time with them, leaving core-s/sim-s within 4%: the CFL condition sets
+    // the work, not the timestep. So this is not a cost that can be stepped
+    // around, and a caller who wants it cheaper has to change `h`.
+    std::printf("\n    Cost per simulated second is flat in dt -- doubling dt doubles the\n"
+                "    substeps and the wall time together, because the CFL condition sets\n"
+                "    the work. `coreSecondsPerCompartment` defaults to the 1 m3 figure.\n");
+}
+
 int main(int argc, char** argv) {
     double duration = 900.0;
     double dt = 0.01;
@@ -64,6 +141,7 @@ int main(int argc, char** argv) {
     // guaranteed to produce large roll rates on an intact ship.
     double waveAmplitude = 0;   // m; 0 means flat water, the flooding scenario
     double wavePeriod = 0;      // s; 0 means take the ship's own roll period
+    bool costOnly = false;      // --cost: measure the step cost and nothing else
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -72,7 +150,13 @@ int main(int argc, char** argv) {
         else if (a.starts_with("--review=")) reviewEvery = std::atof(a.c_str() + 9);
         else if (a.starts_with("--wave=")) waveAmplitude = std::atof(a.c_str() + 7);
         else if (a.starts_with("--period=")) wavePeriod = std::atof(a.c_str() + 9);
+        else if (a == "--cost") costOnly = true;
     }
+    // After the whole argument list, not during it: `--cost` acted immediately
+    // once, so `--cost --dt=0.02` measured at the default 0.01 and printed a
+    // header saying so. An option whose meaning depends on where it appears in
+    // the line is a trap.
+    if (costOnly) { measureStepCost(dt); return 0; }
 
     Ship ship = game::buildFerry();
     ship.initialise(0.0);

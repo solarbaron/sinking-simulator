@@ -612,7 +612,7 @@ fi
 # just added a test. One `expected` variable cannot disagree with itself.
 if [ -x "$TESTS" ]; then
   suite=$("$TESTS" 2>&1 | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  expected=200339
+  expected=200346
   check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
         "$expected validation checks" "$FRONT"
   # **The roadmap publishes the same count in a different format**, and it was
@@ -828,6 +828,21 @@ if [ -x "$WATER" ]; then
         "0.1525 rad/s, 3× over the threshold" "$DOC"
   check "and that it does promote" 7 0 "$seaprom" \
         "0.1525 rad/s, 3× over the threshold" "$DOC"
+
+  # **The cost, which is the figure that decides whether this tier can be turned
+  # on at all.** It replaced a `5.0` that had carried "estimate, will be measured"
+  # since it was written, and a tolerance here is not a rounding allowance: the
+  # claim is that a promoted compartment costs three orders of magnitude more than
+  # realtime, so what has to stay true is the order of magnitude. Gated at the 1 m³
+  # end because that is the cheapest case and therefore the strongest form of the
+  # claim -- if even 1 m³ is 28x realtime, nothing larger is affordable either.
+  #
+  # ~90 s: five sizes up to 100 m³, six steps each.
+  hint "| 1 m³ | 65 650 | 525 | 279 | **27.9** | 5.6× |" "$DOC"
+  wcost=$("$WATER" --cost 2>&1)
+  onem3=$(printf '%s\n' "$wcost" | sed -n 's/^ *1 m3 *[0-9]* *[0-9]* *[0-9.]* *\([0-9.]*\).*/\1/p')
+  check "one cubic metre, core-seconds per simulated second" 27.9 4.0 "$onem3" \
+        "| 1 m³ | 65 650 | 525 | 279 | **27.9** | 5.6× |" "$DOC"
 else
   echo "  - water_probe not built, skipping the promoter's figures"
   skipped="$skipped water_probe"
