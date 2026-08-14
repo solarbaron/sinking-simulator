@@ -21,6 +21,7 @@
 #include "../../engine/sim/waves.hpp"
 #include "../../game/prototype/ferry.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -352,16 +353,41 @@ int main(int argc, char** argv) {
     // and the particle count is the one the comment calls "the memory
     // bottleneck".
     {
-        const double h = 0.05;
-        const double m3PerParticleBudget = crit.particleBudget / 1000.0;
-        const double m3PerTileBudget = crit.tileBudget * (64.0 * h * h * h);
+        // **Asked of `estimateFlipCost`, not re-typed from it.** This printed
+        // `crit.particleBudget / 1000.0` and `crit.tileBudget * 64h³` with its
+        // own local `h = 0.05` -- so the one tool whose job is to check the two
+        // budgets was the last place still carrying a private copy of the cost
+        // model, and would have gone on agreeing with itself after any edit to
+        // the real one. `testBudgetsAdmitTheSameVolume` had exactly this and it
+        // is what hid the 0.08% truncation until it was fixed.
+        Compartment probe;
+        probe.waterVolume = 10.0;      // m³, above the tile count's floor of 1
+        int probeParticles = 0, probeTiles = 0;
+        promotion::estimateFlipCost(probe, crit, probeParticles, probeTiles);
+
+        const double m3PerParticleBudget =
+            probeParticles > 0 ? crit.particleBudget * probe.waterVolume / probeParticles : 0.0;
+        const double m3PerTileBudget =
+            probeTiles > 0 ? crit.tileBudget * probe.waterVolume / probeTiles : 0.0;
         std::printf("\n    the particle budget admits %.1f m3; the tile budget admits %.1f m3\n",
                     m3PerParticleBudget, m3PerTileBudget);
-        std::printf("    so %s binds first, by %.2fx -- the other cannot ever be reached\n",
-                    m3PerTileBudget < m3PerParticleBudget ? "the TILE budget" : "the PARTICLE budget",
-                    m3PerParticleBudget > m3PerTileBudget
-                        ? m3PerParticleBudget / m3PerTileBudget
-                        : m3PerTileBudget / m3PerParticleBudget);
+        // The ratio, and what it means -- which is *not* the same sentence at
+        // 1.00x. When the two admit the same volume neither binds first and both
+        // are reachable; saying "the other cannot ever be reached" there is
+        // false, and it was printed on every run after the budgets were brought
+        // into agreement. A line that reports a defect must stop reporting it
+        // once the defect is gone.
+        const double lo = std::min(m3PerParticleBudget, m3PerTileBudget);
+        const double hi = std::max(m3PerParticleBudget, m3PerTileBudget);
+        const double ratio = lo > 0 ? hi / lo : 0.0;
+        if (ratio <= 1.001) {
+            std::printf("    they agree to %.2fx, so neither is unreachable\n", ratio);
+        } else {
+            std::printf("    so %s binds first, by %.2fx -- the other cannot ever be reached\n",
+                        m3PerTileBudget < m3PerParticleBudget ? "the TILE budget"
+                                                             : "the PARTICLE budget",
+                        ratio);
+        }
     }
 
     if (!promotedEver.empty()) {
