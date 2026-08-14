@@ -305,11 +305,11 @@
 //     0.01 s to factor the implicit operator once. Then **0.35-0.41 core-seconds
 //     per simulated second** at 1 ms steps, because a linear model is
 //     unconditionally stable and its step is set by what has to be resolved.
-//   * **Tier 2**, the same patch: **1155 core-seconds per simulated second**. The
+//   * **Tier 2**, the same patch: **490 core-seconds per simulated second**. The
 //     explicit step is 1.72 us -- thickness-governed, not chosen -- so it takes
 //     580 000 steps to Tier 1's thousand.
 //
-// So Tier 1 is **2800x cheaper than Tier 2 on the same plating** and about four
+// So Tier 1 is **1200x cheaper than Tier 2 on the same plating** and about four
 // times the cost of the beam that covers the entire ship. That is the trade: three
 // orders of magnitude of speed for everything nonlinear.
 //

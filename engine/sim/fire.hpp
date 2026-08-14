@@ -1074,11 +1074,24 @@ inline constexpr double kBreathingZone = 1.5;
 // which is EN's 25 for convection plus about 175 for the radiation this file does
 // not carry".
 
-// Convection and the emissivity of the gas-to-steel exchange. Defaults are
-// EN 1991-1-2 §3.1: 25 W/(m^2 K) on the fire-exposed side of a standard-fire
-// boundary, and a resultant emissivity of 0.7 (the code's 0.8 surface emissivity
-// against a near-black flame is 0.7 after the configuration factor a compartment
-// enclosed by its own hot layer carries).
+// Convection and the emissivity of the gas-to-steel exchange.
+//
+// 25 W/(m^2 K) is EN 1991-1-2 §3.1's coefficient on the fire-exposed side of a
+// standard-fire boundary. 0.7 is the resultant emissivity, and it is the carbon
+// steel figure -- EN 1993-1-2 §4.2.5.1, the material part, rather than the
+// actions part quoted above it.
+//
+// **This used to derive the 0.7 from "the code's 0.8 surface emissivity ... after
+// the configuration factor", and there is no 0.8 anywhere in this repository.**
+// The only emissivity in the tree is this one. So the parenthetical explained a
+// constant in terms of a second constant that does not exist, and 0.7/0.8 is
+// 0.875, which is not a configuration factor either standard names -- EN's
+// default is 1.0. The value is unchanged; what is removed is a derivation that
+// could not be checked and would have misled anyone who tried.
+//
+// The clause attribution above is from the standards' structure and has not been
+// re-read against the documents themselves; if the two parts are ever confirmed,
+// this comment is where the confirmation belongs.
 struct BoundaryFilm {
     double convective = 25.0;   // W/(m^2 K)
     double emissivity = 0.7;    // dimensionless, resultant

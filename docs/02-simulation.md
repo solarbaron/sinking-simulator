@@ -2651,9 +2651,9 @@ modulus to the oedometer one, so the enhanced modes buy a closed form rather tha
 a tuning.
 
 **Cost, one core:** 21.1 µs to form an element stiffness (once, at promotion),
-267 ns for an internal force step against 129 ns for `fem.cpp`'s linear tet. Per
+293 ns for an internal force step against 129 ns for `fem.cpp`'s linear tet. Per
 element that is 2×; per square metre of 20 mm plating per simulated second it is
-**37 s against 4.1 × 10⁶ s**, a factor of 1.1 × 10⁵, because the tet mesh pays in
+**40 s against 4.1 × 10⁶ s**, a factor of 1.0 × 10⁵, because the tet mesh pays in
 element count *and* in timestep and the solid-shell pays in neither.
 
 **Two corrections this produced.** The timestep claim above was wrong: a
@@ -5896,7 +5896,7 @@ Two mutants are worth recording for what they did *not* need:
 Explicit central-difference time integration inside Tier 2 (standard for
 impact/fracture, no global stiffness matrix, trivially parallel). Tier 1 is
 implicit and cheap — measured at 0.35–0.41 core-seconds per simulated second at
-1 ms steps against Tier 2's 1155 on the same plating, because a linear model is
+1 ms steps against Tier 2's 490 on the same plating, because a linear model is
 unconditionally stable and takes a thousand steps where the explicit one takes
 580 000. Lumped mass matrix in both, so the two agree about inertia at the moment
 a region is promoted.

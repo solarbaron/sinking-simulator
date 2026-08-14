@@ -189,7 +189,7 @@ three-dimensional regions — and that element now exists
 strains and seven enhanced strain parameters, one element through the plate. On
 the same mesh at the slenderness of real plating it lands within 0.4% of the
 closed form where a plain hex is 1 400× too stiff and a linear tet 3 800× too
-stiff, and a square metre of 20 mm plating costs 37 core-seconds per simulated
+stiff, and a square metre of 20 mm plating costs 40 core-seconds per simulated
 second instead of 4.1 million. It also corrected the spike: the stable timestep is
 set by the plate thickness after all, not by the in-plane element size, because a
 solid-shell keeps its through-thickness stretch. Full numbers, limits and what
@@ -215,7 +215,7 @@ And it now decides for itself when to exist (`engine/sim/promotion.{hpp,cpp}`).
 The beam model is on everywhere and a zone is promoted only where the response is
 *local* — a station standing above the ship's own median utilisation, or a contact
 patch past the struck bay's plastic collapse pressure — because a Tier-2 element
-costs 4.0 core-seconds per simulated second and that is linear in the number of
+costs 1.7 core-seconds per simulated second and that is linear in the number of
 zones, so a criterion that fires everywhere is unaffordable rather than merely
 noisy. A promoted zone is handed the girder's own stress to start from, which on
 the ferry's side turns out to make her *stiffer* rather than weaker, and hands back
@@ -236,7 +236,7 @@ static condensation is exact at the interface for *any* load (2 × 10⁻¹⁰ m 
 0.31 m deflection against an independent solve), a free component keeps exactly
 six zero eigenvalues, and the reduced frequencies come down **from above**,
 monotonically, because a reduction can only stiffen. On the same patch of the
-ferry's side it costs 0.4 core-seconds per simulated second against Tier 2's 1155
+ferry's side it costs 0.4 core-seconds per simulated second against Tier 2's 490
 — 1200× — and what it buys with that is nothing nonlinear at all: it cannot yield,
 tear, buckle or rotate, so it also reports when it has stopped being valid and the
 region has to be promoted. Three published figures in the plan turned out to be

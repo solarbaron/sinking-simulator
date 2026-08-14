@@ -312,7 +312,7 @@ The longest and highest-risk phase.
   **Sturm sequence** because a skipped mode is otherwise silent.
 
   **Three published figures were wrong and are corrected there**: the cost saving
-  is 2800× rather than 10⁻⁵; "the static interface response improves with mode
+  is 1200× rather than 10⁻⁵; "the static interface response improves with mode
   count" is false, it starts exact and the modes buy the *interior* and the
   dynamics; and the standard "cut off at twice the band of interest" buys 0.6%
   inside the 10 Hz hull-girder band, not four figures, because the cutoff is a
@@ -320,7 +320,7 @@ The longest and highest-risk phase.
   assembled one.
 
   Cost on the same plating: **0.10 core-seconds per simulated second** for Tier 0
-  over the whole ship, **0.35–0.41** for this patch at Tier 1, **1155** for the
+  over the whole ship, **0.35–0.41** for this patch at Tier 1, **490** for the
   same patch at Tier 2. What it cannot do is yield, tear, buckle, contact or
   rotate — it is linear by construction — so `checkValidity` exists to say when the
   region has to be promoted, and it under-predicts a concentration so the warning
@@ -1228,7 +1228,7 @@ should be honest about that.
   twelve reviews, with it once.
 
   **Cost is *not* linear in the resolution, and that is the difference from the
-  structural tier.** A Tier-2 zone is exactly `4.0 × elements` core-seconds per
+  structural tier.** A Tier-2 zone is exactly `1.7 × elements` core-seconds per
   simulated second because its step is fixed. Halving a cell here multiplies the
   cells by eight *and* halves the advective step *and* lengthens the pressure
   solve, so the measured cost **per cell per simulated second rises** rather than
@@ -1773,7 +1773,7 @@ Phase 0 ✅ ──▶ Phase 1 ──┬──▶ Phase 2 ──┬──▶ Phas
    better-understood work than an open performance question. The tier structure
    still means a failure here degrades to Tier-1-only (elastic deformation,
    scripted-threshold tearing) rather than killing the project — and Tier 1 now
-   exists and is measured at 2800× cheaper than Tier 2 on the same plating, so
+   exists and is measured at 1200× cheaper than Tier 2 on the same plating, so
    that fallback is a real one rather than a plan.
 2. **Coupling stability.** Partitioned multiphysics can go unstable in ways
    neither solver does alone. Mitigation: every coupling gets an energy-balance
