@@ -1580,17 +1580,15 @@ should be honest about that.
   therefore bound 6.25× sooner and the particle budget could never be reached at
   all.
 
-  **This entry then said the header's "particles are the memory bottleneck" was
-  wrong, and the correction was the thing that was wrong.** It put tiles at 92% of
-  the footprint — computed at the estimator's 1000 particles/m³, which is a byte
-  claim taken from the density that the very next paragraph forbids using for byte
-  claims. At the solver's real 8/h³ = 64 000/m³ a cubic metre is 920 kB of tiles
-  against **8.19 MB** of particles: **tiles are 10%**, and the original line was
-  right. (That correction first said 15%, off a "~80 bytes" a particle that the
-  field comment stated while itemising the sixteen doubles — 128 B — that
-  contradict it. A correction of a correction, each one closer.) Two paragraphs of one entry, contradicting each other, both written in
-  the same sitting — the 64× correction was applied to the figures it was derived
-  for and not to the sentence sitting beside them.
+  **The memory share took three attempts to state, and the sequence is the
+  lesson.** This entry first said the header's "particles are the memory
+  bottleneck" was wrong and put tiles at 92% of the footprint — a byte claim
+  computed at the estimator's 1000 particles/m³, in the same breath as
+  establishing that byte claims must use the solver's real 64 000. Corrected to
+  15%, still off, because `flip::Particle` was documented as "~80 bytes" in a
+  comment that itemises sixteen doubles. At the measured 128 B a cubic metre is
+  920 kB of tiles against **8.19 MB** of particles: **tiles are 10%**, and the
+  line originally being corrected was right all along.
 
   The consequence was not a tuning matter. **Any compartment over 16 m³ was
   refused outright**, however hard she rolled, on a ship whose compartments run to
