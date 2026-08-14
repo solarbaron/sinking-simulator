@@ -285,13 +285,22 @@ std::vector<std::string> validateGirder(const HullGirder& g) {
         problems.push_back("fewer than three stations is not a beam");
         return problems;
     }
+    // **"of peak" was what these said, and the block above rejects that
+    // normalisation by name.** `shearClosure` is the residual over `W/2` and
+    // `momentClosure` over `W L / 8` -- deliberately *not* over the curve's own
+    // peak, because a balanced ship's peak is its residual and the ratio would
+    // read 1.0 on a perfect calculation. On the suite's own 10% imbalance
+    // fixture the residual really is 100% of the peak in both quantities while
+    // these print 20% and 40%, so the label was wrong by 5x and 2.5x in the one
+    // case the tests construct. The numbers were always right; the units in the
+    // sentence were not.
     if (std::abs(g.shearClosure) > 0.05)
         problems.push_back("shear does not close at the forward perpendicular (" +
                            std::to_string(100.0 * g.shearClosure) +
-                           "% of peak) -- the ship is not in equilibrium");
+                           "% of W/2) -- the ship is not in equilibrium");
     if (std::abs(g.momentClosure) > 0.05)
         problems.push_back("bending moment does not close at the forward perpendicular (" +
-                           std::to_string(100.0 * g.momentClosure) + "% of peak)");
+                           std::to_string(100.0 * g.momentClosure) + "% of W L / 8)");
     const double imbalance = std::abs(g.totalBuoyancy - g.totalWeight) /
                              std::max(g.totalWeight, 1.0);
     if (imbalance > 0.02)

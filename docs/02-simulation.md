@@ -941,7 +941,9 @@ They were found by the near-field/far-field energy check, not by any functional
 test — every coefficient looked like a coefficient. That check compares damping
 from integrating pressure over the hull against damping from the amplitude of the
 wave radiated to infinity: the same number by conservation of energy, computed
-along completely different paths. It reads under 0.01 in the clean band and runs
+along completely different paths. It reads 4.5e-3 on a smooth 1 m cylinder and
+**0.14** on the ferry's own table -- this said "under 0.01 in the clean band",
+which was the cylinder's number standing in for the ship's -- and runs
 to 60 on a spike, so the signal is unambiguous.
 
 **What is implemented is detection and repair**, not removal: solves whose energy

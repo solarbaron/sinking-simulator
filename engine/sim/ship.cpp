@@ -315,6 +315,24 @@ std::vector<std::string> Ship::validate() const {
     const double hullVolume = integrate(hull).volume;
     if (hullVolume <= 0) note("hull volume is not positive");
 
+    // **The one hydrodynamic rule this function can enforce, and it was stated
+    // as an imperative and checked nowhere.** `ship.hpp` says waveDamping must
+    // stay zero while `radiation` is attached, because the memory convolution is
+    // already applying the radiation share of B44 -- supplying both is the double
+    // count that cost 27% of mid-frequency heave when radiation first landed.
+    //
+    // `attachRollDamping()` zeroes it, which covers the path that goes through
+    // `attachRollDamping()`. But `rollDampingForm` is a public optional and
+    // `waveDamping` is a public field, so a caller who builds the form by hand or
+    // assigns to it afterwards re-creates the defect silently, and the total goes
+    // straight into `cAng.x`. `validateRollDamping()` cannot see this -- it takes
+    // the form alone and has no way to know a `RadiationForce` exists, which is
+    // why it reports the *correct* configuration as a problem and callers filter
+    // that string out.
+    if (radiation && rollDampingForm && rollDampingForm->waveDamping > 0)
+        note("roll wave damping is supplied while a radiation model is attached: the "
+             "memory convolution already applies it, so the ship is damped twice in roll");
+
     double subdivided = 0;
     for (const Compartment& c : compartments) {
         if (c.mesh.tris.empty()) { note("compartment '" + c.name + "' is empty"); continue; }

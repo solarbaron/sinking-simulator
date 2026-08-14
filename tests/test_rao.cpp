@@ -922,6 +922,58 @@ void testRollDecaySeesAddedInertiaAboutTheCentreOfGravity() {
 // testStationsFromAMeshAreExactForABox; what is checked here is that a real hull
 // form lands inside the domain the regressions were fitted over, because outside
 // it the eddy polynomial returns whatever it returns.
+// `waveDamping` must stay zero while a radiation model is attached, because the
+// memory convolution already applies the radiation share of B44 -- and supplying
+// both is the documented double count that cost 27% of mid-frequency heave when
+// radiation first landed.
+//
+// **That rule was an imperative in a header and was enforced in exactly one
+// place**: `attachRollDamping()` sets the field to zero. But `rollDampingForm` is
+// a public optional and `waveDamping` a public field, so a caller who builds the
+// form by hand, or assigns to it after attaching, re-creates the defect in
+// silence -- the total flows straight into the roll damping coefficient.
+//
+// `validateRollDamping()` cannot catch it: it sees the form alone and has no way
+// to know a `RadiationForce` exists, which is why it reports the *correct*
+// configuration as a problem and every caller filters that string out. Only
+// `Ship::validate()` can see both, and now does.
+void testRollWaveDampingAndRadiationAreNotBothApplied() {
+    Ship ship = rollShip();
+    ship.attachRollDamping(kRollWaterline, kRollKeelLength, kRollKeelBreadth);
+    ship.attachRadiation(kRollWaterline, 9);
+
+    expectTrue("attachRollDamping leaves waveDamping at zero",
+               ship.rollDampingForm && ship.rollDampingForm->waveDamping == 0.0);
+    const auto clean = ship.validate();
+    const bool cleanComplains =
+        std::any_of(clean.begin(), clean.end(), [](const std::string& s) {
+            return s.find("damped twice in roll") != std::string::npos;
+        });
+    expectTrue("so a correctly configured ship says nothing about it", !cleanComplains);
+
+    // Now do what the header forbids, the way a caller actually could.
+    ship.rollDampingForm->waveDamping = 5.0e7;
+    const auto doubled = ship.validate();
+    const bool caught =
+        std::any_of(doubled.begin(), doubled.end(), [](const std::string& s) {
+            return s.find("damped twice in roll") != std::string::npos;
+        });
+    expectTrue("but supplying both is reported", caught);
+
+    // The guard: without radiation the same wave damping is legitimate -- it is
+    // the 5-30% of B44 a caller with no radiation model is *supposed* to supply,
+    // so the check must key on the pair and not on the field alone.
+    Ship noRadiation = rollShip();
+    noRadiation.attachRollDamping(kRollWaterline, kRollKeelLength, kRollKeelBreadth);
+    noRadiation.rollDampingForm->waveDamping = 5.0e7;
+    const auto lone = noRadiation.validate();
+    const bool falsePositive =
+        std::any_of(lone.begin(), lone.end(), [](const std::string& s) {
+            return s.find("damped twice in roll") != std::string::npos;
+        });
+    expectTrue("while wave damping without radiation is not a problem", !falsePositive);
+}
+
 void testRollDampingFormComesOffTheHull() {
     Ship ship = rollShip();
     const RollDampingHull form =
@@ -1172,6 +1224,7 @@ void runRaoTests() {
     testSemicircularSectionsPinTheTransferSign();
     testRollAddedInertiaIsReferredToTheCentreOfGravity();
     testRollDecaySeesAddedInertiaAboutTheCentreOfGravity();
+    testRollWaveDampingAndRadiationAreNotBothApplied();
     testRollDampingFormComesOffTheHull();
     testRollFreeDecayMatchesTheIkedaCoefficient();
     testBilgeKeelsShortenTheRollDecay();

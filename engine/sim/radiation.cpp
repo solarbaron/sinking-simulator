@@ -702,7 +702,10 @@ void transferToBaseline(double m[3][3], double draft) {
 
 // A section solve whose near-field and far-field damping disagree by more than
 // this is not a discretisation error, it is an irregular frequency: measured
-// backgrounds are under 0.01 in the useful band and the spikes run to 60.
+// backgrounds reach 0.14 on the ferry's table -- 4.5e-3 on a smooth cylinder,
+// which is where the "under 0.01" this used to claim came from -- and the spikes
+// run to 60. So the margin between the background and this threshold is about
+// 1.4x, not the 20x the old figure implied.
 constexpr double kIrregularResidual = 0.2;
 
 // Trapezium weight for station i: half the distance to each neighbour.

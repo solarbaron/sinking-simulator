@@ -124,7 +124,11 @@ struct SectionCoefficients {
     // this is a direct measure of how well the discretisation is doing. It is
     // reported rather than asserted because the caller chose the panel count.
     //
-    // **Check it.** It reads under 0.01 in the useful band and runs to 60 at an
+    // **Check it.** On a smooth 1 m semicircle it reads 4.5e-3 at 40 panels; on
+    // the ferry's own table the worst *kept* solve is **0.14**, printed by the
+    // suite on every run. This line said "under 0.01 in the useful band", which
+    // is the cylinder's figure quoted as if it were the ship's -- 14x out
+    // against a number nothing had read. It runs to 60 at an
     // irregular frequency, where the source formulation returns nonsense --
     // including negative damping. stripTheoryTable() uses it to reject and
     // interpolate over those; a caller going straight to sectionCoefficients()

@@ -129,10 +129,39 @@ void testTearingHappensAtTheFailureStrainAndNotBefore() {
     expectTrue("just short of it the panel is intact", !indentAt(p, 0.999 * tearing).torn);
     expectTrue("just past it the panel has torn", indentAt(p, 1.001 * tearing).torn);
 
-    // Energy to tear, both ways round.
+    // Energy to tear, against the closed form rather than against its own body.
+    //
+    // **This asserted `energyToTear(p) == indentationEnergy(p, tearing)`, which
+    // is `energyToTear`'s one-line definition** (`indentation.cpp`) evaluated on
+    // the same arguments in the same order: bit-exactly zero residual against a
+    // 1e-9 tolerance, unfailable for any implementation that stores what it
+    // divided.
+    //
+    // The header states an independent form — `sigma_y t A eps_f`, reached only
+    // through the failure-strain regularisation — and the whole "5%, not ten
+    // times" correction rests on the span cancelling out of it. That is the
+    // claim worth pinning, and it was the one thing here nothing checked.
     const double energy = energyToTear(p);
-    expectNear("the energy to tear is the energy at the tearing penetration", energy,
-               indentationEnergy(p, tearing), 1e-9 * energy);
+    const double closedForm =
+        p.yieldStrength * p.thickness * (p.span * p.contactWidth) * p.failureStrain;
+    std::printf("     energy to tear %.0f J, closed form sigma_y t A eps_f %.0f J\n",
+                energy, closedForm);
+    expectNear("the energy to tear is sigma_y t A eps_f", energy, closedForm,
+               1e-9 * closedForm);
+
+    // **And the span really does cancel.** Holding the struck area fixed while
+    // moving the span is what makes the hole a 5% question rather than a tenfold
+    // one; if this ever stops holding, every published hole area moves with it.
+    IndentedPanel shortSpan = p;
+    shortSpan.span = 0.70;
+    shortSpan.contactWidth = (p.span * p.contactWidth) / shortSpan.span;  // same area
+    const double shortEnergy = energyToTear(shortSpan);
+    expectNear("the same struck area tears at the same energy whatever the span",
+               shortEnergy, energy, 1e-9 * energy);
+    // The guard: the two spans really are different, or the line above compares
+    // a panel with itself.
+    expectTrue("and the two spans genuinely differ",
+               std::abs(shortSpan.span - p.span) > 1.0);
     expectTrue("more energy than that does not drive it deeper by this model",
                penetrationForEnergy(p, 10.0 * energy) <= tearing + 1e-12);
 
