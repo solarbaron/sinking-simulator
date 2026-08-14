@@ -449,6 +449,109 @@ void testAntiChatterWithHysteresis() {
 // than a pass/fail read; see CLAUDE.md. So the assertions below document the
 // state, and the hang is what would actually announce the change. Both are worth
 // having and neither substitutes for the other.
+// A compartment that is pumped out is demoted immediately, without waiting for
+// the dwell.
+//
+// `!volumeHolds` is the second of the two demotion conditions and no test had
+// ever taken it: every demotion in the suite came from `idleReviews >= hold`,
+// i.e. the ship going quiet. Water leaving the compartment is the other way a
+// promotion ends, and it is the one a bilge pump causes.
+//
+// The distinction matters because the two have different timing. Going quiet is
+// deliberately slow -- `hold` reviews of hysteresis, so a ship that rolls once
+// more does not thrash. Losing the water is immediate: there is nothing left to
+// resolve, and holding a FLIP field open for three more reviews over a compartment
+// with 0.1 m³ in it is pure cost. This asserts the immediacy, not just the fact.
+void testDrainingACompartmentDemotesItAtOnce() {
+    std::printf("\n   a compartment that drains is demoted at once, not after the hold\n");
+
+    Ship ferry = ferryAfloat();
+    floodCompartment(ferry, 0, 5.0);
+    setRollRate(ferry, 0.15);          // well above promote and hold alike
+
+    WaterCriterion crit;
+    crit.dwell = 1;                    // promote on the first qualifying review
+    WaterPromoter promoter(crit);
+
+    promoter.review(ferry);
+    expectEqual("the compartment is active to begin with",
+                static_cast<int>(promoter.active().size()), 1);
+
+    // Pump it out, and keep the ship rolling hard so the *motion* still holds --
+    // otherwise this would demote through the idle path and prove nothing.
+    floodCompartment(ferry, 0, 0.1);   // below minVolume
+    const WaterReview rev = promoter.review(ferry);
+
+    expectEqual("draining it demotes it on the very next review",
+                static_cast<int>(rev.demoted.size()), 1);
+    expectEqual("and it is no longer active",
+                static_cast<int>(promoter.active().size()), 0);
+
+    // The control that makes the timing claim mean something: the ship is still
+    // rolling above the hold threshold, so the idle path cannot be what demoted
+    // it, and `hold` is 3 -- more reviews than have happened.
+    expectTrue("while the motion was still above the hold threshold",
+               std::abs(ferry.state.angularVelocity.x) >= crit.rollRateHold);
+    expectTrue("and fewer reviews have passed than the hold would need",
+               promoter.reviews() < crit.hold);
+}
+
+// Lateral acceleration alone can hold a compartment active.
+//
+// `accelHolds` is read on every review and had never been the deciding term:
+// every hold and anti-chatter test in this file drives roll only, so `accel` was
+// 0 throughout and the branch was reached but never *taken*. A criterion that had
+// dropped the acceleration term from the hold test entirely would pass all of
+// them.
+void testAccelerationAloneHoldsACompartment() {
+    std::printf("\n   lateral acceleration alone can hold a compartment active\n");
+
+    Ship ferry = ferryAfloat();
+    floodCompartment(ferry, 0, 5.0);
+
+    WaterCriterion crit;
+    crit.dwell = 1;
+    WaterPromoter promoter(crit);
+
+    // Promote on roll.
+    setRollRate(ferry, 0.15);
+    primeAccel(promoter, ferry);
+    promoter.review(ferry, kAccelDt);
+    expectEqual("promoted on roll", static_cast<int>(promoter.active().size()), 1);
+
+    // Now stop rolling, but keep throwing her sideways: roll is below its hold
+    // threshold and acceleration is above its own, so the compartment must stay.
+    //
+    // **A sustained acceleration is a velocity that keeps climbing**, not one
+    // that is set and reset. The first version of this test set the velocity and
+    // then zeroed it before the next review, so successive samples differed by
+    // +v then -v and half the reviews saw the ship decelerating to a stop -- the
+    // compartment demoted, and the failure was the test's own, not the code's.
+    // That is the same misconception the units fix in this file was about,
+    // arriving from the other side.
+    setRollRate(ferry, 0.0);
+    double vy = 0.0;
+    const double accel = 2.0 * crit.accelHold;
+    for (int i = 0; i < crit.hold + 2; ++i) {
+        vy += accel * kAccelDt;                     // still accelerating
+        ferry.state.velocity = Vec3{0, vy, 0};
+        promoter.review(ferry, kAccelDt);
+    }
+
+    expectEqual("acceleration alone keeps it active past the hold count",
+                static_cast<int>(promoter.active().size()), 1);
+    expectEqual("with no demotions at all", promoter.demotions(), 0);
+
+    // The control: with neither trigger it goes, and within the hold count. Same
+    // ship, same promoter, so the only thing that changed is the acceleration.
+    for (int i = 0; i < crit.hold + 1; ++i) {
+        ferry.state.velocity = Vec3{};
+        promoter.review(ferry, kAccelDt);
+    }
+    expectEqual("but with the acceleration gone as well, it demotes",
+                static_cast<int>(promoter.active().size()), 0);
+}
+
 void testMinDepthIsNotEnforced() {
     std::printf("\n   minDepth is declared and deliberately not enforced\n");
 
@@ -511,6 +614,50 @@ void testCopiedShipHasNoPromotedWater() {
     // assertions above would pass on a copy constructor that cleared the source.
     expectTrue("while the original still has its own",
                ferry.waterPromoter_.active().size() > 0);
+
+    // **The same invariant through copy *assignment*, which is a different
+    // function and was covered by nothing.** `Ship::operator=(const Ship&)` is
+    // referenced by zero objects in the whole build -- it carries its own copy of
+    // the promoter/field-map pairing (a `clear()` beside a delete loop) and could
+    // have copied the promoter while dropping the fields, which is precisely the
+    // defect the constructor test above exists to prevent, and every test would
+    // still have passed. Half the special members were dead code holding an
+    // invariant asserted only on the other half.
+    Ship assigned = ferryAfloat();
+    assigned = ferry;
+
+    expectEqual("the assigned-to ship has no FLIP fields either",
+                static_cast<int>(assigned.activeWaterFields_.size()), 0);
+    expectEqual("and its promoter agrees that nothing is active",
+                static_cast<int>(assigned.waterPromoter_.active().size()), 0);
+    expectEqual("and its review count is reset too",
+                assigned.waterPromoter_.reviews(), 0);
+    expectTrue("and the source is still intact after being assigned from",
+               ferry.waterPromoter_.active().size() > 0);
+
+    // **And through the move constructor**, which is the one member that
+    // *transfers* the promoter and the field map rather than clearing them --
+    // and which was referenced by zero objects anywhere: every candidate site is
+    // copy-elided, so the transfer at ship.cpp had never executed once.
+    //
+    // `std::move` is explicit rather than relying on a return value, because
+    // elision is exactly what kept this untested.
+    const int activeBeforeMove = static_cast<int>(ferry.waterPromoter_.active().size());
+    const int reviewsBeforeMove = ferry.waterPromoter_.reviews();
+    expectTrue("the ship about to be moved has something worth transferring",
+               activeBeforeMove > 0 && reviewsBeforeMove > 0);
+
+    Ship moved = std::move(ferry);
+
+    expectEqual("a move transfers the promoter's active list rather than clearing it",
+                static_cast<int>(moved.waterPromoter_.active().size()), activeBeforeMove);
+    expectEqual("and its review count",
+                moved.waterPromoter_.reviews(), reviewsBeforeMove);
+    // The source is left valid and empty: `activeWaterFields_` was moved from, so
+    // the destructor must not double-delete. Asserting the map rather than the
+    // promoter, because that is the one holding raw pointers.
+    expectEqual("and leaves the source's field map empty",
+                static_cast<int>(ferry.activeWaterFields_.size()), 0);  // NOLINT: moved-from, deliberately
 }
 
 void testBudgetsAdmitTheSameVolume() {
@@ -720,6 +867,21 @@ void testEmptyCompartmentReturnsNull() {
 
     auto field = promoteWater(forepeak, ferry, crit);
     expectTrue("empty compartment returns nullptr", field == nullptr);
+
+    // **And handing that nullptr straight to `demoteWater` must be a no-op**,
+    // which is the other half of the same contract and was covered by nothing:
+    // the guard `if (!field) return;` sat one line away from the test that
+    // already had a `nullptr` in hand and threw it away. A promoter that
+    // demotes a compartment it never managed to promote takes exactly this
+    // path, and without the guard it dereferences null.
+    forepeak.waterVolume = 7.25;      // a value that must survive untouched
+    forepeak.surfaceOffset = 1.5;
+    demoteWater(forepeak, nullptr);
+
+    expectNear("demoting a null field leaves the volume exactly alone",
+               forepeak.waterVolume, 7.25, 0.0);
+    expectNear("and the surface offset with it",
+               forepeak.surfaceOffset, 1.5, 0.0);
 }
 
 void testCentroidPreservation() {
@@ -979,6 +1141,8 @@ void runWaterPromotionTests() {
     testAntiChatterWithHysteresis();
 
     // Section 3: Budget
+    testDrainingACompartmentDemotesItAtOnce();
+    testAccelerationAloneHoldsACompartment();
     testMinDepthIsNotEnforced();
     testCopiedShipHasNoPromotedWater();
     testBudgetsAdmitTheSameVolume();

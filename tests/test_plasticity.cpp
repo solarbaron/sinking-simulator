@@ -284,6 +284,36 @@ void testFlowCurves() {
                structural.yieldStrength, 1.0);
     expectNear("the failure model's uniform strain is the curve's Considere point",
                material.failure.uniformStrain, uniformElongation(material.flow), 1e-12);
+
+    // **The pairing above covers `ah36Steel` and nothing else, and the ship has
+    // two materials.** `zone::Solver` reads its elastic constants, mass and
+    // critical timestep from `Patch::material` -- a `StructuralMaterial` taken
+    // from `structure.materials[panel.material]` -- while its *return map* runs
+    // on a separately supplied `plasticity::Material`, which every caller
+    // defaults to `shipSteel()`. Two sources for one patch's steel.
+    //
+    // For index 0 they agree, which is what the three assertions above pin. For
+    // index 1 they do not: `mildSteel()` yields at 235 MPa against `shipSteel()`'s
+    // 355, so a zone on the ferry's weather deck (`scantlings.cpp` sets
+    // `weatherDeck.material = 1`) would integrate 235 MPa plating that does not
+    // yield until 355 -- **51% too strong**, and chosen for promotion precisely
+    // because Tier 0 read it as the weaker material.
+    //
+    // This asserts the disagreement rather than the agreement, because the fix is
+    // to thread the right plastic material through `zone::indent` and that is a
+    // change to the solver's interface, not to a constant. Until then the hazard
+    // is real and this is what says so out loud: if someone makes the two agree,
+    // or adds a third material, this fails and points at the thread that has to
+    // be pulled.
+    const StructuralMaterial mild = mildSteel();
+    expectTrue("the ship's second material is genuinely weaker than the plastic default",
+               mild.yieldStrength < flowStress(material.flow, 0.0));
+    const double ratio = flowStress(material.flow, 0.0) / mild.yieldStrength;
+    std::printf("     the plastic default is %.2fx the yield of the ship's mild steel"
+                " (%.0f vs %.0f MPa) -- a zone on a mild-steel panel integrates the\n"
+                "     wrong one, and `zone::Solver` has no way to tell\n",
+                ratio, flowStress(material.flow, 0.0) / 1e6, mild.yieldStrength / 1e6);
+    expectNear("and the gap is the documented 1.51x", ratio, 355.0 / 235.0, 0.01);
 }
 
 // --- uniaxial tension against the closed form ----------------------------------
