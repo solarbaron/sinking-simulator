@@ -227,6 +227,20 @@ control is also what caught `$?` being the status of the *negation* after
 `if ! cmd`, which was written into both functions, hours apart, by someone who had
 already fixed it once.
 
+**This has now happened a third time, in the ad-hoc detector rather than in the
+code.** A mutation sweep over `edgeDrive` piped each run through `grep "FAIL"` and
+reported one mutant as surviving. It had not survived: removing that guard is a
+heap overread, and the binary died at **exit 139** before printing a summary, so
+there was no `FAIL` line to match and the loudest possible kill scored as a
+escape. The detector recognised only the failure shape that was expected —
+exactly the defect the paragraph above describes, written by the same hands that
+had just written the paragraph. **Judge a mutation run on the exit code and the
+summary line, never on the presence of a string**; a mutant that crashes, hangs or
+dies before it reports is the normal case here, not the exotic one. The same run
+also shows why it matters that a check be pointed at the right claim: `grep -c`
+returning 0 was, on a previous occasion, proof a mutation *had not applied* — the
+identical observation meaning the opposite thing.
+
 ## Settled decisions — do not reopen
 
 Recorded in `docs/01-architecture.md` §1 with full reasoning:
