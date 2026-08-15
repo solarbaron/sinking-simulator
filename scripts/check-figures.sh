@@ -89,6 +89,27 @@ RENDER_DOC=docs/03-renderer-audio.md
 DOC=docs/06-roadmap.md
 fails=0
 checks=0
+
+# **The binaries this reads must not change while it reads them**, and until a
+# figure check reported three section-mesher figures as drifted, nothing said so.
+# What had happened was a `ninja` finishing mid-run: the check started at
+# 02:16:06, `section_probe` was relinked at 02:17:44 from a tree carrying an
+# experimental edit, and the section block sits ninety-odd checks in. The figures
+# were a correct measurement of a *different program*, and the obvious reading was
+# a defect in a mesher nobody had touched for sixty-five commits.
+#
+# One `stat` at each end turns that into a line of output. It is deliberately not
+# a hash: the point is to catch a rebuild, and mtime is what a rebuild changes.
+TOOLS_WATCHED="$SHIPSIM $TESTS $SPIKE $ZONE $BULK $RAM $WATER $GAS $SECTION $GPU $SMOKE $SEAWAY"
+toolStamps() {
+  local out="" t
+  for t in $TOOLS_WATCHED; do
+    [ -x "$t" ] || continue
+    out="$out $t:$(stat -c '%Y:%s' "$t" 2>/dev/null || echo '?')"
+  done
+  printf '%s' "$out"
+}
+stampsBefore=$(toolStamps)
 # **Every block that does not run is named in the summary.** See the note above the
 # summary itself: a gate that skipped everything used to print `ok` and a count of
 # zero, which `verify.sh` accepts, and the count is the only thing that would have
@@ -1246,6 +1267,19 @@ fi
 # read and pasted -- the per-block notes scroll off the top of a 900 s run. GPU
 # blocks must still *skip* rather than fail on a machine with no device, which is
 # why a named skip is not itself red: what was missing is that it be visible.
+# Did anything we read get rebuilt while we were reading it? Reported before the
+# figure verdict, because if it did then the verdict is about two programs and
+# every other line below is unsafe to act on.
+stampsAfter=$(toolStamps)
+if [ "$stampsBefore" != "$stampsAfter" ]; then
+  printf '%s✗%s a tool changed on disk while the gate was reading it — this run\n' "$red" "$off"
+  printf '      compared figures against more than one build, and its verdict\n'
+  printf '      means nothing. Re-run on a tree nobody is building.\n'
+  printf '      %sbefore:%s%s\n' "$dim" "$stampsBefore" "$off"
+  printf '      %safter: %s%s\n' "$dim" "$stampsAfter" "$off"
+  exit 1
+fi
+
 if [ "$checks" -eq 0 ]; then
   printf '%s✗%s the gate checked nothing at all — no tool it reads was built\n' "$red" "$off"
   echo "0 of 0 published figures could be checked;$skipped did not run"
