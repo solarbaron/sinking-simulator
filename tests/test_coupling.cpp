@@ -2228,6 +2228,92 @@ void testPlasticSofteningGoesBack() {
 // one §4 gives for dropping an orphan node -- a torn element handed back as a
 // stiffness of zero leaves rows nothing supports, and `reduction.hpp` §3 records
 // that the banded factorisation does not reliably catch that.
+// --- 5c. The overload that reads a solved zone, rather than assembled pieces ---------
+//
+// `softening(Patch, Solver, ...)` is the call §5 is written around, and until this
+// test it was the one of the pair that no object in the build referenced: an `nm
+// --undefined-only` sweep found it defined at `coupling.cpp:364`, declared at
+// `coupling.hpp:437`, and called by nothing. Every test above reaches the mesh
+// overload with pieces the caller assembled by hand, which is exactly the shape
+// that cannot catch a wrapper unpacking the wrong field.
+//
+// Three things here are its own and not the mesh overload's. The elastic refusal.
+// That the fields it unpacks are the ones it claims. And that it forwards
+// `modulus` -- the last being the one a plausible edit breaks silently, since a
+// wrapper that drops a defaulted argument still compiles and still returns a
+// `Softening` full of believable numbers.
+void testTheSofteningOverloadReadsTheSolvedZone() {
+    std::printf("\n--- coupling: softening read from a solved zone ---\n");
+    const Fixture f = buildFixture();
+    const plasticity::Material material = plasticity::shipSteel();
+
+    // "Solved elastically" and "solved and did not yield" are the same empty array
+    // and different answers, which is the distinction `withoutTornElements` draws
+    // one function earlier.
+    zone::SolveParams elasticParams;
+    elasticParams.plastic = false;
+    elasticParams.indenter.halfLength = 0.0;
+    elasticParams.duration = 2.0 * f.patch.criticalTimestep;
+    zone::Solver elasticSolver(f.patch, material, elasticParams);
+    const coupling::Softening none = coupling::softening(f.patch, elasticSolver, material);
+    expectTrue("an elastically solved zone yields no correction", none.attachment.empty());
+    expectEqualCount("and nothing is reported softened", none.softened, 0u);
+    // **And says *which* why.** Asserting only that `problems` is non-empty does
+    // not reach this guard at all: with it removed the call falls through to the
+    // mesh overload, which finds a zero-length state against a non-empty mesh and
+    // reports "it is not this mesh's history" -- non-empty, plausible, and blaming
+    // a mesh mismatch for what is actually an elastic solve. A caller chasing that
+    // message goes looking for the wrong bug. Verified by mutation: dropping the
+    // guard leaves every other assertion here green.
+    expectTrue("but it says why rather than looking undamaged", !none.problems.empty());
+    expectTrue("and blames the elastic solve rather than the mesh it was solved on",
+               none.problems.front().find("solved elastically") != std::string::npos);
+
+    // A yielded zone, driven the way `testTheRampAndTheTearReadBack` drives a torn
+    // one -- through `adopt`, because reaching real flow costs core-minutes and what
+    // is under test is the reading, not the plasticity.
+    zone::SolveParams plasticParams;
+    plasticParams.plastic = true;
+    plasticParams.indenter.halfLength = 0.0;
+    plasticParams.duration = 2.0 * f.patch.criticalTimestep;
+    zone::Solver yielded(f.patch, material, plasticParams);
+    std::vector<solidshell::ElementPlasticState> state = yielded.elementState();
+    expectEqualCount("the solver keeps a state per element", state.size(),
+                     f.patch.elementCount());
+    for (std::size_t e = 0; e < 4 && e < state.size(); ++e)
+        for (int g = 0; g < solidshell::kGauss; ++g)
+            state[e].point[g].equivalentPlasticStrain = 0.02;
+    yielded.adopt(yielded.position(), std::vector<double>(3 * f.patch.nodeCount(), 0.0), state, 0,
+                  0, 0, 0, 0);
+
+    // **The unpacking, pinned.** The wrapper picks which of the patch's fields are
+    // the mesh and the elastic material; one that passed a different material would
+    // compile and would still soften four elements.
+    const coupling::Softening viaSolver = coupling::softening(f.patch, yielded, material);
+    const coupling::Softening viaPieces =
+        coupling::softening(f.patch.mesh, f.patch.material, material, yielded.elementState());
+    expectEqualCount("reading the zone softens what assembling the pieces softens",
+                     viaSolver.softened, viaPieces.softened);
+    expectNear("to the same worst knockdown", viaSolver.worstRatio, viaPieces.worstRatio, 0.0);
+    expectNear("and the same mean", viaSolver.meanRatio, viaPieces.meanRatio, 0.0);
+    // Vacuity: two empty results agree trivially, and the elastic case above shows
+    // this call can produce one.
+    expectEqualCount("which is not a pair of empty answers", viaSolver.softened, 4u);
+
+    // **`modulus` is forwarded**, which is the argument a plausible edit drops. A
+    // wrapper that took the default for both would return the secant answer twice
+    // and every assertion above would still hold. `shearRatio` branches on it per
+    // Gauss point, and on this history the two are not close: secant 0.0836 against
+    // tangent 0.0102, because past yield the tangent modulus is far below the
+    // secant one and the added compliance goes as its reciprocal.
+    const coupling::Softening tangent =
+        coupling::softening(f.patch, yielded, material, coupling::Modulus::Tangent);
+    expectTrue("the tangent knockdown is softer than the secant by more than a factor of two",
+               tangent.worstRatio < 0.5 * viaSolver.worstRatio);
+    expectTrue("and both are real knockdowns rather than a collapsed zero",
+               tangent.worstRatio > 1e-6 && viaSolver.worstRatio < 1.0);
+}
+
 void testTearingAndSofteningCompose() {
     std::printf("\n--- coupling: tearing and softening are different mechanisms ---\n");
     const Fixture f = buildFixture();
@@ -2362,5 +2448,6 @@ void runCouplingTests() {
     testPrescribedSolveAndMeshSurgery();
     testTierOneCannotSeeTheStiffeners();
     testPlasticSofteningGoesBack();
+    testTheSofteningOverloadReadsTheSolvedZone();
     testTearingAndSofteningCompose();
 }

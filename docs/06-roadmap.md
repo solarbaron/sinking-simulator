@@ -29,7 +29,7 @@ Numerical core, flooding, air, damaged stability, validation harness.
 - Mesh boolean (clip, weld, cap by ear clipping) so compartments are carved out
   of the hull form rather than authored as boxes
 - Watertightness checking and load-time ship definition validation
-- 200 409 closed-form validation checks
+- 200 420 closed-form validation checks
 - A 120 m ferry that lolls over or capsizes depending on what you do — and, since
   GM stopped being sampled at a fixed ±0.03 rad, does not survive any of the three
 - Explicit co-rotational tet FEM, CPU reference plus a Vulkan compute back-end,
@@ -51,8 +51,8 @@ without.
   ASan poisoning of the unused region (`01-architecture.md` §5). These are what
   make the Chase-Lev handle scheme below safe without a reclamation scheme.
 - ~~**Job throughput and grain-scaling benchmark**~~ **done** — `tools/job_bench`.
-  Dispatch costs 17–23 ns uncontended; efficiency plateaus at ~2 µs chunks; the
-  penalty for bad grain is at least 17× and grows with worker count. Numbers and
+  Dispatch costs 15–19 ns uncontended; efficiency plateaus at ~2 µs chunks; the
+  penalty for bad grain is at least 15× and grows with worker count. Numbers and
   caveats in `01-architecture.md` §1.
 - ~~**Grain auto-tuning**~~ **done** — `parallelForAuto()` probes for cost and
   targets 10 µs chunks, clamped to 2–64 chunks per lane. Matches or beats the
@@ -1485,10 +1485,11 @@ should be honest about that.
   integrator's own closed form `−g dt² N(N+1)/2` to 1.1e-15, with **exactly zero**
   sideways. Mass is not conserved to a tolerance, it is *exact*: `expectNear(...,
   0.0, 0.0)` on the residual, with the particle count asserted as an integer
-  beside it, through a dam break that clamps 18 610 particles against walls.
+  beside it, through a dam break in which the particle count is asserted as an
+  integer beside a mass residual of exactly zero.
 
   **Sparsity is tested for what it is for.** An empty 400³-cell room — 64 million
-  cells, 7.4 GB dense at the 115 bytes a cell this structure costs — allocates
+  cells, 7.4 GB dense at the 116 bytes a cell this structure costs — allocates
   **zero tiles and zero bytes**. The same water in a 20³ room and a 400³ room
   allocates the same 48 tiles and produces **bit-identical** particle positions
   after fifty steps, which is the statement that the room's extent does not enter
@@ -1506,8 +1507,11 @@ should be honest about that.
   rooms or changed over a fall, and a factor of three is invisible to all of them.
   Same shape as the half-bandwidth `reduction.cpp` reported and the suite believed.
 
-  **Sloshing, against `2π/√(g k tanh k d)`.** The first mode comes out **+5.66%**
-  on six cells of depth and **+3.97%** on nine, converging on about +3%, which is
+  **Sloshing, against `2π/√(g k tanh k d)`.** The first mode comes out **+5.99%**
+  on six cells of depth at two cells of amplitude. Refining at a *fixed* three
+  cells of amplitude — the only sequence here that moves one variable — gives
+  **+5.79%** on eight cells, **+4.07%** on ten and **+3.58%** on twelve,
+  converging on about +3%, which is
   the nonlinear correction at `a/d = 1/3` and does not go away with the grid. The
   amplitude has to be a *couple of cells*: a voxelised free surface cannot
   represent a sub-cell tilt and therefore has no restoring force to give, and the

@@ -81,7 +81,7 @@
 //   1. **An empty compartment costs nothing.** No particles, no tiles, no bytes,
 //      no work: `Solver::bytes()` is 0 and `step()` returns having done nothing,
 //      whatever the domain is. A 400x400x400-cell compartment -- 64 million cells,
-//      7.4 GB dense at the 115 bytes a cell this structure costs -- with no water
+//      7.4 GB dense at the 116 bytes a cell this structure costs -- with no water
 //      in it allocates zero.
 //   2. **Cost follows the water, not the room.** The same body of water in a 20^3
 //      domain and in a 400^3 domain allocates the *same* tiles and produces

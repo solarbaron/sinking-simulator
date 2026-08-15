@@ -66,10 +66,18 @@
 # it, and the tools they run -- `seaway_view` most of all -- had published figures
 # that nothing in the repository re-ran.
 #
-# `01`, `04` and `05` stay at zero on purpose: `01` and `04` are design documents
-# whose digits are dates, section numbers and budgets nothing computes, and `05`'s
-# are the fields of a file format that `test_shipfile.cpp` already parses. A figure
-# is worth gating here when a *tool* produces it.
+# **`01` no longer stays at zero, and the reason it used to is a lesson about
+# document-level reasoning.** The rule -- `01` and `04` are design documents whose
+# digits are dates, section numbers and budgets nothing computes -- is true of most
+# of `01` and false of the table at §104-109 and the paragraphs under it, which are
+# `job_bench` output and nothing else. Judging a document as a whole hid a table of
+# live measurements inside a correct generalisation about the document containing
+# it; CI has been running `job_bench` since the beginning under a comment saying its
+# figures are what the docs quote, checking only the exit code. Four of those
+# figures had drifted by the time anyone re-derived them. `04` and `05` do stay at
+# zero: `04`'s digits really are budgets and dates, and `05`'s are the fields of a
+# file format `test_shipfile.cpp` already parses. A figure is worth gating here when
+# a *tool* produces it -- which is a question about the line, not about the file.
 #
 # Cost: the damage figures need no flooding at all and run with `--duration=1` in
 # about a second each; three runs pay for the full 900 s. Around 105 s for the
@@ -83,6 +91,11 @@ RAM=${RAM:-./build/ram_view}
 WATER=${WATER:-./build/water_probe}
 GAS=${GAS:-./build/gas_probe}
 GASDOC=engine/sim/promotion.hpp
+JOBS=${JOBS:-./build/job_bench}
+ARCH_DOC=docs/01-architecture.md
+FLIP=${FLIP:-./build/flip_probe}
+FLIP_DOC=engine/sim/flip.hpp
+ESC_DOC=docs/flip-escalation-design.md
 SECTION=${SECTION:-./build/section_probe}
 SECTION_DOC=docs/02-simulation.md
 RENDER_DOC=docs/03-renderer-audio.md
@@ -124,8 +137,11 @@ red=$'\033[0;31m'; green=$'\033[0;32m'; dim=$'\033[2m'; off=$'\033[0m'
 
 # check <label> <expected> <tolerance> <actual> <doc quote to find>
 #
-# The tolerance is relative for magnitudes and the caller passes an absolute one
-# for angles by giving a tolerance larger than 1. It is deliberately tight: these
+# **The tolerance is absolute, always** -- `awk` on |actual - expected|. This
+# comment used to say it was "relative for magnitudes", which it has never been:
+# a reader sizing a tolerance for a figure of 356736 from that sentence would
+# have written 0.01 meaning 1% and got a gate a hundred-thousand times tighter
+# than intended. It is deliberately tight: these
 # runs are deterministic, so a figure that moves at all is either a real change in
 # the physics or a real change in the ship, and both want a human to look.
 check() {
@@ -639,7 +655,7 @@ fi
 # just added a test. One `expected` variable cannot disagree with itself.
 if [ -x "$TESTS" ]; then
   suite=$("$TESTS" 2>&1 | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  expected=200409
+  expected=200420
   check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
         "$expected validation checks" "$FRONT"
   # **The roadmap publishes the same count in a different format**, and it was
@@ -1271,6 +1287,249 @@ fi
 # read and pasted -- the per-block notes scroll off the top of a 900 s run. GPU
 # blocks must still *skip* rather than fail on a machine with no device, which is
 # why a named skip is not itself red: what was missing is that it be visible.
+# --- the job system's grain figures, which are the first gate on `01` ----------
+#
+# `01-architecture.md` was one of the documents the note at the top of this file
+# recorded as gating zero figures, on a reason -- design documents whose digits are
+# section numbers and budgets nothing computes -- that is true of most of it and
+# false of the table at §104-109. CI runs `job_bench`
+# (`.github/workflows/ci.yml:49`) under a comment saying its figures are what the
+# docs quote, and asserts only the exit code: the `zone_gpu_probe` hole above, in
+# a second place.
+#
+# **This is the only tool here whose figures are load-dependent**, and that splits
+# the block rather than making it unwritable.
+#
+# *Machine-independent, always checked.* `parallelForAuto`'s chunk count is not a
+# measurement. `jobs.hpp:125-133` says why: on a 20 M element loop the lower clamp
+# binds, so 12 lanes x 64 gives 768 chunks and 27 lanes x 64 gives 1728 whatever
+# the probe measured. Confirmed bit-identical over thirty-one runs spanning load
+# 1.7 to 10. The *grain* carries a tolerance of 2 where the chunk count carries 0,
+# and they are not the same claim: grain is `ceil(remaining / 768)` and
+# `remaining` moves by the length of the geometric probe prefix, which steps from
+# 1365 elements to 341 on a machine slower than 5.9 ns/element. The chunk count is
+# invariant under that by construction, since `ceil(r / ceil(r/768)) == 768`.
+#
+# *Load-dependent, checked only on a box wide enough to mean it.* `verify.sh full`
+# runs on a 2-core GitHub runner where `JobSystem(23)` is 23 threads on 2 cores
+# and every millisecond column is meaningless. A gate that goes red there teaches
+# people to ignore red, which is worse than the hole it closes -- so the sweep is
+# skipped by name rather than fudged with a tolerance wide enough to survive it.
+#
+# ~3 s.
+if [ -x "$JOBS" ]; then
+  bench=$("$JOBS" 2>&1)
+  # Keyed on `$2 == "workers:"` and not on line numbers: §2's per-worker tables
+  # and §3b's rows are both five numeric columns, and only §2's sit under a
+  # `   N workers:` heading. The `grain for a` line closes the last table, which
+  # is what stops 3b being read as a continuation of it.
+  sweep() {
+    printf '%s\n' "$bench" |
+      awk -v w="$1" '$2 == "workers:" { inblock = ($1 == w); next }
+                     /grain for a/ { inblock = 0 }
+                     inblock && NF == 5 && $1 ~ /^[0-9]+$/ { print $1, $3, $4 }'
+  }
+  auto() {
+    printf '%s\n' "$bench" |
+      awk -v w="$1" -v c="$2" '/^3b\./ { in3b = 1; next } /^4\./ { in3b = 0 }
+                               in3b && NF == 5 && $1 == w { print $c }'
+  }
+
+  check "auto-grain chunk count, 8 workers (12 lanes x 64)"  768 0 "$(auto 8 3)" \
+        '12 lanes x 64 gives 768' engine/core/jobs.hpp
+  check "auto-grain chunk count, 23 workers (27 lanes x 64)" 1728 0 "$(auto 23 3)" \
+        '27 lanes x 64 gives 1728' engine/core/jobs.hpp
+  check "the grain that falls out of it, 8 workers"  26040 2 "$(auto 8 2)" \
+        'the grain comes out 26 040 and' engine/core/jobs.hpp
+  check "the grain that falls out of it, 23 workers" 11574 2 "$(auto 23 2)" \
+        'the grain comes out 26 040 and' engine/core/jobs.hpp
+
+  if [ "$(nproc 2>/dev/null || echo 0)" -ge 24 ]; then
+    uncont=$(printf '%s\n' "$bench" | awk '/^1\. Per-job/{i=1;next} /^2\./{i=0}
+                                           i && NF==3 && $1=="0" {print $2}')
+    # **The plateau is asserted as a *position*, not as a millisecond.** The
+    # milliseconds move 1.2-1.5x between runs; which grain first comes within 15%
+    # of the best does not. That is also the figure `01` actually publishes: the
+    # chunk *size* where efficiency plateaus, whose microsecond column is a pure
+    # function of the baseline and the chunk count.
+    pgrain=$(sweep 8 | awk '{ g[NR]=$1; t[NR]=$3; if (b=="" || $3<b) b=$3 }
+                            END { for (i=1;i<=NR;i++) if (t[i] <= 1.15*b) { print g[i]; exit } }')
+    # A tolerance of 8 on 17 is not a rounding allowance, for the reason the
+    # `water_probe` block above gives about 27.9 +/- 4.0: what has to stay true is
+    # that dispatching a job costs tens of nanoseconds and not hundreds, because
+    # that is the whole of the cancelled-Chase-Lev argument at §138-143.
+    # Twenty-three runs here gave 14.8-16.1; a further fifteen elsewhere gave up
+    # to 19.2.
+    check "uncontended dispatch (ns/job)" 17 8 "$uncont" \
+          '| Dispatch, uncontended (0 workers) | **15–19 ns/job** |' "$ARCH_DOC"
+    check "grain at which 8 workers reach the plateau" 1024 0 "$pgrain" \
+          '| Chunk size at which efficiency plateaus | **≈ 2 µs** |' "$ARCH_DOC"
+
+    # **The grain penalty is gated as a bound and can only be gated as a bound.**
+    # The grain-16 row moved 1.5x and 2.5x across runs while the plateau it is
+    # divided by held to 1.05x, so the ratio spans 17.8-28.1x and 28.0-73.7x here.
+    # The floor gated is *below* the published 15x, deliberately: the published
+    # bound is the claim, and a gate set at the claim with 5% of headroom is a
+    # tripwire that goes red on a correct build. See §112-129 for why the bound
+    # moves down as the box gets quieter -- CI is not the quiet end of that curve,
+    # but this check runs on developer boxes that might be.
+    checks=$((checks + 1))
+    pen8=$(sweep 8   | awk '$1 == 16 { w = $3 } { if (b=="" || $3<b) b=$3 } END { printf "%.1f", w/b }')
+    pen23=$(sweep 23 | awk '$1 == 16 { w = $3 } { if (b=="" || $3<b) b=$3 } END { printf "%.1f", w/b }')
+    if awk -v a="$pen8" -v b="$pen23" 'BEGIN { exit !(a >= 13 && b >= 20) }'; then
+      printf '  %s✓%s the grain-16 penalty is at least 13x at 8 workers (%sx) and 20x at 23 (%sx)\n' \
+             "$green" "$off" "$pen8" "$pen23"
+    else
+      printf '  %s✗%s the grain penalty fell through its floor: %sx at 8 workers, %sx at 23\n' \
+             "$red" "$off" "$pen8" "$pen23"
+      printf '      %s%s publishes "**at least 15×**" — below 13x the claim is gone%s\n' \
+             "$dim" "$ARCH_DOC" "$off"
+      fails=$((fails + 1))
+    fi
+
+    # **And that the tuner lands in the plateau**, which is the claim §123-129
+    # makes and is a relation rather than a millisecond.
+    checks=$((checks + 1))
+    ratio8=$(sweep 8 | awk -v a="$(auto 8 4)" '{ if (b=="" || $3<b) b=$3 } END { printf "%.3f", a/b }')
+    ratio23=$(sweep 23 | awk -v a="$(auto 23 4)" '{ if (b=="" || $3<b) b=$3 } END { printf "%.3f", a/b }')
+    if awk -v a="$ratio8" -v b="$ratio23" 'BEGIN { exit !(a <= 1.15 && b <= 1.15) }'; then
+      printf '  %s✓%s the auto-tuner lands in the plateau (%s and %s of the best swept grain)\n' \
+             "$green" "$off" "$ratio8" "$ratio23"
+    else
+      printf '  %s✗%s the auto-tuner no longer lands in the plateau: %s and %s of the best grain\n' \
+             "$red" "$off" "$ratio8" "$ratio23"
+      fails=$((fails + 1))
+    fi
+  else
+    echo "  - fewer than 24 hardware threads, skipping job_bench's load-dependent figures"
+    skipped="$skipped job_bench(sweep)"
+  fi
+else
+  echo "  - job_bench not built, skipping the job system's grain figures"
+  skipped="$skipped job_bench"
+fi
+
+# --- the FLIP solver's studies, which nothing in the repository re-ran ------------
+#
+# `tools/flip_probe` is the purest case of the shape this file exists for:
+# `06-roadmap.md`'s Phase 5 item, `engine/sim/flip.hpp` §1-§3 and
+# `flip-escalation-design.md` all quote it, `verify.sh` runs `flip_tests` -- a
+# different target, `CMakeLists.txt:131` -- and nothing has ever run the probe.
+#
+# **Unlike `job_bench` above, every figure here is gateable.** Two 70 s runs diff
+# to nothing but wall-clock columns; filtered of those, three runs are
+# byte-identical. So these carry the digit the document rounded to and nothing
+# more, and several carry a tolerance of zero.
+#
+# **What runs is four of the five studies.** `--slosh` is the other 39 s -- 56% of
+# the tool's runtime for two figures -- and is left out. Its `h=0.04`, two-cell row
+# is the same configuration the transfer study's tank already reports as APIC
+# `+4.45%`, so it is covered here for free, and its convergence claim is asserted
+# inside the tool by `require("refinement improves the period at fixed amplitude
+# in cells", monotone)` rather than published as a figure. `--quick` would be 3.4 s
+# but drops the tank table, which is five of the eight transfer figures and the
+# whole "the ordering reverses" argument. ~31 s.
+if [ -x "$FLIP" ]; then
+  flip=$("$FLIP" --sparse --solver --transfer --dam 2>&1)
+  # Four columns is the empty-room table, six is the same water in three rooms;
+  # both keyed on the room, neither on a line number.
+  empty()   { printf '%s\n' "$flip" | awk -v c="$1" 'NF == 4 && $1 == "400^3" { print $c; exit }'; }
+  wet()     { printf '%s\n' "$flip" | awk -v c="$1" 'NF == 6 && $1 == "400^3" { print $c }'; }
+  poisson() { printf '%s\n' "$flip" | awk -v k="$1" -v c="$2" '$1 == k && $2 == "1e-13" && NF == 4 { print $c }'; }
+  rot()     { printf '%s\n' "$flip" | awk -v m="$1" -v c="$2" '$1 == m && NF == 4 { print $c }'; }
+  tank()    { printf '%s\n' "$flip" | awk -v m="$1" -v c="$2" '$1 == m && NF == 6 { gsub(/[+%]/, "", $c); print $c }'; }
+
+  check "an empty 400^3 room allocates tiles" 0 0 "$(empty 3)" \
+        '**zero tiles and zero bytes**' "$DOC"
+  check "an empty 400^3 room allocates bytes" 0 0 "$(empty 4)" \
+        '**zero tiles and zero bytes**' "$DOC"
+  check "the same water in a 400^3 room, tiles" 48 0 "$(wet 2)" \
+        'allocates the same 48 tiles and produces **bit-identical** particle positions' "$DOC"
+  check "bytes per allocated cell" 116.1 0.05 \
+        "$(printf '%s\n' "$flip" | sed -n 's/.*costs \([0-9.]*\) bytes per allocated cell.*/\1/p')" \
+        '7.4 GB dense at the 116 bytes a cell this structure costs' "$DOC"
+
+  # **"the same 48 tiles" is a claim about three rooms, and gating one of them
+  # does not make it.** A structure that had started counting the domain would
+  # give 48 in the 20^3 room and something larger in the 400^3 -- and the row
+  # above, taken from the 400^3, would be the one that moved, while the claim
+  # under test is that the three are *equal*. Same argument the `section_probe`
+  # block makes for checking the negative control beside the tied one.
+  checks=$((checks + 1))
+  distinct=$(printf '%s\n' "$flip" | awk 'NF == 6 && $1 ~ /\^3$/ { print $2, $3, $4 }' | sort -u | wc -l)
+  if [ "$distinct" = 1 ]; then
+    printf '  %s✓%s the 20^3, 100^3 and 400^3 rooms allocate one identical row of tiles/cells/bytes\n' \
+           "$green" "$off"
+  else
+    printf '  %s✗%s the room extent has entered the arithmetic — %s distinct rows across three rooms\n' \
+           "$red" "$off" "$distinct"
+    fails=$((fails + 1))
+  fi
+
+  check "SOR sweeps to a 1e-13 residual on 24 cells" 1170 0 "$(poisson 24 3)" \
+        'relaxation of 1.7 needs **1 170 sweeps** to reach a 1e-13 residual on 24' "$FLIP_DOC"
+  check "Jacobi-CG iterations for the same"            24 0 "$(poisson 24 4)" \
+        '- CG solve dominates (24 iterations for machine precision)' "$ESC_DOC"
+  check "SOR sweeps to a 1e-13 residual on 64 cells"  8221 0 "$(poisson 64 3)" \
+        'At 64 cells it is 8 221 sweeps' "$FLIP_DOC"
+  check "Jacobi-CG iterations for the same"             64 0 "$(poisson 64 4)" \
+        'At 64 cells it is 8 221 sweeps' "$FLIP_DOC"
+
+  check "PIC angular momentum kept over ten transfers"  0.892 0.0005 "$(rot PIC 3)" \
+        'keeps **89.2%** of its angular momentum through ten particle→grid→particle' "$DOC"
+  check "APIC angular momentum kept over ten transfers" 0.982 0.0005 "$(rot APIC 3)" \
+        'transfers and APIC **98.2%** — 1.08% against 0.18% per transfer, **6.1× less**.' "$DOC"
+  # FLIP is the identity here by construction, and it is the control that says the
+  # other two rows are measuring a transfer at all rather than a decaying number.
+  check "FLIP is the identity, which is the control"      1.0 0.0 "$(rot FLIP 3)" \
+        'transfers and APIC **98.2%** — 1.08% against 0.18% per transfer, **6.1× less**.' "$DOC"
+  check "how much less APIC loses per transfer"           6.1 0.05 \
+        "$(printf '%s\n' "$flip" | sed -n 's/.*-- \([0-9.]*\) times less\..*/\1/p')" \
+        'transfers and APIC **98.2%** — 1.08% against 0.18% per transfer, **6.1× less**.' "$DOC"
+
+  # The tank pair is the point exactly as the capsize bracket above is: the whole
+  # argument for APIC is that the ordering *reverses* between the rotation study
+  # and this one, and either figure alone is consistent with a solver that had
+  # lost one of them. The crossings go with the periods -- a period read off a
+  # signal that crossed the centreline three times is not the same measurement as
+  # one read off eight.
+  check "FLIP particle noise in the tank"  0.876 0.0005 "$(tank FLIP 4)" \
+        'In a sloshing tank the ordering reverses: FLIP carries **87.6%** particle-borne' "$DOC"
+  check "APIC particle noise in the tank"  0.013 0.0006 "$(tank APIC 4)" \
+        'velocity the grid never sees, APIC **1.3%**' "$DOC"
+  check "APIC first-mode period error (%)"  4.45 0.005 "$(tank APIC 3)" \
+        'comes out **+4.45%**, PIC **+9.16%** and FLIP **+9.81%** -- and PIC crosses' "$FLIP_DOC"
+  check "PIC first-mode period error (%)"   9.16 0.005 "$(tank PIC 3)" \
+        'comes out **+4.45%**, PIC **+9.16%** and FLIP **+9.81%** -- and PIC crosses' "$FLIP_DOC"
+  check "FLIP first-mode period error (%)"  9.81 0.005 "$(tank FLIP 3)" \
+        'comes out **+4.45%**, PIC **+9.16%** and FLIP **+9.81%** -- and PIC crosses' "$FLIP_DOC"
+  check "PIC centreline crossings in five seconds"  3 0 "$(tank PIC 6)" \
+        'the centreline three times in five seconds where APIC crosses eight, because' "$FLIP_DOC"
+  check "APIC centreline crossings in five seconds" 8 0 "$(tank APIC 6)" \
+        'the centreline three times in five seconds where APIC crosses eight, because' "$FLIP_DOC"
+
+  # **The dam break has no figure worth gating and one relation that is.** Its
+  # front position, peak speed and clamp count are outputs of a scheme with no
+  # closed form to check them against -- the tool says so itself. What it does
+  # have is Ritter's dry-bed celerity as a ceiling the front must never pass,
+  # which is the one thing here a wrong advection would break and a tolerance
+  # would hide.
+  checks=$((checks + 1))
+  ritter=$(printf '%s\n' "$flip" | sed -n "s/.*2 sqrt(g h0) = \([0-9.]*\) m\/s.*/\1/p")
+  peak=$(printf '%s\n' "$flip" | awk 'NF == 7 && $1 ~ /^0\./ { if ($3 > m) m = $3 } END { print m + 0 }')
+  if awk -v p="$peak" -v r="$ritter" 'BEGIN { exit !(p > 0 && p < r) }'; then
+    printf '  %s✓%s the dam-break front stays under Ritter (%s m/s against %s)\n' \
+           "$green" "$off" "$peak" "$ritter"
+  else
+    printf '  %s✗%s the dam-break front reached %s m/s against Ritter %s\n' \
+           "$red" "$off" "$peak" "$ritter"
+    fails=$((fails + 1))
+  fi
+else
+  echo "  - flip_probe not built, skipping the FLIP solver's studies"
+  skipped="$skipped flip_probe"
+fi
+
 # Did anything we read get rebuilt while we were reading it? Reported before the
 # figure verdict, because if it did then the verdict is about two programs and
 # every other line below is unsafe to act on.

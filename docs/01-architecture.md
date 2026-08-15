@@ -103,22 +103,34 @@ alone varied by 2.1× between runs, which the tool now reports rather than hides
 
 | Quantity | Measured |
 |---|---|
-| Dispatch, uncontended (0 workers) | **17–23 ns/job** |
-| Dispatch, 16–23 workers, all jobs from one lane | ~250 ns/job |
+| Dispatch, uncontended (0 workers) | **15–19 ns/job** |
+| Dispatch, 16–23 workers, all jobs from one lane | **under 400 ns/job**, and load-dependent by 5× between runs of the same binary |
 | Chunk size at which efficiency plateaus | **≈ 2 µs** |
-| Penalty for getting grain wrong | **at least 17×**, and worse with more workers (grain 16 vs the plateau: median 21× at 8 workers, 41× at 23) |
+| Penalty for getting grain wrong | **at least 15×**, and worse with more workers (grain 16 vs the plateau: median 21× at 8 workers, 44× at 23) |
 
 Three conclusions:
 
 **Grain dominates everything else.** At a fixed worker count, the span between
 the worst and best grain **grows with worker count** -- median 21x at 8 workers
-and 41x at 23 over eight runs, because contention on the tiny-chunk end scales
-with lanes while the plateau does not. A single figure hides that: "~40x" was
-right for 23 workers and about double the truth at 8. The grain-16 row alone
-varies 3x between runs at 23 workers, so the honest published claim is the bound
--- every one of sixteen measurements exceeded 17x. Nothing else in the job system comes
-close to mattering that much, which is why grain auto-tuning was built and the
-queue rewrite was not.
+and 44x at 23 over twenty-five runs, because contention on the tiny-chunk end
+scales with lanes while the plateau does not. A single figure hides that: "~40x"
+was right for 23 workers and about double the truth at 8. The grain-16 row alone
+varies 3x between runs at 23 workers, so the honest published claim is the bound.
+
+**That bound was 17x and is now 15x, and the reason is a direction, not a
+tolerance.** It was set on sixteen measurements that all exceeded 17x. It then
+survived a further twenty-five runs on this box -- minimum 17.80x -- and was
+contradicted once, at 16.51x, on a box at load 0.47 where nothing here had
+measured. Non-reproduction is not refutation, so the deciding evidence is the
+*sign* of the load dependence: putting ten spinners on the machine moved the
+penalty **up**, to 20.6-28.1x. Grain-16 is dispatch-bound and the plateau is
+work-bound, so a quieter box makes the numerator cheaper faster than the
+denominator, and the ratio falls as the machine gets idler. This box at load ~1.9
+is not the quiet end of that curve, which is exactly where the bound is weakest.
+15x is where it goes with the one contradicting measurement inside it.
+
+Nothing else in the job system comes close to mattering that much, which is why
+grain auto-tuning was built and the queue rewrite was not.
 
 `parallelForAuto()` acts on this: it probes with a geometrically growing prefix
 on the calling thread, derives cost per element, and picks a grain targeting
@@ -137,16 +149,29 @@ performance work and the determinism requirement genuinely conflict, and
 determinism wins.
 
 **The Chase-Lev revisit is cancelled, on evidence.** Uncontended dispatch is
-0.2% of a 10 µs chunk; even the worst-case contended figure is ~2.5%, and that
+0.2% of a 10 µs chunk; even the worst-case contended figure is under 4%, and that
 case is empty jobs all submitted from one lane, which maximises steal pressure
 and does not occur with real work. At plateau grains the sweep shows no
 dispatch-limited regime at all, so there is nothing for a faster queue to
 recover. Revisit only if a profile shows queue contention.
 
-**Efficiency falls off well before 23 workers.** 8 workers reach ~5.7×, 16 reach
-~6.7×, 23 reach ~6.9×. How much of that is the job system and how much is a
-machine already running at load 11 cannot be separated here; it needs a quiet
-box before any conclusion is drawn about worker-count tuning.
+**Efficiency falls off well before 23 workers.** This paragraph used to publish
+5.7×, 6.7× and 6.9× at 8, 16 and 23 workers and to say that a machine at load 11
+could not be separated from the job system without a quiet box. It has now had
+one. Over eight runs at load ~1.7: **8 workers reach 7.2–8.5×, 16 reach
+10.8–12.4×, 23 reach 11.4–12.6×** — efficiency 80–94%, 64–73% and 47–53% against
+a pool that is `workers + 1` wide, because the submitting thread works too.
+
+So the falloff is real and the old numbers were mostly the load. The shape worth
+keeping is that **the last seven workers buy about 3%**: 16→23 moves the speedup
+from ~11.6× to ~12.0× while the pool grows by 41%. That is the figure that bears
+on worker-count tuning, and unlike the absolute speedups it is stable across
+both load conditions.
+
+These are indicative, not gated: the millisecond columns move 1.2–1.3× between
+runs on an idle box and `verify.sh full` runs on a 2-core CI runner where
+`JobSystem(23)` is 23 threads on 2 cores. `check-figures.sh` gates the
+machine-independent grain figures and skips these by name.
 
 ### Verification
 
