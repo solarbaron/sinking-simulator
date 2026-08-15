@@ -36,23 +36,48 @@ namespace {
 void testTheSpectrumIntegratesToStefanBoltzmann() {
     // Derived from h, c and k rather than quoted -- the same discipline
     // `fire.hpp` applies to the caloric constants. CODATA's 5.670374419e-8 is
-    // exactly this expression evaluated at the 2019 defining constants, so
-    // agreeing with it to 1e-12 is a check on the algebra rather than a
-    // tautology.
+    // this expression evaluated at the 2019 defining constants and then **rounded
+    // to ten significant digits**, so the two agree to ten and differ in the
+    // eleventh: 3.2525e-11 relative, measured. That gap is the published rounding
+    // rather than an error here, so 3.3e-11 is the tightest this may honestly be.
+    //
+    // The comment here used to say "exactly", and read the agreement as a check on
+    // the algebra at 1e-12 -- a tolerance the code never used and which the real
+    // gap fails by 33x. What the tightening does buy is rejecting a *nine*-digit
+    // quotation: 5.67037442e-8 is 1.44e-10 off, which 1e-9 accepted.
     expectNear("Stefan-Boltzmann comes out of h, c and k", gpu::stefanBoltzmann(),
-               5.670374419e-8, 5.670374419e-8 * 1e-9);
+               5.670374419e-8, 5.670374419e-8 * 3.3e-11);
+
+    // The same constant under the other convention: `fire.hpp` quotes CODATA's
+    // ten-digit figure, this file derives it from the SI's exact h, c and k. Two
+    // computations of one physical constant, and nothing in the suite related them
+    // -- `test_fire.cpp` holds the quoted one against its own local re-derivation,
+    // so a divergence between the *modules* would have shown up nowhere and left
+    // the fire model and the renderer radiating at quietly different rates.
+    // Allowed to differ, but only by that published rounding.
+    expectNear("and it is fire.hpp's kStefanBoltzmann under the other convention",
+               gpu::stefanBoltzmann(), sim::fire::kStefanBoltzmann,
+               sim::fire::kStefanBoltzmann * 3.3e-11);
 
     // 1 nm to 1 m. **The upper limit is not decoration.** Stopping at 1 mm loses
     // 5.6e-6 of a 300 K body's power to the Rayleigh-Jeans tail -- measured, by
-    // running exactly this check with that limit -- which is four orders of
+    // running exactly this check with that limit -- which is eight orders of
     // magnitude above the tolerance below and would have been read as a broken
     // quadrature rather than as a truncated integral.
+    //
+    // **5e-14 and not 1e-9.** The worst of these four residuals is 6.7e-15, and
+    // moving from 512 to 2048 intervals takes it to 2.5e-14, so 5e-14 bounds the
+    // rule's own rounding floor rather than one lucky configuration. It matters
+    // beyond tidiness: at 1e-9 the whole suite stayed green with `stefanBoltzmann()`
+    // replaced by the quoted literal -- measured, by substituting it -- so the
+    // derivation this file exists to justify was unfalsifiable. At 5e-14 all four
+    // of these go red against the literal, which is what the header claims.
     for (double temperature : {300.0, 800.0, 1200.0, 2000.0}) {
         const double integrated = gpu::blackbodyBandRadiance(1e-9, 1.0, temperature, 512);
         const double closed = gpu::blackbodyRadiance(temperature);
         expectNear("the integrated spectrum is sigma T^4 / pi at " +
                        std::to_string(static_cast<int>(temperature)) + " K",
-                   integrated / closed, 1.0, 1e-9);
+                   integrated / closed, 1.0, 5e-14);
     }
 
     // And the quadrature converges rather than happening to land: refining it must

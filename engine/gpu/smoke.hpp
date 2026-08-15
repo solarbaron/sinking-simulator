@@ -131,9 +131,17 @@ namespace gpu {
 
 // The 2019 SI defining constants, exact by definition. Stefan-Boltzmann is
 // *derived* from them rather than quoted, on the same terms as `fire.hpp`'s
-// caloric constants: a quoted 5.670374419e-8 against these h, c and k would
-// disagree in the ninth digit, and `tests/test_smoke.cpp` asserts the quadrature
-// against this sigma at 1e-9, which is tight enough to see that.
+// caloric constants -- but not because a quoted value would be visibly different.
+// CODATA's 5.670374419e-8 is this very expression rounded to ten significant
+// digits: it agrees with the derivation to all ten and first differs in the
+// eleventh, by **3.2525e-11** relative, measured.
+//
+// **This said "the ninth digit", and that a 1e-9 assertion was tight enough to
+// see it.** Both were wrong, and the second was the one that mattered: with
+// `stefanBoltzmann()` replaced by the literal the entire suite stayed green, so
+// the derivation this paragraph exists to justify was unfalsifiable by any test.
+// `tests/test_smoke.cpp` now asserts the quadrature at 5e-14, 650x below the gap,
+// and the substitution turns all four of those assertions red.
 inline constexpr double kPlanck = 6.62607015e-34;      // J s
 inline constexpr double kLightSpeed = 299792458.0;     // m/s
 inline constexpr double kBoltzmann = 1.380649e-23;     // J/K
