@@ -2774,9 +2774,24 @@ three-metre zone at four elements across each 0.70 m bay:
 |---|---|
 | Zone | 14 panels → **224 elements**, 522 nodes, 24.0 m² of 12 mm plating |
 | Promotion — meshing, and a power iteration per element for the step | **7 ms**, once |
-| Predicted | 900 core-seconds per simulated second |
+| Predicted | **380 core-seconds** per simulated second — `224 x 1.7`, `promotion.hpp`'s `coreSecondsPerElement` |
 | Delivered, 23 workers | 21 290 steps, **4.5 s of wall time**, 0.94 µs/element/step |
 | The same run, one worker | 15.4 s, 3.24 µs/element/step |
+
+**That prediction read 900 until this table was read against itself.** 900 is
+`224 x 5.5e5 x 7.3 us`, the pre-`cacheRestForms` element cost that §1 above
+declares superseded and 2.4x pessimistic -- and the row *directly beneath it*
+refutes it without leaving the table: 15.4 core-seconds of one-worker wall time
+over 0.04 s of simulated time is **385**, which is `promotion.hpp`'s live 3.1 us
+to within 1%. A prediction and its own measurement, adjacent, 2.36x apart, and
+printed on the same run by the same tool.
+
+`zone.hpp` §1 had already corrected this figure to 380 and said so in those
+words. It did not reach here, which is the same unpropagated-retraction failure
+this document records at §2755-2759 for the `4.0` and `7.3 us` constants -- four
+sites found and fixed, and this was the fifth. What made it survive the sweep is
+that it is spelled `900` rather than `4.0`: a derived number does not match a
+grep for the constant it was derived from.
 
 The element loop is dispatched through `core::JobSystem` and the nodal accumulation
 is a CSR gather in a fixed order, so **the threaded answer is bit-identical to the
