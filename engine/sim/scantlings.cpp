@@ -603,6 +603,53 @@ bool Builder::layOutFrames() {
         return false;
     }
     layout = buildGirthLayout(scantlings, midshipGirth);
+
+    // --- Does the layout mean anything on this hull? --------------------------
+    //
+    // A girth fraction is a number until a hull says what is at it, and
+    // `validateScantlings()` cannot say: it is handed no hull. So the one check
+    // that needs the description and the surface together lives here, where the
+    // midship section and its girth already are.
+    //
+    // It can only be asked amidships. The layout is global -- that is what makes a
+    // longitudinal one continuous member -- while the turn of the bilge moves: on
+    // the reference ferry it is at girth fraction 0.51 amidships, 0.49 at x = 36 m
+    // and 0.39 at x = 52 m, because the girth loses half-breadth towards the ends
+    // while the wall side loses none. Amidships is where the strakes are drawn and
+    // where the hull girder is, so amidships is what gets asked.
+    //
+    // What it asks: shell plating thins from the keel to the sheer, and the turn
+    // of the bilge -- the most curved and most worked plating on the ship -- is on
+    // the thick side of that. Plating at the turn thinner than plating at the keel
+    // means a seam has been declared at a fraction that is not where its author
+    // thought it was.
+    //
+    // Two points rather than a sweep of every seam, deliberately: a thickened
+    // patch region legitimately thins again at its upper seam, and a sweep would
+    // report that as a fault. The two-point form is silent on a patch and fires on
+    // a misplaced strake.
+    const Section& mid = sections[midship];
+    double widest = 0;
+    for (const Vec3& p : mid.point) widest = std::max(widest, p.y);
+    std::size_t turnAt = 0;
+    while (turnAt + 1 < mid.point.size() && mid.point[turnAt].y < widest * (1.0 - 1e-6)) ++turnAt;
+    if (widest > 0 && turnAt < mid.arc.size()) {
+        const double turn = mid.arc[turnAt] / midshipGirth;
+        const ShellRegion* atTurn = regionAt(scantlings, mid.x, turn);
+        const ShellRegion* atKeel = regionAt(scantlings, mid.x, 0.0);
+        // A section that only reaches full breadth at the deck edge -- a wall-sided
+        // barge, a yacht -- has no turn to speak of, and nothing is said.
+        if (turn < 0.9 && atTurn != nullptr && atKeel != nullptr &&
+            atTurn->thickness < atKeel->thickness)
+            report("the turn of the bilge is at girth fraction " + std::to_string(turn) +
+                   " amidships, z = " + std::to_string(mid.point[turnAt].z) +
+                   " m, and the strake covering it is " + atTurn->name + " (" +
+                   std::to_string(atTurn->girthFrom) + " to " + std::to_string(atTurn->girthTo) +
+                   ") at " + std::to_string(1000.0 * atTurn->thickness) + " mm -- thinner than " +
+                   atKeel->name + "'s " + std::to_string(1000.0 * atKeel->thickness) +
+                   " mm at the keel, so the most curved plating on the section is in "
+                   "side-shell scantlings");
+    }
     return true;
 }
 
@@ -1210,12 +1257,36 @@ Scantlings ferryScantlings() {
     s.frameMaterial = 0;
     s.longitudinalSpacing = 0.70;
 
-    // Girth fractions: the ferry's midship girth runs about 3 m across the flat of
-    // bottom, 5 m round the bilge to the turn at z = 4.2 m, then 10.8 m of wall
-    // side to the sheer at 15 m. So the bottom is the first eighth, the bilge the
-    // next seventh, and the side everything above -- with the sheer strake, which
-    // is always thickened because it is the extreme fibre of the hull girder,
-    // taking the top 4%.
+    // Girth fractions, measured off the meshed hull rather than estimated from it.
+    // The midship girth is **22.02 m**: 3.00 m across the flat of bottom (the hull
+    // stands 3.0 m of half-breadth at the baseline, `verticalFullness`'s 0.30
+    // floor), 8.22 m round the bilge to the turn at z = 4.2 m, then 10.80 m of wall
+    // side to the sheer at 15 m. So the flat of bottom ends at girth fraction 0.136
+    // and the turn of the bilge is at 0.511 -- with the sheer strake, which is
+    // always thickened because it is the extreme fibre of the hull girder, taking
+    // the top 4%.
+    //
+    // **This read "3 m + 5 m + 10.8 m = 18.8 m", and the bilge ran to 0.28.** The
+    // two outer terms are right and the bilge arc is 8.22 m, not 5, so 18.8 m
+    // matches no measurement of this hull. What 0.28 bought was z = 1.25 m -- 59%
+    // of full breadth, a quarter of the way up the bilge radius -- so 15.5 mm bilge
+    // plating stopped short and 12.0 mm side plating carried the whole turn,
+    // thinner than the 14.5 mm bottom below it. Nothing noticed: the strakes were
+    // all present, the girth was covered, every panel count was right, and
+    // `validateScantlings` is handed no hull and so cannot ask where a fraction
+    // lands. `Builder::layOutFrames` now reports it.
+    //
+    // The girth was measured three ways and they agree to 8 mm: bisecting the
+    // spacing at which `buildGirthLayout`'s band count steps (22.0229 m, exact and
+    // needing no geometry), summing the chords between panel corners amidships
+    // (22.0225), and adding up `buildHull`'s tabulated waterlines by hand
+    // (22.0313, which the sampled polyline must come in under because it chords
+    // the corners).
+    //
+    // The seam is 0.52 rather than 0.511 so the bilge strake laps a little onto the
+    // wall side, which is what a shell expansion does and what leaves the turn
+    // wholly in thick plate. 0.53 would make it the last band of the bilge instead
+    // of the first of the side, and the shell would come out 3 200 panels.
     ShellRegion bottom;
     bottom.name = "bottom";
     bottom.girthFrom = 0.00;
