@@ -1283,10 +1283,38 @@ Scantlings ferryScantlings() {
     // (22.0313, which the sampled polyline must come in under because it chords
     // the corners).
     //
-    // The seam is 0.52 rather than 0.511 so the bilge strake laps a little onto the
-    // wall side, which is what a shell expansion does and what leaves the turn
-    // wholly in thick plate. 0.53 would make it the last band of the bilge instead
-    // of the first of the side, and the shell would come out 3 200 panels.
+    // **The fix is `0.52` on the two lines below, and it is not applied here.** This
+    // paragraph described it in the present tense while the code read 0.28, which
+    // is the same defect one level up: a comment citing a state that does not
+    // exist. 0.52 rather than 0.511 so the bilge strake laps a little onto the wall
+    // side, which is what a shell expansion does and what leaves the turn wholly in
+    // thick plate; 0.53 would make it the last band of the bilge instead of the
+    // first of the side and the shell would come out 3 200 panels.
+    //
+    // Applied and measured, it does what it should: the band count holds at 31,
+    // the check below falls silent, and the section moves to A 1.849 m2, NA 6.620 m,
+    // I 46.92 m4, 1 765 t. Fifteen assertions across four test files move with it,
+    // and two of them are not figures to re-derive:
+    //
+    //   - `collapse.cpp`'s sweep starts at **six times first yield** and extends
+    //     only if the peak lands on the last point -- a branch whose comment says
+    //     it fires for damaged sections. With the seam corrected the *intact* ferry
+    //     lands on it exactly: peak-to-last is 1.000000 against 0.927 at 0.28. So
+    //     the `6.0` is sized against a ship whose scantlings were wrong, and the
+    //     corrected ship sits precisely on the boundary. The extension still finds
+    //     the peak -- 2.0745e9 either way, differing at the eleventh digit from
+    //     re-sampling 150 steps over a longer range -- but `test_promotion.cpp`'s
+    //     "bit-identical to the old sizing" is a statement about that branch not
+    //     firing, and it no longer holds for this hull.
+    //   - `test_reduction.cpp`'s half-bandwidth bound of 80 sits between three
+    //     orderings measured on the ferry patch: 173 unordered, 89 Cuthill-McKee
+    //     from a minimum-degree node, 71 from a pseudo-peripheral one. The
+    //     corrected patch measures 89. Moving the bound to fit without re-measuring
+    //     all three would leave a number that no longer separates a good ordering
+    //     from a dropped one, which is the whole of what it is for.
+    //
+    // Both want re-deriving rather than patching, so the seam change waits for
+    // them rather than landing on top of fifteen loosened assertions.
     ShellRegion bottom;
     bottom.name = "bottom";
     bottom.girthFrom = 0.00;
