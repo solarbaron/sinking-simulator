@@ -126,7 +126,22 @@ void testImbalanceShowsInTheClosure() {
     // is set from that arithmetic rather than from a round number.
     expectTrue("a 10% imbalance leaves a large residual at the far end",
                std::abs(g.momentClosure) > 0.2);
-    expectTrue("and validate() says so", !validateGirder(g).empty());
+    // A 10% imbalance trips three guards at once -- shear closure, moment closure
+    // and the buoyancy/weight total -- so "says so" does not say which, and any one
+    // of the three could be deleted with the suite still green. They are three
+    // different first moves for whoever reads the message: an integration bug at
+    // the ends, a moment-arm bug, or a ship that is simply not floating here.
+    const std::vector<std::string> said = validateGirder(g);
+    expectTrue("and validate() says so", !said.empty());
+    const auto mentions = [&](const char* s) {
+        for (const std::string& p : said)
+            if (p.find(s) != std::string::npos) return true;
+        return false;
+    };
+    expectTrue("naming the imbalance, which is what the fixture built",
+               mentions("not floating at this attitude"));
+    expectTrue("and the moment residual it leaves at the far end",
+               mentions("bending moment does not close"));
 
     // And the balanced case must be clean, or the check above is meaningless.
     const HullGirder ok = integrateGirder(x, w, std::vector<double>(x.size(), 1.0e5));

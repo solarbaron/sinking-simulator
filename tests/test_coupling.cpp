@@ -1332,7 +1332,15 @@ void testPrescribedSolveAndMeshSurgery() {
     const coupling::DamagedMesh nothing = coupling::withoutElements(f.patch.mesh, all);
     expectEqualCount("removing every element leaves no element", nothing.mesh.elementCount(), 0u);
     expectEqualCount("and no node", nothing.mesh.nodeCount(), 0u);
+    // Removing every element orphans every node, so both guards fire and "says so"
+    // does not distinguish them. Deleting the first leaves the caller holding a
+    // node-bookkeeping detail -- "N node(s) were left with no element" -- where the
+    // fact is that the mesh is gone. `edgeDrive` and `softening` in this same file
+    // were hardened against exactly this; `withoutElements` sits twenty lines away
+    // and was not.
     expectTrue("and says so", !nothing.problems.empty());
+    expectTrue("saying the mesh is gone, not that some nodes were tidied up",
+               nothing.problems.front().find("every element was removed") != std::string::npos);
 
     std::vector<std::uint8_t> none(elements, 0u);
     const coupling::DamagedMesh whole = coupling::withoutElements(f.patch.mesh, none);

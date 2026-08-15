@@ -1645,9 +1645,22 @@ void testUnreasonableScantlingsAreReported() {
                gap.shell[4].girthFrom < 0.35 && gap.shell[5].girthFrom < 0.35);
 
     // And the generator leaves that band unplated rather than guessing at it.
+    // **`makeStructuralMesh` folds every `validateScantlings` message into its own
+    // `problems`** (`scantlings.cpp:969`), and the assertion four lines above has
+    // already established that the validator is non-empty for this fixture. So
+    // "the generator says so too" was true whether or not the generator said
+    // anything: deleting the builder's own geometric check leaves it green while
+    // testing exactly nothing about the generator, which is its entire purpose.
+    // The builder's check is the one that measures the *hull*; the validator only
+    // reads the description.
     std::vector<std::string> problems;
     const StructuralMesh mesh = makeStructuralMesh(game::buildFerry().hull, gap, &problems);
     expectTrue("the generator says so too", !problems.empty());
+    bool builderSaidIt = false;
+    for (const std::string& p : problems)
+        if (p.find("had no plating region covering them") != std::string::npos)
+            builderSaidIt = true;
+    expectTrue("in its own words, not the description validator's", builderSaidIt);
     expectTrue("and the shell really is short of plating",
                shellPanelArea(mesh) < 0.95 * shellPanelArea(makeStructuralMesh(
                                           game::buildFerry().hull, ferryScantlings())));

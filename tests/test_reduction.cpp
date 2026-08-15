@@ -1196,8 +1196,21 @@ void testModeCount() {
         params.maxIterations = 0;
         const Reduction reduced = craigBampton(sub, params);
         expectEqual("an eigensolve given no iterations yields no modes", reduced.modes, 0);
+        // Two guards fire here, and they are cause and symptom. `fixedInterfaceModes`
+        // refuses outright -- "given no iterations to run" -- and `craigBampton` then
+        // separately reports that 0 of 8 modes came back. Deleting the first leaves
+        // only the second, which describes what the reduction is missing without
+        // saying that the eigensolver was never allowed to start.
         expectTrue("and the reduction says so rather than inventing them",
                    !reduced.problems.empty());
+        bool saidWhy = false, saidWhat = false;
+        for (const std::string& p : reduced.problems) {
+            if (p.find("given no iterations to run") != std::string::npos) saidWhy = true;
+            if (p.find("of 8 fixed-interface modes were computed") != std::string::npos)
+                saidWhat = true;
+        }
+        expectTrue("naming the eigensolve that never ran", saidWhy);
+        expectTrue("and the modes that are therefore missing", saidWhat);
         expectTrue("and what is left is a usable Guyan condensation",
                    reduced.size() == reduced.boundary && reduced.stiffness.size() ==
                        static_cast<std::size_t>(reduced.boundary) *
@@ -3481,15 +3494,37 @@ void testThreeComponentsAssembleIntoTheWhole() {
             named = named || p.find("identity") != std::string::npos;
         expectTrue("and it says the assembly has no identity, not that nothing coincided", named);
 
+        // Seven guards in `assemble` share this one observable, and they are ordered:
+        // the component-range check runs before the self-join check, which runs
+        // before the map-size and map-range checks. So each of these fixtures can be
+        // answered by a guard other than the one it was built for, and the message
+        // is what separates them.
+        //
+        // The range check is also the one holding `parts[cb]` inside its array --
+        // `past[0].b = 7` against a three-component list -- so its removal is a heap
+        // overread rather than a wrong message, the same shape as `edgeDrive`'s
+        // wrong-zone guard.
+        const auto refusedWith = [&](const std::vector<reduction::Joint>& j, const char* text) {
+            const std::vector<std::string> said = reduction::assemble(component, j).problems;
+            if (said.empty()) return false;
+            for (const std::string& p : said)
+                if (p.find(text) != std::string::npos) return true;
+            return false;
+        };
+
         std::vector<reduction::Joint> self = all;
         self[0].b = self[0].a;
         expectTrue("a component joined to itself is refused",
                    !reduction::assemble(component, self).problems.empty());
+        expectTrue("and named as a self-join, not as a map that overruns",
+                   refusedWith(self, "joins a component to itself"));
 
         std::vector<reduction::Joint> past = all;
         past[0].b = 7;
         expectTrue("a joint naming a component that is not there is refused",
                    !reduction::assemble(component, past).problems.empty());
+        expectTrue("and named as a component that is not in the list",
+                   refusedWith(past, "names a component that is not in the list"));
 
         // A map shorter than the boundary it claims to describe. This is what a
         // component whose reduction fell back to empty produces, and accepting it

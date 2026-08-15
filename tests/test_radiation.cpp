@@ -147,12 +147,31 @@ void testLewisFormsReproduceTheirInputs() {
     // approximated.
     // A Lewis form may bulge outside the B x T rectangle, so sigma > 1 is not
     // itself unattainable; for B/2T = 2 the family runs out at about 1.23.
-    const LewisSection tooFull = lewisSection(20.0, 5.0, 1.45);
-    expectTrue("an unattainable area coefficient is reported",
-               !validateLewisSection(tooFull).empty());
+    // **"Both must be reported" is what the comment says and what the assertions
+    // did not check.** `folded` forces `a3` past univalence *after* the fit, which
+    // also throws the sectional area off what was asked for -- so the area guard
+    // fires as well, and deleting the univalence check entirely leaves the caller
+    // told that sigma = 0.90 is unattainable for this beam/draft ratio. That is a
+    // real and different failure, the one `tooFull` is here to produce, and a
+    // reader who believed it would go looking for the Lewis family's limits
+    // instead of a contour that crosses itself.
+    const auto mentions = [](const std::vector<std::string>& v, const char* s) {
+        for (const std::string& p : v)
+            if (p.find(s) != std::string::npos) return true;
+        return false;
+    };
+
+    const std::vector<std::string> tooFullSaid = validateLewisSection(lewisSection(20.0, 5.0, 1.45));
+    expectTrue("an unattainable area coefficient is reported", !tooFullSaid.empty());
+    expectTrue("naming the family it fell outside of",
+               mentions(tooFullSaid, "outside the Lewis family"));
+
     LewisSection folded = lewisSection(20.0, 5.0, 0.90);
     folded.a3 = 0.6;   // forced past univalence
-    expectTrue("a folded Lewis form is reported", !validateLewisSection(folded).empty());
+    const std::vector<std::string> foldedSaid = validateLewisSection(folded);
+    expectTrue("a folded Lewis form is reported", !foldedSaid.empty());
+    expectTrue("and the fold is named, not just the area it threw off",
+               mentions(foldedSaid, "not univalent"));
 }
 
 // --- The 2D section solver, against Ursell -----------------------------------
