@@ -515,20 +515,49 @@ double distanceToMesh(const TriMesh& mesh, const Vec3& p) {
 
 // Every shell panel corner has to sit on the hull, not near it.
 //
-// It does not sit on it exactly, and the reason is worth stating: a corner at a
-// given girth fraction is interpolated along a polyline of sampled heights, and
-// where two consecutive samples straddle a waterline or a triangulation diagonal
-// the chord between them leaves the surface. So the right assertion is not a
-// fixed tolerance but a *convergence*: the deviation must fall as the section is
-// sampled more finely, which a mis-aimed ray or a wrong interpolation would not
-// do. Measured here at 41, 28, 12, 3.8 and 1.0 mm.
+// It does not sit on it exactly, and the reason sets the shape of the assertion.
+// A corner at a given girth fraction is interpolated along a polyline of sampled
+// heights, and where two consecutive samples straddle a slope break -- a meshed
+// waterline, or the diagonal of a quad -- the chord between them leaves the
+// surface. The deviation there is `ab/(a+b)` times the change of slope, `a` and
+// `b` being the distances from the break to the two samples either side, so it
+// is bounded by a quarter of the sample pitch times the steepest break on the
+// ship -- and it is *proportional to where the break happens to fall between two
+// samples*.
+//
+// **That phase is why a fixed tolerance was the wrong assertion.** This read
+// `finest < 1.5e-3` and passed at 768 samples by luck: measured, it fails at 600
+// (1.64 mm), 640 (1.54), 680 (1.82) and 740 (1.62) -- four counts *finer* than
+// one it passes at -- and also at `frameSpacing` 2.0 and 3.0. The deviation is
+// not even monotone in the sample count: 56 samples is worse than 40.
+//
+// So what is asserted is the *bound*. Measured over seventeen counts from 40 to
+// 1024, the worst deviation runs 0.046 to 0.195 of the sample pitch, so a quarter
+// of the pitch holds everywhere with 28% of headroom. A deviation that scales
+// with the pitch is discretisation; a mis-aimed ray, a wrong neighbour or a
+// clamped parameter is not, because none of those shrink as the section is
+// sampled more finely.
+//
+// A fitted convergence order was the other candidate and is a second lottery: the
+// envelope is a max over eleven slope breaks, so it is bounded above by `C·dz`
+// and not below, and the apparent order across the test's own ladder comes out
+// superlinear -- impossible for a kink error. The bound is the honest form.
+//
+// Measured here at 41.4, 28.2, 11.6, 3.8 and 1.0 mm -- 0.130, 0.179, 0.148,
+// 0.097 and 0.052 of the pitch.
 void testPanelCornersConvergeOntoTheHull() {
     const TriMesh hull = game::buildFerry().hull;
+    double zLo = 1e300, zHi = -1e300;
+    for (const Vec3& v : hull.verts) {
+        zLo = std::min(zLo, v.z);
+        zHi = std::max(zHi, v.z);
+    }
+    const double depth = zHi - zLo;
+    expectTrue("the ferry hull has a depth to sample over", depth > 10.0);
 
-    double previous = 1e300;
-    int improved = 0;
-    double finest = 1e300;
     double outermost = 0;
+    int withinBound = 0;
+    double coarsest = 0, worstRatio = 0;
     for (int samples : {48, 96, 192, 384, 768}) {
         Scantlings s = ferryScantlings();
         s.girthSamples = samples;
@@ -543,13 +572,19 @@ void testPanelCornersConvergeOntoTheHull() {
                 worst = std::max(worst, distanceToMesh(hull, c));
             for (const Vec3& c : mesh.panels[i].corner) outermost = std::max(outermost, std::abs(c.y));
         }
-        if (worst < previous) ++improved;
-        previous = worst;
-        finest = worst;
+        const double pitch = depth / (samples - 1);
+        if (worst <= 0.25 * pitch) ++withinBound;
+        worstRatio = std::max(worstRatio, worst / pitch);
+        if (coarsest == 0) coarsest = worst;
     }
-    expectEqual("finer sampling puts the corners closer to the hull every time", improved, 5);
-    expectTrue("and the finest is inside a millimetre and a half", finest < 1.5e-3);
+    std::printf("     panel corners: worst deviation %.3f of the sample pitch\n", worstRatio);
+
+    expectEqual("the deviation stays inside a quarter of the sample pitch at every count",
+                withinBound, 5);
     expectNear("the widest corner reaches the moulded half beam exactly", outermost, 10.0, 1e-9);
+    // Vacuity: five numbers that never moved would satisfy the bound. The
+    // coarsest sampling has to be materially bad for the bound to mean anything.
+    expectTrue("and the coarsest sampling really is coarse", coarsest > 0.020);
 }
 
 // Frame spacing is nominal: the hull is divided into a whole number of bays so
