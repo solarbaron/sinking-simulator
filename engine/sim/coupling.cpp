@@ -102,6 +102,22 @@ EdgeDrive edgeDrive(const Coupling& coupling, const reduction::Substructure& zon
         ++out.count;
         out.largest = std::max(out.largest, std::fabs(out.displacement[g]));
     }
+    // **No path through `couple()` is known to reach this, and it is kept anyway.**
+    // `ready()` above already requires `sharedDof > 0`, and `sharedDof` counts the
+    // matched entries that set `zoneShared[j] = 1` twenty lines up -- so a ready
+    // coupling has at least one shared DOF, and the `a < 0` and `g >= size()`
+    // continues above are guarded by invariants `assemble` and `Substructure`
+    // maintain. The physically meaningful case this message describes -- a zone
+    // sharing no boundary DOF -- is caught earlier by `ready()`, whose message is
+    // the more accurate one.
+    //
+    // It stays because `Coupling` is an aggregate with public fields and no
+    // invariant of its own: anything that builds one by hand, or a future `couple`
+    // that fills the arrays partially, lands here rather than driving nothing in
+    // silence. What it is *not* is a tested guard, and it should not be mistaken for
+    // one -- the suite reaches the three above it and not this. Its negative control
+    // is incidental: the happy-path tests assert `problems.empty()`, so this firing
+    // would turn them red.
     if (out.count == 0)
         out.problems.push_back("nothing was driven: the zone shares no boundary DOF");
     return out;

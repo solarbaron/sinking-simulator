@@ -1275,20 +1275,41 @@ void testResolutionConvergence() {
 void testRefusals() {
     const StructuralMesh structure = makeBox(kT, kT);
 
+    // **`empty()` is `elementCount() == 0` and never reads `problems`**, so the
+    // three refusals below are three ways of reaching one assertion. Deleting all
+    // three `report(...)` calls while leaving the returns -- the header's promise of
+    // "a full account in `problems`" removed entirely, the refusals kept -- left the
+    // suite at 200 420 checks and zero failures. So each refusal now says which one
+    // it is. A section that came back empty for an unrelated reason, or a guard that
+    // fired with another guard's text, is a different bug from the one under test
+    // and is what these strings separate.
     section::SectionParams backwards = boxParams();
     backwards.xTo = backwards.xFrom;
-    expectTrue("cut planes out of order are refused",
-               section::buildSection(structure, backwards).empty());
+    const section::Section outOfOrder = section::buildSection(structure, backwards);
+    expectTrue("cut planes out of order are refused", outOfOrder.empty());
+    expectTrue("and say it is the planes, not the plating",
+               !outOfOrder.problems.empty() &&
+                   outOfOrder.problems.front().find("not in order") != std::string::npos);
 
     section::SectionParams noSubdivision = boxParams();
     noSubdivision.subdivision = 0;
-    expectTrue("a subdivision below one is refused",
-               section::buildSection(structure, noSubdivision).empty());
+    const section::Section unsubdivided = section::buildSection(structure, noSubdivision);
+    expectTrue("a subdivision below one is refused", unsubdivided.empty());
+    expectTrue("and say it is the subdivision",
+               !unsubdivided.problems.empty() &&
+                   unsubdivided.problems.front().find("subdivision") != std::string::npos);
 
     section::SectionParams noRoles = boxParams();
     noRoles.shell = noRoles.deck = noRoles.bulkhead = false;
-    expectTrue("a section of no roles at all is refused",
-               section::buildSection(structure, noRoles).empty());
+    const section::Section roleless = section::buildSection(structure, noRoles);
+    expectTrue("a section of no roles at all is refused", roleless.empty());
+    // This one is the reason the strings matter. "No plating of the requested roles"
+    // and "the cut planes are empty of ship" are the same empty section and
+    // different bugs, and the box fixture has plating across the whole of its
+    // length -- so a reader who saw only `empty()` could not tell which happened.
+    expectTrue("and say it is the roles that emptied it, not the station",
+               !roleless.problems.empty() &&
+                   roleless.problems.front().find("requested roles") != std::string::npos);
 
     // A cut plane that is not a panel seam. Panels the plane passes through have no
     // corner set that belongs to either side, so they are dropped -- and *counted*,

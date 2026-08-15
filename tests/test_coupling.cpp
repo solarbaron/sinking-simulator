@@ -1265,6 +1265,19 @@ void testPrescribedSolveAndMeshSurgery() {
         const coupling::Coupling wrong = coupling::couple(surroundings, rs, zoneSub, rs);
         expectTrue("a reduction that is not the zone's is refused", !wrong.ready());
         expectTrue("and says which precondition failed", !wrong.problems.empty());
+
+        // **Driving from it is the caller's next move, and `edgeDrive`'s first
+        // guard is the only one that answers it correctly.** Removing that guard
+        // does not produce silence: a not-ready coupling has an empty assembly, so
+        // control falls to the length check and the caller is told "the state is not
+        // this assembly's" -- non-empty, plausible, and pointing at the state when
+        // the fault is the coupling. So the message is asserted, not just its
+        // presence.
+        const coupling::EdgeDrive unready = coupling::edgeDrive(wrong, zoneSub, std::vector<double>());
+        expectEqualCount("a coupling that is not ready drives nothing", unready.count, 0u);
+        expectTrue("and blames the coupling rather than the state it was handed",
+                   !unready.problems.empty() &&
+                       unready.problems.front().find("coupling is not ready") != std::string::npos);
     }
 
     // A state of the wrong length. Every index in the coupling is in range for the
@@ -1283,6 +1296,34 @@ void testPrescribedSolveAndMeshSurgery() {
         const coupling::EdgeDrive bad = coupling::edgeDrive(link, zoneSub, truncated);
         expectEqualCount("a state that is not this assembly's drives nothing", bad.count, 0u);
         expectTrue("and says so", !bad.problems.empty());
+        expectTrue("naming the state rather than the coupling or the zone",
+                   bad.problems.front().find("not this assembly's") != std::string::npos);
+    }
+
+    // **The zone that is not the one the coupling was built against.** This guard is
+    // not only a diagnostic: past it, the loop indexes `zoneShared[j]` and
+    // `zoneDof[j]` over the *substructure's* boundary count, so a longer boundary
+    // reads off the end of both -- a heap overread ASan would catch only if a test
+    // ever passed a mismatched pair, and none did. Nothing in the repository called
+    // `edgeDrive` with a substructure other than the one `couple` was given.
+    //
+    // The mistake is a plausible one rather than a contrived one: both substructures
+    // are in scope at every call site, and swapping them is a one-word edit that
+    // compiles.
+    {
+        std::vector<double> state;
+        std::vector<coupling::Prescribed> nothing2;
+        expectTrue("the reference solve runs again", coupling::prescribedStaticSolve(
+                                                         link.assembly, load, held, nothing2,
+                                                         state, &problem));
+        const coupling::EdgeDrive wrongZone = coupling::edgeDrive(link, surroundings, state);
+        expectTrue("the surroundings are not the zone the coupling was built against",
+                   surroundings.boundaryDof().size() != link.zoneDof.size());
+        expectEqualCount("so nothing is driven", wrongZone.count, 0u);
+        expectTrue("and it is the zone that is named",
+                   !wrongZone.problems.empty() &&
+                       wrongZone.problems.front().find("not built against this zone") !=
+                           std::string::npos);
     }
 
     // Mesh surgery, against counts that are known rather than observed.
