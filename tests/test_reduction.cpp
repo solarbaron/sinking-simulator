@@ -1504,11 +1504,35 @@ void testFerryPatch() {
     // and started at a pseudo-peripheral one gives 71. The assertion sits below the
     // middle of those, so dropping either half of the ordering is a failure rather
     // than a slowdown nobody sees.
+    //
+    // **Those three numbers used to live only in this comment**, which made the
+    // bound impossible to re-derive: any change to the ferry's geometry moves all
+    // three and nothing short of hand-instrumenting the ordering could say where
+    // they landed. The two candidates are now reported, and the ordering's real
+    // guarantee -- that it keeps *the narrower of the two*, so it "is incapable of
+    // being a regression" -- is asserted here rather than only claimed in
+    // `reduction.cpp`.
+    //
+    // **They are node bandwidths and `halfBandwidth()` is a DOF bandwidth**, which
+    // is worth stating because the obvious assertion across them is wrong: this
+    // patch reports 57 nodes against 71 DOF, which reads like the ordering picking
+    // the worse of two until you notice the units. Three DOF a node puts the
+    // mesher's own numbering at about 171 -- the 173 above -- and the 71 that was
+    // kept at about 23 nodes.
+    const std::size_t naturalNodes = sub.naturalNodeBandwidth();
+    const std::size_t renumberedNodes = sub.renumberedNodeBandwidth();
+    expectTrue("the renumbering is the narrower of the two candidates, or it is not used",
+               std::min(naturalNodes, renumberedNodes) == renumberedNodes ||
+                   sub.halfBandwidth() >= 3 * std::min(naturalNodes, renumberedNodes));
+    expectTrue("and on this patch it is the renumbering that wins",
+               renumberedNodes < naturalNodes);
     expectTrue("the interior renumbering earns its place", sub.halfBandwidth() <= 80);
-    std::printf("     half-bandwidth %zu over %zu interior DOF (%.2f MB of banded store)\n",
+    std::printf("     half-bandwidth %zu DOF over %zu interior DOF (%.2f MB of banded store); "
+                "interior node bands: mesher %zu, Cuthill-McKee %zu\n",
                 sub.halfBandwidth(), sub.interiorCount(),
                 8.0 * static_cast<double>(sub.interiorCount()) *
-                    static_cast<double>(sub.halfBandwidth() + 1) / 1e6);
+                    static_cast<double>(sub.halfBandwidth() + 1) / 1e6,
+                naturalNodes, renumberedNodes);
 
     ReduceParams reduceParams;
     reduceParams.modes = 4;

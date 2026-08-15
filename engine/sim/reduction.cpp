@@ -594,6 +594,18 @@ struct Substructure::Impl {
     solidshell::DofExpansion expansion;
 
     std::size_t band = 0;
+    // What the mesher's own numbering would have cost. `band` is the narrower of
+    // the two by construction, so this is never the smaller of the pair -- and it
+    // is the only way to see whether the renumbering bought anything on a given
+    // mesh without hand-instrumenting the ordering.
+    // The two candidate orderings, **as node bandwidths over the interior
+    // adjacency** -- which is not the same quantity as `band` above and must not be
+    // compared with it. `band` is a DOF bandwidth taken from the assembled pattern,
+    // roughly three times the node figure but not exactly, because eliminated DOF
+    // and attached blocks both move it. Kept so a caller can see which ordering was
+    // taken and by how much, without hand-instrumenting the ordering.
+    std::size_t naturalNodeBand = 0;
+    std::size_t renumberedNodeBand = 0;
     std::unique_ptr<solidshell::BandedSpd> factor;
     bool ready = false;
     double assemblySeconds = 0;
@@ -1064,6 +1076,8 @@ Substructure::Substructure(const solidshell::HexMesh& mesh, const StructuralMate
     }
     const std::size_t naturalBand = bandwidthOf(interiorAdjacency, natural);
     const std::size_t renumberedBand = bandwidthOf(interiorAdjacency, renumbered);
+    s.naturalNodeBand = naturalBand;
+    s.renumberedNodeBand = renumberedBand;
     const std::vector<std::uint32_t>& order =
         renumberedBand <= naturalBand ? renumbered : natural;
 
@@ -1155,6 +1169,8 @@ std::size_t Substructure::dofCount() const { return impl_->dofs; }
 std::size_t Substructure::boundaryCount() const { return impl_->boundary.size(); }
 std::size_t Substructure::interiorCount() const { return impl_->interior.size(); }
 std::size_t Substructure::halfBandwidth() const { return impl_->band; }
+std::size_t Substructure::naturalNodeBandwidth() const { return impl_->naturalNodeBand; }
+std::size_t Substructure::renumberedNodeBandwidth() const { return impl_->renumberedNodeBand; }
 double Substructure::assemblySeconds() const { return impl_->assemblySeconds; }
 std::size_t Substructure::attachedBlocks() const { return impl_->attachedBlocks; }
 double Substructure::attachedMass() const { return impl_->attachedMass; }

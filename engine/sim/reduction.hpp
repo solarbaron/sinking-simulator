@@ -679,6 +679,19 @@ public:
     std::size_t boundaryCount() const;
     std::size_t interiorCount() const;
     std::size_t halfBandwidth() const;  // of K_ii after the interior renumbering
+    // The two candidate interior orderings, as **node** bandwidths over the
+    // interior adjacency. These are not `halfBandwidth()` in different clothes:
+    // that one is a DOF bandwidth read off the assembled pattern, near three times
+    // these but not exactly, since eliminated DOF and attached blocks move it.
+    // Comparing across the two units is a mistake the test below now names.
+    //
+    // They are exposed because the ordering keeps *the narrower of the two* -- RCM
+    // is not unconditionally better here, see the note above `reverseCuthillMcKee`
+    // -- and without them there is no way to see which was taken, or whether a
+    // change of geometry has flipped the choice, short of instrumenting the
+    // ordering by hand.
+    std::size_t naturalNodeBandwidth() const;
+    std::size_t renumberedNodeBandwidth() const;
     double assemblySeconds() const;
 
     // What the `Attachment` contributed. `attachedMass` is the sum of the array
