@@ -1727,8 +1727,17 @@ an error. Their rigid closing energy is 223 MJ; the extra comes from the water
 each hull has to accelerate, which the contact removes momentum from as surely as
 it does from the steel. The striker decelerates along its own bow and carries
 surge added mass; the struck ship is driven along her beam and carries sway added
-mass, which is nearly her displacement again, so the pair's true closing energy is
-301 MJ. A bound written against the rigid masses passes this run by half a
+mass, which at the `Ship::addedMassSway = 0.9` this run uses is nearly her
+displacement again, so the pair's true closing energy is 301 MJ.
+
+**That 0.9 is a textbook coefficient and not this hull's**, which `ship.hpp` says
+of itself — "plausible textbook figures, not this hull's" — and which matters
+here because the sentence above reads as a measurement. Solving the barge's own
+sections gives an infinite-frequency sway added mass of about **0.18** of
+displacement, five times smaller, and an impact is precisely the high-frequency
+limit where `A_inf` is the right quantity. The bound this paragraph is arguing
+for is an upper one, so a coefficient that is too large makes it *looser* rather
+than wrong — but the 301 MJ is a figure about a coefficient, not about a ship. A bound written against the rigid masses passes this run by half a
 percent and would read as a model creating energy the first time anything moved.
 
 
