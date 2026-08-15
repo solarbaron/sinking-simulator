@@ -100,11 +100,15 @@ checks=0
 #
 # One `stat` at each end turns that into a line of output. It is deliberately not
 # a hash: the point is to catch a rebuild, and mtime is what a rebuild changes.
-TOOLS_WATCHED="$SHIPSIM $TESTS $SPIKE $ZONE $BULK $RAM $WATER $GAS $SECTION $GPU $SMOKE $SEAWAY"
+# The tool paths are resolved further down, so this stats `build/` rather than
+# naming them: the first version listed `$SHIPSIM` and friends here and died on
+# `unbound variable` under `set -u`, three hundred lines before those are set.
+# Globbing the directory is also stricter -- it notices a tool that appears or
+# disappears mid-run, which naming a fixed list cannot.
 toolStamps() {
   local out="" t
-  for t in $TOOLS_WATCHED; do
-    [ -x "$t" ] || continue
+  for t in ./build/*; do
+    [ -x "$t" ] && [ -f "$t" ] || continue
     out="$out $t:$(stat -c '%Y:%s' "$t" 2>/dev/null || echo '?')"
   done
   printf '%s' "$out"
