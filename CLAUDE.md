@@ -240,7 +240,8 @@ Recorded in `docs/01-architecture.md` §1 with full reasoning:
   Recoverable later via 32-bit handles into the frame arena — *not* via epoch
   reclamation.
 - **Chase-Lev revisit cancelled on evidence**: dispatch is 0.2% of a 10 µs chunk,
-  and the sweep shows no dispatch-limited regime. Grain matters ~40×; the queue
+  and the sweep shows no dispatch-limited regime. Grain matters at least 17× and
+  worse with more workers (21× at 8, 41× at 23); the queue
   does not.
 
 The renderer targets a **GTX 1070 Ti (Pascal)**: no mesh shaders, no hardware ray

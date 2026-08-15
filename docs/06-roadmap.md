@@ -52,7 +52,8 @@ without.
   make the Chase-Lev handle scheme below safe without a reclamation scheme.
 - ~~**Job throughput and grain-scaling benchmark**~~ **done** — `tools/job_bench`.
   Dispatch costs 17–23 ns uncontended; efficiency plateaus at ~2 µs chunks; the
-  penalty for bad grain is ~40×. Numbers and caveats in `01-architecture.md` §1.
+  penalty for bad grain is at least 17× and grows with worker count. Numbers and
+  caveats in `01-architecture.md` §1.
 - ~~**Grain auto-tuning**~~ **done** — `parallelForAuto()` probes for cost and
   targets 10 µs chunks, clamped to 2–64 chunks per lane. Matches or beats the
   best hand-picked grain without being told the element cost. Restricted to

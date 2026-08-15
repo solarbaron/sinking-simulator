@@ -93,7 +93,7 @@ public:
     };
 
     // parallelFor with the grain chosen from a measurement rather than from the
-    // caller's guess. `tools/job_bench` shows a ~40x swing between a bad grain
+    // caller's guess. `tools/job_bench` shows at least a 17x swing between a bad grain
     // and a good one, against ~0.2% from dispatch cost -- this is where the
     // leverage is.
     //
@@ -120,6 +120,21 @@ public:
     // Tuning constants, all derived from tools/job_bench measurements.
     // Efficiency plateaus around 2 us chunks, so 10 us is comfortably inside the
     // flat region with margin for the probe being wrong.
+    //
+    // **On a large loop this target is never reached, and `kMaxChunksPerLane` is
+    // why.** `parallelForAuto` clamps the cost-derived grain into
+    // `[remaining/maxChunks, remaining/minChunks]`, and on `job_bench`'s 20 M
+    // element sweep the lower bound binds every time: 12 lanes x 64 gives 768
+    // chunks and 27 lanes x 64 gives 1728, so the grain comes out 26 040 and
+    // 11 574 whatever the probe measured. At the measured 2.3 ns an element those
+    // are **60 us and 27 us chunks against a 10 us target**. Measured across eight
+    // runs the chosen grain was bit-identical every time while `nsPerElement`
+    // moved, which is the signature of a binding clamp rather than a measurement.
+    //
+    // That is not obviously wrong -- both land inside the plateau, which is what
+    // the target exists to guarantee -- but it means this constant does not decide
+    // grain for any loop big enough to matter, and a change to it would move
+    // nothing on that workload. The chunk-count ceiling is the real control.
     static constexpr double kTargetChunkNanos = 10'000.0;
     // Below this there is less work than a dispatch round trip is worth.
     static constexpr double kSerialThresholdNanos = 20'000.0;

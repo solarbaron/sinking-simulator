@@ -106,12 +106,17 @@ alone varied by 2.1× between runs, which the tool now reports rather than hides
 | Dispatch, uncontended (0 workers) | **17–23 ns/job** |
 | Dispatch, 16–23 workers, all jobs from one lane | ~250 ns/job |
 | Chunk size at which efficiency plateaus | **≈ 2 µs** |
-| Penalty for getting grain wrong | **~40×** (grain 16 vs the plateau) |
+| Penalty for getting grain wrong | **at least 17×**, and worse with more workers (grain 16 vs the plateau: median 21× at 8 workers, 41× at 23) |
 
 Three conclusions:
 
 **Grain dominates everything else.** At a fixed worker count, the span between
-the worst and best grain is around 40×. Nothing else in the job system comes
+the worst and best grain **grows with worker count** -- median 21x at 8 workers
+and 41x at 23 over eight runs, because contention on the tiny-chunk end scales
+with lanes while the plateau does not. A single figure hides that: "~40x" was
+right for 23 workers and about double the truth at 8. The grain-16 row alone
+varies 3x between runs at 23 workers, so the honest published claim is the bound
+-- every one of sixteen measurements exceeded 17x. Nothing else in the job system comes
 close to mattering that much, which is why grain auto-tuning was built and the
 queue rewrite was not.
 
