@@ -468,7 +468,7 @@ The longest and highest-risk phase.
   so κ(Kaa) is a constant 3.50 rather than (h/t)⁴; **measured by A/B, that changes
   nothing for this kernel**, because the shader's equilibration was already
   addressing the same conditioning. What remains: at 768 and 3 072 elements the float
-  kernel tears 41 and 248 where the double reference tears **32 and 162**, while the
+  kernel tears 40 and 247 where the double reference tears **32 and 162**, while the
   negative control — the double solver on a mesh jittered by 2 × 10⁻⁷ m — tears
   exactly 32 and 162. Plastic dissipation runs 27–34% high where the control moves
   0.06–0.8%. **A previous claim here that it "tears 60 elements where the double

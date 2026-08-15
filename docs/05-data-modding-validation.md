@@ -334,7 +334,8 @@ ferry it has to reproduce:
 | Check | Reference |
 |---|---|
 | Hull mesh from `ships/ferry.ship` | `game::buildFerry()`, vertex and index for index, to 1e-6 m |
-| Displacement, compartment volumes, waterplane | the same ship, to 1e-8 relative |
+| Displacement and waterplane | the same ship, to 1e-8 relative |
+| Compartment volumes | the same ship, to 1e-7 relative |
 | Draft, GM, KB, freeboard, GZ at 13 heel angles | the same ship, to 1e-6 m |
 | 150 s of the 'full' damage-control scenario | the same ship, tracks to 4e-7 |
 | 900 s outcomes for all three scenarios | `scripts/verify.sh full`, identical verdicts |

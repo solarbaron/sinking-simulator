@@ -2576,9 +2576,9 @@ first optimisation to reach for and it is a memory decision, so it belongs with
 the Tier-2 solver rather than here.
 
 The consequence for the budget in `07-fem-spike-findings.md` §6 is real and should
-not be glossed: a 200 m² collision zone at 50 mm elements costs ~7 400 core-seconds
-per simulated second elastic, and **~2 × 10⁵ core-seconds elastoplastic** — five
-minutes of wall time on the 24-thread CPU against about two hours. Plasticity is
+not be glossed: a 200 m² collision zone at 50 mm elements costs ~8 000 core-seconds
+per simulated second elastic, and **~2 × 10⁵ core-seconds elastoplastic** — five and
+a half minutes of wall time on the 24-thread CPU against about two hours. Plasticity is
 what makes the crush zone expensive, not the element.
 
 #### What it cannot do yet
@@ -2661,7 +2661,7 @@ thickness-locking penalty of 1.225 — which is exactly the ratio of the plane-s
 modulus to the oedometer one, so the enhanced modes buy a closed form rather than
 a tuning.
 
-**Cost, one core:** 21.1 µs to form an element stiffness (once, at promotion),
+**Cost, one core:** 21.9 µs to form an element stiffness (once, at promotion),
 293 ns for an internal force step against 129 ns for `fem.cpp`'s linear tet. Per
 element that is 2×; per square metre of 20 mm plating per simulated second it is
 **40 s against 4.1 × 10⁶ s**, a factor of 1.0 × 10⁵, because the tet mesh pays in
@@ -2670,7 +2670,10 @@ element count *and* in timestep and the solid-shell pays in neither.
 **Two corrections this produced.** The timestep claim above was wrong: a
 solid-shell keeps its through-thickness stretch mode — deliberately, a crush zone
 needs the plate to thin — so the stable step is `t/c_p` **regardless of in-plane
-size** (measured flat to 0.1% from 5t to 50t). The win over a bending-resolving tet
+size** (`dt·c_p/t` is 0.9924 at 5t and reaches 0.999 only at 10t —
+this read "flat to 0.1% from 5t to 50t", which `07-fem-spike-findings.md` §4
+retracts as a figure quoted from the wide end of its own sweep). The win over a
+bending-resolving tet
 mesh is real and measured at 6.7×, but it comes from the thickness element being
 the whole plate rather than an eighth of it, not from in-plane sizing. And the
 element's binding limit is not accuracy but **geometry**: the assumed strains are
@@ -2715,8 +2718,8 @@ bounds the barrier one.
 
 The per-element stiffness store is what puts the ceiling there, so the question is
 what to do about it — and the obvious answer is wrong. **Recomputing instead of
-storing costs 133× the bandwidth it saves**: forming an element stiffness is
-21.1 µs (`07-fem-spike-findings.md`) while streaming its 4.6 kB at the saturated
+storing costs 138× the bandwidth it saves**: forming an element stiffness is
+21.9 µs (`07-fem-spike-findings.md`) while streaming its 4.6 kB at the saturated
 29 GB/s is 0.16 µs. This paragraph first suggested exactly that trade without
 costing it, which is the error this file keeps recording other people making.
 
