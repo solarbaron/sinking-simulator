@@ -176,6 +176,18 @@ sequence decide one thing, they need the same notion of "on the boundary".
 is the second time that mistake was made in this repo — the first was recorded, in
 this table, by the work that immediately preceded it.
 
+**A gate reads the tree and the build directory for its whole duration, so
+editing either while one runs produces a failure that is yours and looks like the
+code's.** Three times in one session: twice `verify.sh` caught a check count that
+had moved since the run began, and once a figure check reported three
+section-mesher figures as drifted when `ninja` had relinked `section_probe`
+underneath it — the run started at 02:16:06 and the binary was rebuilt at
+02:17:45, with the section block at line 93 of about a hundred. That third one
+cost the most, because the figures were *correctly* reporting an experimental
+change to the strake fractions and the obvious reading was a defect in a mesher
+that had not been touched for sixty-five commits. All three reproduced their
+published values the moment the tree was clean. Start the gate, then stop typing.
+
 **A mutation run that is interrupted leaves a tree that is green because the
 mutant survived.** This is the one place where a passing suite is actively
 evidence *against* you, and it has happened here: an agent killed mid-sweep by a
