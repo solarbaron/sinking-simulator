@@ -639,7 +639,7 @@ fi
 # just added a test. One `expected` variable cannot disagree with itself.
 if [ -x "$TESTS" ]; then
   suite=$("$TESTS" 2>&1 | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  expected=200402
+  expected=200407
   check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
         "$expected validation checks" "$FRONT"
   # **The roadmap publishes the same count in a different format**, and it was

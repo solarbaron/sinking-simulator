@@ -250,9 +250,49 @@ void testMalformedInputFailsCleanly() {
         for (int i = 0; i < 4; ++i) badLength[25 + static_cast<std::size_t>(i)] = std::byte{0x7F};
     Hull lengthTarget;
     ByteReader lengthReader(badLength);
-    core::deserialise(lengthTarget, lengthReader);  // may fail; must not over-read
-    expectTrue("a corrupt length prefix leaves the reader in bounds",
+    // Asserted, not discarded. A prefix of 0x7F7F7F7F cannot be skipped inside a
+    // buffer this size, so the refusal is not a judgement call -- and the line
+    // below only ever said the reader stayed in bounds, which a decoder that
+    // accepted the field would also satisfy.
+    expectTrue("a length prefix longer than the buffer is refused",
+               !core::deserialise(lengthTarget, lengthReader));
+    expectTrue("and leaves the reader in bounds",
                lengthReader.cursor() <= badLength.size());
+
+    // **The other arm of that guard: a prefix that is too *small*.**
+    //
+    // The case above is too large, so the reader runs out of buffer and what is
+    // really being exercised is the truncation path. This one records four bytes
+    // for a payload that decodes eight, so nothing runs off the end at all and the
+    // reader never fails -- and the stream is still corrupt, because the next
+    // field's header would then be read four bytes late.
+    //
+    // Without the guard the desynchronised 8-byte name hash matches no field, so
+    // the field is treated as unknown to this build and skipped wholesale on a
+    // garbage length; if that garbage happens to fit, the skip succeeds and
+    // `deserialiseObject` returns **true** with a half-populated object. That is
+    // the failure the length prefix exists to prevent, and it is why the
+    // `compartments` assertion below matters more than the refusal itself.
+    //
+    // Offset 25 is the first field's length prefix -- 8 bytes of type id, 4 of
+    // field count, then that field's 8-byte name hash, 1 kind byte and 4 count
+    // bytes -- and it is checked rather than trusted, because a header that grows
+    // a byte would otherwise move this patch silently onto the payload.
+    std::vector<std::byte> shortLength(full);
+    expectTrue("offset 25 really is the first field's length prefix, reading 8",
+               shortLength.size() > 36 && shortLength[25] == std::byte{0x08} &&
+                   shortLength[26] == std::byte{0x00} && shortLength[27] == std::byte{0x00} &&
+                   shortLength[28] == std::byte{0x00});
+    shortLength[25] = std::byte{0x04};
+    Hull shortTarget;
+    shortTarget.compartments = 99;
+    ByteReader shortReader(shortLength);
+    expectTrue("a length prefix shorter than the payload it describes is refused",
+               !core::deserialise(shortTarget, shortReader));
+    expectEqual("and nothing past the corrupt field reached the target",
+                shortTarget.compartments, 99);
+    expectTrue("with the reader still inside the buffer",
+               shortReader.cursor() <= shortLength.size());
 }
 
 // The wire format must be byte-for-byte reproducible, or replays and network
