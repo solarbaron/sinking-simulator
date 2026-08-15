@@ -2569,11 +2569,19 @@ Two things had to be got right that are easy to get wrong:
 | Solid-shell elastoplastic update, marching and yielding | 7.3 µs, **26.9×** |
 | Per-point state | 120 B; 10⁶ elements × 8 points = **916 MB** |
 
-**35% of that 7.3 µs is re-forming B on the rest geometry, which never changes.**
-It is loop-invariant and hoistable, at 12 kB per element — against the 4.6 kB per
-element the elastic path already spends on a condensed stiffness. That is the
-first optimisation to reach for and it is a memory decision, so it belongs with
-the Tier-2 solver rather than here.
+**Re-forming B on the rest geometry is loop-invariant, and hoisting it was the
+first optimisation to reach for.** It costs 12 kB per element — against the 4.6 kB
+per element the elastic path already spends on a condensed stiffness — so it is a
+memory decision, and it belongs with the Tier-2 solver rather than here.
+
+**It has since been taken, and this paragraph used to estimate the prize at 35%.**
+Measured now, by running `zone_probe` against itself with `--forms-cache=never`:
+the same 21 290-step solve costs **1.00 µs/element/step** rebuilt and **0.55 µs**
+cached on 23 workers, and **3.75 µs** against **1.75 µs** on one — a saving of
+**45%** and **53%**. The one-worker pair is the cleaner read of the per-element
+work, and 53% is where `07-fem-spike-findings.md` §6's independent A/B on the real
+run also lands, at 51%. So the estimate was low, not high: the hoist paid better
+than the paragraph proposing it expected.
 
 The consequence for the budget in `07-fem-spike-findings.md` §6 is real and should
 not be glossed: a 200 m² collision zone at 50 mm elements costs ~8 000 core-seconds
@@ -2774,9 +2782,19 @@ three-metre zone at four elements across each 0.70 m bay:
 |---|---|
 | Zone | 14 panels → **224 elements**, 522 nodes, 24.0 m² of 12 mm plating |
 | Promotion — meshing, and a power iteration per element for the step | **7 ms**, once |
-| Predicted | **380 core-seconds** per simulated second — `224 x 1.7`, `promotion.hpp`'s `coreSecondsPerElement` |
-| Delivered, 23 workers | 21 290 steps, **4.5 s of wall time**, 0.94 µs/element/step |
-| The same run, one worker | 15.4 s, 3.24 µs/element/step |
+| Predicted | **382 core-seconds** per simulated second — `zone::estimatedCost`, which `zone_probe` prints |
+| Delivered, 23 workers | 21 290 steps, **2.6 s of wall time**, 0.55 µs/element/step |
+| The same run, one worker | 8.3 s, 1.75 µs/element/step |
+| The same again, `--forms-cache=never` | 4.8 s and 17.9 s, 1.00 and 3.75 µs/element/step |
+
+**The wall times moved because the default did, not because anything rotted.**
+This table published 4.5 s and 15.4 s, and those are the *uncached* figures — the
+row added above reproduces them at 4.8 s and 17.9 s. `cacheRestForms` is now the
+default path, which is the third row's whole point: a figure measured under a flag
+that later became the default reads as drift when it is really a configuration
+nobody wrote down. The step count, the timestep and the prediction are identical
+across all three and are what the figure gate checks; the seconds are this box on
+23 threads and are not gateable at all.
 
 **That prediction read 900 until this table was read against itself.** 900 is
 `224 x 5.5e5 x 7.3 us`, the pre-`cacheRestForms` element cost that §1 above
@@ -2785,6 +2803,14 @@ refutes it without leaving the table: 15.4 core-seconds of one-worker wall time
 over 0.04 s of simulated time is **385**, which is `promotion.hpp`'s live 3.1 us
 to within 1%. A prediction and its own measurement, adjacent, 2.36x apart, and
 printed on the same run by the same tool.
+
+The two estimators now agree, which is the other half of the fix and the half
+worth stating. `promotion.hpp`'s per-element constant gives `224 x 1.7` = **381**
+and `zone::estimatedCost` -- which works off `kPlasticMicroseconds` and the patch's
+own critical timestep, and is what the tool prints -- gives **382**. They used to
+be **2.35x apart**, printed on the same run of the same tool, and nobody had read
+them side by side. 0.3% apart is a corroboration; 2.35x apart was two numbers for
+one quantity that nothing compared.
 
 `zone.hpp` §1 had already corrected this figure to 380 and said so in those
 words. It did not reach here, which is the same unpropagated-retraction failure

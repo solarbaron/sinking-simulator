@@ -91,6 +91,8 @@ RAM=${RAM:-./build/ram_view}
 WATER=${WATER:-./build/water_probe}
 GAS=${GAS:-./build/gas_probe}
 GASDOC=engine/sim/promotion.hpp
+ZONE=${ZONE:-./build/zone_probe}
+ZONE_DOC=docs/02-simulation.md
 JOBS=${JOBS:-./build/job_bench}
 ARCH_DOC=docs/01-architecture.md
 FLIP=${FLIP:-./build/flip_probe}
@@ -1528,6 +1530,90 @@ if [ -x "$FLIP" ]; then
 else
   echo "  - flip_probe not built, skipping the FLIP solver's studies"
   skipped="$skipped flip_probe"
+fi
+
+# --- the Tier-2 zone at ship scale, which verify.sh runs for its exit code -------
+#
+# `zone_probe` is the third and last tool in the shape this file exists for.
+# `verify.sh:671` runs it -- under a comment saying "it is why the zone's cost has
+# to stay visible" -- and asserts `^ok$`. Nothing checked a figure. It publishes
+# into `02-simulation.md`'s cost table, `06-roadmap.md`'s Phase 4 item,
+# `07-fem-spike-findings.md` §6, and the headers of `zone.hpp` and
+# `solid_shell.hpp` -- **the two engine headers this gate reads nothing from**,
+# and between them the densest concentration of ungated tool output in the repo.
+# One of its figures was already wrong when this block was written: the cost table
+# predicted 900 core-seconds against its own measurement of 385, on the row below.
+#
+# **It is bit-deterministic in everything but wall clock.** Two runs diff to the
+# `ms to know`, `decided in us`, `s wall` and profile columns and nothing else, so
+# every physics figure here carries tolerance 0. The seconds are not gated at all:
+# they are this box on 23 threads, and the same solve is 4.8 s with
+# `--forms-cache=never`, which is the configuration the table used to publish
+# without saying so.
+#
+# ~8 s for the whole thing, which is the cheapest block in this file per figure.
+if [ -x "$ZONE" ]; then
+  zone=$("$ZONE" --radius=3.0 --depth=0.22 2>&1)
+  zfield() { printf '%s\n' "$zone" | sed -n "s/$1/\1/p" | head -1; }
+
+  check "the zone the criterion promotes, elements" 224 0 \
+        "$(zfield '^zone *: [0-9]* panels -> \([0-9]*\) elements.*')" \
+        '| Zone | 14 panels → **224 elements**, 522 nodes, 24.0 m² of 12 mm plating |' "$ZONE_DOC"
+  check "and nodes" 522 0 "$(zfield '^zone *: .* \([0-9]*\) nodes.*')" \
+        '| Zone | 14 panels → **224 elements**, 522 nodes, 24.0 m² of 12 mm plating |' "$ZONE_DOC"
+  check "and plating area (m2)" 24.0 0.05 "$(zfield '^zone *: .*, \([0-9.]*\) m2 of 12 mm.*')" \
+        '| Zone | 14 panels → **224 elements**, 522 nodes, 24.0 m² of 12 mm plating |' "$ZONE_DOC"
+  check "the critical timestep (us)" 1.816 0.0005 \
+        "$(zfield '^cost *: dt = \([0-9.]*\) us.*')" \
+        '| 2 (0.25 × 0.175 m) | 1.816 µs | 1.816 µs | 1.000 |' "$ZONE_DOC"
+  check "steps the solve actually took" 21290 0 \
+        "$(zfield '^solve *: \([0-9]*\) steps.*')" \
+        '| Delivered, 23 workers | 21 290 steps, **2.6 s of wall time**, 0.55 µs/element/step |' "$ZONE_DOC"
+  check "the work the punch cost (MJ)" 2.755 0.0005 \
+        "$(zfield '^energy *: in \([0-9.]*\) MJ.*')" \
+        'the 2.755 MJ a 0.22 m punch costs' "$DOC"
+  check "elements torn" 80 0 "$(zfield '^damage *: \([0-9]*\) of 224 elements deleted.*')" \
+        '| Delivered, 23 workers | 21 290 steps, **2.6 s of wall time**, 0.55 µs/element/step |' "$ZONE_DOC"
+  check "and what the energy-driven drive tears instead" 42 0 \
+        "$(zfield '^ *\([0-9]*\) element(s) torn against 80.*')" \
+        '45 970 steps against 21 290 — because a striker that has nearly stopped crawls,' "$ZONE_DOC"
+  check "the steps that drive takes" 45970 0 \
+        "$(zfield '.*against 6; \([0-9]*\) steps against 21290.*')" \
+        '45 970 steps against 21 290 — because a striker that has nearly stopped crawls,' "$ZONE_DOC"
+  check "the pre-load the girder puts through the patch (MPa)" 13.1 0.05 \
+        "$(zfield '^preload: .* -> \([0-9.]*\) MPa through the patch.*')" \
+        "| zone handed the girder's 13.1 MPa | **20.25 MN**, +7.1% |" "$ZONE_DOC"
+  check "and the force at 0.078 m under it (MN)" 20.25 0.005 \
+        "$(printf '%s\n' "$zone" | awk '$1=="solid-shell" && $2=="FEM" && NF==5 { print $4 }')" \
+        "| zone handed the girder's 13.1 MPa | **20.25 MN**, +7.1% |" "$ZONE_DOC"
+
+  # **The two cost estimators, checked against each other and not only against the
+  # document.** `zone::estimatedCost` works off `kPlasticMicroseconds` and the
+  # patch's own critical timestep; `promotion.hpp`'s `coreSecondsPerElement` is a
+  # per-element constant. The tool prints both on the same run -- 382 on the `cost`
+  # line and 381 on the `promote` line -- and they were **2.35x apart** until
+  # someone read them side by side. That is this repo's most-repeated defect: two
+  # computations of one quantity that nothing compares. Gating either alone would
+  # not have caught it, so the ratio is gated too.
+  predicted=$(zfield '^ *predicted \([0-9]*\) core-seconds.*')
+  promoted=$(printf '%s\n' "$zone" | sed -n 's/^promote: .*224 element(s) active, \([0-9]*\) core-s\/s.*/\1/p' | head -1)
+  check "the cost the zone predicts for itself" 382 2 "$predicted" \
+        '| Predicted | **382 core-seconds** per simulated second — `zone::estimatedCost`, which `zone_probe` prints |' "$ZONE_DOC"
+  check "and the cost the promoter charges for the same zone" 381 2 "$promoted" \
+        'them side by side. 0.3% apart is a corroboration; 2.35x apart was two numbers for' "$ZONE_DOC"
+  checks=$((checks + 1))
+  if awk -v a="$predicted" -v b="$promoted" 'BEGIN { exit !(a > 0 && b > 0 && a/b < 1.05 && b/a < 1.05) }'; then
+    printf '  %s✓%s the promoter and the zone agree on what the zone costs (%s against %s)\n' \
+           "$green" "$off" "$promoted" "$predicted"
+  else
+    printf '  %s✗%s the two cost estimators have parted again: promoter %s, zone %s\n' \
+           "$red" "$off" "$promoted" "$predicted"
+    printf '      %sthey were 2.35x apart once and both were printed on this same run%s\n' "$dim" "$off"
+    fails=$((fails + 1))
+  fi
+else
+  echo "  - zone_probe not built, skipping the Tier-2 zone's figures"
+  skipped="$skipped zone_probe"
 fi
 
 # Did anything we read get rebuilt while we were reading it? Reported before the
