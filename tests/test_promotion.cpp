@@ -3315,6 +3315,47 @@ fire::Model gasModelWith(double lengthX, double lengthY, double height, double l
     return model;
 }
 
+// **The gas trigger reads the compartment's own agent, not carbon dioxide.**
+//
+// `Layer::temperature` defaults its species, and `fire.hpp` states that nothing
+// inside the model takes that default because a `GasCompartment` has its species
+// to hand. Three places did: `wallExchange`, and both of these -- `gasCandidates`'
+// promote trigger and `GasPromoter`'s hold predicate.
+//
+// It is invisible on every fixture in this file because `heatCapacity` weights the
+// species term by `min(agent, mass)` and none of them carries agent. So the layer
+// has to be inerted for the question to have an answer, and with an agent whose
+// `cv` is far from carbon dioxide's -- argon is 312 against 654, on the far side of
+// air's 718, so the correction changes sign as well as size.
+//
+// `rise` is not a diagnostic: `risePromote` is 20 K and `riseHold` 10 K, so this
+// decides whether an LES field is built and whether it stays.
+void testTheGasTriggerReadsTheCompartmentsOwnAgent() {
+    std::printf("\n   the gas trigger reads the compartment's agent\n");
+
+    fire::Model model;
+    fire::GasCompartment gas = gasStratified(20.0, 8.0, 5.0, 1.2, 600.0);
+    gas.agentSpecies = fire::kArgon;
+    gas.upper.agent = 0.5 * gas.upper.mass;
+    gas.lower.agent = 0.5 * gas.lower.mass;
+    model.gas.push_back(gas);
+
+    const double proper = gas.upper.temperature(gas.agentSpecies) -
+                          gas.lower.temperature(gas.agentSpecies);
+    const double asCarbonDioxide = gas.upper.temperature() - gas.lower.temperature();
+    std::printf("      rise %.1f K read with argon, %.1f K read as carbon dioxide\n", proper,
+                asCarbonDioxide);
+    expectTrue("the two spellings disagree by more than either threshold, or nothing is proved",
+               std::abs(proper - asCarbonDioxide) > 20.0);
+
+    promotion::GasCriterion criterion;
+    const std::vector<promotion::GasCandidate> found = promotion::gasCandidates(model, criterion);
+    testing::expectEqual("the compartment is a candidate", static_cast<long long>(found.size()), 1LL);
+    if (!found.empty())
+        expectNear("and its rise is the one read with the compartment's own agent", found[0].rise,
+                   proper, 0.0);
+}
+
 void testAGasPromotionNeedsBothOfItsTriggers() {
     std::printf("\n   which burning compartment deserves a field\n");
     const promotion::GasCriterion criterion;
@@ -3784,6 +3825,7 @@ void runPromotionTests() {
     testTheResolvedModelAgreesWithTwoZonesWhereTwoZonesAreRight();
     testTheResolvedModelDepartsFromTwoZonesWhereTheyAreWrong();
     testTheCeilingJetCriterionIsAClosedForm();
+    testTheGasTriggerReadsTheCompartmentsOwnAgent();
     testAGasPromotionNeedsBothOfItsTriggers();
     testGasHysteresisAndDwellPreventChatter();
     testWhatAResolvedRunIsHandedAndWhatItReports();

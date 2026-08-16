@@ -816,7 +816,16 @@ std::vector<GasCandidate> gasCandidates(const fire::Model& model, const GasCrite
         const double height = gas.ceilingZ - gas.floorZ;
         const double reach = compartmentReach(gas.floorArea, gas.perimeter);
         const double spread = les::ceilingJetSpread(reach, height);
-        const double rise = gas.upper.temperature() - gas.lower.temperature();
+        // **With the compartment's own agent.** `Layer::temperature` defaults to
+        // carbon dioxide, and `fire.hpp` says nothing inside the model takes that
+        // default because a `GasCompartment` has its species to hand. Two places
+        // did: `fire.cpp`'s `wallExchange`, fixed, and these two. `heatCapacity`
+        // weights the species term by `min(agent, mass)`, so with no agent the two
+        // spellings are the same double and with one they are not -- on a
+        // half-agent argon layer the rise is 697 K read properly and 523 K read as
+        // carbon dioxide, against a `risePromote` of 20.
+        const double rise = gas.upper.temperature(gas.agentSpecies) -
+                            gas.lower.temperature(gas.agentSpecies);
 
         if (!(criterion.spreadPromote > 0) || !(criterion.risePromote > 0)) continue;
         if (spread < criterion.spreadPromote) continue;
@@ -887,7 +896,10 @@ GasReview GasPromoter::review(const fire::Model& model) {
         const double height = gas.ceilingZ - gas.floorZ;
         const double spread =
             les::ceilingJetSpread(compartmentReach(gas.floorArea, gas.perimeter), height);
-        const double rise = gas.upper.temperature() - gas.lower.temperature();
+        // The compartment's own agent here too: promote and hold must read the
+        // same layer the same way, or a zone chatters on the difference.
+        const double rise = gas.upper.temperature(gas.agentSpecies) -
+                            gas.lower.temperature(gas.agentSpecies);
         return spread >= criterion_.spreadHold && rise >= criterion_.riseHold;
     };
 
