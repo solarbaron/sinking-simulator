@@ -1569,13 +1569,27 @@ void testTheCostEstimateIsAFunctionOfTheRightThings() {
                0.5 * zone::estimatedCost(coarse), 0.02 * zone::estimatedCost(coarse));
     expectTrue("and the two thicknesses really do differ in step",
                stout.criticalTimestep > 1.8 * coarse.criticalTimestep);
-    // And the elastic path is cheaper by the ratio the measurements say. The
-    // plastic figure moved from 7.3 µs to 3.1 when the step-invariant element forms
-    // stopped being rebuilt every step, so this ratio moved from 27 to 11 -- the
-    // elastic path barely uses those forms, so only one of the two numbers changed.
-    expectNear("the elastic path is 11 times cheaper, as measured",
-               zone::estimatedCost(coarse, true) / zone::estimatedCost(coarse, false),
-               3.1 / 0.273, 0.1);
+    // And the elastic path is cheaper by the ratio the measurements say.
+    //
+    // **This asserted `3.1 / 0.273` and could not fail.** Everything but the two
+    // constants cancels out of `estimatedCost(p, true) / estimatedCost(p, false)`
+    // -- the element count, the step count, the 1e-6 -- so the left side *is*
+    // `kPlasticMicroseconds / kElasticMicroseconds`, and the right side was those
+    // same two constants written out again. The label said "as measured" and
+    // nothing measured entered it. It would have held at any pair of values,
+    // including the 11.4x that was wrong by a factor of five and a half.
+    //
+    // The number below is a measurement and comes from outside this file:
+    // `zone_probe` on the ferry patch, plastic against `--elastic`, same patch and
+    // same thread count so only the flag differs -- 1.981, 1.981, 2.007 over three
+    // pairs. `check-figures.sh` re-derives it on every full run, which is the part
+    // that stops the constants and the solver drifting apart again.
+    // 2.40 and not 1.99: the ratio has to be read where nothing tears, or it is a
+    // ratio of two different amounts of work -- the plastic run deletes elements as
+    // they fail and stops integrating them, the elastic run never does. See
+    // `zone.cpp`'s table. `check-figures.sh` re-derives this from two real solves.
+    expectNear("the elastic path is 2.4x cheaper, as actually measured",
+               zone::estimatedCost(coarse, true) / zone::estimatedCost(coarse, false), 2.40, 0.06);
     expectTrue("an empty patch costs nothing", zone::estimatedCost(zone::Patch{}) == 0.0);
 }
 

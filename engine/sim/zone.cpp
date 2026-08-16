@@ -25,7 +25,33 @@ using solidshell::kNodes;
 // the whole of the difference. Measured both ways on the same element, 7.18 µs
 // against 3.06.
 constexpr double kPlasticMicroseconds = 3.1;
-constexpr double kElasticMicroseconds = 0.273;
+// **This read 0.273, which made the elastic path 11.4x cheaper than the plastic
+// one. Measured, it is 2.40x.** So 3.1/2.40 = 1.29. The error was in the unsafe
+// direction: `estimatedCost` is what refuses a zone at promotion, and it was
+// under-quoting an elastic patch by a factor of nine.
+//
+// **The measurement has to be taken where nothing tears**, which is the whole
+// difficulty. `zone_probe --threads=1` on the ferry patch, plastic against
+// `--elastic`, same patch and same thread count so only the flag differs:
+//
+//     depth 0.05   2.68 s / 1.11 s = 2.414     0 of 224 elements deleted
+//     depth 0.08   4.00 s / 1.67 s = 2.395     0 of 224 elements deleted
+//     depth 0.22   8.26 s / 4.17 s = 1.981    80 of 224 elements deleted
+//
+// The first two agree to 0.4% and the third does not, because the plastic run
+// *deletes elements* as they tear and then has fewer of them to integrate, while
+// the elastic run never tears and carries all 224 to the end. The deep figure is
+// therefore a ratio of two different amounts of work, and taking it -- which this
+// comment did in its first draft, giving 1.56 -- builds the tearing of one
+// particular punch into a constant that is supposed to be per element.
+//
+// Two ratios and no comparison is also why the original 0.273 survived: a units
+// trap sits on the direct comparison. `SolveResult::microsecondsPerElementStep` is
+// **wall** time over element-steps, while these are serial per-element figures
+// that `estimatedCost` multiplies into **core** seconds. Set side by side they
+// look 1.7x apart on a two-thread run when the real disagreement is 13%. Only in a
+// ratio does the thread count cancel.
+constexpr double kElasticMicroseconds = 1.29;
 
 // --- Welding -------------------------------------------------------------------
 //

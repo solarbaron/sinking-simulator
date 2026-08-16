@@ -1611,6 +1611,53 @@ if [ -x "$ZONE" ]; then
     printf '      %sthey were 2.35x apart once and both were printed on this same run%s\n' "$dim" "$off"
     fails=$((fails + 1))
   fi
+
+  # **The predicted elastic/plastic ratio against the measured one**, which is the
+  # check that would have caught `kElasticMicroseconds` at 0.273 -- a value that
+  # made the elastic path 11.4x cheaper than the plastic one where it is 2.4x, and
+  # that `estimatedCost` used to refuse zones at promotion. The unit test beside it
+  # asserted `3.1 / 0.273` against `estimatedCost(p,true)/estimatedCost(p,false)`,
+  # which is those same two constants with everything else cancelled: it could not
+  # fail, and it held for years at a figure wrong by nine.
+  #
+  # **Read at `--depth=0.05`, and the depth is the point.** At the standard 0.22 the
+  # plastic run tears 80 of its 224 elements and stops integrating them while the
+  # elastic run never tears and carries all 224, so the ratio there -- 1.98 -- is
+  # between two different amounts of work. At 0.05 and 0.08 nothing tears in either
+  # and the ratio is 2.414 and 2.395, agreeing to 0.4%. The `deleted 0` check below
+  # is that precondition asserted rather than assumed.
+  #
+  # `--threads=1` for the same reason a ratio is used at all: at 23 workers the
+  # elastic solve is barrier-bound -- less work per element to amortise the sync --
+  # and comes out *slower* per element-step than the plastic one, 0.76 us against
+  # 0.55. Wall time over element-steps is not a per-element cost unless the thread
+  # count is held down. ~10 s.
+  zplastic=$("$ZONE" --radius=3.0 --depth=0.05 --threads=1 2>&1)
+  zelastic=$("$ZONE" --radius=3.0 --depth=0.05 --threads=1 --elastic 2>&1)
+  wallOf() { printf '%s\n' "$1" | sed -n 's/^solve *: [0-9]* steps in \([0-9.]*\) s wall.*/\1/p'; }
+  costOf() { printf '%s\n' "$1" | sed -n 's/^ *predicted \([0-9]*\) core-seconds.*/\1/p'; }
+  tornOf() { printf '%s\n' "$1" | sed -n 's/^damage *: \([0-9]*\) of [0-9]* elements deleted.*/\1/p'; }
+
+  check "the shallow punch tears nothing, plastic"  0 0 "$(tornOf "$zplastic")" \
+        'depth 0.05   2.68 s / 1.11 s = 2.414     0 of 224 elements deleted' engine/sim/zone.cpp
+  check "nor elastic, so the two runs integrate the same elements" 0 0 "$(tornOf "$zelastic")" \
+        'depth 0.05   2.68 s / 1.11 s = 2.414     0 of 224 elements deleted' engine/sim/zone.cpp
+
+  checks=$((checks + 1))
+  measuredRatio=$(awk -v p="$(wallOf "$zplastic")" -v e="$(wallOf "$zelastic")" \
+                      'BEGIN { if (e > 0) printf "%.3f", p / e; else print "0" }')
+  predictedRatio=$(awk -v p="$(costOf "$zplastic")" -v e="$(costOf "$zelastic")" \
+                       'BEGIN { if (e > 0) printf "%.3f", p / e; else print "0" }')
+  if awk -v m="$measuredRatio" -v p="$predictedRatio" \
+        'BEGIN { exit !(m > 0 && p > 0 && m / p < 1.15 && p / m < 1.15) }'; then
+    printf '  %s✓%s the elastic/plastic cost the constants predict matches the solver (%s against %s)\n' \
+           "$green" "$off" "$predictedRatio" "$measuredRatio"
+  else
+    printf '  %s✗%s the cost constants have drifted from the solver: predicted %sx, measured %sx\n' \
+           "$red" "$off" "$predictedRatio" "$measuredRatio"
+    printf '      %skPlasticMicroseconds / kElasticMicroseconds in engine/sim/zone.cpp%s\n' "$dim" "$off"
+    fails=$((fails + 1))
+  fi
 else
   echo "  - zone_probe not built, skipping the Tier-2 zone's figures"
   skipped="$skipped zone_probe"
