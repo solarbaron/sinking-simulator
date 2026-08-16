@@ -1026,16 +1026,27 @@ FibreStress fibreStress(const std::vector<StressSample>& samples, bool deck, dou
 //     fix that would need no limit is a `junctionTolerance` scaled off the plating,
 //     which this file already says it wants and which changes the junction *census*
 //     as well as the tie, so it is a separate piece of work.
-//   * **`hullGirderSection` sampled exactly on a frame station loses 76% of the
-//     ship**, and it is the Tier-0 reference everything above is compared against.
-//     Measured: 0.42932 m^2 at x = 19.2, 21.6 and 24.0 against 1.80133 at 19.6 and
-//     18.8 -- the plating either side of the plane fails the half-open `straddles`
-//     test in `sectionElements` on a floating-point knife edge and only the
-//     longitudinals survive. It is not every station (16.8 is fine), which is what
-//     says it is representation rather than geometry. `tools/section_probe --scan`
-//     therefore samples Tier 0 at the centre of a bay and reports both areas rather
-//     than their ratio. Fixing it belongs with `girder.hpp`, and it moves published
-//     figures.
+//   * **`hullGirderSection` sampled exactly on a frame station lost 76% of the
+//     ship, and does not any more.** It read 0.42932 m^2 at x = 19.2, 21.6 and
+//     24.0 against 1.80133 at 19.6 and 18.8 -- the plating either side of the plane
+//     failing the half-open `straddles` test in `sectionElements` on a
+//     floating-point knife edge, leaving only the longitudinals. Not every station
+//     (16.8 was fine), which is what said it was representation rather than
+//     geometry.
+//
+//     `scantlings.cpp` carries the fix, with this measurement quoted back at it:
+//     `straddles` is tolerant by `kFlat` while the crossing search is exact, so the
+//     plane could be admitted while lying a hair outside the panel -- the ferry's
+//     station 33 is 19.200000000000003, so a cut asked for at 19.2 sat 3.6e-15 aft
+//     of the bay that owned it. The cut is clamped to the panel's own edge now.
+//     Re-measured: 1.80133 at 19.2, identical to 18.8 and 16.8 to five decimals,
+//     and 1.80129, 1.80113, 1.80083 at 19.6, 21.6 and 24.0 -- the gentle taper the
+//     ship actually has.
+//
+//     This paragraph said "fixing it belongs with `girder.hpp`, and it moves
+//     published figures" for as long as the fix had already landed elsewhere.
+//     `tools/section_probe --scan` still samples Tier 0 at the centre of a bay,
+//     which is now a choice rather than a workaround.
 //   * **The thickness-seam rule costs five times more at the ends than amidships,
 //     and how much depends on where the section was cut.** `nodeThickness` was an
 //     area-weighted mean over the sub-quads *inside* the section, so a station where

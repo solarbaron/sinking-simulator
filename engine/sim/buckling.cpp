@@ -116,9 +116,38 @@ std::vector<GirderBuckling> girderBuckling(const std::vector<GirderStress>& stre
         g.deckInCompression = deckCompressed;
         g.plate = plateBuckling(thickness, frameSpacing, stiffenerSpacing, compression, material);
 
-        const StiffenedSection combined =
-            stiffenedSection(scantlings.frameProfile, thickness, stiffenerSpacing);
-        g.column = columnBuckling(combined, frameSpacing, compression, material);
+        // The longitudinal at that same fibre, for the same reason the thickness
+        // above comes from the panels present. This passed
+        // `scantlings.frameProfile`, the transverse web frame, to a column whose
+        // span is the frame spacing -- and `buckling.hpp` calls the column mode
+        // "The longitudinal, with its attached strip of plating".
+        //
+        // A longitudinal runs *along* x, so it is present at this station when the
+        // station lies between its ends -- not when its centroid is within half a
+        // bay, which is the panels' test and would exclude nearly all of them.
+        const StiffenerProfile* longitudinal = nullptr;
+        double attached = 0;
+        double bestMember = -1e30;
+        for (const StructuralMember& m : structure.members) {
+            if (m.role != MemberRole::Longitudinal) continue;
+            if (s.x < std::min(m.a.x, m.b.x) || s.x > std::max(m.a.x, m.b.x)) continue;
+            const double z = 0.5 * (m.a.z + m.b.z);
+            const double score = deckCompressed ? z : -z;
+            if (score > bestMember) {
+                bestMember = score;
+                longitudinal = &m.profile;
+                attached = m.attachedPlateThickness;
+            }
+        }
+        // No longitudinal at this fibre is not a column of zero strength -- it is a
+        // check that cannot be made. `g.column` stays default, so `g.utilisation`
+        // below is the plate mode alone rather than a knockdown from a member that
+        // is not there.
+        if (longitudinal != nullptr) {
+            const StiffenedSection combined =
+                stiffenedSection(*longitudinal, attached, stiffenerSpacing);
+            g.column = columnBuckling(combined, frameSpacing, compression, material);
+        }
 
         g.utilisation = std::max(g.plate.utilisation, g.column.utilisation);
         out.push_back(g);

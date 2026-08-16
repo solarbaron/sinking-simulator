@@ -6021,7 +6021,7 @@ Two things that table makes plain and a single reduction factor would hide.
 `k_p,θ` falls *far* faster than `k_y,θ` — 0.42 against 1.00 at 400 °C — so the
 elastic limit is gone long before the yield moves. And `k_E,θ` is below `k_y,θ`,
 so anything that fails by instability rather than by squashing loses strength
-faster than the yield factor says: the ferry's midship section sheds 17.6% of its
+faster than the yield factor says: the ferry's midship section sheds 21.2% of its
 ultimate sagging moment at 400 °C, at which temperature `k_y` is still exactly 1.
 
 **That last sentence used to read "from 500 °C up" and it was wrong at both

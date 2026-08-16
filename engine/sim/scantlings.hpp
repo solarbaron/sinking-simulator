@@ -422,6 +422,11 @@ struct SectionElement {
     double zLo = 0, zHi = 0;     // m, its extreme fibres
     double thickness = 0;        // m, plating thickness or stiffener web thickness
     double width = 0;            // m, girth spanned; zero for a stiffener
+    // A stiffener's own profile and the plating it is welded to, kept because the
+    // column-buckling check needs both and `thickness` above is neither: for a
+    // stiffener it is the *web* thickness. Empty and zero for a plate element.
+    StiffenerProfile profile{};
+    double attachedPlateThickness = 0;  // m
     int material = 0;
     bool stiffener = false;
 };

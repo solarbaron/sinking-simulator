@@ -297,8 +297,25 @@ std::vector<CollapseElement> collapseElementsAt(const StructuralMesh& structure,
             // A stiffener is a column between frames, and it is stocky enough that
             // it usually yields first. It does not shed the way a plate panel
             // does, so it holds its capacity.
+            // **The stiffener's own profile and its own plating.** This passed
+            // `scantlings.frameProfile` -- the transverse web frame -- to a check
+            // whose span is the frame spacing and whose attached plating is the
+            // longitudinal spacing, which is a longitudinal by construction.
+            // `buckling.hpp` says so in those words: "The longitudinal, with its
+            // attached strip of plating, buckles as an Euler column". So do
+            // `02-simulation.md` §2287 and §6055, `06-roadmap.md` §824, and this
+            // header's own "the buckling stress its own plating and spacing imply".
+            //
+            // The second argument was wrong too, and separately: `e.thickness` is
+            // the stiffener's *web* thickness for a stiffener element, not the
+            // plating it is welded to -- 10 mm against the ferry bottom's 14.5.
+            //
+            // This is the un-conservative half of the defect. `compressiveCapacity`
+            // is `min(yield, buckling)`, and the frame profile put the stiffener at
+            // 354.8 MPa against a yield of 355 -- it could not buckle at all, only
+            // yield.
             const StiffenedSection combined =
-                stiffenedSection(scantlings.frameProfile, e.thickness, stiffenerSpacing);
+                stiffenedSection(e.profile, e.attachedPlateThickness, stiffenerSpacing);
             c.curve.bucklingStress =
                 columnBuckling(combined, frameSpacing, 0.0, material).criticalStress;
             c.curve.shedExponent = 0.0;

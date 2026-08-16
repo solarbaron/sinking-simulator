@@ -29,7 +29,7 @@ Numerical core, flooding, air, damaged stability, validation harness.
 - Mesh boolean (clip, weld, cap by ear clipping) so compartments are carved out
   of the hull form rather than authored as boxes
 - Watertightness checking and load-time ship definition validation
-- 200 501 closed-form validation checks
+- 200 503 closed-form validation checks
 - A 120 m ferry that lolls over or capsizes depending on what you do — and, since
   GM stopped being sampled at a fixed ±0.03 rad, does not survive any of the three
 - Explicit co-rotational tet FEM, CPU reference plus a Vulkan compute back-end,
@@ -777,9 +777,12 @@ should be honest about that.
   worst spread in `k_y` that implies is 0.039.
 
   **A structural consequence that is not the yield factor.** The ferry's midship
-  section loses **17.6% of its ultimate sagging moment at 400 °C, where `k_y` is
-  still exactly 1** — plate buckling goes with `E`, and `k_E` is 0.70 there. At
-  600 °C it keeps 0.376 against `k_y = 0.47`. A single 0.7 × 2.4 m × 12 mm panel
+  section loses **21.2% of its ultimate sagging moment at 400 °C, where `k_y` is
+  still exactly 1** — buckling goes with `E`, and `k_E` is 0.70 there. At
+  600 °C it keeps 0.356 against `k_y = 0.47`. (These read 17.6% and 0.376 while
+  the stiffener column check used the transverse frame's profile instead of the
+  longitudinal's: a frame is stiff enough that `min(yield, buckling)` took the
+  yield every time, so only the plate panels carried the `k_E` sensitivity.) A single 0.7 × 2.4 m × 12 mm panel
   changes regime outright: squash-governed cold (Johnson-Ostenfeld biting at
   213.6 MPa), elastic-buckling-governed at 600 °C (69.1 MPa, 0.323 of cold). The
   fully plastic moment does scale by exactly `k_y`, and is the closed-form anchor.

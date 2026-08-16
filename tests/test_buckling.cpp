@@ -209,6 +209,32 @@ void testGirderBucklingFollowsTheCompressedFibre() {
         if (g.deckInCompression) keelChecked = false;
     expectTrue("hogging compresses the keel, so the keel is what is checked", keelChecked);
 
+    // **And the column mode is the longitudinal's, not the transverse frame's.**
+    // `buckling.hpp` says it in those words -- "The longitudinal, with its attached
+    // strip of plating, buckles as an Euler column" -- and this passed
+    // `scantlings.frameProfile`, which is the web frame. Nothing noticed because
+    // nothing reads `GirderBuckling::column` at all: the ferry's plate mode is the
+    // weaker one at every fibre she carries, so `g.utilisation` is the plate check
+    // either way and a mutation to the profile here survived the whole suite.
+    //
+    // Hogging compresses the keel, so the member is the bottom strake's own
+    // longitudinal on its own plating -- taken from the scantling description
+    // rather than by repeating the fibre search, which would only be this file's
+    // copy of the thing under test.
+    const ShellRegion& bottom = sc.shell.front();
+    const StiffenedSection keelColumn =
+        stiffenedSection(bottom.longitudinal, bottom.thickness, sc.longitudinalSpacing);
+    const double wanted =
+        columnBuckling(keelColumn, structure.frameSpacing, 0.0, ah36Steel()).criticalStress;
+    const StiffenedSection asFrame =
+        stiffenedSection(sc.frameProfile, bottom.thickness, sc.longitudinalSpacing);
+    const double asFrameStress =
+        columnBuckling(asFrame, structure.frameSpacing, 0.0, ah36Steel()).criticalStress;
+    expectTrue("the frame and the longitudinal really do disagree here",
+               std::abs(asFrameStress - wanted) > 0.01 * wanted);
+    expectNear("the column check follows the keel longitudinal", hogBuckle.front().column.criticalStress,
+               wanted, 1e-9 * wanted);
+
     // Sagging is the mirror, and must check the deck.
     const HullGirder sag = integrateGirder(x, b, w);
     expectTrue("the sagging case really sags", !sag.hogging());

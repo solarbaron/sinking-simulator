@@ -1108,6 +1108,8 @@ std::vector<SectionElement> sectionElements(const StructuralMesh& mesh, double x
         e.zLo = std::min(root.z, tip.z);
         e.zHi = std::max(root.z, tip.z);
         e.thickness = m.profile.webThickness;
+        e.profile = m.profile;
+        e.attachedPlateThickness = m.attachedPlateThickness;
         e.width = 0.0;
         e.material = m.material;
         e.stiffener = true;

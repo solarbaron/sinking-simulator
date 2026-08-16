@@ -3037,16 +3037,23 @@ void testHotStructureIsWeaker() {
 
         // **The test that fails if the modulus factor is ignored.** At 400 C
         // `k_y` is exactly 1, so a yield-only reduction leaves the section
-        // completely unchanged -- and it is not: it has lost 17.6% of its ultimate
-        // strength through `k_E` alone, because the plate panels' buckling stress
+        // completely unchanged -- and it is not: it has lost 21.2% of its ultimate
+        // strength through `k_E` alone, because the buckling stress of both modes
         // is proportional to E.
+        //
+        // **This read 17.6% while the stiffener column check was using the
+        // transverse frame's profile.** A frame is far stiffer than a longitudinal,
+        // so the stiffeners came out effectively unbucklable -- `min(yield,
+        // buckling)` picked the yield every time -- and only the plate panels
+        // carried the `k_E` sensitivity. With the longitudinal's own profile the
+        // stiffeners lose strength with `E` too, and the section sheds more.
         expectTrue("at 400 C the yield strength has not moved at all",
                    th::carbonSteelYieldFactor(400.0 + kC) == 1.0);
-        expectNear("yet the section has lost 17.6% of its ultimate strength", uWarm / uCold,
-                   0.824, 0.01);
+        expectNear("yet the section has lost 21.2% of its ultimate strength", uWarm / uCold,
+                   0.788, 0.01);
 
         // And at 600 C it loses more than `k_y` says, for the same reason.
-        expectNear("at 600 C it keeps 0.376 of its ultimate strength", uHot / uCold, 0.376,
+        expectNear("at 600 C it keeps 0.356 of its ultimate strength", uHot / uCold, 0.356,
                    0.01);
         expectTrue("which is below the yield reduction factor of 0.47",
                    uHot / uCold < 0.9 * th::carbonSteelYieldFactor(600.0 + kC));
