@@ -473,7 +473,18 @@ bool World::loadImpl(ByteReader& reader) {
                 if (!payload.readU32(blobSize)) return false;
                 // Refuse a blob whose size no longer matches the component:
                 // reading it in would be a silent reinterpretation.
-                if (blobSize != info.size) continue;
+                //
+                // **This said `continue`, which is not a refusal.** The row had
+                // already been created by `appendRow`, and chunks come from a bare
+                // `::operator new` that does not zero, so skipping the read left
+                // the component holding whatever was in that memory -- with
+                // `has<T>()` true, `get<T>()` returning indeterminate bytes, and
+                // `load` returning success. `save` writes the size tag for exactly
+                // this check and says so: "record the size and let the reader
+                // refuse a mismatch". This is that refusal. `load` clears the world
+                // and returns false, which is what the header already promised and
+                // what every other malformed-stream path here does.
+                if (blobSize != info.size) return false;
                 if (!payload.readRaw(target, blobSize)) return false;
             }
         }

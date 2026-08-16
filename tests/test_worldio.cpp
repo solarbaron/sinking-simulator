@@ -112,6 +112,62 @@ void testRoundTripPreservesEverything() {
     expectEqual("every component value survives the round trip", wrong, 0);
 }
 
+// **An opaque component whose size changed must not load as indeterminate bytes.**
+//
+// `save` writes an unreflected component as a size-tagged blob and its own comment
+// says why: "only this build can interpret it, so record the size and let the
+// reader refuse a mismatch". The reader did not refuse. It `continue`d -- leaving
+// the row that `appendRow` had already created holding whatever the fresh
+// `::operator new` chunk contained, since chunks are not zeroed -- and `load`
+// returned true. `has<T>()` was then true and `get<T>()` read indeterminate
+// memory, which is a class of bug ASan does not instrument and this build has no
+// MSan for.
+//
+// The size change cannot be staged inside one build, so it is staged in the bytes.
+// An `OpaqueState` is three `uint64_t`, so its record ends with a length of 28 --
+// four for the size tag and twenty-four for the payload -- immediately followed by
+// the size tag itself, 24. That adjacent pair is the blob, and the test asserts it
+// occurs exactly once so it cannot be patching something else.
+void testAnOpaqueComponentOfTheWrongSizeIsRefused() {
+    World source;
+    const Entity e = source.create();
+    source.add<Hydrostatics>(e, Hydrostatics{12000.0, 5.5, 9});
+    source.add<OpaqueState>(e, OpaqueState{{0xAAAAAAAAAAAAAAAAull, 2, 3}});
+
+    ByteWriter writer;
+    source.save(writer);
+    std::vector<std::byte> bytes = writer.bytes();
+
+    const auto readU32 = [&](std::size_t at) {
+        std::uint32_t v = 0;
+        std::memcpy(&v, bytes.data() + at, 4);
+        return v;
+    };
+    std::size_t sizeTagAt = 0;
+    int found = 0;
+    for (std::size_t i = 0; i + 8 <= bytes.size(); ++i)
+        if (readU32(i) == 28u && readU32(i + 4) == 24u) {
+            sizeTagAt = i + 4;
+            ++found;
+        }
+    expectEqual("the opaque blob's size tag is found exactly once", found, 1);
+
+    const std::uint32_t wrongSize = 16;
+    std::memcpy(bytes.data() + sizeTagAt, &wrongSize, 4);
+
+    World target;
+    ByteReader reader(std::span<const std::byte>(bytes.data(), bytes.size()));
+    const bool loaded = target.load(reader);
+
+    // Refused, and refused the way `load` documents every other refusal: false,
+    // and an empty world rather than a half-loaded one. The alternative -- loading
+    // the entity and leaving the component indeterminate -- is the failure this
+    // exists to remove, and it cannot be told apart from a good load by a caller.
+    expectTrue("a blob whose size no longer matches is refused", !loaded);
+    expectEqual("and the world is left empty rather than half-loaded",
+                static_cast<int>(target.entityCount()), 0);
+}
+
 // Generation counters are part of the world state: a handle that was stale
 // before the save must still be stale after it, or destroyed entities come back.
 void testHandleStalenessSurvives() {
@@ -358,6 +414,7 @@ void testLoadReplacesExistingContents() {
 void runWorldIoTests() {
     std::printf("\n--- world save/load ---\n");
     testRoundTripPreservesEverything();
+    testAnOpaqueComponentOfTheWrongSizeIsRefused();
     testHandleStalenessSurvives();
     testUnknownComponentIsSkipped();
     testTruncatedSaveIsRejected();
