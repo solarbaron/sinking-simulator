@@ -368,10 +368,35 @@ std::unique_ptr<flip::Field> promoteWater(const Compartment& comp, const Ship& /
     // Grid cell size: use FLIP default 0.05 m (5 cm cells).
     const double h = 0.05;
 
-    // Compute wetted depth from volume and plan area, matching computeWaterDepth()
-    // and estimateFlipCost()'s assumption of ~1000 particles per m³.
+    // Compute wetted depth from volume and plan area, the same depth
+    // `computeWaterDepth()` reports.
+    //
+    // **Not "matching `estimateFlipCost`'s assumption of ~1000 particles per m³",
+    // which this comment used to claim and which is not what happens.** The
+    // seeding below is 2³ per cell, `8/h³` = 64 000 per m³. `WaterCriterion`
+    // documents that 64× deliberately -- the estimate is what the *budget* is
+    // denominated in and is self-consistent with `tileBudget` -- so the number is
+    // not wrong, but a comment here asserting the two agree is.
     const double planArea = (comp.bboxHi.x - comp.bboxLo.x) * (comp.bboxHi.y - comp.bboxLo.y);
     const double wettedDepth = (planArea > 0) ? comp.waterVolume / planArea : 0;
+
+    // **Water too shallow for the lattice to hold is refused, not silently
+    // dropped.** `seedBox` puts its lowest plane of particles at `0.5/perAxis`
+    // of a cell above the floor -- 0.25 h, or 12.5 mm at h = 0.05 -- and filters
+    // every position against the box top. A wetted depth under that admits *no*
+    // particle at all, and what followed was not an empty solve but a lost
+    // compartment: `setTotalMass` had nothing to distribute the mass over,
+    // `demoteWater` read `totalMass()` back as zero, and the water was gone.
+    //
+    // Measured on the ferry's forepeak, 232 m² of plan area: 2.8 m³ went in and
+    // 0.0000 m³ came out, silently, while 3.0 m³ round-tripped exactly. The
+    // round-trip test used 5.0 m³. Mass conservation here is exact or it is
+    // nothing, so this returns `nullptr` and leaves the compartment quiescent --
+    // the same answer it gives for a compartment with no water in it, and one
+    // the callers already handle.
+    const int particlesPerAxis = 2;
+    const double lowestParticlePlane = 0.5 * h / static_cast<double>(particlesPerAxis);
+    if (!(wettedDepth > lowestParticlePlane)) return nullptr;
 
     // Grid constructor: need lo[3], hi[3], and h. Vec3 doesn't have .data().
     double lo[3] = {comp.bboxLo.x, comp.bboxLo.y, comp.bboxLo.z};
@@ -390,9 +415,9 @@ std::unique_ptr<flip::Field> promoteWater(const Compartment& comp, const Ship& /
     field->grid.n[1] = ny;
     field->grid.n[2] = nz;
 
-    // Seed particles: 2^3 lattice per cell
-    const int particlesPerCell = 2;
-    flip::seedBox(*field, lo, hi, particlesPerCell, kRhoSeawater);
+    // Seed particles: 2^3 lattice per cell, the count the refusal above is derived
+    // from -- one constant, so the guard cannot drift from what it guards.
+    flip::seedBox(*field, lo, hi, particlesPerAxis, kRhoSeawater);
 
     // Set exact mass from compartment water volume (m³ → kg)
     const double mass = comp.waterVolume * kRhoSeawater;
@@ -406,6 +431,13 @@ std::unique_ptr<flip::Field> promoteWater(const Compartment& comp, const Ship& /
 
 void demoteWater(Compartment& comp, std::unique_ptr<flip::Field> field) {
     if (!field) return;
+    // **A field with no particles is not a compartment with no water.** Reading
+    // `totalMass()` off an empty field gives zero and writing that back destroys
+    // whatever the compartment was holding. `promoteWater` no longer produces such
+    // a field, but the guard belongs on this side too: this function takes
+    // ownership of a field it did not create, and the failure it prevents is the
+    // silent loss of the one quantity this tier conserves exactly.
+    if (field->particles.empty()) return;
 
     // Read FLIP state back into compartment quiescent representation.
 

@@ -660,6 +660,132 @@ void testCopiedShipHasNoPromotedWater() {
                 static_cast<int>(ferry.activeWaterFields_.size()), 0);  // NOLINT: moved-from, deliberately
 }
 
+// **What the estimator bills against what the promoter actually allocates.**
+//
+// These deliberately differ, and the ratio between them is a documented number
+// that nothing checked. `WaterCriterion` says it outright: `estimateFlipCost`
+// bills 1000 particles per m3 and `flip::seedBox` at 2^3 per cell on a 0.05 m
+// grid puts `8/h^3` = 64 000 there, so the estimate is a *budget denomination*
+// that is self-consistent with `tileBudget`, and any sentence about bytes has to
+// use the other number.
+//
+// A prose ratio between two live computations is the shape this repo keeps
+// finding wrong -- the zone's elastic and plastic per-element costs sat 5.6x from
+// each other behind exactly such a sentence. So it is measured here. The excess
+// over 64 000 is the wetted box rounding onto the grid: `promoteWater` takes the
+// compartment's full bounding box in x and y and a depth of `volume / planArea`,
+// and `seedBox` fills whole cells, so the seeded box is a little larger than the
+// water it stands for.
+void testTheEstimateAndTheAllocationDifferByTheDocumentedFactor() {
+    std::printf("\n   the estimate against the allocation\n");
+
+    // Volumes above the seeding's resolution limit -- below it `promoteWater`
+    // refuses and there is no allocation to compare against; see
+    // `testTheRoundTripConservesAtEveryVolume`.
+    for (double volume : {3.0, 5.0, 12.0}) {
+        Ship ferry = ferryAfloat();
+        Compartment& forepeak = ferry.compartments[0];
+        forepeak.waterVolume = volume;
+
+        WaterCriterion crit;
+        int predictedParticles = 0, predictedTiles = 0;
+        estimateFlipCost(forepeak, crit, predictedParticles, predictedTiles);
+
+        auto field = promoteWater(forepeak, ferry, crit);
+        expectTrue("the compartment promotes", field != nullptr);
+        const double actual = static_cast<double>(field->particles.size());
+        const double perM3 = actual / volume;
+
+        std::printf("      %5.1f m3: billed %6d, allocated %7.0f -- %6.0f/m3, %.1fx the estimate\n",
+                    volume, predictedParticles, actual, perM3,
+                    actual / std::max(1.0, static_cast<double>(predictedParticles)));
+
+        // **Not asserted as a rate per cubic metre, because it is not one.**
+        // Measured here: 123 947/m3 at 3 m3, 74 368 at 5, 61 973 at 12 -- the
+        // count is the same 371 840 across 3, 5 and 8 m3 and then doubles. It
+        // quantises to *particle planes*: `seedBox` lays planes every `h/perAxis`
+        // = 25 mm and keeps those under the surface, so the count steps as the
+        // wetted depth crosses each plane and is flat between them. The nominal
+        // `8/h^3` = 64 000 is what a box filling whole cells would give, and no
+        // real compartment does. Pinning it would be a figure that holds at the
+        // volumes tried and fails at the ones that were not -- the shape this
+        // suite has been unpicking elsewhere.
+        //
+        // What is stable is the order of the gap, which is the documented claim.
+        expectTrue("the promoter allocates orders more than the budget bills",
+                   actual > 20.0 * predictedParticles);
+        expectTrue("and the rate is somewhere near the nominal 8 per cell",
+                   perM3 > 40000.0 && perM3 < 200000.0);
+        // The estimator's own rate, so this reads the documented 64x rather than
+        // re-typing 1000 and comparing the test's copy of the model with itself.
+        const double billedPerM3 = predictedParticles / volume;
+        expectNear("the estimator bills the 1000 per m3 the budget is denominated in",
+                   billedPerM3, 1000.0, 1e-9);
+
+        demoteWater(forepeak, std::move(field));
+    }
+}
+
+// **Mass across the promote/demote round trip, at volumes that span the seeding's
+// own resolution limit rather than at one that clears it.**
+//
+// The round trip is asserted elsewhere at 5.0 m3 with a tolerance of exactly zero,
+// which is the right assertion at a volume chosen before anyone knew the limit
+// existed. Below it the water did not come back short -- it came back as *nothing*.
+// `seedBox` puts its lowest plane of particles a quarter of a cell above the floor,
+// 12.5 mm at h = 0.05, and filters every position against the box top, so a wetted
+// depth under that seeds no particle at all; `setTotalMass` then had nothing to
+// distribute and `demoteWater` read the total back as zero.
+//
+// Measured on this forepeak, 232 m2 of plan area, so the limit falls at 2.9 m3:
+// 2.8 m3 in gave 0.0000 m3 out and 3.0 m3 round-tripped exactly.
+void testTheRoundTripConservesAtEveryVolume() {
+    std::printf("\n   the round trip across the seeding's resolution limit\n");
+
+    int promoted = 0, refused = 0;
+    for (double v : {0.5, 1.0, 2.0, 2.8, 2.9, 3.0, 5.0, 12.0}) {
+        Ship ferry = ferryAfloat();
+        Compartment& c = ferry.compartments[0];
+        c.waterVolume = v;
+        WaterCriterion crit;
+
+        auto field = promoteWater(c, ferry, crit);
+        if (!field) {
+            // Refused. The compartment keeps its water, which is the whole point:
+            // a tier that cannot represent this depth must leave it quiescent.
+            ++refused;
+            expectNear("a refused compartment keeps every drop", c.waterVolume, v, 0.0);
+            continue;
+        }
+        ++promoted;
+        expectTrue("a promoted field is never empty", !field->particles.empty());
+        demoteWater(c, std::move(field));
+        expectNear("and a promoted one round-trips exactly", c.waterVolume, v, 0.0);
+    }
+
+    // **`demoteWater`'s own guard, which the refusal above hides.** With
+    // `promoteWater` refusing, no empty field ever reaches `demoteWater` from
+    // inside this module -- verified by mutation: deleting its guard leaves the
+    // suite green. But it takes ownership of a field it did not create, and
+    // reading `totalMass()` off an empty one gives zero and writes that back over
+    // whatever the compartment held. So it is handed one directly.
+    {
+        Ship ferry = ferryAfloat();
+        Compartment& c = ferry.compartments[0];
+        c.waterVolume = 7.5;
+        auto barren = std::make_unique<flip::Field>();
+        demoteWater(c, std::move(barren));
+        expectNear("a field with no particles does not empty the compartment",
+                   c.waterVolume, 7.5, 0.0);
+    }
+
+    // Vacuity on both sides: a guard that refused everything would conserve
+    // perfectly and promote nothing, and one that refused nothing is the bug.
+    expectTrue("some volumes promote", promoted > 0);
+    expectTrue("and some are refused, or the limit is not being exercised", refused > 0);
+    std::printf("      %d promoted, %d refused, none lost\n", promoted, refused);
+}
+
 void testBudgetsAdmitTheSameVolume() {
     std::printf("\n   the two budgets admit the same volume\n");
 
@@ -1162,6 +1288,8 @@ void runWaterPromotionTests() {
     testMinDepthIsNotEnforced();
     testCopiedShipHasNoPromotedWater();
     testBudgetsAdmitTheSameVolume();
+    testTheRoundTripConservesAtEveryVolume();
+    testTheEstimateAndTheAllocationDifferByTheDocumentedFactor();
     testParticleBudgetEnforcement();
     testTileBudgetEnforcement();
     testBudgetAccountingAcrossReviews();
