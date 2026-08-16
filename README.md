@@ -22,7 +22,7 @@ slice.
 ```sh
 cmake -S . -B build -G Ninja
 ninja -C build
-./build/shipsim_tests                       # 200500 validation checks against closed-form answers
+./build/shipsim_tests                       # 200501 validation checks against closed-form answers
 ./build/shipsim --scenario=none             # 120 m ferry, holed, nobody does anything
 ./build/shipsim --scenario=doors            # close the watertight door
 ./build/shipsim --scenario=full             # full damage control response

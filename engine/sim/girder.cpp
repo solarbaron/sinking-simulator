@@ -168,8 +168,35 @@ std::vector<double> weightDistribution(const Ship& ship, const std::vector<doubl
         const double span = b - a;
         if (!(span > 0)) continue;
         const double perLength = mass * kGravity / span;
-        for (std::size_t i = 0; i < x.size(); ++i)
-            if (x[i] >= a && x[i] <= b) out[i] += perLength;
+        // **By the overlap of each station's own slab, not by whether the station
+        // falls inside the compartment.** `integrateGirder` reads this array
+        // trapezoidally, which weights station `i` by the slab
+        // `[0.5(x[i-1]+x[i]), 0.5(x[i]+x[i+1])]` -- half-width at the ends. Giving
+        // every station in `[a, b]` the full `perLength` therefore delivers
+        // `M h (W/S)` rather than `W`, and both end stations carry a whole slab
+        // where they own half of one.
+        //
+        // Measured on the suite's own flooding fixture -- an 81-station barge, so
+        // `h = 1.5`, with a hold from -15 to +15 whose bulkheads land exactly on
+        // stations -- the girder carried **105.00%** of the water in the hold. On
+        // the ferry at the default 41 stations no bulkhead coincides and the sign
+        // varies by compartment: the forepeak came out +12.5%, the engine room
+        // -3.6%. `validateGirder` compares that weight against the true displaced
+        // buoyancy at a 2% threshold, so a correctly floating flooded ship could be
+        // reported as not floating.
+        //
+        // The construction below is the one `buoyancyDistribution` already uses
+        // fifty lines above, for the same reason. It also fixes the other tail: a
+        // compartment shorter than one slab used to contribute nothing at all.
+        for (std::size_t i = 0; i < x.size(); ++i) {
+            const double left = i == 0 ? x[0] : 0.5 * (x[i - 1] + x[i]);
+            const double right = i + 1 == x.size() ? x.back() : 0.5 * (x[i] + x[i + 1]);
+            const double width = right - left;
+            if (width <= 0) continue;
+            const double overlap = std::min(right, b) - std::max(left, a);
+            if (overlap <= 0) continue;
+            out[i] += perLength * overlap / width;
+        }
     }
     return out;
 }

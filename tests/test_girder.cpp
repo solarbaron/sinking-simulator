@@ -302,6 +302,20 @@ void testFloodingBendsTheHull() {
     wet.initialise(0.0);   // and again, to re-level the water and re-find the draft
     const HullGirder after = hullGirder(wet, Sea(0.0), 81);
 
+    // **And carries exactly the water that is in it.** `weightDistribution` spreads
+    // each compartment's water over its own extent, which the header states as the
+    // contract, and `integrateGirder` reads the result trapezoidally -- so what the
+    // girder ends up carrying is the sum of `perLength` times each station's own
+    // slab, not `perLength` times the span. Asserted as a fraction because the
+    // failure it catches is a fraction: one station spacing out of the compartment's
+    // length.
+    const double water = wet.compartments[0].waterVolume * wet.seaDensity * kGravity;
+    const double delivered = after.totalWeight - before.totalWeight;
+    std::printf("     floodwater: %.4e N in the hold, %.4e N delivered to the girder (%.2f%%)\n",
+                water, delivered, 100.0 * delivered / water);
+    expectNear("the girder carries exactly the water in the hold", delivered, water,
+               1e-6 * water);
+
     expectTrue("the flooded case carries more weight", after.totalWeight > before.totalWeight);
     expectTrue("water amidships sags the hull", after.maxMoment < before.maxMoment);
     const double reference = after.totalWeight * (wet.hullHi.x - wet.hullLo.x) / 8.0;
