@@ -1417,6 +1417,11 @@ bool solveStatic(const HexMesh& mesh, const StructuralMaterial& material, Formul
     // silently drop every entry that fell outside it, which reads as a slightly
     // soft answer rather than as a missing term.
     for (const DofBlock& block : extra) {
+        // Skipped on the same rule the assembly loop uses, or a block that will
+        // never be scattered still widens the band and is paid for in `n*(b+1)`
+        // doubles and an `n*b^2` factorisation. Harmless to the answer -- assembly
+        // coverage is a strict subset of this -- and pure waste.
+        if (block.stiffness.size() < block.dof.size() * block.dof.size()) continue;
         std::size_t lo = free, hi = 0;
         bool any = false;
         for (std::uint32_t global : block.dof) {

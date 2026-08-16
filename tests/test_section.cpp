@@ -1272,6 +1272,118 @@ void testResolutionConvergence() {
 
 // --- 6. What the mesher refuses ---------------------------------------------------
 
+// **A malformed attachment block must reach `applyBeamLoad` as nothing at all.**
+//
+// One `DofBlock` has three consumers in this tree and, until this test, three
+// contracts. `solveStatic` (`solid_shell.cpp:1481-1491`) skips a block whose
+// stiffness array is short and any degree of freedom past the end of the mesh.
+// `reduction::Substructure` refuses one outright with a reason, and
+// `test_reduction.cpp` asserts that. `section.cpp`'s `stiffnessTimes` read all of
+// them unchecked -- `block.stiffness[i * m + j]`, `u[block.dof[j]]`,
+// `out.force[block.dof[i]]`, no size or range guard -- which is a heap overread.
+//
+// The sharp end is not the overread but the claim above it: `stiffnessTimes` says
+// its result "is the reaction of the system that was solved and not of a second
+// one". That is false exactly when a block is malformed, because the solve skipped
+// what the reaction read. Two systems, and the measurable one was the one that had
+// not been solved.
+//
+// Nothing in the tree builds a malformed block -- `constraint.cpp` sizes 12/144 and
+// `coupling.cpp` 24/576, both unconditionally -- so this was latent rather than
+// live. It is reachable from outside: `Section::attachment` is a public member and
+// `applyBeamLoad` takes the `Section` whole.
+void testAMalformedAttachmentBlockChangesNothing() {
+    std::printf("\n--- section: a malformed attachment block is skipped by both routes ---\n");
+    const StructuralMesh structure = makeBox(kT, kT);
+    const section::Section clean = section::buildSection(structure, boxParams());
+    expectTrue("the box sections", !clean.empty());
+
+    section::BeamLoad bending;
+    bending.curvature = 1e-6;
+    const StructuralMaterial material = ah36Steel();
+    const section::BeamResponse before = section::applyBeamLoad(clean, material, bending);
+    expectTrue("and takes a curvature: " + before.problem, before.ok);
+
+    // Two malformations, and they are not the same claim.
+    //
+    // A block whose stiffness array is short is dropped **whole** by both routes,
+    // so it is inert. A block with one degree of freedom past the end of the mesh
+    // is *not* inert: both routes still assemble its in-range entries, which is
+    // the right behaviour and the reason "malformed" and "ignored" are different
+    // words. What has to hold in both cases is that the two routes do the same
+    // thing -- and `BeamResponse::residual` is, in its own words, "the only thing
+    // here that would notice a stiffness assembled one way and a reaction taken
+    // another".
+    const std::size_t dofCount = clean.mesh.nodeCount() * 3;
+
+    section::Section shortArray = clean;
+    {
+        solidshell::DofBlock bad;
+        bad.dof = {0u, 1u};
+        bad.stiffness.assign(3u, 1e12);   // 3 is short for 2x2, so it is dropped whole
+        shortArray.attachment.stiffness.push_back(bad);
+    }
+    const section::BeamResponse shortRun = section::applyBeamLoad(shortArray, material, bending);
+    expectTrue("a short stiffness array still solves: " + shortRun.problem, shortRun.ok);
+    expectNear("and is dropped whole, so it moves no force", shortRun.axialForce,
+               before.axialForce, 0.0);
+    expectNear("nor the moment", shortRun.bendingMoment, before.bendingMoment, 0.0);
+    expectNear("nor the strain energy", shortRun.strainEnergy, before.strainEnergy, 0.0);
+
+    section::Section pastTheEnd = clean;
+    {
+        solidshell::DofBlock bad;
+        bad.dof = {0u, static_cast<std::uint32_t>(dofCount + 7)};
+        bad.stiffness = {1e12, -1e12, -1e12, 1e12};
+        pastTheEnd.attachment.stiffness.push_back(bad);
+    }
+    const section::BeamResponse reached = section::applyBeamLoad(pastTheEnd, material, bending);
+    expectTrue("a block reaching past the mesh still solves: " + reached.problem, reached.ok);
+    std::printf("     residual: %.3e clean, %.3e with a block past the end\n", before.residual,
+                reached.residual);
+    // The point of the whole test. Before the guards, `stiffnessTimes` read
+    // `u[dof[1]]` past the end of the displacement vector while `solveStatic` had
+    // skipped that column, so the reaction was of a system nobody solved -- and on
+    // a 1e12 stiffness the disagreement is not subtle.
+    expectTrue("the reaction is still the reaction of the system that was solved",
+               reached.residual <= std::max(1e-6, 4.0 * before.residual));
+
+    // **And it contributes exactly its in-range sub-block, no more.** A 2x2 block
+    // whose second degree of freedom is past the end has one surviving entry, the
+    // (0,0), so it must do exactly what a 1x1 block carrying that entry alone does.
+    // Asserting only the residual is not enough to pin this: the out-of-range row
+    // writes `out.force[dof[1]]` past the end of the force vector and reads
+    // `u[dof[1]]` past the end of the displacements, and neither lands anywhere the
+    // residual looks. The energy does see it, which is what makes the guard
+    // testable rather than merely correct.
+    section::Section inRangeOnly = clean;
+    {
+        solidshell::DofBlock one;
+        one.dof = {0u};
+        one.stiffness = {1e12};
+        inRangeOnly.attachment.stiffness.push_back(one);
+    }
+    const section::BeamResponse alone = section::applyBeamLoad(inRangeOnly, material, bending);
+    expectTrue("the one-entry block solves: " + alone.problem, alone.ok);
+    expectNear("a block reaching past the mesh does exactly what its in-range part does",
+               reached.strainEnergy, alone.strainEnergy, 0.0);
+    expectNear("to the same force", reached.axialForce, alone.axialForce, 0.0);
+    // Vacuity: the 1e12 has to actually be doing something, or two inert blocks
+    // would agree trivially.
+    expectTrue("and that part is not itself inert", alone.strainEnergy != before.strainEnergy);
+
+    // Vacuity: a well-formed block on the same two DOF must NOT be inert, or the
+    // assertions above would hold for a routine that ignored every block.
+    section::Section stiffened = clean;
+    solidshell::DofBlock good;
+    good.dof = {0u, 1u};
+    good.stiffness = {1e12, 0.0, 0.0, 1e12};
+    stiffened.attachment.stiffness.push_back(good);
+    const section::BeamResponse held = section::applyBeamLoad(stiffened, material, bending);
+    expectTrue("a well-formed block is not skipped", held.ok &&
+                                                         held.strainEnergy != before.strainEnergy);
+}
+
 void testRefusals() {
     const StructuralMesh structure = makeBox(kT, kT);
 
@@ -4260,6 +4372,7 @@ void runSectionTests() {
     testMemberRunsStopAtAThicknessStep();
     testResolutionConvergence();
     testRefusals();
+    testAMalformedAttachmentBlockChangesNothing();
     testBandwidthReducingOrder();
     testFreeEdgesInFreshAirAreNotJunctions();
     testSubstructureConsumesTheSection();

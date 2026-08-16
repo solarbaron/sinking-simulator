@@ -1747,11 +1747,31 @@ Applied stiffnessTimes(const Section& section, const StructuralMaterial& materia
         }
         for (int a = 0; a < kDof; ++a) out.energy += 0.5 * local[a] * result[a];
     }
+    // **The same blocks `solveStatic` assembles means the same blocks it skips.**
+    // The comment above this function says the reaction reported here "is the
+    // reaction of the system that was solved and not of a second one", and that
+    // was true only while every block was well formed: `solveStatic`
+    // (`solid_shell.cpp:1481-1491`) drops a block whose stiffness array is short
+    // and any degree of freedom past the end of the mesh, and this read all of
+    // them -- unchecked, so a short array or a stale DOF index was a heap
+    // overread rather than a disagreement. Two systems, and the one that could be
+    // measured was the one that had not been solved.
+    //
+    // Nothing in the tree builds a malformed block today: `constraint.cpp` and
+    // `coupling.cpp` size theirs unconditionally, 12/144 and 24/576. The guards
+    // are here so the equivalence in that comment holds for a block from anywhere,
+    // which is what a `Section` with a public `attachment` invites.
+    const std::size_t dofCount = out.force.size();
     for (const solidshell::DofBlock& block : section.attachment.stiffness) {
         const std::size_t m = block.dof.size();
+        if (block.stiffness.size() < m * m) continue;
         for (std::size_t i = 0; i < m; ++i) {
+            if (block.dof[i] >= dofCount) continue;
             double sum = 0;
-            for (std::size_t j = 0; j < m; ++j) sum += block.stiffness[i * m + j] * u[block.dof[j]];
+            for (std::size_t j = 0; j < m; ++j) {
+                if (block.dof[j] >= dofCount) continue;
+                sum += block.stiffness[i * m + j] * u[block.dof[j]];
+            }
             out.force[block.dof[i]] += sum;
             out.energy += 0.5 * u[block.dof[i]] * sum;
         }

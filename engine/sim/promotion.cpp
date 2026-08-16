@@ -128,9 +128,30 @@ TierZero tierZero(const Ship& ship, const Sea& sea, const StructuralMesh& struct
     // was a ratio to. With the default zero the two are the same value, so nothing
     // moves unless a caller asked for something.
     out.buckling = girderBuckling(out.stress, structure, scantlings, out.yieldStrength);
-    if (params.collapse)
+    if (params.collapse) {
         out.strength = longitudinalStrength(out.girder, structure, scantlings, params.shedExponent,
                                             params.curvatureSteps);
+        // **A station that vanishes cannot be the worst one.**
+        // `longitudinalStrength` drops a station whose section produced no elements
+        // and one whose first-yield curvature is not positive, and it drops them by
+        // `continue` -- so they are absent from `out.strength` rather than present
+        // and zero. `collapseUtilisation` below is a maximum over what survived, so
+        // a station that went missing is one the collapse trigger cannot fire on,
+        // and the error is in the unsafe direction.
+        //
+        // This is the trapdoor `CLAUDE.md` already records from the other end:
+        // panels "admitted by a tolerant membership test and then dropped by an
+        // exact geometry one, losing all 188 plate panels on 11 of 51 stations".
+        // Reached from here it was silent. `girderStress`'s equivalent skip is
+        // documented where a caller reads the result; this one was not, and unlike
+        // that one there is a channel right here to say it in.
+        if (out.strength.size() < out.girder.stations.size())
+            out.problems.push_back(
+                std::to_string(out.girder.stations.size() - out.strength.size()) + " of " +
+                std::to_string(out.girder.stations.size()) +
+                " girder stations produced no strength curve, so they are not in "
+                "collapseUtilisation and cannot be the worst station");
+    }
 
     out.yieldUtilisation = worstUtilisation(out.stress, &out.yieldX);
     out.buckleUtilisation = worstBucklingUtilisation(out.buckling, &out.buckleX);
