@@ -258,7 +258,9 @@ int main(int argc, char** argv) {
         travel = std::max(travel, std::abs(a[i] - patch.mesh.position[i]));
     }
     const double rms = a.empty() ? 0.0 : std::sqrt(sum / static_cast<double>(a.size()));
-    std::printf("%-28s %16.3e %16.3e %12.2e\n", "node position RMS / max (m)", rms, worst,
+    // Both of these are statistics of `gpu - cpu`, so neither belongs under the
+    // column headings above: the label carries the units instead.
+    std::printf("%-28s %16.3e %16.3e %12.2e\n", "node pos |GPU-CPU| rms / max (m)", rms, worst,
                 travel > 0 ? worst / travel : 0.0);
     std::printf("%-28s %16.4f\n", "  patch travel (m)", travel);
 
@@ -272,7 +274,10 @@ int main(int argc, char** argv) {
             peakStrain = std::max(peakStrain, p);
             worstStrain = std::max(worstStrain, std::abs(p - q));
         }
-    std::printf("%-28s %16.4f %16.3e %12.2e\n", "peak eps_p / worst diff", peakStrain, worstStrain,
+    // Second column is a difference, not the GPU's own peak -- the heading above
+    // says "GPU (float)" and this row does not obey it.
+    std::printf("%-28s %16.4f %16.3e %12.2e\n", "peak eps_p (CPU) / |GPU-CPU|", peakStrain,
+                worstStrain,
                 peakStrain > 0 ? worstStrain / peakStrain : 0.0);
 
     // **How close either path came to tearing at all**, which is what decides

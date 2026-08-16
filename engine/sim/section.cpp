@@ -1264,7 +1264,7 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
                std::to_string(section.worstTaper) + ", which is about " +
                std::to_string(100.0 * section.taperStiffness) +
                "% excess bending stiffness in those elements alone. It is the plating's own"
-               " bending about its own mid-surface, which is 0.03% of a hull girder's second"
+               " bending about its own mid-surface, which is 0.038% of a hull girder's second"
                " moment; ThicknessSeam::Split is the control that measures it");
     if (section.invertedElements > 0)
         report(std::to_string(section.invertedElements) + " of " +

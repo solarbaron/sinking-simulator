@@ -1853,9 +1853,10 @@ int main(int argc, char** argv) {
             // seventy and says nothing about shear lag; and the highest fibre there is a
             // stem or a forecastle rather than the strength deck, which is a place the
             // beam's own notion of a deck modulus has already stopped meaning anything.
-            // The statistic is therefore taken over the sections carrying at least a
-            // quarter of the peak moment, and the ends are reported rather than averaged
-            // in.
+            // The statistic is therefore taken over the sections carrying at least
+            // **half** the peak moment, and the ends are reported rather than averaged
+            // in. (This said "a quarter" against a `0.5 *` two lines below, which is
+            // the wrong window to picture when reading the number it produces.)
             if (std::abs(moment) > 0.5 * std::abs(tier0.maxMoment)) {
                 if (std::abs(lag) > std::abs(worstLag)) {
                     worstLag = lag;
@@ -1947,9 +1948,14 @@ int main(int argc, char** argv) {
         // that did not agree would mean the moment is not being carried, and a worst
         // that agreed would mean the 3D field had come back a beam.
         if (!(std::abs(peakDeck.mean / peakBeamDeck - 1.0) < 0.15)) {
-            std::printf("       ! the deck's *mean* stress is %+.1f%% of M/Z. The mean over a fibre"
-                        " is the one thing a beam does get right, so a disagreement here is the"
-                        " moment not arriving rather than a distribution\n",
+            // "differs from M/Z by", not "is % of M/Z": the value is `100*(r - 1)`,
+            // and the guard only fires above 15, so "+18.3% of M/Z" read literally
+            // says the moment is nearly absent when it is agreeing to 18%. On a path
+            // that returns 1, that sends the reader after a missing load rather than
+            // a distribution error.
+            std::printf("       ! the deck's *mean* stress differs from M/Z by %+.1f%%. The mean"
+                        " over a fibre is the one thing a beam does get right, so a disagreement"
+                        " here is the moment not arriving rather than a distribution\n",
                         100.0 * (peakDeck.mean / peakBeamDeck - 1.0));
             return 1;
         }

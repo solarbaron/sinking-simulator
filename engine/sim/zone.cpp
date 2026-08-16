@@ -245,12 +245,13 @@ Patch buildPatch(const StructuralMesh& structure, const Vec3& impact, const Mesh
             for (std::size_t other : users->second) {
                 if (other == s || taken[other]) continue;
                 const PlatePanel& q = structure.panels[static_cast<std::size_t>(candidate[other])];
+                bool crossesSeam = false;
                 if (std::abs(q.thickness - patch.thickness) > 1e-9) {
                     if (params.singleThickness) {
                         ++thicknessStops;
                         continue;
                     }
-                    ++thicknessCrossings;
+                    crossesSeam = true;
                 }
                 if (q.material != materialIndex) {
                     ++materialStops;
@@ -262,6 +263,12 @@ Patch buildPatch(const StructuralMesh& structure, const Vec3& impact, const Mesh
                     ++foldStops;
                     continue;
                 }
+                // **Counted here and not at the thickness test**, because the report
+                // below says these edges "were meshed ... anyway" and until this line
+                // that was not yet true: a neighbour differing in thickness *and*
+                // material, or beyond the fold limit, was counted as meshed and then
+                // rejected two tests later.
+                if (crossesSeam) ++thicknessCrossings;
                 taken[other] = 1u;
                 oriented[other] = n;
                 order.push_back(other);
@@ -565,8 +572,16 @@ Patch buildPatch(const StructuralMesh& structure, const Vec3& impact, const Mesh
             for (const auto& [t, node] : onMember) alignment += dot(rise, nodeNormal[node]);
             alignment /= static_cast<double>(onMember.size());
             if (std::abs(alignment) < 0.9) {
-                report("a stiffener's web rises " + std::to_string(alignment) +
-                       " out of the plating's thickness direction, so it has no single"
+                // **As an angle, because `alignment` is a cosine and the sentence
+                // read as a deviation.** It is the mean of `dot(rise, nodeNormal)`,
+                // so 1.0 is a web perfectly square to the plate and 0.0 is one lying
+                // flat in it -- and "rises 0.02 out of the thickness direction" reads
+                // as negligible when it is the worst case there is. `promotion.cpp`
+                // reports the same kind of quantity as radians off an axis; this now
+                // matches it, and 0.9 is 25.8 degrees.
+                const double lean = std::acos(std::min(1.0, std::abs(alignment)));
+                report("a stiffener's web leans " + std::to_string(lean) +
+                       " rad out of the plating's thickness direction, so it has no single"
                        " eccentricity and was left out of the zone");
                 continue;
             }

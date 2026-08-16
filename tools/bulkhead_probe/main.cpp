@@ -570,9 +570,18 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
     std::vector<int> failedPanel;
     const double startEnthalpy = solver.account().enthalpy;
 
+    // **Four of these columns are not the value at `t`, and the header now says so.**
+    // `peakSteel`, `peakHead` and `peakUtilisation` are running maxima over the whole
+    // run -- monotone, never the instantaneous reading -- and `failureAxial` is
+    // latched at the moment a member goes, so it prints 0.00 until then. Only
+    // `gas`, `iface` and `M` are recomputed each report. Read as a time series the
+    // peak columns erase the very thing §the coupling says matters: the head is
+    // greatest *before* the compartment behind starts emptying, and the steel is
+    // hottest well *after*, and a monotone trace can show neither.
     if (verbose)
-        std::printf("\n%8s %9s %9s %9s %9s %9s %9s %9s %7s\n", "t (s)", "gas (K)", "steel (K)",
-                    "iface (m)", "head (m)", "M (kN m)", "sigN(MPa)", "util", "failed");
+        std::printf("\n%8s %9s %9s %9s %9s %9s %9s %9s %7s\n", "t (s)", "gas (K)",
+                    "pkSteel(K)", "iface (m)", "pkHead(m)", "M (kN m)", "sigN@fail", "pkUtil",
+                    "failed");
 
     const int steps = static_cast<int>(std::lround(o.duration / o.coupling));
     for (int step = 0; step < steps; ++step) {
