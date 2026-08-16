@@ -1037,8 +1037,25 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
     // --- Damping ------------------------------------------------------------
     // Stiffnesses are measured, not assumed: the waterplane area and the angular
     // restoring rates come from finite-differencing the same hydrostatic integral
-    // that produced the buoyancy force. Refreshed periodically because they change
-    // far more slowly than the ship moves.
+    // that produced the buoyancy force.
+    //
+    // **Refreshed every sixteenth tick because the sweep is expensive, and that is
+    // measured rather than assumed.** This comment used to say only that the
+    // quantities "change far more slowly than the ship moves", which is the weaker
+    // half of the argument and is not quite true of the waterplane: on a wall-sided
+    // section its area goes as `L B / cos(phi)`, so it is heel-driven, not
+    // draft-driven, and 15 ticks at 0.02 s is 3-4 degrees of a 20-degree roll.
+    // That is about 2% of area and, since the damping goes as its square root, 1%
+    // of the coefficient it sizes -- which is the whole of what the cached value
+    // feeds, never a restoring force, and behind a `max(A, 1.0)` floor.
+    //
+    // The cost is the half that decides it. On the ferry a `PlaneSweep::below` is
+    // **7.2 us** and the waterplane needs two of them, against the 16 us tick this
+    // file cites fifty lines below when it refuses to cache the Ikeda coefficient
+    // -- so recomputing it every tick is **90%** of a tick, where that one was
+    // 0.3%. Constructing the sweep is not the cost and caching it would not help:
+    // construct-plus-below measures 7.1 us, the same as the traversal alone. At one
+    // tick in sixteen the two sweeps are 5.6%.
     if (stabilityRefreshCounter_ % 16 == 0) {
         const double h = 0.05;
         cachedWaterplaneArea_ = (hullSweep.below(planeOffset + h).volume -
