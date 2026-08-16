@@ -36,6 +36,63 @@ bool constantFromShader(const std::string& source, const std::string& name, long
     return true;
 }
 
+// Two more spellings the reader above does not know, and both had a C++ twin that
+// nothing compared: `const float NAME = ` for the fixed-point work scale, and
+// `layout(local_size_x = N)` for the dispatch geometry.
+bool floatConstantFromShader(const std::string& source, const std::string& name, double& out) {
+    const std::string key = "const float " + name + " = ";
+    const std::size_t at = source.find(key);
+    if (at == std::string::npos) return false;
+    out = std::atof(source.c_str() + at + key.size());
+    return true;
+}
+
+bool localSizeXFromShader(const std::string& source, long long& out) {
+    const std::string key = "local_size_x = ";
+    const std::size_t at = source.find(key);
+    if (at == std::string::npos) return false;
+    out = std::atoll(source.c_str() + at + key.size());
+    return true;
+}
+
+// **The dispatch geometry and the work scale, which the layout check above skips.**
+// A wrong `local_size_x` dispatches the wrong number of groups -- `groupsFor` divides
+// by the host's copy -- and a wrong `kWorkScale` mis-scales every `atomicAdd` into the
+// work accumulator. The GPU/CPU work comparison further down would catch the second,
+// but it *skips without a Vulkan device* and this does not.
+void testTheShadersAndTheHostAgreeOnTheirDispatch() {
+    struct Pair { const char* shader; long long group; };
+    const Pair pairs[] = {{"solidshell_forces.comp", gpu::kElementGroup},
+                          {"solidshell_integrate.comp", gpu::kNodeGroup}};
+    for (const Pair& p : pairs) {
+        const std::string path = std::string(SHIPSIM_SHADER_SOURCE_DIR) + "/" + p.shader;
+        std::ifstream file(path);
+        expectTrue(std::string(p.shader) + " is readable", file.good());
+        if (!file.good()) continue;
+        const std::string source((std::istreambuf_iterator<char>(file)),
+                                 std::istreambuf_iterator<char>());
+        long long got = -1;
+        expectTrue(std::string(p.shader) + " declares a workgroup size",
+                   localSizeXFromShader(source, got));
+        testing::expectEqual(std::string(p.shader) + "'s workgroup matches the host's dispatch", got,
+                    p.group);
+    }
+
+    const std::string path =
+        std::string(SHIPSIM_SHADER_SOURCE_DIR) + "/solidshell_integrate.comp";
+    std::ifstream file(path);
+    if (file.good()) {
+        const std::string source((std::istreambuf_iterator<char>(file)),
+                                 std::istreambuf_iterator<char>());
+        double scale = -1;
+        expectTrue("the integrate shader declares kWorkScale",
+                   floatConstantFromShader(source, "kWorkScale", scale));
+        // Exact: the host divides by its copy what the shader multiplied by its own,
+        // so anything but equality is a scaled answer nobody would question.
+        testing::expectNear("and it is the scale the host divides by", scale, gpu::kWorkScale, 0.0);
+    }
+}
+
 // **Both** force shaders, because there are now two mappings of the same element and
 // they read the same buffers. A stride that drifts in one file and not the other is
 // exactly the kind of difference that would show up as "the new mapping disagrees
@@ -940,6 +997,7 @@ void testTheEnhancedBlockInDouble() {
 void runZoneGpuTests() {
     std::printf("\n--- the solid-shell zone on the GPU ---\n");
     testTheShadersAndTheHostAgreeOnTheLayout();
+    testTheShadersAndTheHostAgreeOnTheirDispatch();
     testItDeclinesWhatItCannotDo();
     // **Every device test runs on both mappings.** They are two kernels, and a suite
     // that exercised only the default would leave the other one shipping untested --

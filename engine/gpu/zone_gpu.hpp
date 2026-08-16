@@ -105,10 +105,27 @@
 #include "../sim/plasticity.hpp"
 #include "../sim/zone.hpp"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace gpu {
+
+// **Three constants with a twin in a `.comp`, and the twins are checked.**
+// `tests/test_zone_gpu.cpp` already reads the GLSL source and compares eleven
+// buffer-layout constants against the C++ -- a check that needs no Vulkan device,
+// because it greps rather than dispatches. These three carried a comment claiming
+// the same agreement and were not in that list, and they lived in `zone_gpu.cpp`'s
+// anonymous namespace where a test could not reach them.
+//
+// `kWorkScale` is the one with teeth. `solidshell_integrate.comp` multiplies by it
+// before an integer `atomicAdd` and the host divides by its own copy, so a
+// disagreement is a silently mis-scaled work accumulation. The GPU/CPU work
+// comparison that would catch it *skips without a device*; the source check does
+// not.
+inline constexpr std::uint32_t kElementGroup = 32;  // solidshell_forces.comp local_size_x
+inline constexpr std::uint32_t kNodeGroup = 64;     // solidshell_integrate.comp local_size_x
+inline constexpr double kWorkScale = 100.0;         // solidshell_integrate.comp kWorkScale
 
 // What the device produced, in the CPU's own types so `zone::Solver::adopt` can
 // take it and the validated energy, tearing and panel-reporting paths run on it

@@ -22,8 +22,6 @@ using sim::solidshell::kNodes;
 // with real contents only for the kernels that declare them**, and otherwise get a
 // four-byte stub, so the float path pays nothing for them.
 constexpr int kBufferCount = 16;
-constexpr uint32_t kElementGroup = 32;  // matches solidshell_forces.comp
-constexpr uint32_t kNodeGroup = 64;     // matches solidshell_integrate.comp
 
 // Layout of one element's `RestForms` in the buffer, in floats. Must match the
 // constants at the top of solidshell_forces.comp; the shader's copy is checked
@@ -46,7 +44,6 @@ constexpr std::size_t kEasFormG = 0;
 constexpr std::size_t kEasFormW = kGauss * 6 * kEas;               // 336
 constexpr std::size_t kEasFormStride = kEasFormW + kGauss;         // 344
 
-constexpr double kWorkScale = 100.0;  // matches solidshell_integrate.comp
 
 // Which of the five compiled variants of the workgroup kernel a precision selects, and
 // which fp64 buffers it needs. All five come from one GLSL source
