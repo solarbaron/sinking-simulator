@@ -69,8 +69,20 @@ struct HullGirder {
 
     // What is left at the after and forward perpendiculars, where both must be
     // zero. Non-zero means the ship was not in equilibrium, or the distributions
-    // do not integrate to the same total. Normalised on the largest value the
-    // same quantity reaches along the length, so it reads as a relative error.
+    // do not integrate to the same total.
+    //
+    // **Normalised on `W/2` and `W L / 8`, not on the curve's own peak** -- which
+    // is what this comment used to say and what `girder.cpp` rejects by name:
+    // "Normalising by the peak of the same quantity is degenerate", because a
+    // balanced ship carrying almost no moment has a peak that *is* the residual
+    // and reports 1.0. The message strings were corrected when that was found and
+    // this declaration was not, which is the half a reader meets first.
+    //
+    // The difference is not small and it is optimistic. On the suite's own 10%
+    // imbalance fixture these print 0.20 and 0.40 while the residual really is
+    // 100% of the peak in both -- so a reader taking them as fractions of the peak
+    // is out by 5x and 2.5x, in the direction of calling an unbalanced ship
+    // balanced. `validateGirder`'s `> 0.05` gate is 5% of `W/2`, on the same terms.
     double shearClosure = 0;
     double momentClosure = 0;
 

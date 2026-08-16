@@ -610,7 +610,21 @@ WallExchange wallExchange(const GasCompartment& gas,
     if (face.size() != surfaceKelvin.size() || face.empty()) return out;
 
     const double zi = gas.interfaceZ();
-    const double tUpper = gas.upper.temperature(), tLower = gas.lower.temperature();
+    // **`gas.agentSpecies`, not the default.** `fire.hpp` says of that default that
+    // "nothing inside `fire.cpp` ever takes the default, because a `GasCompartment`
+    // always has its own species to hand" -- and this line was the one that did.
+    // Every other site passes it (`:732`, `:733`, `:1267`, `:1340`).
+    //
+    // It is not a tidiness matter. `heatCapacity` is
+    // `mass*kCvAir + min(agent,mass)*(s.cv() - kCvAir)` and the temperature divides
+    // by it, so with a real agent load the default reports the layer as though the
+    // agent were CO2 whatever it is -- argon's cv is 312 against carbon dioxide's
+    // 654, either side of air's 718. The film built below then drives a radiative
+    // term in `(T_g^2 + T_s^2)(T_g + T_s)` off the wrong gas temperature, and the
+    // same layer answers two different temperatures depending on which half of the
+    // model asks. With no agent the two are equal to the bit, which is why it hid.
+    const double tUpper = gas.upper.temperature(gas.agentSpecies);
+    const double tLower = gas.lower.temperature(gas.agentSpecies);
 
     // The band a face belongs to, as a pure function of its own centroid, so that the
     // same face set always produces the same films in the same order. `zBase` is the

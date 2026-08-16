@@ -2996,6 +2996,55 @@ void testTheFilmCoefficientCarriesRadiationExactly() {
                 fire::filmCoefficient(1073.15, 500.0, p) - p.convective, worst, worstAt);
 }
 
+// **The film is built from the compartment's own agent, not from carbon dioxide.**
+//
+// `Layer::temperature` defaults its species to `kCarbonDioxide`, and `fire.hpp` says
+// of that default "nothing inside `fire.cpp` ever takes the default, because a
+// `GasCompartment` always has its own species to hand". `wallExchange` took it.
+//
+// It hid because `heatCapacity` is `mass*kCvAir + min(agent,mass)*(s.cv() - kCvAir)`
+// and every fixture that reaches `wallExchange` has `agent == 0`, where the species
+// term is multiplied by exactly zero and both spellings give the identical double.
+// So the compartment has to be carrying agent for the question to have an answer,
+// and the agent has to be one whose `cv` is far from carbon dioxide's: argon is 312
+// against 654, on opposite sides of air's 718, so the sign of the correction flips
+// as well as its size.
+void testTheWallFilmUsesTheCompartmentsOwnAgent() {
+    std::printf("\n   the wall film reads the compartment's agent\n");
+
+    // The same standing plate the split test uses, so the film geometry is a
+    // fixture that is already understood and the only thing new here is the agent.
+    const solidshell::HexMesh mesh = standingPlate(4.0, 4.0, 0.0095, 4, 8);
+    std::vector<thermal::BoundaryFace> face;
+    for (const thermal::BoundaryFace& f : thermal::boundaryFaces(mesh))
+        if (f.normal.x > 0.5) face.push_back(f);
+    expectTrue("the plate has film faces", !face.empty());
+    const std::vector<double> surface(face.size(), 400.0);
+
+    fire::GasCompartment gas = twoLayerBox(2.5, 800.0, 300.0);
+    gas.agentSpecies = fire::kArgon;
+    // Half the upper layer's mass as agent -- an inerting discharge, which is what
+    // the species field exists for.
+    gas.upper.agent = 0.5 * gas.upper.mass;
+    gas.lower.agent = 0.5 * gas.lower.mass;
+
+    const double asArgon = gas.upper.temperature(gas.agentSpecies);
+    const double asDefault = gas.upper.temperature();
+    std::printf("      upper layer: %.2f K read with argon, %.2f K with the default\n",
+                asArgon, asDefault);
+    expectTrue("the two species really do disagree on this layer, or nothing is proved",
+               std::abs(asArgon - asDefault) > 20.0);
+
+    const fire::WallExchange w = fire::wallExchange(gas, face, surface);
+    expectTrue("the exchange produced films", !w.film.empty());
+    // Exact: the film's driving temperature is the layer's temperature, and there is
+    // no arithmetic between them to round.
+    expectNear("the upper film is driven by the layer read with its own agent",
+               w.film[0].ambient, asArgon, 0.0);
+    expectNear("and the lower likewise", w.film.back().ambient,
+               gas.lower.temperature(gas.agentSpecies), 0.0);
+}
+
 void testTheWallExchangeSplitsAtTheLayerInterface() {
     const solidshell::HexMesh mesh = standingPlate(4.0, 4.0, 0.0095, 4, 8);
     std::vector<thermal::BoundaryFace> face;
@@ -3017,9 +3066,14 @@ void testTheWallExchangeSplitsAtTheLayerInterface() {
     expectEqual("with no banding there are exactly two films",
                 static_cast<long long>(two.film.size()), 2);
     expectNear("and they cover the whole plate between them", two.totalArea, 16.0, 1e-9);
+    // Asked with the compartment's own species, which is what `wallExchange` uses.
+    // These two calls were defaulted, so they agreed with the bug rather than
+    // catching it -- on this fixture the agent is zero and the two spellings are
+    // equal to the bit, so the assertion held either way and said nothing about
+    // which species the film had been built from.
     expectTrue("the upper film is the hot layer's temperature and the lower the cool one's",
-               two.film[0].ambient == gas.upper.temperature() &&
-                   two.film[1].ambient == gas.lower.temperature());
+               two.film[0].ambient == gas.upper.temperature(gas.agentSpecies) &&
+                   two.film[1].ambient == gas.lower.temperature(gas.agentSpecies));
     // Split at 2.5 m on a plate whose element rows are 0.5 m tall: the three rows
     // centred at 2.75, 3.25 and 3.75 are above it and the other five are below, so
     // 12 faces of 0.5 m2 against 20. Not the middle, which is what a single film at
@@ -5392,6 +5446,7 @@ void runFireTests() {
     std::printf("\n--- the boundary the structure sees ---\n");
     testTheFilmCoefficientCarriesRadiationExactly();
     testTheWallExchangeSplitsAtTheLayerInterface();
+    testTheWallFilmUsesTheCompartmentsOwnAgent();
     testBandingTheFilmRemovesTheSpreadError();
     testFilmMembershipIsExactAtTheInterface();
     testBandsAreCutAtTheHeightAskedForAndNotAtTheRowPitch();

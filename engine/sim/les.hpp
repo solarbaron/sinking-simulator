@@ -439,7 +439,13 @@ double alpertCeilingJetRise(double heatRelease, double radius, double height);
 double ceilingJetSpread(double radius, double height);
 
 inline constexpr double kAlpertNear = 16.9;        // K on kW^(2/3) m^(-5/3)
-inline constexpr double kAlpertFar = 5.38;         // K on kW^(2/3) m^(-1/3) m^(-1)
+inline constexpr double kAlpertFar = 5.38;         // K on kW^(2/3) m^(-2/3) m^(-1)
 inline constexpr double kAlpertCrossover = 0.18;   // r/H at which the branches swap
+// The far coefficient's radius exponent read `-1/3` and is `-2/3`: the correlation
+// above is `5.38 (Q/r)^(2/3) / H`, and `les.cpp`'s `cbrt(qkw*qkw/(r*r))` is the
+// same. It is checkable without either -- two branches of one correlation both turn
+// `kW^(2/3)` times a length group into kelvin, so their length groups must have the
+// same dimension, and `m^(-2/3) m^(-1)` is `m^(-5/3)`, which is what the near
+// coefficient carries. `-1/3` would have made them different units.
 
 }  // namespace sim::les
