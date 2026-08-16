@@ -108,9 +108,16 @@ struct GirderBuckling {
 // keel, sagging compresses the deck -- and sagging is the dangerous one on most
 // ships, because the deck is the thinner, more widely stiffened structure and it
 // is furthest from the neutral axis.
+//
+// `yieldStrength` of zero takes the structure's own, which is what every caller but
+// `tierZero` wants. `tierZero` resolves one explicitly -- a mixed-material ship has
+// no single yield strength -- and it has to reach the Johnson-Ostenfeld cap here or
+// its `TierZero::yieldStrength`, documented as "what the utilisations are ratios
+// to", governs one of the three and silently not the other two.
 std::vector<GirderBuckling> girderBuckling(const std::vector<GirderStress>& stresses,
                                            const StructuralMesh& structure,
-                                           const Scantlings& scantlings);
+                                           const Scantlings& scantlings,
+                                           double yieldStrength = 0);
 
 // Worst utilisation anywhere, and where.
 double worstBucklingUtilisation(const std::vector<GirderBuckling>& checks, double* atX = nullptr);

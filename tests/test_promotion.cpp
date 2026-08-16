@@ -2104,6 +2104,64 @@ void testASolvedZoneReportsTheThicknessItHasLeft() {
 // couple of MPa, which puts first yield five orders below the curvature at which
 // the section actually collapses, and the sweep then never reached the peak.
 
+// **`TierZeroParams::yieldStrength` governs all three utilisations, or it governs
+// one and says otherwise.**
+//
+// `TierZero::yieldStrength` is documented "Pa, what the utilisations are ratios
+// to" -- plural -- and `tierZero` resolved it, handed it to `girderStress`, and
+// then called `girderBuckling` and `longitudinalStrength`, neither of which took
+// it. Both re-derive `structure.materials.front()`. So an explicit yield strength
+// moved `yieldUtilisation` and left `buckleUtilisation` alone.
+//
+// Nothing caught it because every fixture in this file sets
+// `tier.yieldStrength = ah36Steel().yieldStrength`, which is exactly what
+// `materials.front()` yields on the ferry -- the two paths agreed by construction
+// in every test. That is this repo's "two estimators for one quantity, never
+// compared" shape, arriving through a default rather than through a constant.
+//
+// Buckling is where it matters most: the Johnson-Ostenfeld cap is *made of* sigma_y,
+// so a ship with HT deck plating over a mild-steel bottom gets 235 MPa where 390
+// belongs, at exactly the fibre the check is about.
+void testAnExplicitYieldStrengthReachesEveryUtilisation() {
+    std::printf("\n   an explicit yield strength reaches all three utilisations\n");
+    const Ship ferry = ferryAfloat();
+    const StructuralMesh& structure = ferryStructure();
+    const Scantlings scantlings = ferryScantlings();
+    const Crest crest = crestAmidships(ferry, 3.0);
+
+    const promotion::TierZero plating =
+        promotion::tierZero(ferry, crest.sea, structure, scantlings);
+
+    // Half the plating's yield. A softer steel buckles sooner, so the utilisation
+    // must rise -- and the direction is the point: a parameter that is read but
+    // used backwards would move it the other way.
+    promotion::TierZeroParams soft;
+    soft.yieldStrength = 0.5 * ah36Steel().yieldStrength;
+    const promotion::TierZero halved =
+        promotion::tierZero(ferry, crest.sea, structure, scantlings, soft);
+
+    std::printf("      yield %.0f MPa -> yield util %.4f, buckle util %.4f\n",
+                plating.yieldStrength / 1e6, plating.yieldUtilisation, plating.buckleUtilisation);
+    std::printf("      yield %.0f MPa -> yield util %.4f, buckle util %.4f\n",
+                halved.yieldStrength / 1e6, halved.yieldUtilisation, halved.buckleUtilisation);
+
+    expectNear("halving the yield strength doubles the yield utilisation",
+               halved.yieldUtilisation, 2.0 * plating.yieldUtilisation,
+               1e-9 * plating.yieldUtilisation);
+    expectTrue("and it reaches the buckling check too",
+               halved.buckleUtilisation > plating.buckleUtilisation);
+    // Vacuity: two zeros would satisfy the inequality above.
+    expectTrue("on a buckling utilisation that is not zero", plating.buckleUtilisation > 0);
+
+    // And the default is unchanged by the parameter existing: zero still means the
+    // plating's own, so a caller that asks for nothing gets what it always got.
+    promotion::TierZeroParams silent;
+    const promotion::TierZero implied =
+        promotion::tierZero(ferry, crest.sea, structure, scantlings, silent);
+    expectNear("an unset yield strength is still the plating's own",
+               implied.buckleUtilisation, plating.buckleUtilisation, 0.0);
+}
+
 void testACollapseSweepReachesThePeakOnADamagedSection() {
     std::printf("\n   a damaged section still has to reach its own peak\n");
     const StructuralMesh& structure = ferryStructure();
@@ -3710,6 +3768,7 @@ void runPromotionTests() {
     testASolvedZoneNamesTheLongitudinalItTore();
     testTheReductionMakesTierZeroReportLessStrength();
     testASolvedZoneReportsTheThicknessItHasLeft();
+    testAnExplicitYieldStrengthReachesEveryUtilisation();
     testACollapseSweepReachesThePeakOnADamagedSection();
     testTheContactTriggerIsAClosedForm();
     testTheDentedCapacityKnockdownIsContinuousAndMonotone();

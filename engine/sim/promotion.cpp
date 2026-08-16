@@ -123,7 +123,11 @@ TierZero tierZero(const Ship& ship, const Sea& sea, const StructuralMesh& struct
     for (std::string& problem : validateGirder(out.girder)) out.problems.push_back(problem);
 
     out.stress = girderStress(out.girder, structure, out.yieldStrength);
-    out.buckling = girderBuckling(out.stress, structure, scantlings);
+    // `out.yieldStrength`, not the plating's own: this field is documented as "what
+    // the utilisations are ratios to" and it used to be what exactly one of them
+    // was a ratio to. With the default zero the two are the same value, so nothing
+    // moves unless a caller asked for something.
+    out.buckling = girderBuckling(out.stress, structure, scantlings, out.yieldStrength);
     if (params.collapse)
         out.strength = longitudinalStrength(out.girder, structure, scantlings, params.shedExponent,
                                             params.curvatureSteps);

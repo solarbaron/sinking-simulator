@@ -69,15 +69,21 @@ BucklingCheck columnBuckling(const StiffenedSection& section, double length,
 
 std::vector<GirderBuckling> girderBuckling(const std::vector<GirderStress>& stresses,
                                            const StructuralMesh& structure,
-                                           const Scantlings& scantlings) {
+                                           const Scantlings& scantlings,
+                                           double yieldStrength) {
     std::vector<GirderBuckling> out;
     out.reserve(stresses.size());
 
     const double frameSpacing = structure.frameSpacing > 0 ? structure.frameSpacing
                                                            : scantlings.frameSpacing;
     const double stiffenerSpacing = scantlings.longitudinalSpacing;
-    const StructuralMaterial material =
+    StructuralMaterial material =
         structure.materials.empty() ? ah36Steel() : structure.materials.front();
+    // An explicit yield strength overrides the plating's own, and only the yield
+    // strength -- the modulus and Poisson ratio still come from the steel, because
+    // what a caller is choosing here is which of a mixed ship's yields to be a
+    // ratio to, not a different material.
+    if (yieldStrength > 0) material.yieldStrength = yieldStrength;
 
     for (const GirderStress& s : stresses) {
         // Only the compressed fibre can buckle. Hogging compresses the keel,
