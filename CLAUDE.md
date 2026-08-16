@@ -227,6 +227,14 @@ control is also what caught `$?` being the status of the *negation* after
 `if ! cmd`, which was written into both functions, hours apart, by someone who had
 already fixed it once.
 
+**A mutation harness that restores the source and not the binary is a fourth
+door into the same room.** The sweep script above copied the file back and stopped
+there, so the next `./build/shipsim_tests` -- run to confirm the tree was clean --
+executed the *mutant's* binary against restored source and reported one failure.
+It reads exactly like a real regression, and the instinct it trains is to go
+looking for a bug in the code that was just written. Restore and **rebuild**, then
+check; a clean source tree is not a clean tree.
+
 **This has now happened a third time, in the ad-hoc detector rather than in the
 code.** A mutation sweep over `edgeDrive` piped each run through `grep "FAIL"` and
 reported one mutant as surviving. It had not survived: removing that guard is a
