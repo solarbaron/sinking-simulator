@@ -652,9 +652,21 @@ Matrix6 transferAddedMass(const Matrix6& matrix, const Vec3& offset) {
 
 double RadiationTable::dampingAt(int i, int j, double omegaQuery) const {
     const int n = size();
-    if (n == 0 || omegaQuery <= omega.front() || omegaQuery >= omega.back()) return 0.0;
+    // **Strictly outside, and it used to be `<=` / `>=`.** The grid's own end
+    // points are not outside the grid: at `omega.front()` this returned 0 where
+    // the table holds 8.56e6, and a caller sampling the table on its own
+    // frequencies -- the natural way to build a retardation kernel -- hits both
+    // ends every time. Zero beyond the ends is still the right extrapolation and
+    // is unchanged.
+    if (n == 0 || omegaQuery < omega.front() || omegaQuery > omega.back()) return 0.0;
     const std::size_t upper = static_cast<std::size_t>(
         std::lower_bound(omega.begin(), omega.end(), omegaQuery) - omega.begin());
+    // Exactly the first grid point: `lower_bound` gives 0 and there is nothing
+    // below it to interpolate from. Taken before `upper - 1` underflows, which is
+    // the reason the bound was `<=` in the first place -- the guard was doing two
+    // jobs and only one of them was right.
+    if (upper == 0)
+        return damping[0][static_cast<std::size_t>(i)][static_cast<std::size_t>(j)];
     const std::size_t lower = upper - 1;
     const double t = (omegaQuery - omega[lower]) / (omega[upper] - omega[lower]);
     const double a = damping[lower][static_cast<std::size_t>(i)][static_cast<std::size_t>(j)];

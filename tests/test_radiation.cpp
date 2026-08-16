@@ -608,6 +608,20 @@ void testDampingIsPhysical() {
     expectNear("B is zero above the grid", table.dampingAt(2, 2, 2.0 * table.omega.back()), 0.0,
                0.0);
 
+    // **The two grid points the assertions above step over.** "Zero outside the
+    // grid" is the right extrapolation and `omega.front()` and `omega.back()` are
+    // not outside it -- they are the grid. A caller sampling the table on its own
+    // frequencies, which is the natural way to build a retardation kernel, hits
+    // both ends every time.
+    const double firstB = table.damping.front()[2][2];
+    const double lastB = table.damping.back()[2][2];
+    expectTrue("the end points carry damping worth reporting, or this proves nothing",
+               std::abs(firstB) > 0 && std::abs(lastB) > 0);
+    expectNear("dampingAt reproduces the first grid point", table.dampingAt(2, 2, table.omega.front()),
+               firstB, 1e-12 * std::abs(firstB));
+    expectNear("and the last", table.dampingAt(2, 2, table.omega.back()), lastB,
+               1e-12 * std::abs(lastB));
+
     std::printf("     table: %d frequencies, worst kept energy residual %.2e,"
                 " %d of %d section solves rejected as irregular frequencies\n",
                 table.size(), table.worstEnergyResidual, table.repairedSolves, table.totalSolves);

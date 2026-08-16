@@ -318,7 +318,12 @@ int main(int argc, char** argv) {
 
         char name[64];
         std::snprintf(name, sizeof(name), "smoke_%02d.png", frame);
-        core::writePng(outputDirectory + "/" + name, image);
+        // Checked for the reason `ferry_view` now states: the figure gate reads
+        // this tool's stdout and never opens the file it names.
+        if (!core::writePng(outputDirectory + "/" + name, image)) {
+            std::printf("could not write %s into %s\n", name, outputDirectory.c_str());
+            return 1;
+        }
         std::printf("     %6d %8.0f %8.2f %8.0f %9.2f %9.3f %9.1f %8s %10.2e %14s\n", frame,
                     model.time, fire.heatRelease(model.time) * 1e-6, gas.upper.temperature(),
                     hot.interfaceZ, hot.upper.extinction, tau,

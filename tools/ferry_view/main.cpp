@@ -282,8 +282,18 @@ int main(int argc, char** argv) {
         check("a fully flooded ship renders differently from a dry one", differing > 10000,
               std::to_string(differing) + " pixels changed");
 
-        core::writePng(outputDirectory + "/ferry_dry.png", dryImage);
-        core::writePng(outputDirectory + "/ferry_flooded.png", wetImage);
+        // **Checked, because the figure gate cannot see a file that was not
+        // written.** `check-figures.sh` greps this tool's *stdout* for the frame
+        // table and never opens a PNG, so a full disk or a bad `--out` produced
+        // identical green output at the tool, at `verify.sh` and at the figure
+        // check. `ram_view` and `seaway_view` have always tested this return;
+        // these three sites did not.
+        if (!core::writePng(outputDirectory + "/ferry_dry.png", dryImage) ||
+            !core::writePng(outputDirectory + "/ferry_flooded.png", wetImage)) {
+            std::printf("could not write the dry/flooded pair into %s\n",
+                        outputDirectory.c_str());
+            return 1;
+        }
     }
 
     // --- the casualty, frame by frame ---------------------------------------
@@ -319,7 +329,10 @@ int main(int argc, char** argv) {
 
         char name[64];
         std::snprintf(name, sizeof(name), "ferry_%02d.png", frame);
-        core::writePng(outputDirectory + "/" + name, image);
+        if (!core::writePng(outputDirectory + "/" + name, image)) {
+            std::printf("could not write %s into %s\n", name, outputDirectory.c_str());
+            return 1;
+        }
 
         const sim::Diagnostics diagnostics = ship.diagnostics(0.0);
         std::printf("     %6d %8.0f %8.2f %10.0f %12s\n", frame, scheduler.simulationTime(),

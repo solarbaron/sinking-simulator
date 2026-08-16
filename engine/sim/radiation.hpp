@@ -199,7 +199,8 @@ struct RadiationTable {
     int totalSolves = 0;
 
     int size() const { return static_cast<int>(omega.size()); }
-    // B_ij(omega), linearly interpolated in omega and zero outside the grid.
+    // B_ij(omega), linearly interpolated in omega and zero *strictly* outside the
+    // grid -- the end points themselves return their own row.
     // Zero outside is the physically right extrapolation: radiation damping
     // vanishes at both ends of the spectrum.
     double dampingAt(int i, int j, double omegaQuery) const;
