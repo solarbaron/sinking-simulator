@@ -2535,7 +2535,15 @@ void testTheResolvedGridIsTheCompartmentItCameFrom() {
     expectNear("the grid holds the compartment's own gas volume", grid.volume(), gas.gasVolume,
                1e-9);
     expectNear("and its own footprint", grid.planArea(), gas.floorArea, 1e-9);
-    expectNear("the cells fill the box", grid.cellVolume() * grid.cells(), grid.volume(), 0.0);
+    // **Against the box, not against itself.** `Grid::volume()` *is*
+    // `cellVolume() * cells()`, so this was `x == x` at tolerance zero. The claim
+    // the header makes two lines above the definition is the interesting one: the
+    // cells' total is *not* the product of the three side lengths, and the two
+    // differ in the last bits -- which matters because the divergence source is only
+    // a compatible right-hand side against the volume the cells add up to.
+    const double sides = (grid.h[0] * grid.n[0]) * (grid.h[1] * grid.n[1]) *
+                         (grid.h[2] * grid.n[2]);
+    expectNear("the cells fill the box", grid.volume(), sides, 1e-12 * sides);
     testing::expectEqual("and the estimate a criterion spends is that count",
                          les::estimateCells(gas, coarse(1.0)), grid.cells());
 
@@ -3784,6 +3792,25 @@ void testTheCellBudgetBindsAndTheCostIsMeasured() {
     expectTrue("and the cost per cell rises with refinement rather than staying flat,"
                " which is what stops the cell budget from being a wall-clock budget",
                finest > 1.5 * coarsest);
+
+    // **And the constant the budget is denominated in is compared to them.**
+    // `GasCriterion::coreSecondsPerCell` was measured here in the sense that this
+    // function timed a real solve, printed the answer, and asserted only that it was
+    // positive -- so the header's "Measured in `tests/test_promotion.cpp` rather than
+    // assumed" was not true, and the header's own other sentence, "a one-point
+    // extrapolation nothing asserts", was. Two claims about one field, eight lines
+    // apart, and the pessimistic one was right.
+    //
+    // Bracketing rather than equating, because a per-cell cost is not one number:
+    // it rises with refinement, which is the assertion above. 1.55e-6 at 168 cells
+    // and 1.16e-5 at 1456 measured here, with the constant at 1.0e-5 between them.
+    // Safe against contention for the reason the loop already takes a minimum over
+    // three attempts -- a busy box can only push these *up*, which widens the
+    // bracket rather than breaking it.
+    promotion::GasCriterion rateCheck;
+    expectTrue("the per-cell constant is inside the range a real solve measures",
+               rateCheck.coreSecondsPerCell > coarsest &&
+                   rateCheck.coreSecondsPerCell < finest);
 }
 
 }  // namespace

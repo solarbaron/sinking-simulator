@@ -355,8 +355,18 @@ void testStressFollowsTheMomentAndItsSign() {
 
     for (const GirderStress& s : stresses) {
         if (std::abs(s.moment) < 1e-6) continue;
-        expectNear("deck stress is M over Z_deck", s.stressDeck, s.moment / s.modulusDeck,
-                   1e-9 * std::abs(s.moment / s.modulusDeck));
+        // **Against `M y / I`, not against `M / Z`.** `girderStress` sets
+        // `s.stressDeck = station.moment / section.modulusDeck` and copies both of
+        // those into `s.moment` and `s.modulusDeck`, so asserting
+        // `s.stressDeck == s.moment / s.modulusDeck` was `x == x` -- it survived any
+        // `hullGirderSection` whatever, including a `modulusDeck` out by a factor of
+        // ten, and it ran about forty times a suite. The section is fetched again
+        // here and the stress rebuilt from the fibre and the second moment, which is
+        // the definition the modulus is a shorthand for.
+        const HullGirderSection at = hullGirderSection(structure, s.x);
+        expectNear("deck stress is M y over I", s.stressDeck,
+                   s.moment * (at.zDeck - at.neutralAxis) / at.secondMoment,
+                   1e-9 * std::abs(s.stressDeck));
         expectTrue("hogging puts the deck in tension and the keel in compression",
                    s.stressDeck > 0 && s.stressKeel < 0);
     }

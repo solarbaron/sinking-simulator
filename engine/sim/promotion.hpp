@@ -739,8 +739,17 @@ struct GasCriterion {
     int cellBudget = 12000;
 
     // Core-seconds of wall time per simulated second per cell, for reporting only,
-    // exactly as `Criterion::coreSecondsPerElement` is. Measured in
-    // `tests/test_promotion.cpp` rather than assumed.
+    // exactly as `Criterion::coreSecondsPerElement` is.
+    //
+    // **Bracketed by measurement in `tests/test_promotion.cpp`, not equated to it.**
+    // This said "Measured ... rather than assumed" while that test timed a real
+    // solve, printed the answer and asserted only that it was positive -- and the
+    // note on `cellBudget` eight lines above called it "a one-point extrapolation
+    // nothing asserts", which was the true half. A per-cell cost is not one number:
+    // it rises with refinement, 1.55e-6 at 168 cells against 1.16e-5 at 1456, and
+    // this sits between them. The real compartments run at 7 670 to 11 322 cells,
+    // past both, so it is an extrapolation still -- but one with a measured bracket
+    // round it rather than a claim.
     double coreSecondsPerCell = 1.0e-5;
 
     les::Params grid;
