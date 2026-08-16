@@ -4738,15 +4738,26 @@ Two things it did not fix, both now reported rather than latent:
    status, which is why the two rows above differ. The fix that needs no limit is a
    `junctionTolerance` scaled off the plating, which changes the junction *census* as
    well as the tie.
-2. **`hullGirderSection` sampled exactly on a frame station loses 76% of the ship**,
-   and it is the Tier-0 reference this whole section is compared against. Measured:
-   0.42932 m² at x = 19.2, 21.6 and 24.0 against 1.80133 at 18.8 and 19.6 — the
-   plating either side of the plane fails the half-open `straddles` test in
-   `sectionElements` on a floating-point knife edge and only the longitudinals
-   survive. Not every station does it (16.8 is fine), which is what says it is
-   representation rather than geometry. `section_probe --scan` now samples Tier 0 at
-   the centre of a bay and reports both areas rather than their ratio; fixing it
-   belongs with `girder.hpp` and moves published figures.
+2. **`hullGirderSection` sampled exactly on a frame station lost 76% of the ship —
+   *fixed*.** It read 0.42932 m² at x = 19.2, 21.6 and 24.0 against 1.80133 at 18.8
+   and 19.6: the plating either side of the plane failed the half-open `straddles`
+   test in `sectionElements` on a floating-point knife edge, leaving only the
+   longitudinals. Not every station did it (16.8 was fine), which is what said it
+   was representation rather than geometry.
+
+   `scantlings.cpp` carries the fix and quotes this measurement back at it. The
+   cause is that `straddles` is tolerant by `kFlat` while the crossing search is
+   exact, so the plane could be admitted while lying a hair *outside* the panel —
+   the ferry's station 33 is 19.200000000000003, so a cut asked for at 19.2 sat
+   3.6 × 10⁻¹⁵ aft of the bay that owned it. The cut is clamped to the panel's own
+   edge now. Re-measured: **1.80133 at 19.2**, identical to 18.8 and 16.8 to five
+   decimals, and 1.80129, 1.80113, 1.80083 at 19.6, 21.6 and 24.0 — the gentle taper
+   the ship actually has.
+
+   This item read "fixing it belongs with `girder.hpp` and moves published figures"
+   for as long as the fix had already landed elsewhere. `section_probe --scan` still
+   samples Tier 0 at the centre of a bay, which is now a choice rather than a
+   workaround.
 3. **The thickness-seam rule cost five times more at the ends than amidships —
    *fixed*, see §The halo.** `nodeThickness` was an area-weighted mean over the
    sub-quads *inside* the section, so a station where a strake steps handed one

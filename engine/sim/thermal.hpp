@@ -182,10 +182,16 @@ double carbonSteelEnthalpy(double kelvin);  // J/kg
 //     from 500 C up, and that is not a detail -- an elastic buckling stress is
 //     proportional to E and a squash load is proportional to f_y, so a structure
 //     that fails by instability loses strength *faster* than `k_y` says. Measured
-//     on the reference ferry at 600 C: the midship section keeps 0.376 of its
+//     on the reference ferry at 600 C: the midship section keeps 0.356 of its
 //     ultimate sagging moment against `k_y` = 0.47, and one 0.7 x 2.4 m panel of
 //     12 mm plating keeps 0.323. At **400 C**, where `k_y` is still exactly 1, the
-//     section has already lost 17.6% -- all of it through `k_E`.
+//     section has already lost 21.2% -- all of it through `k_E`.
+//
+//     (These read 0.376 and 17.6% while the stiffener column check used the
+//     transverse frame's profile: a frame is stiff enough that `min(yield,
+//     buckling)` took the yield every time, so only the plate panels carried the
+//     `k_E` sensitivity. Corrected with the profile, and this header was the site
+//     that correction did not reach.)
 //
 // **What is not here, and what it costs.** Thermal elongation used to be the first
 // item on this list and is now `carbonSteelElongation` below, where the estimate

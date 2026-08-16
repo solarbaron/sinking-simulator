@@ -1526,7 +1526,15 @@ void testFerryPatch() {
                    sub.halfBandwidth() >= 3 * std::min(naturalNodes, renumberedNodes));
     expectTrue("and on this patch it is the renumbering that wins",
                renumberedNodes < naturalNodes);
-    expectTrue("the interior renumbering earns its place", sub.halfBandwidth() <= 80);
+    // **Against the ordering it chose, not a hand-picked 80.** The DOF band is about
+    // three times the node band -- three DOF a node, less what the expansion
+    // eliminates -- so the renumbered candidate reported above predicts it, and the
+    // bound re-derives itself when the geometry moves. Measured 71 against
+    // `3*23 + 6` here; on the corrected strakes it is 89 against `3*29 + 6`, and
+    // dropping the renumbering puts it near three times the mesher's own 41 and
+    // fails either. That is the discrimination the 80 carried, without the constant.
+    expectTrue("the interior renumbering earns its place",
+               sub.halfBandwidth() <= 3 * renumberedNodes + 6);
     std::printf("     half-bandwidth %zu DOF over %zu interior DOF (%.2f MB of banded store); "
                 "interior node bands: mesher %zu, Cuthill-McKee %zu\n",
                 sub.halfBandwidth(), sub.interiorCount(),

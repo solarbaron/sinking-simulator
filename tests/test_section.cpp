@@ -1806,7 +1806,14 @@ void testFerrySection() {
     axial.reference = girder.neutralAxis;
     const section::BeamResponse stretched = section::applyBeamLoad(hold, material, axial);
     expectTrue("the ferry section takes an axial load: " + stretched.problem, stretched.ok);
-    expectTrue("its rigid-body restraints carry nothing", stretched.restraintReaction < 1e-3);
+    // **Against the load, not against a newton.** The restraints select one of a
+    // family of zero-energy motions, so what has to be true is that they carry none
+    // of the force that is actually there -- and `< 1e-3` absolute is a bound on
+    // nothing in particular. Measured 1.44e-3 N against an axial 3.67e+05 N, which
+    // is 3.9e-9 of the load. The absolute form goes red on a scantling change that
+    // moves the *load* while leaving the restraints exactly as sound.
+    expectTrue("its rigid-body restraints carry nothing",
+               stretched.restraintReaction < 1e-7 * std::abs(stretched.axialForce));
 
     // The comparison the whole exercise is for: `hullGirderSection` reaches `A`,
     // `z_na` and `I` by summing over a transverse cut and shares no line of code
