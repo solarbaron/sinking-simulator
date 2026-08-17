@@ -952,7 +952,7 @@ bool OceanRenderer::render(const float mvp[16], const std::vector<OceanVertex>& 
     vkCmdCopyImageToBuffer(commands, colour_.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            readback_.handle, 1, &copy);
 
-    device_->endOneShot(commands);
+    if (!device_->endOneShot(commands)) return false;
 
     out = core::Image(width_, height_);
     void* mapped = nullptr;

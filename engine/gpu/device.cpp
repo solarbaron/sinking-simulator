@@ -205,8 +205,12 @@ bool Device::upload(Buffer& target, const void* data, std::uint64_t bytes) {
     VkCommandBuffer commands = beginOneShot();
     VkBufferCopy copy{0, 0, bytes};
     vkCmdCopyBuffer(commands, staging_.handle, target.handle, 1, &copy);
-    endOneShot(commands);
-    return true;
+    // **The submit's result is the return value.** This returned `true`
+    // unconditionally, so a failed transfer read as a successful one -- and
+    // `ensureMaterials` latches `materialRevision_` on that `true`, which made a
+    // single failed upload permanent: the fast path skips every retry thereafter
+    // and every frame is shaded from whatever the buffer happened to hold.
+    return endOneShot(commands);
 }
 
 bool Device::download(const Buffer& source, void* data, std::uint64_t bytes) {
@@ -216,7 +220,10 @@ bool Device::download(const Buffer& source, void* data, std::uint64_t bytes) {
     VkCommandBuffer commands = beginOneShot();
     VkBufferCopy copy{0, 0, bytes};
     vkCmdCopyBuffer(commands, source.handle, staging_.handle, 1, &copy);
-    endOneShot(commands);
+    // Checked before the staging buffer is read: `staging_` is shared across every
+    // transfer in the process, so a copy that never ran leaves the *previous*
+    // transfer's bytes there and the caller cannot tell them from its own.
+    if (!endOneShot(commands)) return false;
 
     void* mapped = nullptr;
     if (vkMapMemory(device_, staging_.memory, 0, bytes, 0, &mapped) != VK_SUCCESS) return false;
@@ -316,22 +323,33 @@ VkCommandBuffer_T* Device::beginOneShot() {
     allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocation.commandBufferCount = 1;
     VkCommandBuffer commands = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(device_, &allocation, &commands);
+    if (vkAllocateCommandBuffers(device_, &allocation, &commands) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
 
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(commands, &begin);
+    if (vkBeginCommandBuffer(commands, &begin) != VK_SUCCESS) {
+        vkFreeCommandBuffers(device_, commandPool_, 1, &commands);
+        return VK_NULL_HANDLE;
+    }
     return commands;
 }
 
-void Device::endOneShot(VkCommandBuffer_T* commands) {
-    vkEndCommandBuffer(commands);
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &commands;
-    vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue_);
+bool Device::endOneShot(VkCommandBuffer_T* commands) {
+    if (commands == nullptr) return false;
+    // The command buffer is freed on every path, including the ones that failed --
+    // it was allocated whatever the submit did with it.
+    bool ok = vkEndCommandBuffer(commands) == VK_SUCCESS;
+    if (ok) {
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &commands;
+        ok = vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS;
+        // Waited on even if the submit failed, so the free below is safe.
+        if (vkQueueWaitIdle(queue_) != VK_SUCCESS) ok = false;
+    }
     vkFreeCommandBuffers(device_, commandPool_, 1, &commands);
+    return ok;
 }
 
 }  // namespace gpu

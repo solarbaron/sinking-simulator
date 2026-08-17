@@ -754,9 +754,12 @@ bool HullRenderer::render(const float mvp[16], const SceneView& view, const Scen
     vkCmdCopyImageToBuffer(commands, colour_.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            readback_.handle, 1, &copy);
 
-    device_->endOneShot(commands);
+    const bool submitted = device_->endOneShot(commands);
     lastFrame_.submitSeconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - submitStarted).count();
+    // Timed first so the figure is recorded either way, then refused: everything
+    // below reads back an image the device may never have drawn.
+    if (!submitted) return false;
 
     if (queryPool_ != nullptr) {
         std::uint64_t stamps[2] = {0, 0};

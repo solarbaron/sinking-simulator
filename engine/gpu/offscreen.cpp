@@ -303,7 +303,9 @@ bool OffscreenRenderer::render(const float mvp[16], const Draw& draw, const floa
     vkCmdCopyImageToBuffer(commands, colour_.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            readback_.handle, 1, &copy);
 
-    device_->endOneShot(commands);
+    // A frame whose submit failed is not a frame; reading the attachment after it
+    // would hand back the previous render.
+    if (!device_->endOneShot(commands)) return false;
 
     out = core::Image(width_, height_);
     void* mapped = nullptr;

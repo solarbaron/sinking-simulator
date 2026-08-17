@@ -92,8 +92,13 @@ public:
     VkShaderModule_T* loadShader(const std::string& path, std::string& error);
     void destroyShader(VkShaderModule_T* module);
 
+    // **Null on failure, and the submit's result comes back.** These used to
+    // discard both: `beginOneShot` ignored `vkAllocateCommandBuffers` and then
+    // recorded into whatever it got, and `endOneShot` dropped `vkQueueSubmit`, so
+    // `upload` returned `true` for a transfer that never ran. A caller must check
+    // the handle before recording and the result before believing the bytes moved.
     VkCommandBuffer_T* beginOneShot();
-    void endOneShot(VkCommandBuffer_T* commands);
+    [[nodiscard]] bool endOneShot(VkCommandBuffer_T* commands);
 
     // Raw handles, for the layers that do need Vulkan directly.
     VkInstance_T* instance() const { return instance_; }
