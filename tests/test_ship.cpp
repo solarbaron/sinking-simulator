@@ -897,6 +897,39 @@ void testAnOpenEscapeTrunkDrainsTheVehicleDeckIntoADryEngineRoom() {
 
 }  // namespace
 
+// **A ship with no mass must not step into a NaN, and must not be reported sunk.**
+//
+// `lightshipMass` defaults to 0, and `Ship::step` does not refuse -- so the
+// effective mass was exactly zero on a dry hull, `fBody` was zero with it, and the
+// linear acceleration was `0/0`. Nothing downstream reads that as a NaN: the
+// orientation's normalisation is `if (l > 1e-300)`, false for a NaN, so the
+// quaternion stays NaN for good; `heelTrimFromRotation` then gives a NaN heel, and
+// `Diagnostics`'s `std::abs(d.heelDeg) < 90.0` is false for a NaN too. The reported
+// answer was `afloat = false`. A misconfiguration arrived as a sinking.
+//
+// The rotational half of the same line has always been defended -- `inverse`
+// returns a zero matrix on a singular inertia -- and this asserts the two halves
+// now agree.
+void testAMasslessShipStepsToFiniteStateRatherThanNaN() {
+    Ship ship;
+    ship.hull = game::buildFerry().hull;
+    ship.initialise(0.0);
+    expectNear("the fixture really has no mass, which is the whole point",
+               ship.lightshipMass, 0.0, 0.0);
+
+    for (int i = 0; i < 20; ++i) ship.step(0.02, Sea(0.0));
+
+    const Vec3 p = ship.state.position;
+    expectTrue("position stays finite",
+               std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z));
+    const Diagnostics d = ship.diagnostics(Sea(0.0));
+    expectTrue("heel stays finite", std::isfinite(d.heelDeg));
+    expectTrue("and trim", std::isfinite(d.trimDeg));
+    // The point of the whole test: a NaN heel makes `afloat` false, so a finite
+    // heel is what stops a missing mass from being reported as a sinking.
+    expectTrue("so she is not reported sunk on account of a NaN", d.afloat);
+}
+
 void runShipTests() {
     std::printf("\n--- horizontal openings and buoyant exchange ---\n");
     testHorizontalExchangeMatchesTheCounterflowClosedForm();
@@ -909,4 +942,5 @@ void runShipTests() {
     testTwoGasStreamsBalanceTheirOwnEnthalpy();
     testTheFerryAsShippedRunsNoExchangeAtAll();
     testAnOpenEscapeTrunkDrainsTheVehicleDeckIntoADryEngineRoom();
+    testAMasslessShipStepsToFiniteStateRatherThanNaN();
 }

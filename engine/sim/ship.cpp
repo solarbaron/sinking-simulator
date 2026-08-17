@@ -1329,7 +1329,22 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
     externalForce = {};
     externalMoment = {};
 
-    const Vec3 aBody{fBody.x / mEff.x, fBody.y / mEff.y, fBody.z / mEff.z};
+    // **A degenerate effective mass gives no acceleration, exactly as a degenerate
+    // inertia gives none on the next line.** `mEff` is `mp.mass` plus a non-negative
+    // added-mass term, so it is exactly zero when `lightshipMass` is left at its
+    // default of 0 and the hull is dry -- and `fBody` is zero with it, so this was
+    // `0/0`. The rotational half has always been defended (`inverse` returns
+    // `Mat3::zero()` below 1e-300) and the translational half was not.
+    //
+    // A NaN here does not surface as a NaN. It reaches the orientation through
+    // `Quat::integrated`, whose `if (l > 1e-300)` normalisation is *false* for NaN
+    // so the quaternion stays NaN for good; then `heelTrimFromRotation` yields a NaN
+    // heel, and `Diagnostics`'s `std::abs(d.heelDeg) < 90.0` is false for NaN too --
+    // so `afloat` comes back false and a misconfigured ship is reported as sunk.
+    // `Ship::validate()` names the missing mass, but it is advisory and nothing on
+    // the step path consults it.
+    const auto accel = [](double force, double mass) { return mass > 0 ? force / mass : 0.0; };
+    const Vec3 aBody{accel(fBody.x, mEff.x), accel(fBody.y, mEff.y), accel(fBody.z, mEff.z)};
     const Vec3 alphaBody = inverse(Ieff) * (tBody - cross(wBody, Ieff * wBody));
 
     // Integrate about the centre of gravity, then map back to the body origin.
