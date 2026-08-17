@@ -14,6 +14,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 using namespace sim;
@@ -104,10 +105,26 @@ void testPlateBucklingMatchesTheClosedForm() {
                1e-6 * want);
     expectNear("and the coefficient is the one for this aspect ratio", c.coefficient, k, 1e-12);
 
-    // The short side is b whichever way round the caller names the sides.
+    // **Swapping the sides is a different panel, and this asserted it was the
+    // same one.** `plateBuckling` used to reduce both orders to the shorter side,
+    // so this assertion held by construction and pinned the defect: a panel
+    // loaded along its 0.70 m side is 2.40 m wide across the load, and 2.40 is
+    // the `b` the Timoshenko form divides by. Asserted against the closed form
+    // for the swapped panel, not against the unswapped answer.
     const BucklingCheck swapped = plateBuckling(t, b, a, 50e6, steel);
-    expectNear("naming the sides the other way round gives the same answer", swapped.elasticStress,
-               c.elasticStress, 1e-9 * c.elasticStress);
+    const double kSwapped = plateBucklingCoefficient(b, a);
+    const double wantSwapped = kSwapped * kPi * kPi * steel.youngsModulus /
+                               (12.0 * (1.0 - steel.poissonRatio * steel.poissonRatio)) * (t / a) *
+                               (t / a);
+    expectNear("loaded across the long side, k is the one for alpha = 0.2917", kSwapped, 13.84017,
+               1e-5);
+    expectNear("and the elastic stress is that k on b = the 2.40 m side", swapped.elasticStress,
+               wantSwapped, 1e-9 * wantSwapped);
+    // The direction is the whole point: a panel unsupported over 2.40 m across
+    // the load is far weaker than the same plate unsupported over 0.70 m, and
+    // the routine used to report the strong answer for both.
+    expectNear("which is 0.2892 of the same plate loaded the other way",
+               swapped.elasticStress / c.elasticStress, 0.28920, 1e-4);
 
     // Thickness squared, and spacing squared the other way. Both are exact.
     const BucklingCheck thicker = plateBuckling(2 * t, a, b, 50e6, steel);
@@ -267,6 +284,76 @@ void testGirderBucklingFollowsTheCompressedFibre() {
                    .empty());
 }
 
+// **A check that could not be made must not read as an unloaded panel.**
+//
+// `utilisation` was `criticalStress > 0 ? std::max(0.0, applied) / criticalStress
+// : 0.0` at both call sites, and that swallows a NaN by two independent routes:
+// `std::max(0.0, NaN)` returns 0.0 because `0.0 < NaN` is false, and `NaN > 0` is
+// false so the else fires. Either way the answer was **zero percent of capacity**
+// -- the most reassuring number a collapse check has, delivered by the one input
+// that means it has no answer. The fold above it then dropped the NaN a second
+// time, because `x > worst` is false for a NaN and a maximum over stations returns
+// the worst of the ones that worked.
+void testANaNCannotReadAsZeroUtilisation() {
+    std::printf("\n--- buckling: a check that could not be made is not a safe panel ---\n");
+    const StructuralMaterial steel = ah36Steel();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    const BucklingCheck good = plateBuckling(0.012, 2.40, 0.70, 50e6, steel);
+    expectTrue("the reference panel is loaded", good.utilisation > 0);
+
+    const BucklingCheck nanApplied = plateBuckling(0.012, 2.40, 0.70, nan, steel);
+    expectTrue("a NaN applied stress does not read as an unloaded panel",
+               std::isnan(nanApplied.utilisation));
+    expectNear("and the capacity reported beside it is still the real one",
+               nanApplied.criticalStress, good.criticalStress, 0.0);
+
+    // A capacity that is not a number, reached through the modulus. `plateConstant`
+    // carries the NaN into the eigenvalue and `johnsonOstenfeld` carries it out.
+    StructuralMaterial noModulus = steel;
+    noModulus.youngsModulus = nan;
+    expectTrue("nor does a capacity that is not a number",
+               std::isnan(plateBuckling(0.012, 2.40, 0.70, 50e6, noModulus).utilisation));
+
+    // The control, and it is the same file getting this right: a NaN *yield* is
+    // caught by `johnsonOstenfeld`'s `!(yieldStrength > 0)`, which is the NaN-safe
+    // form, so the capacity comes back an honest zero rather than a NaN. Zero
+    // capacity keeps its zero utilisation, because that is a refusal the caller
+    // can see in `criticalStress` next to it.
+    StructuralMaterial noYield = steel;
+    noYield.yieldStrength = nan;
+    const BucklingCheck refused = plateBuckling(0.012, 2.40, 0.70, 50e6, noYield);
+    expectNear("a NaN yield strength is refused rather than propagated",
+               refused.criticalStress, 0.0, 0.0);
+    expectNear("and a refused check reports zero, which its zero capacity explains",
+               refused.utilisation, 0.0, 0.0);
+
+    // The column mode carried the identical line and the identical defect.
+    const StiffenedSection sec = stiffenedSection(flatBar(0.150, 0.010), 0.0145, 0.70);
+    expectTrue("the reference column is a column", sec.area > 0 && sec.secondMoment > 0);
+    expectTrue("a NaN applied stress does not read as an unloaded column",
+               std::isnan(columnBuckling(sec, 2.40, nan, steel).utilisation));
+
+    std::vector<GirderBuckling> checks(3);
+    checks[0].x = -10.0;
+    checks[0].utilisation = 0.4;
+    checks[1].x = 0.0;
+    checks[1].utilisation = nan;
+    checks[2].x = 10.0;
+    checks[2].utilisation = 0.9;
+    double atX = -1e30;
+    expectTrue("a station that could not be checked beats every station that could",
+               std::isnan(worstBucklingUtilisation(checks, &atX)));
+    expectNear("and the caller is told which station it was", atX, 0.0, 0.0);
+
+    // Vacuity: the same three stations without the NaN must give the plain
+    // maximum, or everything above would hold for a fold that always said NaN.
+    checks[1].utilisation = 0.5;
+    expectNear("the same fold without a NaN is the ordinary maximum",
+               worstBucklingUtilisation(checks, &atX), 0.9, 0.0);
+    expectNear("at the station that carries it", atX, 10.0, 0.0);
+}
+
 }  // namespace
 
 void runBucklingTests() {
@@ -277,4 +364,5 @@ void runBucklingTests() {
     testThinPlatingBucklesFarBelowYield();
     testColumnBucklingIsEuler();
     testGirderBucklingFollowsTheCompressedFibre();
+    testANaNCannotReadAsZeroUtilisation();
 }

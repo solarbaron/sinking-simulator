@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace sim {
 namespace {
@@ -11,6 +12,31 @@ namespace {
 // carries. Written once so a stray factor cannot appear in only one of them.
 double plateConstant(const StructuralMaterial& m) {
     return kPi * kPi * m.youngsModulus / (12.0 * (1.0 - m.poissonRatio * m.poissonRatio));
+}
+
+// Applied over critical, and **a NaN on either side must not come out as zero**.
+//
+// Both callers wrote this inline as
+// `critical > 0 ? std::max(0.0, applied) / critical : 0.0`, which swallows a NaN
+// twice over and independently. `std::max(0.0, NaN)` is `0.0 < NaN ? NaN : 0.0`,
+// and `0.0 < NaN` is false, so it returns **0.0** -- the argument order decides,
+// and `std::max(NaN, 0.0)` would have propagated. Separately, `NaN > 0` is false
+// and takes the else, which is also 0.0. So a panel whose applied stress or whose
+// capacity is not a number reported **zero utilisation**: the single most
+// reassuring answer a collapse check can give, produced by the one input meaning
+// the check could not be made at all.
+//
+// The two early returns in each caller are already written `!(x > 0)`, which is
+// the NaN-safe form and sends a NaN to the "nothing computed" return. The idiom
+// was in the file. It was the way out that had not been given it.
+//
+// A zero `critical` is a different thing and keeps its zero: that is the caller
+// having been refused, and it is reported by `criticalStress` being zero beside it.
+double utilisationOf(double applied, double critical) {
+    if (std::isnan(applied) || std::isnan(critical))
+        return std::numeric_limits<double>::quiet_NaN();
+    if (!(critical > 0)) return 0.0;
+    return std::max(0.0, applied) / critical;
 }
 
 }  // namespace
@@ -42,15 +68,39 @@ BucklingCheck plateBuckling(double thickness, double loadedLength, double width,
     c.appliedStress = appliedCompression;
     if (!(thickness > 0) || !(loadedLength > 0) || !(width > 0)) return c;
 
-    // A plate does not know which of its sides the caller called which: b is the
-    // short one and a the long one, whatever they were named.
-    const double b = std::min(loadedLength, width);
-    const double a = std::max(loadedLength, width);
+    // **`b` is the side across the load, and that is not always the shorter one.**
+    // This took `min` and `max`, on the argument -- written into `buckling.hpp` in
+    // those words -- that "a plate does not care which of its sides you call
+    // which". It does. `sigma_cr = k pi^2 D / (b^2 t)` is only the Timoshenko form
+    // when `b` is the dimension perpendicular to the load, because that is the
+    // dimension the half-waves span; `k` is measured against `a/b` on the same
+    // convention. The header said so itself eight lines further down -- "a is
+    // along the load and b across it" -- so the file carried both definitions and
+    // the code followed the one that is wrong.
+    //
+    // It matters in one direction only, and it is the bad one. Taking the shorter
+    // side always finds a `k` near 4; the true `k` for a panel loaded across its
+    // long dimension is larger, but it divides by a `b` that is larger squared,
+    // and the square wins. A 0.70 x 2.40 panel loaded along the 0.70:
+    //
+    //     as written   k = 4.072 on b = 0.70  ->  222.8 MPa
+    //     as meant     k = 13.84 on b = 2.40  ->   64.4 MPa
+    //
+    // a factor of 3.46 unconservative, on a check whose whole purpose is to say
+    // that a stress well under yield has already lost the panel.
+    //
+    // Nothing in the tree reaches it today: every caller passes the frame spacing
+    // as the loaded length and the longitudinal spacing as the width -- 2.40
+    // against 0.70 on this ship -- so `min` picked the width and got the right
+    // answer for the wrong reason. A transversely framed ship, where the frames
+    // are the close spacing and the girders the wide one, walks straight into it.
+    const double b = width;
+    const double a = loadedLength;
 
     c.coefficient = plateBucklingCoefficient(a, b);
     c.elasticStress = c.coefficient * plateConstant(material) * (thickness / b) * (thickness / b);
     c.criticalStress = johnsonOstenfeld(c.elasticStress, material.yieldStrength);
-    c.utilisation = c.criticalStress > 0 ? std::max(0.0, appliedCompression) / c.criticalStress : 0.0;
+    c.utilisation = utilisationOf(appliedCompression, c.criticalStress);
     return c;
 }
 
@@ -63,7 +113,7 @@ BucklingCheck columnBuckling(const StiffenedSection& section, double length,
     c.elasticStress = kPi * kPi * material.youngsModulus * section.secondMoment /
                       (section.area * length * length);
     c.criticalStress = johnsonOstenfeld(c.elasticStress, material.yieldStrength);
-    c.utilisation = c.criticalStress > 0 ? std::max(0.0, appliedCompression) / c.criticalStress : 0.0;
+    c.utilisation = utilisationOf(appliedCompression, c.criticalStress);
     return c;
 }
 
@@ -157,11 +207,21 @@ std::vector<GirderBuckling> girderBuckling(const std::vector<GirderStress>& stre
 
 double worstBucklingUtilisation(const std::vector<GirderBuckling>& checks, double* atX) {
     double worst = 0;
-    for (const GirderBuckling& c : checks)
-        if (c.utilisation > worst) {
+    // **A station that could not be checked is worse than any station that could.**
+    // `c.utilisation > worst` is false for a NaN, so a maximum fold drops exactly
+    // the stations whose check failed and returns the worst of the ones that
+    // succeeded -- making a NaN one level down invisible one level up, which is
+    // how a zero utilisation would have reached a caller even after
+    // `utilisationOf` stopped manufacturing one. Once a NaN is seen it stays: no
+    // later comparison against it can be true, so the loop stops rather than
+    // pretending to keep looking.
+    for (const GirderBuckling& c : checks) {
+        if (std::isnan(worst)) break;
+        if (std::isnan(c.utilisation) || c.utilisation > worst) {
             worst = c.utilisation;
             if (atX) *atX = c.x;
         }
+    }
     return worst;
 }
 

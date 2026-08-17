@@ -17,8 +17,11 @@
 //
 //         sigma_cr = k pi^2 E / (12 (1 - nu^2)) * (t / b)^2
 //
-//     with b the *shorter* side. Cured by closer stiffener spacing or thicker
-//     plate, and the (t/b)^2 says which is cheaper.
+//     with b the side *across* the load -- the stiffener spacing, for a
+//     longitudinally framed hull under hull-girder bending -- and not the shorter
+//     side, which is what this said until a 0.70 x 2.40 panel loaded along the
+//     0.70 came out 3.46x too strong. Cured by closer stiffener spacing or
+//     thicker plate, and the (t/b)^2 says which is cheaper.
 //   * **Stiffener column buckling** between frames. The longitudinal, with its
 //     attached strip of plating, buckles as an Euler column,
 //
@@ -73,10 +76,12 @@ struct BucklingCheck {
 // panel is no weaker than a long one.
 double plateBucklingCoefficient(double loadedLength, double width);
 
-// Plate buckling between stiffeners. `width` is the stiffener spacing and
-// `loadedLength` the frame spacing, or the other way round; the routine takes the
-// shorter as b itself, because a plate does not care which of its sides you call
-// which.
+// Plate buckling between stiffeners. `width` is the side across the load -- the
+// stiffener spacing for a longitudinally framed hull -- and `loadedLength` the
+// side along it. **They are not interchangeable**, and the routine no longer
+// pretends they are: swapping them is a different panel with a different answer,
+// which `tests/test_buckling.cpp` asserts against the closed form for both
+// orders rather than asserting they agree.
 BucklingCheck plateBuckling(double thickness, double loadedLength, double width,
                             double appliedCompression, const StructuralMaterial& material);
 
