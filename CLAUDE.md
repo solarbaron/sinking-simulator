@@ -211,6 +211,19 @@ the timeout lands, so a sweep without a per-mutant time bound is reporting a num
 it did not measure. Assert against the arithmetic floor of the substep controller,
 not against a wall clock, so the bound survives a busy box.
 
+**A timed quantity cannot be bracketed against a constant, and a minimum over
+attempts does not fix it.** The gas tier's `coreSecondsPerCell` was documented as
+"measured in the tests" while the test only asserted it was positive, so a bracket
+was added: the constant against the coarsest and finest per-cell timings, taking a
+minimum over three attempts on the argument that contention can only slow a run.
+It holds on an ordinary build and fails under **both** sanitizers. Instrumentation
+multiplies a timed solve by about ten and leaves the constant exactly where it is,
+so both bounds rise past it together -- a minimum over attempts defends against a
+busy neighbour and does nothing whatever against a slower binary. This is the same
+false-kill hazard as above, reached from the opposite direction: not a wall clock
+asserted as a bound, but a constant asserted against a wall clock. **What survives
+instrumentation is a ratio between two timings, because it scales on both sides.**
+
 **And a mutation harness on a busy box reports strength it does not have.** A
 wall-clock assertion falsely killed two *controls* during the GM sweep — controls
 being mutants that are supposed to survive. A false kill inflates the rate and
