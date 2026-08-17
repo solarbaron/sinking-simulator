@@ -1264,11 +1264,60 @@ void testClearResetsState() {
 // Main
 // ===========================================================================
 
+// **A threshold of zero refuses, rather than dividing by it.**
+//
+// The score is `rate / rollRatePromote`, and a zero threshold does not make
+// everything qualify -- it makes the score `+inf` for a moving ship and a NaN for
+// one at rest, which is `computeLateralAccel`'s documented answer when `dt <= 0`.
+// A NaN then goes into the `a.score > b.score` comparator the ranking uses, and a
+// comparator that is not a strict weak ordering is undefined behaviour rather than
+// a wrong number. Both sibling tiers guard the identical construct
+// (`promotion.cpp:271` and `:830`); this one did not.
+void testAZeroThresholdRefusesRatherThanDividingByIt() {
+    std::printf("\n   a zero promote threshold is refused\n");
+
+    Ship ferry = ferryAfloat();
+    setRollRate(ferry, 0.30);
+    ferry.compartments[0].waterVolume = 8.0;
+
+    WaterCriterion sane;
+    const std::vector<WaterCandidate> found = waterCandidates(ferry, sane, Vec3{}, 0.02);
+    expectTrue("the ship qualifies on a real threshold, or this proves nothing",
+               !found.empty());
+
+    // Not empty -- this list is what was *considered*, and a compartment dropped
+    // from it is a silent refusal. Scored zero, with the reason, and above all
+    // finite: the failure being guarded against is a NaN score reaching the sort.
+    const auto refused = [&](WaterCriterion c) {
+        const std::vector<WaterCandidate> got = waterCandidates(ferry, c, Vec3{}, 0.02);
+        expectTrue("the compartment is still considered", !got.empty());
+        bool named = false;
+        for (const WaterCandidate& w : got) {
+            // The failure being guarded against is a NaN reaching the sort, so this
+            // is the assertion that matters and it applies to every entry.
+            expectTrue("every score is finite", std::isfinite(w.score));
+            expectNear("and none of them scored", w.score, 0.0, 0.0);
+            if (w.why.find("threshold is not positive") != std::string::npos) named = true;
+        }
+        // Not every entry: a compartment too large to resolve, or below the motion
+        // thresholds, is refused earlier and carries its own reason. What has to be
+        // true is that the ones reaching the divide say why they did not.
+        expectTrue("and the threshold is named by the ones that reached it", named);
+    };
+    WaterCriterion noRoll = sane;
+    noRoll.rollRatePromote = 0.0;
+    refused(noRoll);
+    WaterCriterion noAccel = sane;
+    noAccel.accelPromote = 0.0;
+    refused(noAccel);
+}
+
 void runWaterPromotionTests() {
     std::printf("\n--- water promotion ---\n");
 
     // Section 1: Criterion
     testShipAtRestPromotesNothing();
+    testAZeroThresholdRefusesRatherThanDividingByIt();
     testShallowPuddlePromotesNothing();
     testMotionBelowThresholdPromotesNothing();
     testRollRateIsBodyFrame();

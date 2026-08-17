@@ -833,8 +833,44 @@ void testValidityIsReported() {
 
 }  // namespace
 
+// **A hull with no length is refused, not divided by.**
+//
+// `radiationHullFromMesh` takes its slab thickness from `(hi.x - lo.x)` over the
+// station count and never checked the numerator, where `measureHull` and
+// `roll_damping`'s own builder both check the same quantity before dividing. A
+// zero-length hull gave `thickness == 0` and a sectional area of `0/0` -- and the
+// guard below it, `area <= 0`, is *false* for a NaN, so the station was accepted
+// carrying a NaN coefficient. `lewisSection` then passes its own `<= 0` test for
+// exactly the same reason and lands on a zero scale, so what a caller received was
+// a silently zero section rather than a refusal.
+void testAHullWithNoLengthIsRefusedRatherThanDividedBy() {
+    // A flat plate in the y-z plane: real triangles, no x-extent at all.
+    TriMesh flat;
+    flat.verts = {Vec3{0, -5, 0}, Vec3{0, 5, 0}, Vec3{0, 5, 8}, Vec3{0, -5, 8}};
+    flat.tris = {Tri{0, 1, 2}, Tri{0, 2, 3}};
+    const RadiationHull hull = radiationHullFromMesh(flat, 4.0, 21);
+
+    expectEqual("a hull with no length yields no stations",
+                static_cast<int>(hull.stations.size()), 0);
+    for (const RadiationStation& s : hull.stations)
+        expectTrue("and no station carries a NaN coefficient",
+                   std::isfinite(s.areaCoefficient) && std::isfinite(s.beam));
+
+    // **What this test does and does not establish, because the difference matters.**
+    // Deleting the `length > 0` guard leaves it green: a mesh with no x-extent also
+    // has no beam at its stations, and the `beam <= 0` check further down catches
+    // it first. So the guard is defence in depth and this is a regression test for
+    // the *outcome* -- no NaN escapes a degenerate hull -- rather than a test of the
+    // guard itself. It is kept because it is one line, because the two functions
+    // that compute the same quantity (`measureHull`, `roll_damping`'s hull builder)
+    // both check before dividing, and because the check that would otherwise catch
+    // a NaN area reads `area <= 0`, which is *false* for a NaN and would let it
+    // through the moment a mesh arrived with extent in y and z but not x.
+}
+
 void runRadiationTests() {
     std::printf("\n--- radiation (strip theory, Cummins/Ogilvie) ---\n");
+    testAHullWithNoLengthIsRefusedRatherThanDividedBy();
     testLewisFormsReproduceTheirInputs();
     testHeavingCircleAgainstUrsell();
     testCircleRollingAboutItsCentreDisplacesNothing();

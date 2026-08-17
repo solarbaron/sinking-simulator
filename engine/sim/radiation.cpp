@@ -1125,6 +1125,14 @@ RadiationHull radiationHullFromMesh(const TriMesh& hull, double waterlineZ, int 
     // coefficient -- is whatever the rounding says. Strip theory has nothing
     // useful to contribute there in any case.
     const double length = hi.x - lo.x;
+    // **Refused before it is divided by**, which is what `measureHull` and
+    // `roll_damping`'s own hull builder both do with the same quantity and this did
+    // not. A hull with no length gives `thickness == 0`, the sectional area below
+    // comes back `0/0`, and the guard there -- `area <= 0` -- is *false* for a NaN,
+    // so the station is accepted carrying a NaN area coefficient. `lewisSection`
+    // then passes its own `<= 0` test for the same reason and lands on a zero scale,
+    // so what reaches a caller is a silently zero section rather than a refusal.
+    if (!(length > 0)) return out;
     const double inset = 0.5 * length / stationCount;
     const double first = lo.x + inset;
     const double span = (length - 2.0 * inset);

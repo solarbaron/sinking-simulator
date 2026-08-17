@@ -186,6 +186,25 @@ std::vector<WaterCandidate> waterCandidates(const Ship& ship, const WaterCriteri
         // Score: how far past threshold is the **weaker** trigger?
         // Both above → score is min of the two ratios.
         // One above → score is that ratio.
+        // **Both thresholds refused before they are divided by, and reported rather
+        // than dropped.** A threshold of zero does not make everything qualify: it
+        // makes the score `+inf` for a moving ship and a NaN for one at rest, which
+        // is `computeLateralAccel`'s own answer when `dt <= 0`. A NaN then reaches
+        // the `a.score > b.score` comparator below, and a comparator that is not a
+        // strict weak ordering is undefined behaviour rather than a wrong number.
+        // Both sibling tiers guard the identical construct (`promotion.cpp:271`
+        // and `:830`).
+        //
+        // Kept in the list with a reason, not `continue`d past. This list is what
+        // a caller reads to see what was *considered*, and a compartment that
+        // vanishes from it is the silent refusal this tier was already caught
+        // doing once, 154 times over.
+        if (!(criterion.rollRatePromote > 0) || !(criterion.accelPromote > 0)) {
+            cand.score = 0;
+            cand.why = "a promotion threshold is not positive, so no score can be formed";
+            candidates.push_back(cand);
+            continue;
+        }
         double rollScore = rollRate / criterion.rollRatePromote;
         double accelScore = accel / criterion.accelPromote;
 
