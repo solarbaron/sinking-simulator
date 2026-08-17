@@ -246,6 +246,11 @@ void emissiveColour(double temperature, const SmokeShading& shading, double out[
 // floor area centred on the body origin, because a square is the only footprint
 // that does not claim to know something. Everything else takes the compartment's
 // bounding box aspect ratio in plan.
+// **One entry per `model.gas`, in the same order, always.** A gas space with no
+// geometry yields a zero-extent placeholder rather than being skipped, because
+// every caller pairs the two by index -- `smoke_view` loops the volumes and reads
+// `model.gas[i]` inside -- and a filtered vector would shift each compartment onto
+// its neighbour's smoke.
 std::vector<SmokeVolume> volumesFromFire(const sim::fire::Model& model, const sim::Ship& ship,
                                          const SmokeShading& shading);
 

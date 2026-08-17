@@ -152,7 +152,21 @@ std::vector<SmokeVolume> volumesFromFire(const sim::fire::Model& model, const si
     const sim::Mat3 rotation = ship.state.orientation.toMat3();
 
     for (const sim::fire::GasCompartment& g : model.gas) {
-        if (!(g.floorArea > 0) || !(g.ceilingZ > g.floorZ)) continue;
+        // **A gas space with no geometry gets a placeholder, not a `continue`.**
+        // Every caller pairs this vector with `model.gas` by index -- `smoke_view`
+        // loops `i < volumes.size()` and reads `model.gas[i]` inside it -- so
+        // skipping one silently shifts every compartment after it onto its
+        // neighbour's smoke, and skipping the last one puts `volumes[findGas(...)]`
+        // out of bounds. `fire::Model::validate` rejects both conditions, so this is
+        // guarded by convention today and by construction now.
+        if (!(g.floorArea > 0) || !(g.ceilingZ > g.floorZ)) {
+            SmokeVolume empty;
+            empty.name = g.name;
+            empty.rotation = rotation;
+            empty.translation = ship.state.position;
+            volumes.push_back(std::move(empty));
+            continue;
+        }
 
         // Plan extents: the compartment's own aspect ratio in plan, scaled so the
         // area is the model's `floorArea` exactly. A gas space with no ship

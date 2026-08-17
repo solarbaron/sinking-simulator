@@ -476,9 +476,19 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
     if (water) {
         // A grounding aft, both holds together, which is what keeps her upright: the
         // asymmetric case is a stability problem and this is a structural one.
-        for (int c : {aftP, aftS})
+        // **Checked, because `findCompartment` returns -1 and this is a store.**
+        // `static_cast<std::size_t>(-1)` is `SIZE_MAX`, so a renamed or missing
+        // compartment writes to a wild address rather than reading a wrong one.
+        // The ferry has been short of an authored compartment before -- her mid
+        // wing tanks were never written -- and `water_probe` guards the same call.
+        for (int c : {aftP, aftS}) {
+            if (c < 0) {
+                std::printf("no aft hold to flood: expected aft_hold_p and aft_hold_s\n");
+                return out;
+            }
             ship.compartments[static_cast<std::size_t>(c)].waterVolume =
                 o.fill * ship.compartments[static_cast<std::size_t>(c)].floodableVolume();
+        }
         ship.initialise(sea);
     }
 
@@ -622,7 +632,8 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
         // air above it -- and the water is the reason the foot of the bulkhead, which
         // is where the head is greatest, is also the part that never gets hot.
         const double wetSurface =
-            water ? ship.compartments[static_cast<std::size_t>(aftP)].surfaceWorldZ -
+            water && aftP >= 0
+                ? ship.compartments[static_cast<std::size_t>(aftP)].surfaceWorldZ -
                         ship.state.position.z
                   : kMeshZLo - 1.0;
         for (std::size_t b = 0; b < wetBand.size(); ++b) {

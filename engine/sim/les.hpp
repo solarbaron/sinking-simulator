@@ -198,7 +198,13 @@ struct Grid {
     // compatible right-hand side if the volume the mean is taken over is the one
     // the cells add up to.
     double volume() const { return cellVolume() * cells(); }
-    double planArea() const { return h[0] * h[1] * static_cast<double>(n[0] * n[1]); }
+    // Each factor widened before the multiply, as `flip.hpp` does for the same
+    // quantity. `n[0] * n[1]` formed the product in `int` first, which is safe only
+    // because `gridFor` clamps each axis to 512 -- and `Field` is a public struct
+    // whose `Grid` a caller can fill in directly.
+    double planArea() const {
+        return h[0] * h[1] * static_cast<double>(n[0]) * static_cast<double>(n[1]);
+    }
     double centre(int axis, int index) const {
         return lo[axis] + (static_cast<double>(index) + 0.5) * h[axis];
     }

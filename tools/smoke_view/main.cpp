@@ -139,8 +139,12 @@ int main(int argc, char** argv) {
     mesh.appendMesh(cut, ship.state.orientation.toMat3(), ship.state.position,
                     static_cast<std::uint32_t>(std::max(steel, 0)), gpu::HullShading{});
 
-    const sim::Compartment& room =
-        ship.compartments[static_cast<std::size_t>(ship.findCompartment("engine_room_s"))];
+    // Checked on the same terms as the two `findGas` lookups twenty lines above,
+    // which this one sat between and did not follow.
+    const int roomIndex = ship.findCompartment("engine_room_s");
+    check("the burning compartment is on the ship", roomIndex >= 0);
+    if (failures != 0) return 1;
+    const sim::Compartment& room = ship.compartments[static_cast<std::size_t>(roomIndex)];
     const sim::Vec3 target{0.5 * (room.bboxLo.x + room.bboxHi.x), 0.0,
                            0.5 * (room.bboxLo.z + room.bboxHi.z)};
 

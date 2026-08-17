@@ -593,6 +593,37 @@ void testTheDrawnVolumeIsTheModelsVolume() {
 
     expectEqual("every tracked gas space is drawable", static_cast<long long>(volumes.size()),
                 static_cast<long long>(model.gas.size()));
+    // **And in the same order**, which is the part callers depend on and nothing
+    // checked. `volumesFromFire` used to `continue` past a gas space with no
+    // geometry, and every consumer pairs the two vectors by index -- `smoke_view`
+    // loops the volumes and reads `model.gas[i]` inside the loop -- so one skipped
+    // compartment shifts each one after it onto its neighbour's smoke, and skipping
+    // the last puts `volumes[findGas(...)]` out of bounds. The count alone cannot
+    // see that: a skip plus a spurious push would keep the size and break the
+    // pairing. It is a placeholder now rather than a skip, and the names are what
+    // says the correspondence held.
+    for (std::size_t i = 0; i < volumes.size() && i < model.gas.size(); ++i)
+        expectTrue("and the two vectors line up name for name",
+                   volumes[i].name == model.gas[i].name);
+
+    // The case that makes the placeholder load-bearing, since the ferry as shipped
+    // has no degenerate gas space and would never take that branch: knock the floor
+    // area out of the *first* one, which is the position that shifts every entry
+    // after it.
+    {
+        sim::fire::Model degenerate = model;
+        expectTrue("the fixture has gas spaces to spoil", degenerate.gas.size() > 1);
+        degenerate.gas.front().floorArea = 0.0;
+        const std::vector<gpu::SmokeVolume> shifted =
+            gpu::volumesFromFire(degenerate, ship, shading);
+        expectEqual("a gas space with no geometry still occupies its slot",
+                    static_cast<long long>(shifted.size()),
+                    static_cast<long long>(degenerate.gas.size()));
+        for (std::size_t i = 0; i < shifted.size(); ++i)
+            expectTrue("so the rest are not shifted onto their neighbours",
+                       shifted[i].name == degenerate.gas[i].name);
+        expectNear("and the spoiled one draws nothing", shifted.front().planArea(), 0.0, 0.0);
+    }
 
     for (std::size_t i = 0; i < volumes.size(); ++i) {
         const gpu::SmokeVolume& v = volumes[i];
