@@ -741,7 +741,12 @@ struct GasCriterion {
     // Core-seconds of wall time per simulated second per cell, for reporting only,
     // exactly as `Criterion::coreSecondsPerElement` is.
     //
-    // **Bracketed by measurement in `tests/test_promotion.cpp`, not equated to it.**
+    // **Not asserted anywhere, and that is a decision rather than an oversight.**
+    // Bracketing it against the measurement was tried and withdrawn: it holds on an
+    // ordinary build and fails under both sanitizers, because instrumentation
+    // multiplies a timed solve by about ten and leaves a constant where it is. What
+    // is asserted instead is the shape -- that the cost rises with refinement --
+    // which scales on both sides and survives.
     // This said "Measured ... rather than assumed" while that test timed a real
     // solve, printed the answer and asserted only that it was positive -- and the
     // note on `cellBudget` eight lines above called it "a one-point extrapolation
