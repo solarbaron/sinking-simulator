@@ -1133,6 +1133,38 @@ void testBilgeKeelsShortenTheRollDecay() {
     expectTrue("all three decays ran long enough to compare", cycles >= 8);
     if (cycles < 8) return;
 
+    // **The damping-ratio table `docs/02-simulation.md` publishes, printed.**
+    // It was a hand-made table with no producer anywhere in the tree: grepping
+    // its own figures -- 0.0259, 0.0323, 0.0470, 0.0810, 0.00062, 0.00193 --
+    // across `tests/`, `tools/` and `engine/` returned nothing for any of them, so
+    // re-deriving it meant writing a driver against the library. That is the exact
+    // condition `check-figures.sh:676-682` describes about the GM-detail figures
+    // before `--gm-detail` existed, and the answer that worked there was to teach
+    // the binary to print what the document claims. Everything this needs was
+    // already sitting in this function.
+    //
+    // `none` carries no damping of any kind, so its decay period is the natural
+    // one rather than a damped one, and the critical coefficient follows from the
+    // stiffness the same way `testRollFreeDecayMatchesTheIkedaCoefficient` takes
+    // it: `2 sqrt(C I)` with `I = C / omega_n^2`, which is `2 C / omega_n`.
+    const double omegaNatural = 2.0 * kPi / noneDecay.period();
+    const Diagnostics rollDiag = none.diagnostics(Sea(0.0));
+    const double rollStiffness = rollDiag.displacementMass * kGravity * rollDiag.gmTransverse;
+    const double criticalRoll = 2.0 * rollStiffness / omegaNatural;
+    expectTrue("the critical roll coefficient is ship-sized", criticalRoll > 0);
+    std::printf("     roll damping ratio at omega_n %.4f rad/s, OG/d %.3f\n", omegaNatural,
+                (withKeels.draft - withKeels.rollAxisAboveKeel) / withKeels.draft);
+    std::printf("     %9s %12s %12s %12s\n", "amplitude", "zeta keels", "zeta bare", "keel share");
+    for (double deg : {2.5, 5.0, 10.0, 20.0}) {
+        RollDampingCondition sample;
+        sample.rollAmplitude = deg * kDegToRad;
+        sample.rollFrequency = omegaNatural;
+        const RollDamping k = rollDamping(withKeels, sample);
+        const RollDamping b = rollDamping(withoutKeels, sample);
+        std::printf("     %8.1f %12.4f %12.5f %11.1f%%\n", deg, k.total / criticalRoll,
+                    b.total / criticalRoll, 100.0 * k.bilgeKeel() / k.total);
+    }
+
     const double kept = withDecay.peaks[cycles - 1] / withDecay.peaks.front();
     const double bareKept = withoutDecay.peaks[cycles - 1] / withoutDecay.peaks.front();
     const double noneKept = noneDecay.peaks[cycles - 1] / noneDecay.peaks.front();

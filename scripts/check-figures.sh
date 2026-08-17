@@ -100,6 +100,9 @@ FLIP_DOC=engine/sim/flip.hpp
 ESC_DOC=docs/flip-escalation-design.md
 SECTION=${SECTION:-./build/section_probe}
 SECTION_DOC=docs/02-simulation.md
+# The same file under the name the roll-damping block reads it by: those figures
+# are §2 seakeeping and have nothing to do with the section mesher.
+SIM_DOC=docs/02-simulation.md
 RENDER_DOC=docs/03-renderer-audio.md
 DOC=docs/06-roadmap.md
 fails=0
@@ -656,8 +659,20 @@ fi
 # and that happened three times in this session alone, each time to whoever had
 # just added a test. One `expected` variable cannot disagree with itself.
 if [ -x "$TESTS" ]; then
-  suite=$("$TESTS" 2>&1 | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  expected=200644
+  # **One run, read many times.** This piped the suite straight into `sed` and
+  # threw the rest away. The suite is 112 s and it already prints every figure
+  # `02-simulation.md` publishes about Ikeda's roll damping, so capturing stdout
+  # instead of streaming it costs nothing and closes the largest coverage hole
+  # this script had: **not one figure in it was computed with Ikeda attached.**
+  # `attachRollDamping` is reachable only through `shipsim --bilge-keels=`, a flag
+  # this script never passes, so no run it performed ever built a
+  # `RollDampingHull` at all -- a whole validated subsystem, fifteen published
+  # numbers, and the only thing re-deriving them was whoever last read the test's
+  # own stdout. The tell was not a wrong figure; it was asking which *flags* the
+  # gate never passes.
+  suiteout=$("$TESTS" 2>&1)
+  suite=$(printf '%s\n' "$suiteout" | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
+  expected=200782
   check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
         "$expected validation checks" "$FRONT"
   # **The roadmap publishes the same count in a different format**, and it was
@@ -668,6 +683,72 @@ if [ -x "$TESTS" ]; then
   # `$expected` so the two cannot part company.
   hint "$(printf '%s %s closed-form validation checks' \
           "${expected%???}" "${expected#${expected%???}}")" "$DOC"
+
+  # --- Ikeda's viscous roll damping, out of the same run -------------------------
+  #
+  # Two hulls and two tables: the ro-pax figures come from `test_roll_damping.cpp`
+  # and the damping-ratio table from `test_rao.cpp`, both printing into the stdout
+  # captured above.
+  #
+  # **The damping-ratio table had no producer at all until it was given one.**
+  # Grepping its own published figures -- 0.0259, 0.0323, 0.0470, 0.0810, 0.00062,
+  # 0.00193 -- across `tests/`, `tools/` and `engine/` returned nothing for any of
+  # them. It was a hand-made table, and re-deriving it meant writing a driver
+  # against the library. Printed at last, it came back 1.5% from what had been
+  # published, on a hull where the `B0` correction in the same commit moves it by
+  # 0.2%. So it had drifted from the code by something that was not that change,
+  # and nothing in the repository could have said so.
+  #
+  # Anchored on `$2 == "m/s"` and on the numeric amplitude rather than on line
+  # offsets: both tables sit in the middle of the suite's output, and a checker
+  # that misparses is worse than no checker.
+  #
+  # **`exit` on the first match, and it is load-bearing.** Without it the flag `f`
+  # opens a range that never closes, so every *later* line in 200 000 lines of
+  # suite output whose first field is numerically 5 or 10 prints as well -- and
+  # `check` then hands awk a multi-line `$actual`, whose numeric coercion takes the
+  # leading token and passes. The figure was right by luck and the parse was
+  # wrong; the tell was stray fragments (`m3:`, `x`) interleaved with the ticks.
+  # This is the collision the file already warns about at :335 for `fem_spike`,
+  # where `awk '$1 == 1'` matches the *section title* `1.` because "1." is a
+  # numeric string.
+  ropax() {
+    printf '%s\n' "$suiteout" |
+      awk -v deg="$1" -v col="$2" \
+          '/ro-pax 170x25x6.5/ { f = 1 }
+           f && $2 == "m/s" && $1 == 0.0 && $3 == deg { print $col; exit }' | tr -d '%'
+  }
+  zetarow() {
+    printf '%s\n' "$suiteout" |
+      awk -v deg="$1" -v col="$2" \
+          '/roll damping ratio at omega_n/ { f = 1 }
+           f && $1 == deg { print $col; exit }' | tr -d '%'
+  }
+  hulls=$(printf '%s\n' "$suiteout" |
+          sed -n 's/.* bare \([0-9.]*\)  keeled \([0-9.]*\).*/\1 \2/p' | tail -1)
+
+  check "the reference ro-pax's bare-hull viscous B44hat" 0.0081 5e-5 \
+        "$(printf '%s\n' "$hulls" | cut -d' ' -f1)" "0.0081 bare" "$SIM_DOC"
+  check "and the same hull with bilge keels, at omegahat 1.1 and 20 deg" 0.0429 5e-5 \
+        "$(printf '%s\n' "$hulls" | cut -d' ' -f2)" "0.0429 with keels" "$SIM_DOC"
+  # The figure `Ship::zetaRoll = 0.08` was anchored to, written down in three
+  # places: here, again at the stand-in paragraph, and in `ship.cpp`.
+  check "fraction of critical at the natural frequency and 10 deg" 0.061 5e-4 \
+        "$(ropax 10.0 8)" "6.1% of critical" "$SIM_DOC"
+  check "the bilge keels' share of the ro-pax total there (%)" 80.2 0.5 \
+        "$(ropax 10.0 16)" "Bilge keels are 80% of the total" "$SIM_DOC"
+
+  check "ferry damping ratio with keels at 2.5 deg" 0.0263 5e-5 "$(zetarow 2.5 2)" \
+        "| 2.5° | 0.0263 |" "$SIM_DOC"
+  check "at 5 deg" 0.0327 5e-5 "$(zetarow 5.0 2)" "| 5° | 0.0327 |" "$SIM_DOC"
+  check "at 10 deg" 0.0476 5e-5 "$(zetarow 10.0 2)" "| 10° | 0.0476 |" "$SIM_DOC"
+  check "at 20 deg" 0.0820 5e-5 "$(zetarow 20.0 2)" "| 20° | 0.0820 |" "$SIM_DOC"
+  # The bare column is the control: it never reaches `B0` at all, so a change to
+  # the bilge-keel pressure model must leave it exactly alone. It is also what
+  # showed the published table had been derived some other way, because it had
+  # moved too.
+  check "and bare at 10 deg, which no bilge-keel term can touch" 0.00196 5e-6 \
+        "$(zetarow 10.0 3)" "| 10° | 0.0476 | 0.00196 |" "$SIM_DOC"
 else
   echo "  - shipsim_tests not built, skipping the README's check count"
   skipped="$skipped shipsim_tests"

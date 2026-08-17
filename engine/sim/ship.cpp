@@ -1185,7 +1185,7 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
     // critical stand-in -- the fourth time in this file that coupling a real
     // model in has meant deleting a lumped one that was secretly doing its job.
     // zetaRoll was fitted to sit where Ikeda puts a ro-pax with bilge keels (8%
-    // of critical against a measured 6.3%), so leaving both in would not look
+    // of critical against a measured 6.1%), so leaving both in would not look
     // wrong; it would just double the damping of the mode that decides whether a
     // damaged ship capsizes.
     //

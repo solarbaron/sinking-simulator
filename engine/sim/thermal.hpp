@@ -497,9 +497,18 @@ double temperatureForElongation(double elongation);
 //     M = M_0 * 2 (sec u - 1) / u^2,     u = (pi/2) sqrt(N / N_E)
 //
 // (Timoshenko, *Theory of Elastic Stability* §1.11), with `M_0` the first-order
-// moment and `N_E` the Euler load. It is 1 at `u = 0` -- exactly, and the series
-// `1 + 5u^2/12 + ...` is what the implementation uses near zero, because
-// `(sec u - 1)/u^2` is 0/0 there and evaluating it as written loses every digit.
+// moment and `N_E` the Euler load. It is 1 at `u = 0` -- exactly, and its series
+// there is `1 + 5u^2/12 + ...`, because `(sec u - 1)/u^2` is 0/0 at the origin
+// and evaluating it as written loses every digit to cancellation nearby.
+//
+// **The implementation does not use that series**, and this said it did.
+// `beamColumnMagnifier` rewrites the whole thing as `sinc(u/2)^2 / cos u`, which
+// is the same number exactly with no subtraction in it, and `thermal.cpp` says so
+// in its own words: "No series expansion and therefore no truncation term to
+// size." Two comments on one function, describing two implementations, one of
+// which had been gone long enough that nobody could say when. Nothing tests a
+// comment; this one was wrong in the direction that invites a reader to go
+// looking for a truncation error that does not exist.
 // It diverges at `N = N_E`. **That divergence is the whole mechanism**: the fire
 // supplies `N`, the head of water supplies `M_0`, and neither on its own is what
 // fells the member.

@@ -215,8 +215,37 @@ BilgeKeel bilgeKeelDamping(const RollDampingHull& h, const Geometry& g, double a
     // regression, which the wrong choice misses by 15% and the right one by 3%.
     // tests/test_roll_damping.cpp keeps that comparison, at a tolerance tight
     // enough to catch a future flip.
+    //
+    // **`cube(m2)`, not `sqr(m2)`.** Each term of A0 and B0 is a girth times a
+    // lever, both nondimensionalised on d, so each must be degree 2 in the m's --
+    // and the elided `1`s are `d/d`, degree 1, not degree 0. Term two is degree 3
+    // over degree 1; term three is `m1` times a degree-1 lever times a degree-0
+    // ratio. Term one was degree 2 over degree 1, the only term in either integral
+    // that did not scale like the rest. That argument needs no source document.
+    //
+    // Which cube it should be does. The regression settles it: swept over Ikeda's
+    // own validated `OG/d` range and nothing else, the sectional model misses
+    // Kawahara by
+    //
+    //     sqr(m2)    3.6% at the fixture, rising monotonically to 15.6% at -1.5
+    //     cube(m2)   4.9% worst anywhere on the range, at -0.25
+    //     cube(m4)   9-15% everywhere, worst 23.7%
+    //
+    // `cube(m4)` is what a first-principles reading gives if term one is the flat
+    // bottom's integral -- pressure rising linearly with girth from the centreline,
+    // lever the horizontal offset, which lands on `m4^3/(3(H0 - 0.215 m1))` exactly
+    // the way term two's `[(1-m1)^3/3 - m2 (1-m1)^2/2]/(1 - 0.215 m1)` falls out of
+    // the side's. It is refuted: 9-15% is not a regression's scatter. So the
+    // reading is wrong, term one is not the flat bottom, and this comment does not
+    // claim to know what it is.
+    //
+    // **What the old test could not see.** It swept omega and amplitude, nine
+    // points, and held the hull at `OG/d = -0.6923`. Neither omega nor amplitude
+    // distinguishes the two readings -- `m2` contains neither -- and -0.69 is
+    // within 0.05 of where `sqr` and `cube` cross. A nine-point grid that varies
+    // only the axes the defect is constant along is a one-point grid.
     const double a0 = (m3 + m4) * m8 - sqr(m7);
-    const double b0 = sqr(m2) / (3.0 * (g.h0 - 0.215 * m1)) +
+    const double b0 = cube(m2) / (3.0 * (g.h0 - 0.215 * m1)) +
                       sqr(1.0 - m1) * (2.0 * m3 - m2) / (6.0 * (1.0 - 0.215 * m1)) +
                       m1 * (m3 * m5 + m4 * m6);
     const double integral = sqr(g.d) * (-a0 * phiCpMinus + b0 * phiCpPlus);

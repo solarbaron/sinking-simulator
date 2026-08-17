@@ -368,22 +368,67 @@ double simplifiedIkedaBilgeKeelHat(const RollDampingHull& h, double amplitudeDeg
 }
 
 void testBilgeKeelAgreesWithTheSimplifiedRegression() {
-    const RollDampingHull h = roPax();
-    for (double omega : {0.4, 0.5236, 0.7})
-        for (double deg : {5.0, 10.0, 20.0}) {
-            const double got = nondimensional(h, rollDamping(h, at(deg, omega)).bilgeKeel());
-            const double want = simplifiedIkedaBilgeKeelHat(h, deg, omega);
-            expectTrue("the regression predicts positive bilge keel damping", want > 0);
-            // The two routes agree to 0.3% at 5 degrees and 3.6% at 20 across
-            // this grid, so 6% is a band the regression's own scatter fits
-            // inside while a wrong sign or a factor-of-two anywhere in the
-            // sectional pressure model does not. Loosening it to the ~10% the
-            // regression's authors quote would let a sign error through, which
-            // was checked by flipping one and watching this test go green.
-            expectNear("sectional bilge keel damping matches Kawahara's regression at " +
-                           std::to_string(static_cast<int>(deg)) + " deg",
-                       got, want, 0.06 * want);
-        }
+    // **Swept over OG/d, because omega and amplitude cannot see the error this
+    // comparison exists to catch.** The previous version of this test held the
+    // hull at the roPax's own `OG/d = -0.6923` and swept omega and amplitude --
+    // nine points, all of them on one hull. B0's first term is a function of
+    // `m2 = OG/d` alone, so a wrong exponent on it is *constant* along both swept
+    // axes, and -0.69 happens to sit within 0.05 of where the wrong reading and
+    // the right one cross. The grid was nine points wide and one point deep, and
+    // it passed at 3.6% against a `sqr` where a `cube` belongs.
+    //
+    // Swept, that same defect reads 15.6%. Measured worst over this grid:
+    //
+    //     OG/d      -1.50  -1.25  -1.00  -0.75  -0.50  -0.25   0.00   0.20
+    //     as shipped  3.7%   1.9%   2.2%   3.1%   4.2%   4.9%   4.6%   4.0%
+    //     with sqr   15.6%  11.3%   7.6%   4.3%   2.8%   4.6%   4.6%   4.2%
+    //
+    // The range is Ikeda's own, and it is taken from `validateRollDamping` rather
+    // than written down twice: every hull below is asserted to be inside it and
+    // one just outside is asserted to be refused, so narrowing the validator
+    // without narrowing this sweep is a failure rather than a silent gap.
+    const double kOgLo = -1.5, kOgHi = 0.2;
+    auto atOg = [](double ogOverD) {
+        RollDampingHull h = roPax();
+        h.rollAxisAboveKeel = h.draft - ogOverD * h.draft;
+        return h;
+    };
+    auto complainsAboutOg = [](const RollDampingHull& hull) {
+        for (const std::string& p : validateRollDamping(hull, at(10.0, 0.5236)))
+            if (p.find("OG/draft") != std::string::npos) return true;
+        return false;
+    };
+    expectTrue("a hull just below Ikeda's OG/d range is refused", complainsAboutOg(atOg(-1.6)));
+    expectTrue("and one just above it", complainsAboutOg(atOg(0.3)));
+
+    double worst = 0;
+    for (double ogOverD : {kOgLo, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, kOgHi}) {
+        const RollDampingHull h = atOg(ogOverD);
+        expectTrue("the swept hull is inside Ikeda's OG/d range", !complainsAboutOg(h));
+        for (double omega : {0.4, 0.5236, 0.7})
+            for (double deg : {5.0, 10.0, 20.0}) {
+                const double got = nondimensional(h, rollDamping(h, at(deg, omega)).bilgeKeel());
+                const double want = simplifiedIkedaBilgeKeelHat(h, deg, omega);
+                expectTrue("the regression predicts positive bilge keel damping", want > 0);
+                // 6% is a band the regression's own scatter fits inside while a
+                // wrong sign, a wrong exponent or a factor of two anywhere in the
+                // sectional pressure model does not -- 4.9% is the worst this
+                // grid reaches, so there is one point of margin and not more.
+                // Loosening it to the ~10% the regression's authors quote would
+                // let a sign error through, which was checked by flipping one and
+                // watching this test go green; it would also let `sqr(m2)` back.
+                expectNear("sectional bilge keel damping matches Kawahara's regression at " +
+                               std::to_string(static_cast<int>(deg)) + " deg, OG/d " +
+                               std::to_string(ogOverD),
+                           got, want, 0.06 * want);
+                const double err = std::abs(got - want) / want;
+                if (err > worst) worst = err;
+            }
+    }
+    // Vacuity: two routes that agreed to the bit would be one route. The
+    // regression is a fit to the sectional model's *output*, so some daylight is
+    // the evidence they are independent implementations.
+    expectTrue("the sweep found hulls the two routes do not agree exactly on", worst > 0.02);
 }
 
 // --- Forward speed -----------------------------------------------------------

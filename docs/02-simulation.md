@@ -1325,11 +1325,11 @@ of s⁻² and destroys the Froude scale invariance that makes B44hat useful.
 
 **Measured on the reference hull** (170 × 25 × 6.5 m ro-pax, Cb 0.55, Cm 0.98,
 KG 11.0 m, 34 × 0.6 m bilge keels; T_roll 13.9 s at GM 2.0 m): viscous B44hat is
-0.0081 bare and 0.0439 with keels at ω̂ = 1.1 and 20°, i.e. 6.3% of critical
+0.0081 bare and 0.0429 with keels at ω̂ = 1.1 and 20°, i.e. 6.1% of critical
 damping at the natural roll frequency and 10° — which is where `Ship::zetaRoll`
 was guessed at 0.08. Bilge keels are 80% of the total, the eddy component
 essentially all of the rest at zero speed, and friction 1.6% at full scale
-against 8.2% for a 2 m model of the same hull (ITTC quotes 1–3% and 8–10%).
+against 8.4% for a 2 m model of the same hull (ITTC quotes 1–3% and 8–10%).
 
 **Validity limits — where this stops being trustworthy.** `validateRollDamping()`
 reports the first group; the rest cannot be detected from the parameters at all
@@ -1376,7 +1376,7 @@ of** `Ship::zetaRoll`.
 
 **Stand-ins removed, for the fourth time in this file**, and this one had a trap
 in it: `zetaRoll = 0.08` was picked to sit where Ikeda puts a ro-pax with bilge
-keels — 6.3% of critical, measured above — so leaving both in would not have
+keels — 6.1% of critical, measured above — so leaving both in would not have
 looked wrong anywhere. It would simply have doubled the damping of the mode that
 decides whether a damaged ship capsizes. The test that catches it is the log
 decrement, and it catches it by a factor of four.
@@ -1467,12 +1467,29 @@ Damping ratio at the natural roll frequency, straight from the coefficient:
 
 | roll amplitude | ζ with bilge keels | ζ bare | bilge-keel share |
 |---|---|---|---|
-| 2.5° | 0.0259 | 0.00062 | 97.6% |
-| 5° | 0.0323 | 0.00105 | 96.7% |
-| 10° | 0.0470 | 0.00193 | 95.9% |
-| 20° | 0.0810 | 0.00368 | 95.5% |
+| 2.5° | 0.0263 | 0.00062 | 97.6% |
+| 5° | 0.0327 | 0.00107 | 96.7% |
+| 10° | 0.0476 | 0.00196 | 95.9% |
+| 20° | 0.0820 | 0.00373 | 95.4% |
 
-Between 2.6% and 8.1% of critical with keels, against 0.06–0.37% bare: a factor of
+> **Correction, and the reason it took this long.** The four rows above read
+> 0.0259 / 0.0323 / 0.0470 / 0.0810 in the keeled column and 0.00105 / 0.00193 /
+> 0.00368 in the bare one. **Nothing in the repository produced them** — grepping
+> every figure in the table across `tests/`, `tools/` and `engine/` returned no
+> hits at all, so re-deriving it meant writing a driver against the library, and
+> nobody had. `test_rao.cpp` now prints it from the same decay it already runs, and
+> `check-figures.sh` gates all five columns.
+>
+> Printed, it came back about 1.5% from what was published. The `B0` correction
+> made in the same commit moves this hull by 0.2% — it is at `OG/d = −0.20`, where
+> `m₂²` and `m₂³` are nearly the same number — and the *bare* column moved too,
+> which no bilge-keel term can touch. So the table had drifted from the code by
+> something other than that change, most likely a different natural frequency or
+> inertia in whatever computed it originally. That is the whole argument for gating
+> a figure rather than measuring it once: a hand-made table cannot be wrong
+> *loudly*.
+
+Between 2.6% and 8.2% of critical with keels, against 0.06–0.37% bare: a factor of
 **22 to 42**, which is why the bilge-keel test needs no tolerance to be
 convincing. The keels dominate more here than the 50–80% Kawahara reports,
 because this hull's roll axis sits close to the waterline and the eddy component
