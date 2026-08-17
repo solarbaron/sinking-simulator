@@ -114,7 +114,20 @@ bool OffscreenRenderer::create(Device& device, std::uint32_t width, std::uint32_
     VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layoutInfo.pushConstantRangeCount = 1;
     layoutInfo.pPushConstantRanges = &push;
-    vkCreatePipelineLayout(device.handle(), &layoutInfo, nullptr, &pipelineLayout_);
+    // Checked, unlike the four siblings in `hull.cpp`, `ocean.cpp` and
+    // `smoke_gpu.cpp` which all check theirs. Nothing leaks either way -- the layout
+    // stays null and the pipeline create below fails, which unwinds through the
+    // shared path -- but the error a caller reads then says
+    // "vkCreateGraphicsPipelines failed" for a layout failure, and the pipeline
+    // create is handed an invalid handle on the way to producing it.
+    if (vkCreatePipelineLayout(device.handle(), &layoutInfo, nullptr, &pipelineLayout_) !=
+        VK_SUCCESS) {
+        error = "vkCreatePipelineLayout failed";
+        device.destroyShader(vertexModule);
+        device.destroyShader(fragmentModule);
+        destroy();
+        return false;
+    }
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

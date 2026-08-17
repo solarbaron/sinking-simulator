@@ -90,13 +90,31 @@ struct FemGpuSolver::Impl {
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(device, out.handle, &req);
         const uint32_t type = findMemoryType(req.memoryTypeBits, memoryFlags);
-        if (type == UINT32_MAX) return false;
+        // Unwound on both post-create paths, as `Device::createBuffer` does. These
+        // two copies of it dropped the buffer on the floor: `out` is a member, so
+        // the destructor reclaims it -- but it leaves a half-built `Buffer` with a
+        // live handle, null memory and zero size, which `valid()` reads as usable.
+        if (type == UINT32_MAX) {
+            vkDestroyBuffer(device, out.handle, nullptr);
+            out.handle = VK_NULL_HANDLE;
+            return false;
+        }
 
         VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         alloc.allocationSize = req.size;
         alloc.memoryTypeIndex = type;
-        if (vkAllocateMemory(device, &alloc, nullptr, &out.memory) != VK_SUCCESS) return false;
-        vkBindBufferMemory(device, out.handle, out.memory, 0);
+        if (vkAllocateMemory(device, &alloc, nullptr, &out.memory) != VK_SUCCESS) {
+            vkDestroyBuffer(device, out.handle, nullptr);
+            out.handle = VK_NULL_HANDLE;
+            return false;
+        }
+        if (vkBindBufferMemory(device, out.handle, out.memory, 0) != VK_SUCCESS) {
+            vkFreeMemory(device, out.memory, nullptr);
+            vkDestroyBuffer(device, out.handle, nullptr);
+            out.memory = VK_NULL_HANDLE;
+            out.handle = VK_NULL_HANDLE;
+            return false;
+        }
         out.size = size;
         return true;
     }
