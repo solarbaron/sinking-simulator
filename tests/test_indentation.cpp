@@ -188,8 +188,15 @@ void testEnergyToTearIsAPlausibleSizeForShipStructure() {
     // not one and not ten thousand.
     const double impact = 0.5 * 8.984e6 * 6.0 * 6.0;
     const double bays = impact / energy;
+    std::printf("     a 12 mm bay absorbs %.3e J; a 6 m/s ferry is %.0f of them\n", energy, bays);
+    // **The upper half of this used to be unreachable.** `energy > 1.0e5` two lines
+    // above forces `bays < 1617`, so `bays < 5000` could never fire and only the
+    // lower half carried information. The label says "tens to hundreds" and the
+    // comment above says "not ten thousand"; 5000 was neither. Bounded at 1000 now,
+    // which is inside what the energy assertion already implies and is therefore a
+    // statement rather than a restatement.
     expectTrue("a ferry at 6 m/s is worth tens to hundreds of bays, not one",
-               bays > 10.0 && bays < 5000.0);
+               bays > 10.0 && bays < 1000.0);
 }
 
 // --- Against a real ship -----------------------------------------------------

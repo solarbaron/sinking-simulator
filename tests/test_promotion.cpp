@@ -901,7 +901,12 @@ void testCostIsLinearInTheNumberOfZones() {
     for (int i = 0; i < 4; ++i) review = starved.review(structure, tier);
     expectTrue("a qualifying zone was found", !review.considered.empty());
     testing::expectEqual("but the budget refused it", starved.promotions(), 0);
-    expectTrue("and said so rather than silently dropping it", !review.problems.empty());
+    // Named, not merely non-empty: `promotion.cpp` has thirteen `problems.push_back`
+    // sites and any of them satisfies "not empty". These refusals were silent for
+    // 154 reviews once already, and what has to be reported is *which* refusal.
+    expectTrue("and said so rather than silently dropping it",
+               !review.problems.empty() &&
+                   review.problems.front().find("element budget") != std::string::npos);
 
     promotion::Criterion generous = tight;
     generous.elementBudget = 100000;
@@ -3719,7 +3724,9 @@ void testTheCellBudgetBindsAndTheCostIsMeasured() {
     expectTrue("both compartments qualify", review.considered.size() == 2);
     testing::expectEqual("and none is resolved under a budget of one cell",
                          static_cast<long long>(starved.active().size()), 0);
-    expectTrue("and it says so rather than dropping them silently", !review.problems.empty());
+    expectTrue("and it says so rather than dropping them silently",
+               !review.problems.empty() &&
+                   review.problems.front().find("cell budget") != std::string::npos);
 
     criterion.cellBudget = les::estimateCells(model.gas[1], criterion.grid);
     promotion::GasPromoter funded(criterion);

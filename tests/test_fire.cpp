@@ -1246,8 +1246,25 @@ void testTheUnfiredCompartmentIsClearlyDifferent() {
                    "exchanging rather than blowing one way",
                    std::abs(door->netMass()) <
                        0.8 * std::max(door->massAToB, door->massBToA));
-        expectTrue("with a neutral plane inside its own span",
-                   door->neutralPlaneZ > 1.79 && door->neutralPlaneZ < 3.81);
+        // **Against the span the flow was actually integrated over.** This read
+        // `> 1.79 && < 3.81`, two numbers that bracket the *active* span with a
+        // hair of slack -- while the label says "its own span", which reads as the
+        // vent's nominal 1.2 to 3.2. The two differ: `substep` does not merely clip
+        // a vent against the water, it **shifts** it, moving sill and soffit
+        // together when the sill would go under, and records the result in
+        // `activeSillZ`/`activeSoffitZ`. Here the door is nominally 1.2..3.2 and
+        // active over 1.8..3.8, and the neutral plane is at 3.2504 -- *above* the
+        // nominal soffit and correctly inside the active span.
+        //
+        // So the old bounds were right and their label was not, which is the worse
+        // way round: read literally the assertion claimed something false, and its
+        // upper half could not fail either way. Asserted structurally now, which
+        // needs no magic numbers and follows the vent wherever the water moves it.
+        expectTrue("with a neutral plane inside the span the flow was integrated over",
+                   door->neutralPlaneZ >= door->activeSillZ &&
+                       door->neutralPlaneZ <= door->activeSoffitZ);
+        expectTrue("and that span really is the shifted one, not the nominal",
+                   door->activeSoffitZ > door->soffitZ);
     }
 }
 
