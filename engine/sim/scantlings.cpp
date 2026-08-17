@@ -1157,6 +1157,23 @@ double ruleMinimumSectionModulus(double lengthPp, double beam, double blockCoeff
 
 // --- Validation -----------------------------------------------------------------
 
+std::vector<std::string> validateMaterial(const StructuralMaterial& m, const std::string& what) {
+    std::vector<std::string> problems;
+    if (!(m.youngsModulus > 0))
+        problems.push_back(what + " has a non-positive Young's modulus, so every elastic form"
+                                  " built from it divides by zero");
+    if (!(m.density > 0)) problems.push_back(what + " has a non-positive density");
+    if (!(m.yieldStrength > 0)) problems.push_back(what + " has a non-positive yield strength");
+    // The open interval, not a clamp: at 0.5 the bulk modulus is infinite and at -1
+    // the shear modulus is, and both arrive as a NaN two multiplications later
+    // rather than as an infinity anyone would notice.
+    if (!(m.poissonRatio > -1.0 && m.poissonRatio < 0.5))
+        problems.push_back(what + " has a Poisson ratio of " + std::to_string(m.poissonRatio) +
+                           ", which is outside (-1, 0.5) -- the bulk modulus is infinite at 0.5"
+                           " and the shear modulus at -1");
+    return problems;
+}
+
 std::vector<std::string> validateScantlings(const Scantlings& s) {
     std::vector<std::string> problems;
     if (s.frameSpacing <= 0) problems.push_back("frame spacing is not positive");
@@ -1165,6 +1182,12 @@ std::vector<std::string> validateScantlings(const Scantlings& s) {
         problems.push_back("fewer than 8 girth samples will not resolve a section");
     if (s.materials.empty()) problems.push_back("no materials are defined");
     if (s.shell.empty()) problems.push_back("no shell plating is defined");
+
+    for (std::size_t i = 0; i < s.materials.size(); ++i)
+        for (std::string& p :
+             validateMaterial(s.materials[i], "material " + std::to_string(i) + " (" +
+                                                  s.materials[i].name + ")"))
+            problems.push_back(std::move(p));
 
     const int materialCount = static_cast<int>(s.materials.size());
     const auto checkMaterial = [&](int index, const std::string& what) {

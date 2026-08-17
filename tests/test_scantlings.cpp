@@ -1633,6 +1633,42 @@ void testUnreasonableScantlingsAreReported() {
     expectTrue("the reference arrangement raises nothing",
                validateScantlings(ferryScantlings()).empty());
 
+    // **The Poisson ratio nothing anywhere checked.** Five places in this engine
+    // divide by `2(1+nu)`, `3(1-2nu)`, `(1+nu)(1-2nu)` or `12(1-nu^2)` --
+    // `plasticity.hpp`, `coupling.cpp`, `solid_shell.cpp`, `zone.cpp` and
+    // `buckling.cpp` -- and none can guard its own denominator without repeating the
+    // test five times. An incompressible 0.5 sends the bulk modulus to infinity and
+    // `isotropicFromBulkShear` turns that into a NaN modulus *and* a NaN ratio, so
+    // every softened element block comes out all-NaN rather than infinite, which is
+    // the form nobody notices.
+    for (double nu : {0.5, -1.0, 0.6, -1.2}) {
+        Scantlings bad = ferryScantlings();
+        bad.materials.front().poissonRatio = nu;
+        const std::vector<std::string> said = validateScantlings(bad);
+        expectTrue("a Poisson ratio outside (-1, 0.5) is refused", !said.empty());
+        bool named = false;
+        for (const std::string& p : said)
+            if (p.find("Poisson ratio") != std::string::npos) named = true;
+        expectTrue("and named as the Poisson ratio, not as something downstream", named);
+    }
+    // The interval is open at 0.5 and closed nowhere else worth testing: 0.499 is a
+    // real if unusual steel and must pass, or the check is a nuisance.
+    {
+        Scantlings nearly = ferryScantlings();
+        nearly.materials.front().poissonRatio = 0.499;
+        expectTrue("but 0.499 is admissible", validateScantlings(nearly).empty());
+    }
+    // And the other three fields the same validator covers.
+    for (int field = 0; field < 3; ++field) {
+        Scantlings bad = ferryScantlings();
+        StructuralMaterial& m = bad.materials.front();
+        if (field == 0) m.youngsModulus = 0.0;
+        if (field == 1) m.density = 0.0;
+        if (field == 2) m.yieldStrength = 0.0;
+        expectTrue("a non-positive modulus, density or yield is refused",
+                   !validateScantlings(bad).empty());
+    }
+
     Scantlings gap = ferryScantlings();
     // Punch a hole in the girth coverage: the side strake now starts above where
     // the bilge ends. Nothing about the thicknesses looks wrong, and the gap is

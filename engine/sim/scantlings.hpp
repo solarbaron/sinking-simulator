@@ -123,6 +123,21 @@ namespace sim {
 // entry per distinct temperature in `StructuralMesh::materials` and every consumer
 // -- `buckling`, `collapse`, `indentation`, `solid_shell` -- reaches it through the
 // material index it already uses. Nothing here needs to know.
+// **What every elastic form in this engine divides by, checked once here.** Five
+// places form `E/(2(1+nu))`, `E/(3(1-2nu))`, `E nu/((1+nu)(1-2nu))` or
+// `E/(12(1-nu^2))` -- `plasticity.hpp`, `coupling.cpp`, `solid_shell.cpp`,
+// `zone.cpp` and `buckling.cpp` -- and none of them can guard its own denominator
+// without repeating the same test five times. An incompressible `nu = 0.5` sends
+// the bulk modulus to infinity and `isotropicFromBulkShear` then returns a NaN
+// modulus *and* a NaN ratio, so every softened element block comes out all-NaN.
+//
+// The admissible open interval is the physical one: `nu` in (-1, 0.5), where the
+// shear modulus is infinite at one end and the bulk modulus at the other.
+// `validateScantlings` runs this over every material it is given; a caller building
+// a `StructuralMaterial` by hand can run it directly.
+std::vector<std::string> validateMaterial(const struct StructuralMaterial& m,
+                                          const std::string& what);
+
 struct StructuralMaterial {
     std::string name = "steel_ah36";
     double density = 7850.0;         // kg/m^3
