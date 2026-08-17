@@ -322,14 +322,26 @@ int main(int argc, char** argv) {
         // The interior first, the shell over it, the sea last: the depth test then
         // carries every one of those occlusions rather than the draw order, which is
         // the arrangement the render tests use deliberately.
+        // **Resolved once and checked, because `find` returns -1.** Narrowed to
+        // `std::uint32_t` that is 4294967295, which lands in a `R32_UINT` vertex
+        // attribute and indexes the material storage buffer on the device -- an
+        // out-of-bounds read that shows as wrong shading or a device fault, not as
+        // a crash here. `-Wall -Wextra -Wpedantic` does not warn on it; that needs
+        // `-Wsign-conversion`. `hull.cpp` resolves its paint names the careful way
+        // and returns a named error when one is missing.
+        const int interiorMaterial = library.find("rusted_steel");
+        const int seaMaterial = library.find("sea_water");
+        if (interiorMaterial < 0 || seaMaterial < 0) {
+            std::printf("the material library has no rusted_steel or sea_water\n");
+            return 1;
+        }
         scene.appendMesh(interior, R, ferry.state.position,
-                         static_cast<std::uint32_t>(library.find("rusted_steel")),
-                         gpu::HullShading{});
+                         static_cast<std::uint32_t>(interiorMaterial), gpu::HullShading{});
         if (!scene.appendShip(ferry, damagedHull, paint, library, shading, error)) {
             std::printf("scene: %s\n", error.c_str());
             return 1;
         }
-        scene.appendOcean(water, static_cast<std::uint32_t>(library.find("sea_water")));
+        scene.appendOcean(water, static_cast<std::uint32_t>(seaMaterial));
 
         const sim::Mat4 mvp =
             sim::perspective(45.0 * sim::kDegToRad, double(kWidth) / kHeight, 1.0, 900.0) *

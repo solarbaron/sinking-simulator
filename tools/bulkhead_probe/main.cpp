@@ -767,6 +767,9 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
 
         ++out.couplingSteps;
         if (verbose && (step % std::max(1, steps / 20) == 0 || step == steps - 1)) {
+            // `size() - 6` wraps to near `SIZE_MAX` on a bulkhead with fewer than
+            // six columns -- a narrower one, a different ship, or a wider spacing.
+            if (chain.column.size() < 6) continue;
             const Column& probe = chain.column[chain.column.size() - 6];
             const BeamMoment b = peakMoment(kTankTop, kBulkheadDeck, [&](double z) {
                 return kSpacing * std::max(0.0, differentialPressure(ship, aftP, erP,

@@ -259,7 +259,15 @@ int main(int argc, char** argv) {
             std::printf("scene: %s\n", error.c_str());
             return 1;
         }
-        scene.appendOcean(surface, library.find("sea_water"));
+        // `find` returns -1 and this parameter is a `std::uint32_t`, so the
+        // conversion is implicit and silent -- see `ram_view` for what 4294967295
+        // does once it reaches the shader's material lookup.
+        const int seaMaterial = library.find("sea_water");
+        if (seaMaterial < 0) {
+            std::printf("the material library has no sea_water\n");
+            return 1;
+        }
+        scene.appendOcean(surface, static_cast<std::uint32_t>(seaMaterial));
 
         // Ride alongside and slightly above, in the ship's frame.
         const sim::Vec3 offset = R * sim::Vec3{-0.9 * particulars.lengthPp,
