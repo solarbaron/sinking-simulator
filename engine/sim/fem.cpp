@@ -2,6 +2,7 @@
 #include "fem.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 namespace sim::fem {
@@ -157,8 +158,24 @@ void TetMesh::computeRestState(const Material& material) {
             adjacencyEntry[cursor[index[t * 4 + c]]++] = static_cast<uint32_t>(t) * 4 + c;
 }
 
+// **A minimum fold cannot carry a NaN, in either argument order.** This mattered
+// because a NaN node used to vanish here and `criticalTimestep` then returned an
+// entirely plausible stable step for geometry that cannot be integrated at all --
+// the shortest edge of the mesh's *finite* tets, with nothing anywhere saying the
+// rest had been dropped.
+//
+// The obvious repair is wrong, and it was tried first. `std::min(a, b)` is
+// `b < a ? b : a`, so `std::min(shortest, x)` returns `shortest` for a NaN `x`
+// (dropped) while `std::min(x, shortest)` returns `x` (carried) -- which looks like
+// the argument order fixes it. It does not: once the accumulator *is* a NaN, the
+// very next finite edge evaluates `std::min(finite, NaN)` as
+// `NaN < finite ? NaN : finite` and overwrites it. A NaN survives only if it
+// happens to be the last edge examined, which is a lottery rather than a guard.
+//
+// So the non-finite case is tested explicitly and kept out of the fold entirely.
 float TetMesh::shortestEdge() const {
     float shortest = std::numeric_limits<float>::infinity();
+    bool nonFinite = false;
     for (std::size_t t = 0; t < tetCount(); ++t) {
         const uint32_t* idx = &index[t * 4];
         for (int a = 0; a < 4; ++a)
@@ -168,10 +185,17 @@ float TetMesh::shortestEdge() const {
                     const float d = position[idx[a] * 3 + k] - position[idx[b] * 3 + k];
                     d2 += d * d;
                 }
-                shortest = std::min(shortest, std::sqrt(d2));
+                const float edge = std::sqrt(d2);
+                if (!std::isfinite(edge))
+                    nonFinite = true;
+                else
+                    shortest = std::min(shortest, edge);
             }
     }
-    return shortest;
+    // An empty mesh keeps the `+infinity` it started with, which is what
+    // `criticalTimestep` turns into its zero sentinel. A mesh with a non-finite
+    // node is a different thing and says so.
+    return nonFinite ? std::numeric_limits<float>::quiet_NaN() : shortest;
 }
 
 float TetMesh::totalMass() const {
@@ -181,7 +205,33 @@ float TetMesh::totalMass() const {
 }
 
 float criticalTimestep(const TetMesh& mesh, const Material& material, float safety) {
-    return safety * mesh.shortestEdge() / material.waveSpeed();
+    // **Zero when there is no answer, which is what the hex solver's identical
+    // function has always done.** `solidshell::criticalTimestep` ends
+    // `return std::isfinite(smallest) ? smallest : 0.0;`; this one ended with a
+    // bare division, and there are three ways to reach it without an answer:
+    //
+    //   * An empty mesh never enters `shortestEdge`'s loop, so it returns
+    //     `+infinity` and this returned `+infinity`. A caller writing
+    //     `dt = std::min(dt, criticalTimestep(...))` keeps its own `dt` unchanged
+    //     and never learns the mesh was empty -- the step it runs at is a step
+    //     nothing chose.
+    //   * A NaN node coordinate used to be **swallowed** by `shortestEdge`'s
+    //     minimum fold, so the shortest edge came back as the shortest of the
+    //     *finite* tets and this returned an entirely plausible stable timestep for
+    //     a mesh with NaN geometry. That is the bad one: the number looks right,
+    //     `stepCpu` then produces NaN everywhere, and nothing points back here.
+    //     `shortestEdge` now reports a NaN for that mesh -- see the note there for
+    //     why no argument order of `std::min` was enough -- and the guard below
+    //     turns it into the sentinel.
+    //   * `waveSpeed()` is `sqrt(E / rho)` with no guard on either. Zero density
+    //     gives `+infinity` and a step of 0; zero modulus gives 0 and a step of
+    //     `+infinity`; both zero gives NaN.
+    //
+    // Zero is the sentinel because it is the one every consumer already tests:
+    // `!(dt > 0)` catches it, and catches NaN with it, while no comparison against
+    // an infinity is false.
+    const float dt = safety * mesh.shortestEdge() / material.waveSpeed();
+    return std::isfinite(dt) && dt > 0.0f ? dt : 0.0f;
 }
 
 void stepCpu(TetMesh& mesh, const Material& material, float dt, float gravity, float damping) {

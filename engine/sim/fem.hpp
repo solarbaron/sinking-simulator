@@ -74,6 +74,12 @@ TetMesh makeBoxTetMesh(float lx, float ly, float lz, int nx, int ny, int nz);
 
 // Largest stable explicit step: the time for a dilatational wave to cross the
 // smallest element, with the usual safety factor.
+//
+// **Zero means there is no answer** -- an empty mesh, a non-finite node, or a
+// material with no wave speed -- and is the same sentinel
+// `solidshell::criticalTimestep` uses. Test it with `!(dt > 0)`, which catches a
+// NaN too; a comparison against an infinity is never false, which is what this
+// used to return for an empty mesh.
 float criticalTimestep(const TetMesh& mesh, const Material& material, float safety = 0.5f);
 
 // One explicit step. `damping` multiplies velocity each step (1.0 = undamped);

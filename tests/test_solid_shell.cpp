@@ -3170,6 +3170,65 @@ void testConstrainedSolveIsExactWhereTheConstraintIsTrue() {
     expectTrue("and says so", problem.find("prescribed") != std::string::npos);
 }
 
+// **Two `criticalTimestep` functions, and until now two contracts.**
+//
+// `solidshell::criticalTimestep` has always ended
+// `std::isfinite(smallest) ? smallest : 0.0`. `fem::criticalTimestep` computed the
+// same kind of quantity for a tet mesh, ended with a bare division, and had no test
+// anywhere in the tree -- so it answered `+infinity` for an empty mesh, and a caller
+// writing `dt = std::min(dt, criticalTimestep(...))` kept its own `dt` and never
+// learned. Zero is the sentinel because `!(dt > 0)` catches it and catches a NaN with
+// it, while **no comparison against an infinity is false**.
+//
+// The one worth the test is the NaN, because it was silent rather than absurd.
+// `TetMesh::shortestEdge` folded with `std::min(shortest, sqrt(d2))`, and
+// `std::min(a, b)` is `b < a ? b : a` -- with the accumulator *first*, `NaN < shortest`
+// is false and the NaN is dropped from the minimum. The shortest edge came back as the
+// shortest of the finite tets, and the step looked entirely reasonable for geometry
+// that cannot be integrated. This asserts the fold propagates it now, which is what
+// gives the sentinel below anything to catch.
+void testBothCriticalTimestepsShareTheirSentinel() {
+    std::printf("\n   two criticalTimestep functions, one sentinel\n");
+    const fem::Material tetSteel;
+    // `makeBoxTetMesh` lays out nodes and connectivity; `tetCount()` reads
+    // `restVolume.size()`, which stays empty until `computeRestState` runs. Without
+    // it `shortestEdge` iterates nothing and returns `+infinity` -- which is how the
+    // vacuity guard below caught this test's own setup before it caught anything else.
+    fem::TetMesh box = fem::makeBoxTetMesh(2.0f, 0.5f, 0.05f, 20, 4, 2);
+    box.computeRestState(tetSteel);
+    expectEqual("the reference mesh is the 960-tet box fem_spike's first row uses",
+                static_cast<int>(box.tetCount()), 960);
+
+    // Vacuity first: a real mesh must give a real answer, or every zero below
+    // would hold for a routine that always said zero.
+    const float good = fem::criticalTimestep(box, tetSteel, 0.5f);
+    expectTrue("a real tet mesh has a positive finite step", good > 0 && std::isfinite(good));
+    expectTrue("and its shortest edge is a real length",
+               box.shortestEdge() > 0 && std::isfinite(box.shortestEdge()));
+
+    // Empty: nothing to cross. Both solvers now answer zero rather than infinity.
+    expectNear("an empty tet mesh answers zero, not infinity",
+               fem::criticalTimestep(fem::TetMesh{}, tetSteel, 0.5f), 0.0f, 0.0f);
+    expectNear("which is what the hex solver has always answered",
+               criticalTimestep(HexMesh{}, steelMaterial(), Formulation::SolidShell, 0.5), 0.0,
+               0.0);
+
+    // A single NaN coordinate. The fold must carry it, and the sentinel must catch it.
+    fem::TetMesh poisoned = box;
+    poisoned.position[0] = std::numeric_limits<float>::quiet_NaN();
+    expectTrue("one NaN node makes the shortest edge a NaN rather than vanishing",
+               std::isnan(poisoned.shortestEdge()));
+    expectNear("so the step it feeds answers zero", fem::criticalTimestep(poisoned, tetSteel, 0.5f),
+               0.0f, 0.0f);
+
+    // A material with no wave speed divides by zero. `sqrt(E/rho)` is unguarded, so
+    // zero modulus gives a wave speed of zero and a step of +infinity.
+    fem::Material noModulus = tetSteel;
+    noModulus.youngsModulus = 0.0f;
+    expectNear("a material with no wave speed answers zero too",
+               fem::criticalTimestep(box, noModulus, 0.5f), 0.0f, 0.0f);
+}
+
 }  // namespace
 
 void runSolidShellTests() {
@@ -3204,4 +3263,5 @@ void runSolidShellTests() {
     testEnhancedBasisScalingCannotChangeTheElement();
     testDofExpansionRefusesWhatItCannotCompose();
     testConstrainedSolveIsExactWhereTheConstraintIsTrue();
+    testBothCriticalTimestepsShareTheirSentinel();
 }

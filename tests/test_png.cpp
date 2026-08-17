@@ -180,6 +180,34 @@ void testDegenerateImages() {
                    identical(column, decodedColumn));
 }
 
+// **The one failure `valid()` exists to catch, which it used to agree with.**
+// `Image(2^31, 2^31)` asks for 2^31 * 2^31 * 4 = 2^64 bytes, which is exactly 0 in
+// a `size_t`. The constructor allocates nothing; the dimensions stay 2^31; and
+// `valid()` recomputed the same wrapped product and matched the empty buffer
+// against it. `encodePng` takes `valid()` as its only size guard, so an image
+// claiming 2^31 rows of 2^31 pixels went into the encode loop with no bytes.
+void testAnOverflowingImageIsNotValid() {
+    const Image huge(1u << 31, 1u << 31);
+    expectTrue("the overflowed allocation really is empty", huge.rgba.empty());
+    expectTrue("and the dimensions really are the ones asked for",
+               huge.width == (1u << 31) && huge.height == (1u << 31));
+    expectTrue("but the image does not claim to be valid", !huge.valid());
+    expectTrue("so the encoder refuses it", core::encodePng(huge).empty());
+
+    // Controls, or every assertion above would hold for a `valid()` that always
+    // said no. The last one is the shape the check has to keep allowing: a
+    // default-constructed image is empty *and* consistent.
+    expectTrue("an ordinary image is still valid", makePattern(7, 5).valid());
+    expectTrue("a 1x1 image is still valid", Image(1, 1).valid());
+    expectTrue("and a default-constructed one is too", Image{}.valid());
+
+    // A buffer that disagrees with the dimensions must still be caught -- that is
+    // the check's day job and the rewrite must not have dropped it.
+    Image truncated(4, 4);
+    truncated.rgba.pop_back();
+    expectTrue("a short buffer is still invalid", !truncated.valid());
+}
+
 }  // namespace
 
 void runPngTests() {
@@ -190,4 +218,5 @@ void runPngTests() {
     testImageSpanningMultipleDeflateBlocks();
     testFileRoundTrip();
     testDegenerateImages();
+    testAnOverflowingImageIsNotValid();
 }

@@ -33,7 +33,24 @@ struct Image {
     Image() = default;
     Image(std::uint32_t w, std::uint32_t h) : width(w), height(h), rgba(std::size_t{w} * h * 4, 0) {}
 
-    bool valid() const { return rgba.size() == std::size_t{width} * height * 4; }
+    // **A size check must not be the constructor's own arithmetic.** This read
+    // `rgba.size() == std::size_t{width} * height * 4` -- character for character
+    // the expression the constructor allocates from -- so when that product wraps,
+    // `valid()` recomputes the identical wrapped value and agrees with the buffer
+    // built from it. `Image(1u << 31, 1u << 31)` wants 2^64 bytes, which is 0 in a
+    // `size_t`: `rgba` comes out **empty**, both dimensions stay 2^31, and this
+    // returned true. It is the one failure the function is positioned to catch and
+    // the one it could not, because a guard that recomputes the bug agrees with it.
+    //
+    // Checked by division, which cannot wrap. It matters beyond tidiness because
+    // `encodePng` uses `valid()` as its only size guard before indexing.
+    bool valid() const {
+        if (width == 0 || height == 0) return rgba.empty();
+        const std::size_t pixels = std::size_t{width} * height;
+        if (pixels / width != height) return false;                 // the product wrapped
+        if (pixels > std::size_t(-1) / 4) return false;             // and so would the * 4
+        return rgba.size() == pixels * 4;
+    }
 
     std::uint8_t* pixel(std::uint32_t x, std::uint32_t y) {
         return rgba.data() + (std::size_t{y} * width + x) * 4;
