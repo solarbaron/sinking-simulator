@@ -106,8 +106,12 @@ is a viable degradation path rather than a joke.
 > read **4.5× slow**. That is the signature of a busy GPU rather than of a moved
 > figure — a competing consumer costs a long kernel far more than a launch-bound
 > one, which is the mechanism §8 measures directly — so **nothing in this table is
-> treated as re-measured**, and nothing here is gated: `scripts/check-figures.sh`
-> reaches §8 and no other section of this file. The single-core 4.5–6.7 M range is
+> treated as re-measured**. The two count columns *are* gated now, and the three
+> clock columns deliberately are not: a run on an idle box returns 0.0079 ms/step
+> against the 0.0083 published here and 121.6 M against 116, on the same binary and
+> the same mesh, which is the spread this paragraph is about. `check-figures.sh`
+> now reaches §1, §2, §3's counts, §6 and §8 — it used to reach §8 alone, and this
+> sentence said so long after that stopped being true. The single-core 4.5–6.7 M range is
 > worse off still: `fem_spike` benchmarks one mesh size on the CPU, so even an idle
 > box would return one point of a range that has two.
 

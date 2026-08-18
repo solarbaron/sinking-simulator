@@ -356,9 +356,12 @@ fi
 # document and nothing re-derived it.
 #
 # ~90 s, nearly all of it GPU wait (6% CPU), which is why it sits behind the same
-# device check as everything else here. The deflections are a CPU closed-form
-# comparison and would run without a device, but the tool has no way to ask for §1
-# alone -- recorded as the reason rather than worked around.
+# device check as everything else here -- and **the deflections need the device
+# too**, which this said the opposite of. `fem_spike/main.cpp:104-108` builds a
+# `FemGpuSolver` inside the refinement loop and returns on failure, so the whole §1
+# table is GPU-solved; only the closed-form `beam theory:` line at `:79` is printed
+# before any device call. The tool has no way to ask for that one line, so the
+# device check stands, but the reason it stands is not the one written here.
 SPIKE=${SPIKE:-./build/fem_spike}
 if [ -x "$SPIKE" ]; then
   spike=$("$SPIKE" 2>&1)
@@ -382,6 +385,66 @@ if [ -x "$SPIKE" ]; then
           "$(err "$spike" 3840)" "| 4 | 3 840 | 0.1491 mm | 32.2% |" "$FEM_DOC"
     check "§1 8 through, error vs theory (%)"  10.8 0 \
           "$(err "$spike" 30720)" "| 8 | 30 720 | 0.1962 mm | 10.8% |" "$FEM_DOC"
+
+    # --- §2 and §3, out of the same run ------------------------------------
+    #
+    # This block parsed §1 and threw the rest of `$spike` away, while §2 and §3
+    # sat in it costing nothing. The document says at :72-74 that every other cell
+    # of both tables "comes back on `./build/fem_spike` exactly as printed, to
+    # every digit", which is the strongest possible claim to leave unchecked.
+    #
+    # **Range-restricted, and the `exit` matters.** `awk '$1 == 1'` also matches
+    # the section *title* line, because `"1."` is a numeric string to awk and
+    # compares equal to 1 -- and §4's line carries `$1 = 46080`, which collides
+    # with §3's third row. Anchoring on the section heading and stopping at the
+    # first hit is what makes each of these one number instead of several.
+    sec2() {
+      printf '%s\n' "$spike" |
+        awk -v steps="$1" -v col="$2" \
+            '/^2\. GPU kernel/ { f = 1 }
+             /^3\. Throughput/ { f = 0 }
+             f && NF == 3 && $1 == steps { print $col; exit }'
+    }
+    sec3() {
+      printf '%s\n' "$spike" |
+        awk -v tets="$1" -v col="$2" \
+            '/^3\. Throughput/ { f = 1 }
+             /^4\. Single-threaded/ { f = 0 }
+             f && NF == 5 && $1 == tets { print $col; exit }'
+    }
+
+    # §2 is a CPU-against-GPU difference and contains no wall clock at all, so
+    # every cell of it is gateable. Tolerances are the rounding the document
+    # published at -- three significant figures on the velocity column, two on
+    # the position column, where the tool prints three.
+    check "§2 1 step, RMS dv / RMS v" 1.96e-5 5e-8 "$(sec2 1 2)" \
+          "| 1 | 1.96 × 10⁻⁵ | 1.5 × 10⁻⁸ m |" "$FEM_DOC"
+    check "§2 1 step, max |dx| (m)" 1.5e-8 5e-10 "$(sec2 1 3)" \
+          "| 1 | 1.96 × 10⁻⁵ | 1.5 × 10⁻⁸ m |" "$FEM_DOC"
+    check "§2 10 steps, RMS dv / RMS v" 1.45e-4 5e-7 "$(sec2 10 2)" \
+          "| 10 | 1.45 × 10⁻⁴ | 3.0 × 10⁻⁸ m |" "$FEM_DOC"
+    check "§2 10 steps, max |dx| (m)" 3.0e-8 5e-10 "$(sec2 10 3)" \
+          "| 10 | 1.45 × 10⁻⁴ | 3.0 × 10⁻⁸ m |" "$FEM_DOC"
+    check "§2 100 steps, RMS dv / RMS v" 1.21e-3 5e-6 "$(sec2 100 2)" \
+          "| 100 | 1.21 × 10⁻³ | 2.7 × 10⁻⁷ m |" "$FEM_DOC"
+    check "§2 100 steps, max |dx| (m)" 2.7e-7 5e-9 "$(sec2 100 3)" \
+          "| 100 | 1.21 × 10⁻³ | 2.7 × 10⁻⁷ m |" "$FEM_DOC"
+    check "§2 1000 steps, RMS dv / RMS v" 4.61e-3 5e-6 "$(sec2 1000 2)" \
+          "| 1 000 | 4.61 × 10⁻³ | 6.0 × 10⁻⁷ m |" "$FEM_DOC"
+    check "§2 1000 steps, max |dx| (m)" 6.0e-7 5e-9 "$(sec2 1000 3)" \
+          "| 1 000 | 4.61 × 10⁻³ | 6.0 × 10⁻⁷ m |" "$FEM_DOC"
+
+    # **§3's two count columns and not one of its three clock columns.** The
+    # document says so itself at :100-102 -- "the two count columns re-derive; the
+    # three clock columns never have" -- and a run here confirms it: `ms/step`
+    # came back 0.0079 against a published 0.0083 and `Melem-upd/s` 121.6 against
+    # 116, on the same binary and the same mesh. The counts are pure functions of
+    # the literal `sizes[]` in `fem_spike/main.cpp`, so they carry tolerance 0.
+    for pair in "960 315" "11520 2745" "46080 10285" "230400 45225" "491520 95337"; do
+      set -- $pair
+      check "§3 $1 tets, node count" "$2" 0 "$(sec3 "$1" 2)" \
+            "| $(printf '%s' "$1" | sed -E 's/([0-9])([0-9]{3})$/\1 \2/') |" "$FEM_DOC"
+    done
   fi
 else
   echo "  - fem_spike not built, skipping §1's deflection table"
