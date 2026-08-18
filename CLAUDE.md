@@ -190,6 +190,24 @@ the two things being compared could disagree about, and check that the grid move
 it** — a wide sweep of the wrong parameter buys nothing, and it buys it while
 looking thorough.
 
+**A figure a program prints is checked by everyone who looks; a figure a person
+copied is checked by nobody.** Seven published tables were re-derived from their
+own tools in one session. The four that had drifted — the roll damping-ratio table,
+the roadmap's GM-detail rows, the hull-form convergence table, and the barge RAO
+sweep — were every one of them transcribed once by hand from a run nobody repeated,
+and two were badly out: a `none` row off by a factor of 34, and nine convergence
+percentages two to five times too large. The three that had not moved a digit —
+strip-theory radiation, propulsion and manoeuvring, hull-to-hull contact — were
+every one of them printed by a test on every run.
+
+The distinction is not the subsystem, the age of the code, or how load-bearing the
+claim is. It is whether anyone sees the number between the day it was written and
+the day it is questioned. **So the repair for a stale figure is not to correct it;
+it is to make a tool print it and then gate it** — correcting it alone puts the
+next reader in exactly the position of the last one. Four of the fixes above
+therefore added a `printf` before adding a `check`, and two of those found the
+document wrong the moment the number was printed for the first time.
+
 **And nothing gated any of it.** The two published figures that comparison was
 protecting — `B44hat = 0.0439` and `6.3% of critical`, each written down in three
 places — are not among the 346 the figure gate re-derives, because Ikeda is only

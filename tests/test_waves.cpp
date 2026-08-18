@@ -243,6 +243,12 @@ void testFrequencyBinEdgesAgainstTheClosedForm() {
         worst = std::max(worst, std::abs(bins[static_cast<std::size_t>(i)].omegaLow - want) / want);
     }
     expectTrue("Pierson-Moskowitz bin edges match exp(-1.25 (wp/w)^4) to 1e-12", worst < 1e-12);
+    // Printed because section 2 publishes it and nothing produced it. The assertion
+    // above is a bound 170x looser than the figure the document quotes, so it could
+    // not have caught the digit drifting.
+    std::printf("     PM quantile: tabulated inverse against the closed form, worst %.1e"
+                " relative over 63 interior edges at N = 64\n", worst);
+
 
     bool contiguous = true, equalEnergy = true;
     for (int i = 0; i < 64; ++i) {
@@ -321,6 +327,15 @@ void testDiscretisedSpectrumPeaksAtTp() {
                    bins[best].omegaLow <= omegaPeak && omegaPeak <= bins[best].omegaHigh);
         expectNear(label("the densest bin's period is Tp at gamma", gamma),
                    2.0 * kPi / bins[best].omega, 13.0, 0.13);
+
+        // The open-topped bin's lower edge as a multiple of omega_p, which section 2
+        // publishes for gamma 3.3 and nothing produced. Independent of Tp and Hs --
+        // `omegaLow = xLow * omegaPeak` and `xLow` is a function of gamma and N alone
+        // -- so this Tp = 13 s fixture answers for the Tp = 9 s one the document
+        // names. It is *not* independent of gamma: PM gives 2.985 and JONSWAP 3.3
+        // gives a different edge, which is why the gamma is on the line.
+        std::printf("     open bin at gamma %.1f starts at %.3f omega_p (N 64)\n", gamma,
+                    bins.back().omegaLow / omegaPeak);
     }
 }
 
@@ -351,11 +366,44 @@ void testMeanPeriodsAgainstGammaFunctions() {
     // assertion that says it is not right.
     expectNear("PM mean period T1 is 0.7718 Tp", field.meanPeriod(), meanRatio * 11.0,
                1e-8 * 11.0);
-    // The bias is +0.66% at N = 96 and halves as N doubles; 1.5% is the bound.
+    // **The bias falls as 1/sqrt(N), which is halving as N *quadruples*.** This
+    // comment and `docs/02-simulation.md` both said "halves as N doubles", and the
+    // document's own three data points refute it: +1.9% at N = 12, +0.93% at 48 and
+    // +0.33% at 384 is a factor of two for a factor of *four* in N each time, and
+    // all four points including this one fit 6.47/sqrt(N) to within a percent. The
+    // sweep below prints them, which is what makes the rate checkable at all rather
+    // than a sentence nobody could test.
     expectNear("PM zero-crossing period T2 is 0.7104 Tp", field.zeroCrossingPeriod(),
                crossRatio * 11.0, 0.015 * 11.0);
     expectTrue("T2 is biased long, not short, by the centroid discretisation",
                field.zeroCrossingPeriod() >= crossRatio * 11.0);
+
+    const double meanResidual = std::abs(field.meanPeriod() / (meanRatio * 11.0) - 1.0);
+    std::printf("     PM T1 = %.5f Tp, exact to %.1e relative at N = 96\n", meanRatio,
+                meanResidual);
+
+    // The centroid discretisation cannot represent the spread of frequencies inside
+    // one interval, so m2 is biased low and T2 comes out long. Printed unsigned and
+    // the sign asserted separately above, because a leading `+` is not something the
+    // gate's extractors admit.
+    std::printf("     PM T2 bias by component count:");
+    double previousBias = 0;
+    bool fallsWithN = true;
+    for (int frequencies : {12, 48, 96, 384}) {
+        SeaState swept;
+        swept.shape = SpectrumShape::PiersonMoskowitz;
+        swept.peakPeriod = 11.0;
+        swept.frequencyCount = frequencies;
+        swept.directionCount = 1;
+        const WaveField at(swept);
+        const double bias = 100.0 * (at.zeroCrossingPeriod() / (crossRatio * 11.0) - 1.0);
+        std::printf("  N %d %.2f%%", frequencies, bias);
+        if (previousBias > 0 && bias >= previousBias) fallsWithN = false;
+        previousBias = bias;
+    }
+    std::printf("\n");
+    expectTrue("the zero-crossing bias falls monotonically with component count",
+               fallsWithN);
 }
 
 // --- Directional spreading ---------------------------------------------------

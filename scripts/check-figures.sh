@@ -766,7 +766,7 @@ if [ -x "$TESTS" ]; then
   # gate never passes.
   suiteout=$("$TESTS" 2>&1)
   suite=$(printf '%s\n' "$suiteout" | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  expected=200810
+  expected=200811
   check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
         "$expected validation checks" "$FRONT"
   # **The roadmap publishes the same count in a different format**, and it was
@@ -777,6 +777,53 @@ if [ -x "$TESTS" ]; then
   # `$expected` so the two cannot part company.
   hint "$(printf '%s %s closed-form validation checks' \
           "${expected%???}" "${expected#${expected%???}}")" "$DOC"
+
+  # --- the spectral wave field, out of the same run --------------------------------
+  #
+  # Section 2's wave-field figures. `test_waves.cpp` printed **nothing** but its own
+  # section header, so every one of these was published and produced by no run at
+  # all -- the same condition the damping-ratio table was in. Printing them found
+  # the document wrong immediately: see the rate correction below.
+  #
+  # **Anchored on words unique to these lines.** `test_ocean.cpp:1047` prints
+  # "Hs 3 m Tp 9 s:" -- the very fixture the wave-field paragraph names -- and
+  # `runOceanTests` runs *before* `runWaveTests`, so a grep on the fixture
+  # description would take the ocean line. Worse, that block is inside
+  # `#if defined(SHIPSIM_HAS_VULKAN) && !defined(__SANITIZE_THREAD__)`, so the
+  # collision exists on a GPU box and vanishes on a headless one, and the gate would
+  # read a different number on different machines without ever saying why.
+  check "PM quantile: tabulated inverse against the closed form (relative)" 6e-15 1e-15 \
+        "$(printf '%s\n' "$suiteout" | sed -n 's/.*PM quantile:.*worst \([0-9.e+-]*\) relative.*/\1/p')" \
+        "reproduces it to 6 × 10⁻¹⁵ relative" "$SIM_DOC"
+  # gamma is on the line because the edge depends on it: PM gives 2.985 and the
+  # JONSWAP 3.3 the document names gives 2.683. It does *not* depend on Tp or Hs,
+  # which is why this Tp = 13 s fixture answers for the Tp = 9 s one published.
+  check "the open-topped bin starts at this multiple of omega_p" 2.7 0.05 \
+        "$(printf '%s\n' "$suiteout" | sed -n 's/.*open bin at gamma 3.3 starts at \([0-9.]*\) omega_p.*/\1/p')" \
+        "starts at 2.7ω_p and runs to infinity" "$SIM_DOC"
+  check "PM mean period ratio T1/Tp" 0.77177 5e-6 \
+        "$(printf '%s\n' "$suiteout" | sed -n 's/.*PM T1 = \([0-9.]*\) Tp.*/\1/p')" \
+        "T1 = 0.77177 Tp" "$SIM_DOC"
+  check "and how exactly the discretisation reproduces it (relative)" 2e-12 5e-13 \
+        "$(printf '%s\n' "$suiteout" | sed -n 's/.*Tp, exact to \([0-9.e+-]*\) relative.*/\1/p')" \
+        "2 × 10⁻¹² relative" "$SIM_DOC"
+
+  # **The zero-crossing bias, and the rate the document had wrong.** It said the
+  # bias halves as N doubles; its own three data points say otherwise, and printing
+  # the sweep settled it -- 12 to 48 is a factor of four in N for a factor of two in
+  # bias. All four fit 6.47/sqrt(N). Printed unsigned, because the document writes
+  # them signed and no extractor in this file admits a leading `+`; the sign is
+  # asserted in the test instead.
+  t2bias() {
+    printf '%s\n' "$suiteout" |
+      sed -n "s/.*PM T2 bias by component count:.*N $1 \([0-9.]*\)%.*/\1/p"
+  }
+  check "PM zero-crossing bias at N = 12 (%)" 1.92 5e-3 "$(t2bias 12)" \
+        "+1.92% at N = 12" "$SIM_DOC"
+  check "at N = 48 (%)" 0.93 5e-3 "$(t2bias 48)" "+0.93% at" "$SIM_DOC"
+  check "at N = 96 (%)" 0.66 5e-3 "$(t2bias 96)" "+0.66% at N = 96" "$SIM_DOC"
+  check "at N = 384, a quarter the bias for thirty-two times the components (%)" 0.33 5e-3 \
+        "$(t2bias 384)" "+0.33% at N = 384" "$SIM_DOC"
 
   # --- hull-to-hull contact, out of the same run ----------------------------------
   #

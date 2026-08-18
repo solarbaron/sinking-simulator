@@ -541,9 +541,19 @@ band truncation anywhere. What follows:
   2 × 10⁻¹² relative.
 - **The second moment is not**, and this is the price. One frequency cannot
   represent the spread of frequencies inside its own interval, so m2 is biased
-  low and the zero-crossing period comes out long: +1.9% at N = 12, +0.93% at
-  N = 48, +0.33% at N = 384, halving as N doubles. It is a discretisation bias,
-  not an error, and the tests assert its sign as well as its size.
+  low and the zero-crossing period comes out long: +1.92% at N = 12, +0.93% at
+  N = 48, +0.66% at N = 96 and +0.33% at N = 384 — falling as `1/sqrt(N)`, so it
+  halves as N *quadruples*. It is a discretisation bias, not an error, and the
+  tests assert its sign as well as its size.
+
+  > **Correction.** This read "halving as N doubles", and its own three data points
+  > refuted it: 12 → 48 is a factor of four in N for a factor of two in bias, and so
+  > is 96 → 384. All four values fit `6.47/sqrt(N)` to within a percent. The same
+  > wrong rate was repeated in `test_waves.cpp`'s comment beside the assertion.
+  >
+  > Nothing produced any of these numbers — `test_waves.cpp` printed only its
+  > section header — so the rate was a sentence no run could contradict. The sweep
+  > that prints them is what made it checkable, and it disagreed on the first run.
 
 Pierson–Moskowitz has an exact cumulative energy distribution,
 `exp(−1.25 (ω_p/ω)⁴)`, so the equal-energy interval edges have a closed form to
