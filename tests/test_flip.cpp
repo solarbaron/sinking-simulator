@@ -54,6 +54,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -1327,6 +1328,62 @@ void testValidation() {
     expectEqual("the solver counts the particle it could not place", s.outsideParticles(), 1);
 }
 
+// **A projection handed a NaN reported a perfect converged solve.**
+//
+// Both of `project`'s reductions were `std::max(accumulator, x)`, which returns
+// the accumulator for a NaN `x` -- the argument order decides, and this one drops
+// it. Everything followed: `rhsScale` came back as the largest *finite* cell,
+// `best` came back 0, `best > tolerance` was false so the entire CG solve was
+// skipped, and `residual_ = 0.0`, `capped_ = false`, `iterations_ = 0` were
+// reported over a velocity field that is not a number.
+//
+// In a singular region -- a fully submerged compartment, the ordinary case for
+// flooding -- one bad face is enough, and the failure is quieter still:
+// `rhsScale` is taken before `removeMean`, so it is a real positive number, and
+// then the mean subtraction spreads the NaN across every cell. The caller is left
+// with a healthy report, an all-zero pressure field, and a divergence nothing
+// removed.
+void testANaNFaceIsNotAConvergedSolve() {
+    std::printf("\n--- flip: a projection handed a NaN has not converged ---\n");
+    const int n[3] = {6, 5, 4};
+    const double h = 0.05;
+    fl::Field f;
+    f.grid.h = h;
+    for (int a = 0; a < 3; ++a) f.grid.lo[a] = 0.0;
+    for (int a = 0; a < 3; ++a) f.grid.n[a] = n[a];
+    const double lo[3] = {0, 0, 0}, hi[3] = {n[0] * h, n[1] * h, n[2] * h};
+    fl::seedBox(f, lo, hi, 2, kRhoSeawater);
+
+    fl::Params p;
+    p.projectionTolerance = 1e-14;
+    p.projectionIterations = 500;
+
+    // The control first: the same field, untouched, must converge. Without this
+    // every assertion below would hold for a solver that called everything capped.
+    fl::Solver clean;
+    clean.rebuild(f, p);
+    clean.transferToGrid(f, p);
+    expectTrue("the reference region is fully submerged", clean.singular());
+    clean.project(0.01, p);
+    expectTrue("and it converges", !clean.lastCapped());
+    expectTrue("with a finite residual", std::isfinite(clean.lastResidual()));
+
+    // One face, out of several hundred, set to a NaN.
+    fl::Solver poisoned;
+    poisoned.rebuild(f, p);
+    poisoned.transferToGrid(f, p);
+    expectTrue("the poisoned solver stores the face it is given",
+               poisoned.setFaceVelocity(0, 2, 2, 2, std::numeric_limits<double>::quiet_NaN()));
+    poisoned.project(0.01, p);
+    expectTrue("one NaN face is reported as not converged", poisoned.lastCapped());
+    expectTrue("and the residual it reports is not a number, so no threshold passes",
+               std::isnan(poisoned.lastResidual()));
+    // The specific lie: it used to report exactly zero, which reads as an exact
+    // solve rather than as a solve that never ran.
+    expectTrue("in particular it does not report a residual of zero",
+               poisoned.lastResidual() != 0.0);
+}
+
 }  // namespace
 
 void runFlipTests() {
@@ -1341,4 +1398,5 @@ void runFlipTests() {
     testMassAndBudget();
     testQuiescent();
     testValidation();
+    testANaNFaceIsNotAConvergedSolve();
 }

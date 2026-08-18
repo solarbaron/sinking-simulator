@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 namespace sim::flip {
 namespace {
@@ -802,6 +803,9 @@ void Solver::project(double dt, const Params& params) {
     const double h = grid_.h;
     const double scale = params.density * h * h / dt;
     double rhsScale = 0;
+    // Set by any non-finite right-hand side or residual seen below. It is a flag
+    // and not a count because one is already fatal to the answer.
+    bool nonFinite = false;
     for (std::size_t s = 0; s < n; ++s) {
         const std::size_t flat = static_cast<std::size_t>(fluid_[s]);
         double divergence = 0;
@@ -813,6 +817,14 @@ void Solver::project(double dt, const Params& params) {
         divergence /= h;
         rhs_[s] = -divergence * scale;
         sol_[s] = 0.0;
+        // `std::max(rhsScale, x)` is `x < rhsScale ? x : rhsScale`, so a NaN here
+        // is dropped and `rhsScale` comes back as the largest of the *finite*
+        // cells. That much is wanted, and this is deliberately **not** where the
+        // non-finite flag is raised: `res_` is a copy of `rhs_`, so
+        // `worstResidual` below sees every entry this loop could, and a second
+        // test here would be a guard no test can tell from its own absence.
+        // Written that way first and removed on the evidence -- a mutation sweep
+        // scored it a survivor, because taking it out changes nothing observable.
         rhsScale = std::max(rhsScale, std::abs(rhs_[s]));
     }
 
@@ -843,8 +855,19 @@ void Solver::project(double dt, const Params& params) {
 
     removeMean(rhs_);
     res_ = rhs_;
-    double best = 0;
-    for (std::size_t s = 0; s < n; ++s) best = std::max(best, std::abs(res_[s]));
+    // The largest |residual|, with the same NaN discipline as `rhsScale` above and
+    // for the same reason: this number decides whether the solve runs at all.
+    const auto worstResidual = [&] {
+        double worst = 0;
+        for (std::size_t s = 0; s < n; ++s) {
+            if (std::isfinite(res_[s]))
+                worst = std::max(worst, std::abs(res_[s]));
+            else
+                nonFinite = true;
+        }
+        return worst;
+    };
+    double best = worstResidual();
     const double tolerance = params.projectionTolerance * rhsScale;
     if (best > tolerance) {
         for (std::size_t s = 0; s < n; ++s)
@@ -863,8 +886,7 @@ void Solver::project(double dt, const Params& params) {
                 res_[s] -= alpha * mat_[s];
             }
             ++iterations_;
-            best = 0;
-            for (std::size_t s = 0; s < n; ++s) best = std::max(best, std::abs(res_[s]));
+            best = worstResidual();
             if (best <= tolerance) break;
             for (std::size_t s = 0; s < n; ++s)
                 pre_[s] = diag_[s] > 0 ? res_[s] / diag_[s] : 0.0;
@@ -877,8 +899,34 @@ void Solver::project(double dt, const Params& params) {
         }
     }
     removeMean(sol_);
-    residual_ = rhsScale > 0 ? best / rhsScale : 0.0;
-    capped_ = best > tolerance;
+    // **A projection that was handed a NaN has not converged, and used to say it
+    // had.** Both reductions above are `std::max(accumulator, x)`, which drops a
+    // NaN rather than carrying it, and every consequence followed from that:
+    // `rhsScale` came back 0 on an all-NaN field, `best` came back 0, `tolerance`
+    // came back 0, `best > tolerance` was `0 > 0` and **the whole CG solve was
+    // skipped**, and then `residual_` reported `0.0` and `capped_` reported
+    // `false` over zero iterations. A perfect converged solve, on a velocity field
+    // that is not a number.
+    //
+    // One NaN cell is enough, and in a singular region it is worse: `rhsScale` is
+    // taken before `removeMean`, so it is a real positive number, and then the
+    // mean subtraction spreads the NaN to every cell. The solve is skipped with a
+    // *plausible* tolerance in hand and the pressures come back all-zero and
+    // finite -- so the caller sees a healthy report, a clean field, and a
+    // divergence that was never removed.
+    //
+    // `capped_` rather than a new flag, because every consumer already asserts on
+    // it -- `test_flip.cpp` at six sites, `test_promotion.cpp` at two,
+    // `flip_probe` at one -- and "it ran out of iterations" and "it never started"
+    // are both `the answer is not trustworthy`, which is what those call sites are
+    // asking. `residual_` is NaN so that any threshold test on it fails too.
+    if (nonFinite) {
+        residual_ = std::numeric_limits<double>::quiet_NaN();
+        capped_ = true;
+    } else {
+        residual_ = rhsScale > 0 ? best / rhsScale : 0.0;
+        capped_ = best > tolerance;
+    }
 
     for (std::size_t s = 0; s < n; ++s)
         pressure_[static_cast<std::size_t>(fluid_[s])] = sol_[s];
