@@ -141,6 +141,7 @@ most useful thing to know about this codebase:
 | A correction that was itself the error: "tiles are **92%** of the footprint" computed at the estimator's 1000 particles/m³, in the same comment block that had just established byte claims must use the solver's real 64 000/m³. At the real density tiles are **10%** and the line it "corrected" was right | an audit asking which claims in the subsystem nothing measures — the contradiction was two paragraphs apart in one entry, written in one sitting |
 | `flip::Particle` documented as "~80 bytes" in a comment that **itemises the sixteen doubles adding to 128** — every megabyte figure in the tier was built on it | `sizeof`, once someone asked. The parenthesis had contradicted itself since it was written |
 | `coreSecondsPerElement = 4.0` in `promotion.hpp`, citing as its source the `zone.hpp` paragraph that names 4.0 as the pre-`cacheRestForms` figure and says "every figure below that predates it is **2.4x pessimistic**" | asking whether the tier's *two* cost estimators agree. They stood 2.35× apart, `zone_probe` printed both on the same run, and nobody had read them side by side |
+| Ikeda's `B0` carrying `m2^2` where every other term in it and in `A0` is degree 2 — a girth times a lever, both over `d` — so the one term setting the bilge keels' hull-pressure damping did not scale like the rest | sweeping `OG/d`, the *only* input the two readings differ in. The check that was there swept frequency and amplitude, nine points, and held the hull at the one `OG/d` where the wrong reading sits within 0.05 of the right one: 3.6% agreement there, **15.6%** at the edge of the same validated range |
 
 **Two estimators for one quantity will disagree, and printing both is not
 comparing them.** Three separate instances here: the water tier's particle and
@@ -175,6 +176,70 @@ sequence decide one thing, they need the same notion of "on the boundary".
 **Writing a lesson down does not make it learned.** The rigid-body threshold above
 is the second time that mistake was made in this repo — the first was recorded, in
 this table, by the work that immediately preceded it.
+
+**A grid that sweeps only the axes a defect is constant along is a one-point
+grid.** `testBilgeKeelAgreesWithTheSimplifiedRegression` compared Ikeda's sectional
+bilge-keel model against Kawahara's independent regression at nine points — three
+frequencies by three amplitudes — and passed at 3.6% against a 6% band for as long
+as it existed. The term it was pointed at is a function of `OG/d` alone. Neither
+swept axis appears in it, so the nine points were nine copies of one point, and the
+single hull they were taken on sits within 0.05 of where the wrong reading and the
+right one cross. Swept over the *validated range of that one parameter* and nothing
+else, the same defect reads 15.6%. **Before trusting a comparison, ask which input
+the two things being compared could disagree about, and check that the grid moves
+it** — a wide sweep of the wrong parameter buys nothing, and it buys it while
+looking thorough.
+
+**And nothing gated any of it.** The two published figures that comparison was
+protecting — `B44hat = 0.0439` and `6.3% of critical`, each written down in three
+places — are not among the 346 the figure gate re-derives, because Ikeda is only
+ever reached through `shipsim --bilge-keels=`, a flag `check-figures.sh` never
+passes. A whole validated subsystem, fifteen published numbers, and not one run in
+the gate that constructs a `RollDampingHull` at all. This is the README hole again
+in a different place: coverage counted as a total rises without arriving anywhere
+in particular, and **the way to see it is to ask which flags the gate never passes**,
+not how many checks it has.
+
+**"Restore *and* rebuild" is not enough if the restore moves the mtime
+backwards.** The harness that produced the kills above did call rebuild after each
+mutant, and the tree still came back **not green**. The restore was
+`shutil.move(f + '.bak', f)` — a rename, which carries the backup's *own* mtime,
+taken before the mutant was compiled. `ninja` compared that against an object file
+built from the mutant, called it up to date, and did nothing; the source read clean
+and the binary kept the mutant. The damage was not to the mutant that caused it but
+to the *next* one in a different file, which then ran with two mutations live and
+scored a kill that was partly somebody else's. `touch` the file after restoring, or
+copy the contents back instead of renaming, and assert the tree is green after each
+restore rather than only at the end. This is the same trapdoor the paragraph above
+describes, reached through the clock instead of through a missing call — and it was
+written by someone who had just read that paragraph.
+
+**`cmd | tail -20` reports the exit status of `tail`.** The sanitize gate above was
+launched as `./scripts/verify.sh sanitize 2>&1 | tail -20` and run in the
+background. It came back **exit 0**, and its last line was
+`✗ 1 failure(s) in 4322s`. A pipeline's status is its *last* stage, so the harness
+recorded a passing run of `tail` and the gate's own verdict reached nobody — and
+because `tail` keeps only the end, every line identifying *which* check failed was
+discarded at the same time. Two losses from one pipe: the status, and the evidence.
+`verify.sh`'s own step logs are `mktemp`'d and cleaned up, so there was nothing to
+go back to. Redirect to a file and read the file; if a pipeline is unavoidable, set
+`pipefail`. This is the fourth shape of the same defect in one session — the
+reporter that only sees expected failures, the `grep FAIL` that scored a segfault
+as a survivor, the waiter below that matched itself, and now a status that was
+never the gate's.
+
+**A waiter whose predicate matches its own command line never fires.** Seven
+background waiters had been armed across a session as
+`until ! pgrep -f "verify.sh sanitize"; do sleep 20; done`. `pgrep -f` matches the
+whole command line, and each waiter's own command line contains that literal
+string, so every one of them matched itself, the condition was permanently false,
+and none could ever fire — one had been spinning for over a day. The tell was
+`pgrep -c -f 'verify.sh sanitize'` returning **8** with exactly one gate running.
+Wait on the pid, which cannot self-match: `while kill -0 "$pid"; do sleep 30; done`.
+This is the same shape as the reporters above — a detector that includes itself in
+what it detects — and it survived seven arming attempts because its failure mode is
+*silence*, which is exactly what a waiter looks like when the thing it waits for has
+not happened yet.
 
 **A gate reads the tree and the build directory for its whole duration, so
 editing either while one runs produces a failure that is yours and looks like the

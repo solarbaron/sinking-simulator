@@ -785,6 +785,63 @@ if [ -x "$SHIPSIM" ]; then
         "a **6.6 mm** layer" "$FRONT"
   check "the vehicle deck's mean breadth (m)" \
         18.684 5e-4 "$(detail layer_breadth_m)" "mean** breadth of 18.684 m" "$FRONT"
+
+  # **`06-roadmap.md` publishes the same measurement for all three scenarios and
+  # none of it was gated.** The `full` row was already known to be wrong: this
+  # block has checked the README's copy since `--gm-detail` existed, and
+  # `README.md` names 6.8e-4 rad in its own prose as the superseded value, while
+  # the roadmap still carried 6.8e-4 along with the two GM figures that moved with
+  # it. One document held the correction and the other held the figure it
+  # corrected, for as long as the gate was pointed at one file.
+  #
+  # `doors` had drifted 2.8%. **`none` had drifted by a factor of 34** -- 119 t to
+  # 4025 t, a 6.9 cm layer to 2.34 m -- which is not drift so much as a different
+  # ship: it predates authoring the mid wing tanks. The verdict column never
+  # changed, so nothing about the row looked wrong.
+  #
+  # Two extra runs, ~150 s. The alternative was adding `--gm-detail` to the three
+  # scenario runs this script already makes, which would have been free; it is not
+  # done because those runs feed four positional parsers apiece and a misparse
+  # bought with saved seconds is the worst trade on offer here.
+  for scen in none doors; do
+    sd=$("$SHIPSIM" --scenario=$scen --duration=1800 --gm-detail 2>/dev/null)
+    sdetail() { printf '%s\n' "$sd" | sed -n "s/^gm-detail: $1 \(.*\)$/\1/p"; }
+    case "$scen" in
+      none)  want_w=4025; want_l=2.34; want_p=0.245; want_f=-2.234; want_c=-2.234 ;;
+      doors) want_w=3950; want_l=2.29; want_p=0.241; want_f=-2.475; want_c=-2.475 ;;
+    esac
+    # **The pointer carries the figures, not just the row label.** `| \`none\`` on
+    # its own also matches the superseded table in the correction block right
+    # below, so it would go on passing while the live row was edited -- a pointer
+    # narrower than the thing it stands for, which this file already warns about
+    # for the dedup key at :154.
+    case "$scen" in
+      none)  row='| 4025 t | 2.34 m | 0.245 rad  | −2.234 m |' ;;
+      doors) row='| 3950 t | 2.29 m | 0.241 rad  | −2.475 m |' ;;
+    esac
+    check "'$scen': water on the vehicle deck (t)" "$want_w" 1 "$(sdetail layer_water_t)" \
+          "$row" "$DOC"
+    check "'$scen': the layer's depth (m)" "$want_l" 5e-3 "$(sdetail layer_depth_m)" \
+          "$row" "$DOC"
+    check "'$scen': the angle it pockets at (rad)" "$want_p" 5e-4 \
+          "$(sdetail pockets_at_rad)" "$row" "$DOC"
+    # These two are the point of the row: with the deck this deeply flooded there
+    # is no free surface left to pocket, so the fixed-angle sample and the
+    # converged value agree to under a millimetre. On `full` they do not agree at
+    # all, which is the finding the table exists to carry.
+    check "'$scen': GM at a fixed +-0.03 rad (m)" "$want_f" 5e-4 \
+          "$(sdetail gm_at_fixed_0.03rad_m)" "$row" "$DOC"
+    check "'$scen': and the converged GM (m)" "$want_c" 5e-4 "$(sdetail gm_converged_m)" \
+          "$row" "$DOC"
+  done
+  # `full`'s roadmap copy, from the run already made above.
+  fullrow='| 6.6 mm | 7.07e-4 rad | **+1.38 m** | **−3.23 m** |'
+  check "'full': the roadmap's copy of the layer depth (mm)" 6.6005 5e-4 \
+        "$(awk -v d="$(detail layer_depth_m)" 'BEGIN{print d*1000}')" "$fullrow" "$DOC"
+  check "'full': the roadmap's copy of the pocketing angle (rad)" 7.0655e-4 5e-8 \
+        "$(detail pockets_at_rad)" "$fullrow" "$DOC"
+  check "'full': the roadmap's copy of the converged GM (m)" -3.2350 5e-4 \
+        "$(detail gm_converged_m)" "$fullrow" "$DOC"
 else
   echo "  - shipsim not built, skipping the README's GM-detail figures"
   skipped="$skipped shipsim-gmdetail"
@@ -909,8 +966,18 @@ if [ -x "$RAM" ]; then
     skipped="$skipped ram_view-scene"
   else
     scene=$(printf '%s\n' "$drawn" | sed -n 's/^ *[0-9]* vertices, \([0-9]*\) triangles, gpu.*/\1/p')
-    check "triangles in the drawn scene: hull, interior and sea" 28019 0 "$scene" \
+    # **`06-roadmap.md` publishes the same count and nothing re-derived it.** It
+    # read 27 631 -- the value `03-renderer-audio.md` names, in prose, as the one
+    # superseded when the mid wing tanks were authored and added 388 triangles to
+    # this frame. One document carried the correction and the other carried the
+    # figure it corrected, for as long as the gate was pointed at one spelling in
+    # one file. Derived from the same literal so the two cannot part company, the
+    # way the suite count at :660 is.
+    sceneWant=28019
+    check "triangles in the drawn scene: hull, interior and sea" "$sceneWant" 0 "$scene" \
           "28 019 triangles" "$RENDER_DOC"
+    hint "$(printf '%s %s triangles at 1280' \
+            "${sceneWant%???}" "${sceneWant#${sceneWant%???}}")" "$DOC"
   fi
 else
   echo "  - ram_view not built, skipping the collision-milestone figures"

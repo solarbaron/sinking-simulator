@@ -599,7 +599,7 @@ The longest and highest-risk phase.
   **And it draws.** `ram_view --frames=N --out=DIR` writes the flooding sequence
   with the damage in it: plating dished in, the torn bays cut out as holes with the
   ferry's own compartment meshes visible through them, and exposed metal round
-  their edges. 27 631 triangles at 1280 × 720, 0.15 ms of GPU. The dent's *shape*
+  their edges. 28 019 triangles at 1280 × 720, 0.15 ms of GPU. The dent's *shape*
   is the membrane model's own tent kinematics, stated in the tool rather than
   implied — `indentation.hpp` reports a depth and a torn set and not a surface —
   and `gpu::HullDamage::addZone` takes the zone's displaced nodes instead when a
@@ -917,9 +917,36 @@ should be honest about that.
 
   | scenario | water on the deck | layer | pockets at | GM at ±0.03 | converged GM | verdict |
   |---|---|---|---|---|---|---|
-  | `none`  | 119 t  | 6.9 cm | 7.4e-3 rad | −0.62 m | **−3.01 m** | LOST, unchanged |
-  | `doors` | 3842 t | 2.23 m | 0.234 rad  | −2.51 m | **−2.51 m** | LOST, unchanged |
-  | `full`  | 11 t   | 6.4 mm | 6.8e-4 rad | **+1.37 m** | **−3.30 m** | **SURVIVED → LOST** |
+  | `none`  | 4025 t | 2.34 m | 0.245 rad  | −2.234 m | **−2.234 m** | LOST, unchanged |
+  | `doors` | 3950 t | 2.29 m | 0.241 rad  | −2.475 m | **−2.475 m** | LOST, unchanged |
+  | `full`  | 11 t   | 6.6 mm | 7.07e-4 rad | **+1.38 m** | **−3.23 m** | **SURVIVED → LOST** |
+
+  > **Correction, and the `none` row was out by a factor of 34.** Every cell above
+  > has been re-derived from `shipsim --scenario=… --duration=1800 --gm-detail` and
+  > all three rows are now gated. What they read before:
+  >
+  > | `none` | 119 t | 6.9 cm | 7.4e-3 rad | −0.62 m | −3.01 m |
+  > | `doors` | 3842 t | 2.23 m | 0.234 rad | −2.51 m | −2.51 m |
+  > | `full` | 11 t | 6.4 mm | 6.8e-4 rad | +1.37 m | −3.30 m |
+  >
+  > The `full` row was **already known to be wrong**: `README.md` publishes the same
+  > measurement, has been gated since `--gm-detail` existed, and names 6.8e-4 rad in
+  > its own prose as the superseded value — it came off the deck's *nominal*
+  > 100 × 19 m rather than the 18.684 m mean breadth the ship carries. One document
+  > carried the correction and this one carried the figure it corrected, because the
+  > gate was pointed at one file.
+  >
+  > `doors` had drifted 2.8%. `none` had drifted from 119 t to 4025 t and from a
+  > 6.9 cm layer to 2.34 m, which is not drift so much as a different ship: it
+  > predates authoring the mid wing tanks, the defect that had 41% of a ram
+  > amidships tearing open onto no compartment at all. The verdict never changed, so
+  > nothing looked wrong.
+  >
+  > The two `GM` columns are printed to three decimals for `none` and `doors`
+  > because that is the point of those rows: with the deck this deeply flooded there
+  > is no free surface left to pocket, so the fixed-angle sample and the converged
+  > value agree to under a millimetre. On `full` they do not agree at all, and that
+  > is the finding.
 
   `full` is the *successful* damage-control response — every action taken, 1442 t
   aboard, 7.2° of heel — and it has been reporting "SURVIVED but the deck edge is
