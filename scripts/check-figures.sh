@@ -778,6 +778,70 @@ if [ -x "$TESTS" ]; then
   hint "$(printf '%s %s closed-form validation checks' \
           "${expected%???}" "${expected#${expected%???}}")" "$DOC"
 
+  # --- propulsion and manoeuvring, out of the same run ----------------------------
+  #
+  # All eight rows of section 7's "Measured behaviour" table. Six were printed by
+  # `test_propulsion.cpp` already; the two bollard coefficients were computed and
+  # then only *bracketed against the published B4-70 reference* -- 0.35 +- 0.03 and
+  # 0.49 +- 0.04 -- so the model's own 0.347 and 0.493, which are what the table
+  # publishes, appeared nowhere a reader or a gate could see them. A bracket around
+  # a reference is not a check that the model still produces what the document says.
+  #
+  # The section's own caveat is left standing and is worth repeating: the MMG
+  # coefficient set "was transcribed from the MMG standard-method literature and
+  # has not been checked against a primary source in this worktree". These checks
+  # say the model has not drifted from its own published figures. They say nothing
+  # about whether those figures are right.
+  boll=$(printf '%s\n' "$suiteout" | grep -m1 'bollard K_T')
+  eta=$(printf '%s\n' "$suiteout" | grep -m1 'open-water peak eta')
+  turn=$(printf '%s\n' "$suiteout" | grep -m1 '35 deg turn:')
+  turn2=$(printf '%s\n' "$suiteout" | grep -m1 '20 deg: R =')
+
+  check "bollard K_T at P/D 1.0, A_E/A_0 0.70" 0.347 5e-4 \
+        "$(printf '%s\n' "$boll" | sed -n 's/.*bollard K_T \([0-9.]*\),.*/\1/p')" \
+        "| 0.347 |" "$SIM_DOC"
+  check "bollard 10 K_Q, same" 0.493 5e-4 \
+        "$(printf '%s\n' "$boll" | sed -n 's/.*10 K_Q \([0-9.]*\),.*/\1/p')" \
+        "| 0.493 |" "$SIM_DOC"
+  check "zero-thrust advance ratio" 0.849 5e-4 \
+        "$(printf '%s\n' "$boll" | sed -n 's/.*zero thrust at J \([0-9.]*\).*/\1/p')" \
+        "| 0.849 |" "$SIM_DOC"
+  check "peak open-water efficiency" 0.672 5e-4 \
+        "$(printf '%s\n' "$eta" | sed -n 's/.*peak eta = \([0-9.]*\) at.*/\1/p')" \
+        "| 0.672 at J = 0.710 |" "$SIM_DOC"
+  check "and the advance ratio it peaks at" 0.710 5e-4 \
+        "$(printf '%s\n' "$eta" | sed -n 's/.*at J = \([0-9.]*\) (zero.*/\1/p')" \
+        "| 0.672 at J = 0.710 |" "$SIM_DOC"
+
+  # The turning circle, which is the whole point of having a manoeuvring model.
+  check "steady turning radius at 35 deg rudder (m)" 360 0.5 \
+        "$(printf '%s\n' "$turn" | sed -n 's/.*R=\([0-9.]*\) m =.*/\1/p')" \
+        "| 1.13 L (360 m) |" "$SIM_DOC"
+  check "the same as a multiple of Lpp" 1.13 5e-3 \
+        "$(printf '%s\n' "$turn" | sed -n 's/.*m = \([0-9.]*\) L.*/\1/p')" \
+        "| 1.13 L (360 m) |" "$SIM_DOC"
+  check "drift angle at 35 deg (deg)" 19.4 0.05 \
+        "$(printf '%s\n' "$turn" | sed -n 's/.*drift=-\([0-9.]*\) deg.*/\1/p')" \
+        "| 19.4° |" "$SIM_DOC"
+  # Not printed as a percentage anywhere, so it is derived here from the two speeds
+  # on the same line rather than from a second run. **The model's figure is 40.6 and
+  # the table publishes 41**, so this check prints a different number from the one
+  # in the document by design: the expectation is the published value and the
+  # tolerance is the whole percent it was published at, which is the rule the rest
+  # of this file follows.
+  check "speed retained at 35 deg (% of approach)" 41 0.5 \
+        "$(printf '%s\n' "$turn" |
+           awk '{ for (i = 1; i <= NF; ++i) { if ($i == "approach") a = $(i+1)
+                                              if ($i ~ /^U=/) { u = $i; sub(/^U=/, "", u) } }
+                  if (a > 0) printf "%.1f", 100 * u / a }')" \
+        "| 41 % |" "$SIM_DOC"
+  check "steady turning radius at 20 deg (L)" 1.76 5e-3 \
+        "$(printf '%s\n' "$turn2" | sed -n 's/.*20 deg: R = \([0-9.]*\) L.*/\1/p')" \
+        "| 1.76 L / 2.73 L |" "$SIM_DOC"
+  check "and at 10 deg (L)" 2.73 5e-3 \
+        "$(printf '%s\n' "$turn2" | sed -n 's/.*10 deg: R = \([0-9.]*\) L.*/\1/p')" \
+        "| 1.76 L / 2.73 L |" "$SIM_DOC"
+
   # --- strip-theory radiation, out of the same run --------------------------------
   #
   # Twelve of the thirteen rows of section 2's "What was measured" table, every one

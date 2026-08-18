@@ -132,6 +132,15 @@ void testBollardPullAndMonotonicity() {
                10.0 * propellerTorqueCoefficient(p, 0.0), 0.49, 0.04);
     expectNear("zero-thrust J matches the B4-70 value", j0, 0.85, 0.05);
 
+    // **Printed as well as bracketed.** The three assertions above are against the
+    // *published* B4-70 values with the band the calibration was fitted to; the
+    // model's own figures -- which is what section 7's table publishes -- were not
+    // written anywhere a reader or a gate could see them. A bracket around a
+    // reference is not a check that the model still produces what the document
+    // says it produces.
+    std::printf("     bollard K_T %.3f, 10 K_Q %.3f, zero thrust at J %.3f\n", bollard,
+                10.0 * propellerTorqueCoefficient(p, 0.0), j0);
+
     // More pitch must buy more top-end and more bollard torque.
     PropellerParams coarse = p;
     coarse.pitchRatio = 1.3;
