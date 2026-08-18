@@ -1094,7 +1094,7 @@ struct Assembly {
 // node pair carries one thickness direction where a corner has two -- so it **ties**
 // them instead, through `Attachment::constrained`. The consequence for this file is
 // worth knowing before reducing one: untied, the section's lowest fixed-interface
-// frequency is its *decks*' own, 0.7785 Hz on that hold against 1.6999 Hz for the
+// frequency is its *decks*' own, 0.7785 Hz on that hold against 1.6980 Hz for the
 // shell alone, and the 20 Hz `cutoffFrequency` below then asks for 178 modes, takes
 // 275 s and does not converge. Tied it is 2.3026 Hz, which is above both pieces, and
 // the interior band goes 125 to 455. Guyan is exactly right at the interface either
@@ -1102,7 +1102,7 @@ struct Assembly {
 //
 // (The figure here read **3.46 Hz** for the shell alone until the tool that
 // `docs/02-simulation.md` §3 says produced it was re-run. No combination of
-// subdivision or member setting reproduces it; the run gives 1.6999 Hz with the
+// subdivision or member setting reproduces it; the run gives 1.6980 Hz with the
 // stiffeners and 0.1524 Hz without. Nothing tests a comment, and this file's own
 // table of what has gone wrong here records that lesson twice already.)
 Assembly assemble(const Reduction& a, const Reduction& b, const InterfaceMap& map);

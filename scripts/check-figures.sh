@@ -1267,6 +1267,85 @@ if [ -x "$SECTION" ]; then
         "$(field "$open" tiedEdges)" "9.6 m of 134.4" "$SECTION_DOC"
   check "ferry chain of 2 with the line ties off, GJ" -0.03334 0.0005 \
         "$(field "$open" GJrel)" "9.6 m of 134.4 | −3.334%" "$SECTION_DOC"
+
+  # --- the modes, the tie and the refinement, which the flags above switch off ----
+  #
+  # **This gate ran `section_probe` and passed the flags that disable the stages
+  # producing the figures.** `--sweep=0` skips the refinement sweep and
+  # `--no-reduce` skips the substructure, so four document sections that the tool
+  # names itself as the source of -- the Tier-1 mesher, the junction tie, the
+  # Craig-Bampton reduction and the resolution table, 400-odd digit-carrying lines
+  # between them -- had between zero and one gated figure each. The tool's own
+  # header says "Every *ship-scale* figure `docs/02-simulation.md` section 3
+  # publishes about the section mesher comes out of this program".
+  #
+  # It cost a figure while nobody was looking. `02-simulation.md` carries a
+  # **Correction** recording that the shell-alone frequency read 3.4600 Hz until the
+  # tool was re-run, ending "this is the fourth time that has cost this repository a
+  # published number". The value that correction installed, 1.6999 Hz, was written
+  # into seven places and gated in none, and it has since moved to 1.6980 -- a fifth
+  # time, to the figure the correction itself put there.
+  #
+  # The exact inertia count the document cites as what makes these frequencies
+  # trustworthy cannot catch that: it brackets the shell mode between 10.5619 and
+  # 10.7753 rad/s, a window 2% wide, and both values sit inside it. A bracket that
+  # proves a mode exists is not a check that it has not moved.
+  #
+  # 103 s, and every physics figure in it is bit-identical across runs -- two runs
+  # diff only in `meshed in`, `solve s` and `reduce s` -- so these carry tolerance 0
+  # except where the document rounds. The three wall-clock columns are not gated,
+  # for the reason the rest of this file gives.
+  sweep=$("$SECTION" --sweep=2 2>&1)
+  cbmode() {
+    printf '%s\n' "$sweep" |
+      awk -v p="$1" 'index($0, "  " p) == 1 { getline
+                     if (match($0, /= [0-9.]+ Hz/)) { print substr($0, RSTART + 2, RLENGTH - 5); exit } }'
+  }
+  resrow() {
+    printf '%s\n' "$sweep" |
+      awk -v s="$1" -v c="$2" '/=== resolution:/ { f = 1 } /^ok$/ { f = 0 }
+                               f && NF == 8 && $1 == s { print $c; exit }'
+  }
+  tierow() {
+    printf '%s\n' "$sweep" |
+      awk -v r="$1" -v c="$2" '/=== the junction tie:/ { f = 1 } /=== resolution:/ { f = 0 }
+                               f && $1 == r { print $c; exit }'
+  }
+
+  # The five fixed-interface frequencies, and the two that matter most are the ones
+  # the paragraph turns on: the decks alone are the softest thing in the section,
+  # and tying the junctions lifts the whole above *both* pieces.
+  check "shell alone, first fixed-interface mode (Hz)" 1.6980 5e-5 "$(cbmode 'shell only')" \
+        "the shell on its own is **1.6980 Hz**" "$SECTION_DOC"
+  check "decks alone, first fixed-interface mode (Hz)" 0.7785 5e-5 "$(cbmode 'decks only')" \
+        "decks *on their own* are" "$SECTION_DOC"
+  check "the untied whole, which the decks set" 0.7785 5e-5 "$(cbmode 'whole, untied')" \
+        "first fixed-interface mode is **0.7785 Hz**" "$SECTION_DOC"
+  check "and tied, above both pieces" 2.3026 5e-5 "$(cbmode 'whole, tied')" \
+        "the same section is **2.3026 Hz**" "$SECTION_DOC"
+
+  # The junction tie, cut against tied. `GJ` is the figure the tie exists for.
+  check "cut section: half-bandwidth" 146 0 "$(tierow cut 2)" "| cut" "$SECTION_DOC"
+  check "cut section: components" 7 0 "$(tierow cut 3)" "| cut" "$SECTION_DOC"
+  check "cut section: GJ (N m^2)" 3.6164e12 5e8 "$(tierow cut 7)" "3.6164e12" "$SECTION_DOC"
+  check "tied section: half-bandwidth" 1520 0 "$(tierow tied 2)" "| tied" "$SECTION_DOC"
+  check "tied section: components" 1 0 "$(tierow tied 3)" "| tied" "$SECTION_DOC"
+  check "tied section: edge joined (m)" 309.6 0.05 "$(tierow tied 4)" "309.6" "$SECTION_DOC"
+  check "tied section: A_eff (m^2)" 1.73266 5e-6 "$(tierow tied 5)" "**1.73266**" "$SECTION_DOC"
+  check "tied section: GJ (N m^2)" 5.2387e12 5e8 "$(tierow tied 7)" "5.2387e12" "$SECTION_DOC"
+
+  # The resolution table, whose own Correction block records that it had drifted
+  # from the program it names and that "no gate re-runs" it. Subdivisions 3 and 4
+  # are 13 s and 38 s of solve on top and are left out; a drifted mesher shows in
+  # the first row.
+  check "resolution sub 1: elements" 2068 0 "$(resrow 1 2)" "| 1 | 2 068 |" "$SECTION_DOC"
+  check "resolution sub 1: A_eff (m^2)" 1.72945 5e-6 "$(resrow 1 4)" "| 1 | 2 068 |" "$SECTION_DOC"
+  check "resolution sub 1: z_na (m)" 6.86238 5e-6 "$(resrow 1 5)" "| 1 | 2 068 |" "$SECTION_DOC"
+  check "resolution sub 1: I_eff (m^4)" 43.8169 5e-5 "$(resrow 1 6)" "| 1 | 2 068 |" "$SECTION_DOC"
+  check "resolution sub 2: elements" 8272 0 "$(resrow 2 2)" "| 2 | 8 272 |" "$SECTION_DOC"
+  check "resolution sub 2: A_eff (m^2)" 1.73081 5e-6 "$(resrow 2 4)" "| 2 | 8 272 |" "$SECTION_DOC"
+  check "resolution sub 2: z_na (m)" 6.85933 5e-6 "$(resrow 2 5)" "| 2 | 8 272 |" "$SECTION_DOC"
+  check "resolution sub 2: I_eff (m^4)" 43.8598 5e-5 "$(resrow 2 6)" "| 2 | 8 272 |" "$SECTION_DOC"
 else
   echo "  - section_probe not built, skipping the reach figures"
   skipped="$skipped section_probe"
@@ -1679,10 +1758,34 @@ if [ -x "$JOBS" ]; then
 
     # **And that the tuner lands in the plateau**, which is the claim §123-129
     # makes and is a relation rather than a millisecond.
+    #
+    # **1.40, and 1.15 was inside the noise.** This is not a ratio between two
+    # timings of the same thing, which is the form this repo trusts. It is a
+    # *single* timed run of the tuner's grain over the **minimum of eight** swept
+    # timings, and a minimum over eight noisy samples is biased low -- so the ratio
+    # sits above 1 even when the tuner is perfect, and the bias grows with the
+    # noise. Measured, fifteen runs on an idle box:
+    #
+    #     ratio8   0.969 .. 1.125   (four of fifteen above 1.07)
+    #     ratio23  0.940 .. 1.028
+    #
+    # against a bound of 1.15. It went red at **1.282** inside a gate run, which is
+    # the only sample taken under the load a gate actually runs at. The check three
+    # lines above this one warns in those words that "a gate set at the claim with
+    # 5% of headroom is a tripwire that goes red on a correct build"; this one was
+    # set at 2.6% of headroom from a quiet-box sample.
+    #
+    # **There is real separation to aim at.** The tuner is deterministic -- grain
+    # 26040 and 11574, 768 and 1728 chunks, on every one of twenty runs, and those
+    # counts are gated exactly a few lines up, which is the structural half of this
+    # claim. For the timing half, the nearest genuinely wrong landing is the
+    # neighbouring swept row: 256 chunks costs 7.96 ms against the plateau's 5.31,
+    # a ratio of **1.50**. Everything further off is 5.6x or worse. So 1.40 sits
+    # above the loaded noise and below the cheapest real failure, and says so.
     checks=$((checks + 1))
     ratio8=$(sweep 8 | awk -v a="$(auto 8 4)" '{ if (b=="" || $3<b) b=$3 } END { printf "%.3f", a/b }')
     ratio23=$(sweep 23 | awk -v a="$(auto 23 4)" '{ if (b=="" || $3<b) b=$3 } END { printf "%.3f", a/b }')
-    if awk -v a="$ratio8" -v b="$ratio23" 'BEGIN { exit !(a <= 1.15 && b <= 1.15) }'; then
+    if awk -v a="$ratio8" -v b="$ratio23" 'BEGIN { exit !(a <= 1.40 && b <= 1.40) }'; then
       printf '  %s✓%s the auto-tuner lands in the plateau (%s and %s of the best swept grain)\n' \
              "$green" "$off" "$ratio8" "$ratio23"
     else

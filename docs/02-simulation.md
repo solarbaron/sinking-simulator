@@ -4444,7 +4444,7 @@ Two things do see the junctions:
 - **The lowest fixed-interface frequency**, which is the sharper instrument on a real
   ship. On the ferry's hold between x = −7.2 m and 19.2 m the whole *unjoined*
   section's first fixed-interface mode is **0.7785 Hz**; the decks *on their own* are
-  0.7785 Hz to four figures and the shell on its own is **1.6999 Hz**. The softest
+  0.7785 Hz to four figures and the shell on its own is **1.6980 Hz**. The softest
   thing in the section is a 26 m deck held on two edges instead of four, and adding
   the shell it ought to be welded to changes it by nothing at all. Tied — see the
   junction tie below — the same section is **2.3026 Hz**, above both pieces. (Every
@@ -4457,6 +4457,15 @@ Two things do see the junctions:
   > produced the figure — was re-run. It gives 1.6999 Hz, and no combination of
   > subdivision or member setting reproduces 3.46. Nothing tests a comment; this is
   > the fourth time that has cost this repository a published number.
+  >
+  > **And then it moved again, to 1.6980 Hz — a fifth time, to the figure this very
+  > correction installed.** The correction re-ran the tool and wrote the answer down
+  > in seven places; it did not *gate* it, so 0.11% of drift sat in all seven until
+  > somebody re-ran the tool again. The exact inertia count quoted above cannot
+  > catch it: it brackets this mode between 10.5619 and 10.7753 rad/s, a window 2%
+  > wide, and 1.6999 and 1.6980 both sit inside it. Every frequency in this
+  > paragraph is now checked by `scripts/check-figures.sh` against a run of
+  > `section_probe --sweep=2`.
 
 #### Against Tier 0, and what closes the gap
 
@@ -4858,7 +4867,7 @@ The hold between x = −7.2 m and 19.2 m, one element per panel:
 
 0.7785 Hz is the decks' own frequency to four figures — adding the shell changed
 nothing, because in the model it was not attached. 2.3026 Hz is above the decks'
-0.7785 *and* the shell's 1.6999, which is what a joined structure does. `GJ` moves
+0.7785 *and* the shell's 1.6980, which is what a joined structure does. `GJ` moves
 +44.9%.
 
 `A_eff` moves +0.19% and `I_eff` +0.12%, the same local consistency error the box

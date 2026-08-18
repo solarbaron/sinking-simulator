@@ -87,7 +87,7 @@
 //     which turns out to be the sharper instrument on a real ship. On the
 //     reference ferry's hold between x = -7.2 m and x = 19.2 m the whole *unjoined*
 //     section's first fixed-interface mode is **0.7785 Hz**; the decks *on their
-//     own* are 0.7785 Hz, to four figures, and the shell on its own is 1.6999 Hz.
+//     own* are 0.7785 Hz, to four figures, and the shell on its own is 1.6980 Hz.
 //     The softest thing in the section is a 26 m deck held on two edges instead of
 //     four, and adding the shell it should be welded to changes it by nothing at
 //     all. That is the junctions' cost stated as a number, and §5 is what moves it:
@@ -259,7 +259,7 @@
 //             to, first fixed-interface mode **0.7785 Hz** -- which is the decks'
 //             own 0.7785 Hz to four figures, because the shell contributes nothing.
 //     tied:   1 component, 309.6 m of that edge joined, first fixed-interface mode
-//             **2.3026 Hz** -- above the decks' 0.7785 *and* the shell's 1.6999,
+//             **2.3026 Hz** -- above the decks' 0.7785 *and* the shell's 1.6980,
 //             which is what a joined structure does.
 //
 // `GJ` goes 3.6164e12 to 5.2387e12 N m^2, +44.9%. `A_eff` moves +0.19% and `I_eff`

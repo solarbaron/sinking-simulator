@@ -276,6 +276,20 @@ the timeout lands, so a sweep without a per-mutant time bound is reporting a num
 it did not measure. Assert against the arithmetic floor of the substep controller,
 not against a wall clock, so the bound survives a busy box.
 
+**A ratio is only safe when both sides are the same kind of measurement.** The
+note below says what survives instrumentation is a ratio between two timings,
+because it scales on both sides. That is true and it is not sufficient: the figure
+gate compared the auto-tuner's *single* timed run against the **minimum of eight**
+swept timings, and a minimum over eight noisy samples is biased low, so the ratio
+sits above 1 even when the tuner is perfect and the bias grows with the noise. The
+bound was 1.15. Fifteen runs on an idle box spread 0.969–1.125, four of them above
+1.07; inside a gate run it reached **1.282** and went red on code nobody had
+touched. Both sides must be the same *statistic*, not merely the same units — and
+where they cannot be, set the bound from the loaded distribution and record the
+distance to the nearest genuine failure. Here that distance was there to use: the
+tuner is deterministic across twenty runs, its chunk counts are gated exactly, and
+the cheapest wrong landing costs 1.50× against noise reaching 1.28.
+
 **A timed quantity cannot be bracketed against a constant, and a minimum over
 attempts does not fix it.** The gas tier's `coreSecondsPerCell` was documented as
 "measured in the tests" while the test only asserted it was positive, so a bracket
