@@ -778,6 +778,88 @@ if [ -x "$TESTS" ]; then
   hint "$(printf '%s %s closed-form validation checks' \
           "${expected%???}" "${expected#${expected%???}}")" "$DOC"
 
+  # --- strip-theory radiation, out of the same run --------------------------------
+  #
+  # Twelve of the thirteen rows of section 2's "What was measured" table, every one
+  # of which `test_radiation.cpp` already printed and none of which was gated. They
+  # all reproduce, so nothing here is a correction -- which is worth saying, because
+  # the two tables gated just before this one did not.
+  #
+  # The runtime row is excluded: 0.53 microseconds per tick is a wall clock.
+  radline() { printf '%s\n' "$suiteout" | grep -m1 -- "$1"; }
+
+  semi=$(radline 'semicircle: Ca(inf)')
+  check "heaving semicircle, Ca at infinite frequency" 1.0022 5e-5 \
+        "$(printf '%s\n' "$semi" | sed -n 's/.*Ca(inf) \([0-9.]*\) .*/\1/p')" \
+        "1.0022 × ρπa²/2" "$SIM_DOC"
+  check "and its added-mass minimum" 0.5983 5e-5 \
+        "$(printf '%s\n' "$semi" | sed -n 's/.*min Ca \([0-9.]*\) .*/\1/p')" \
+        "**0.5983** at" "$SIM_DOC"
+  check "at this nondimensional frequency" 0.894 5e-4 \
+        "$(printf '%s\n' "$semi" | sed -n 's/.*omega sqrt(a\/g) \([0-9.]*\);.*/\1/p')" \
+        "= 0.894\`, against Ursell" "$SIM_DOC"
+  # The near-field/far-field energy balance -- the instrument that found the
+  # radiation solver returning *negative* damping at four frequencies.
+  check "energy residual at 40 panels" 4.5e-3 5e-5 \
+        "$(printf '%s\n' "$semi" | sed -n 's/.*residual \([0-9.e+-]*\) at 40 panels.*/\1/p')" \
+        "4.5 × 10⁻³ at 40 panels" "$SIM_DOC"
+  check "and at 80" 2.2e-3 5e-5 \
+        "$(printf '%s\n' "$semi" | sed -n 's/.*at 40 panels, \([0-9.e+-]*\) at 80.*/\1/p')" \
+        "2.2 × 10⁻³ at 80" "$SIM_DOC"
+
+  # Published as 3.9e-4 and measured 3.85e-4, which is exactly half a unit in the
+  # last published place -- the policy tolerance would sit on the boundary, so this
+  # one is a whole unit and says why.
+  check "reciprocity A24 against A42 at 80 panels" 3.9e-4 1e-5 \
+        "$(radline 'reciprocity (A24 vs A42)' | sed -n 's/.*A42) \([0-9.e+-]*\) at.*/\1/p')" \
+        "3.9 × 10⁻⁴ at 80 panels" "$SIM_DOC"
+
+  ogil=$(radline 'Ogilvie: B->K->B')
+  check "Ogilvie round trip B to K to B, worst of peak" 6.3e-3 5e-5 \
+        "$(printf '%s\n' "$ogil" | sed -n 's/.*worst \([0-9.e+-]*\) of peak.*/\1/p')" \
+        "6.3 × 10⁻³ of peak" "$SIM_DOC"
+  check "A_inf, rigid lid against Ogilvie (%)" 0.57 5e-3 \
+        "$(printf '%s\n' "$ogil" | sed -n 's/.*lid), \([0-9.]*\)% apart.*/\1/p')" \
+        "0.57% apart" "$SIM_DOC"
+  check "and how far the Ogilvie value varies across omega (%)" 2.3 5e-2 \
+        "$(printf '%s\n' "$ogil" | sed -n 's/.*apart, \([0-9.]*\)% spread.*/\1/p')" \
+        "varies 2.3% across" "$SIM_DOC"
+
+  trans=$(radline 'closed-form transforms:')
+  check "closed-form transform of B" 2.8e-7 5e-9 \
+        "$(printf '%s\n' "$trans" | sed -n 's/.*error \([0-9.e+-]*\) (B),.*/\1/p')" \
+        "2.8 × 10⁻⁷ (B)" "$SIM_DOC"
+  check "and of A" 4.4e-6 5e-8 \
+        "$(printf '%s\n' "$trans" | sed -n 's/.*, \([0-9.e+-]*\) (A).*/\1/p')" \
+        "4.4 × 10⁻⁶ (A)" "$SIM_DOC"
+
+  mem=$(radline 'memory: K falls to')
+  check "memory: K falls to 1% of peak at (s)" 20.3 5e-2 \
+        "$(printf '%s\n' "$mem" | sed -n 's/.*peak at \([0-9.]*\) s.*/\1/p')" \
+        "**20.3 s**" "$SIM_DOC"
+  check "and to 0.1% at (s)" 56.6 5e-2 \
+        "$(printf '%s\n' "$mem" | sed -n 's/.*and 0.1% at \([0-9.]*\) s.*/\1/p')" \
+        "0.1% at 56.6 s" "$SIM_DOC"
+
+  ss=$(radline "state space on the ferry's K33")
+  check "state space, relative rms" 7.6e-2 5e-4 \
+        "$(printf '%s\n' "$ss" | sed -n 's/.*relative rms \([0-9.e+-]*\),.*/\1/p')" \
+        "7.6% relative RMS" "$SIM_DOC"
+  check "and its peak error as a percentage of K(0)" 2.8 5e-2 \
+        "$(printf '%s\n' "$ss" | sed -n 's/.*peak error \([0-9.]*\)% of K(0).*/\1/p')" \
+        "**2.8% of K(0)**" "$SIM_DOC"
+  check "Prony on a planted 4-pole signal, relative rms" 3.0e-9 5e-11 \
+        "$(radline 'Prony on a planted' | sed -n 's/.*relative rms \([0-9.e+-]*\).*/\1/p')" \
+        "3.0 × 10⁻⁹ relative RMS" "$SIM_DOC"
+
+  scale=$(radline 'geometric scaling by 2.5:')
+  check "geometric scaling, added mass exact to" 7.5e-15 5e-17 \
+        "$(printf '%s\n' "$scale" | sed -n 's/.*added mass to \([0-9.e+-]*\),.*/\1/p')" \
+        "7.5 × 10⁻¹⁵" "$SIM_DOC"
+  check "and damping to" 1.9e-12 5e-14 \
+        "$(printf '%s\n' "$scale" | sed -n 's/.*damping to \([0-9.e+-]*\) relative.*/\1/p')" \
+        "1.9 × 10⁻¹²" "$SIM_DOC"
+
   # --- the barge RAO sweep, out of the same run -----------------------------------
   #
   # **Section 2 says an RAO is "the one place this simulator can be checked against
