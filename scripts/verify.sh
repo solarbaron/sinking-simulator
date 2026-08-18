@@ -465,6 +465,29 @@ selftest() {
   control_pass "a step that succeeds" \
           expect_ok ctl '[1-9][0-9]* checks, 0 failures' sh -c 'echo "4210 checks, 0 failures"'
 
+  # **A figure gate that skipped most of its blocks has not passed either.**
+  # `^ok — [1-9]` accepted `ok — 10 published figures ...` from a tree where only
+  # `shipsim_tests` was built and twelve tool blocks never ran -- a tenth of the
+  # coverage, reported in the same words as all of it. This is the `0 checks, 0
+  # failures` shape one level up: not a degenerate run emitting the success
+  # string, but a *partial* one. The pattern below is the one used against
+  # `check-figures.sh` on a machine with a device, where nothing may be skipped.
+  control "a figure gate that ran a tenth of its blocks" 'never reported' \
+          expect_ok ctl '^ok — [1-9][0-9]* published figures still match the tool$' \
+          sh -c 'echo "ok — 10 published figures still match the tool, and these did not run: ram_view zone_probe"'
+  control_pass "a figure gate that skipped nothing" \
+          expect_ok ctl '^ok — [1-9][0-9]* published figures still match the tool$' \
+          sh -c 'echo "ok — 381 published figures still match the tool"'
+
+  # **And `check()` rejected an empty parse while accepting a garbled one.**
+  # `awk` coerces any non-numeric string to 0, so a check whose expected value is
+  # zero -- there are six -- passed on `n/a`, on a stray unit, on an error
+  # message. Driven here through the real script so the control breaks if that
+  # predicate is ever loosened: a tool whose output the `sed` cannot parse into a
+  # number must go red, not green.
+  control "a figure gate handed a non-numeric parse" 'not a number' \
+          sh -c 'cd '"$PWD"' && CTL_FIGURE=n/a ./scripts/check-figures.sh --selftest-parse'
+
   # --- build_into, against a compiler that dies without saying `error:` -----
   # The real case was a full disk. This is the same class without one: the
   # child is killed outright, ninja says nothing, and the reporter has only the
@@ -661,8 +684,26 @@ gpu_ok "ram_view" '^ok$' ./build/ram_view --speed=4.0 --duration=120
 # is a green verdict on an empty set, and `^ok — ` accepted it. Measured, not
 # supposed: with the GPU tools hidden it still checks 78 of them, so any number
 # the gate should accept starts with a digit other than zero.
+#
+# **And `[1-9]` closes `ok — 0` and nothing above it.** A tree with only
+# `shipsim_tests` built runs two blocks, skips the other twelve, prints
+# `ok — 10 published figures ...` and passes: a green verdict on a tenth of the
+# coverage, which reads exactly like a green verdict on all of it. A floor on the
+# count would be a guess that goes stale every time a block is added. What
+# actually needs asserting is the **skipped set**, which `check-figures.sh`
+# already prints and which it deliberately does not judge -- whether a skip is
+# legitimate is a question about *this machine*, and this script is the one that
+# knows. Same division of labour as `gpu_ok` above.
+#
+# With a device present nothing may be skipped at all, which the `$` anchor says:
+# the skipped form of that line continues ", and these did not run: ...".
+if [ "$GPU" = present ]; then
+  figures_ok='^ok — [1-9][0-9]* published figures still match the tool$'
+else
+  figures_ok='^ok — [1-9]'
+fi
 require_built ./scripts/check-figures.sh &&
-  expect_ok "published figures" '^ok — [1-9]' ./scripts/check-figures.sh
+  expect_ok "published figures" "$figures_ok" ./scripts/check-figures.sh
 # The Tier-2 zone at ship scale: solid-shell elements over the ferry's own
 # plating, driven to tearing, and the torn panels fed to breach. The unit suite
 # tests the pieces at unit scale because a real solve is core-minutes; this is the

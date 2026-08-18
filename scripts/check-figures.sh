@@ -174,6 +174,19 @@ check() {
     printf '  %s✗%s %s — could not parse the figure out of the tool output\n' "$red" "$off" "$label"
     fails=$((fails + 1)); return 1
   fi
+  # **An empty parse was rejected and a garbled one was not.** `awk` coerces any
+  # non-numeric string to 0, so every check whose expected value *is* zero -- and
+  # there are six of them -- passed on a tool whose output format had moved out
+  # from under the `sed`. `n/a`, `-`, a stray unit, an error message: all zero,
+  # all green. That is the same shape as the reporters `verify.sh selftest`
+  # exists for, one level down: a failure path that only recognises the failure
+  # it was written for.
+  if ! awk -v a="$actual" \
+       'BEGIN { exit !(a ~ /^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$/) }'; then
+    printf '  %s✗%s %s — the figure parsed out of the tool is not a number: %s%s%s\n' \
+           "$red" "$off" "$label" "$dim" "$actual" "$off"
+    fails=$((fails + 1)); return 1
+  fi
   if awk -v a="$actual" -v e="$expect" -v t="$tol" \
         'BEGIN { d = a - e; if (d < 0) d = -d; exit !(d <= t) }'; then
     printf '  %s✓%s %s = %s\n' "$green" "$off" "$label" "$actual"
@@ -210,6 +223,24 @@ hint() {
   fails=$((fails + 1))
   return 1
 }
+
+# A hook for `verify.sh selftest`, which drives every reporter in this repository
+# with a failure it was **not** written for. `check` is a reporter like any other
+# and had no control on it at all: it rejected an empty parse and accepted a
+# garbled one, because `awk` turns any non-numeric string into 0 and six checks
+# here expect exactly 0.
+#
+# Driven through the real `check` rather than a mock, so the control breaks if the
+# predicate is ever loosened. Placed after the definitions and before any tool
+# runs; it costs nothing on a normal invocation and exits without touching a
+# binary.
+if [ "${1:-}" = --selftest-parse ]; then
+  check "control: the tool printed something that is not a figure" 0 0 \
+        "${CTL_FIGURE:-n/a}" "shipsim" README.md
+  if [ "$fails" -gt 0 ]; then exit 1; fi
+  echo "control did not go red: a non-numeric parse was accepted as zero"
+  exit 0
+fi
 
 # --- the GPU zone solver's published torn counts ---------------------------------
 #
