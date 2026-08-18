@@ -257,6 +257,53 @@ void testHeaveExcitationCancelsWhenTheWavelengthMatchesTheShip() {
                atHalfL.heave < 0.5 * between.heave);
 }
 
+// **The published barge sweep, printed.** `docs/02-simulation.md` section 2 calls an
+// RAO "the one place this simulator can be checked against the outside world", and
+// then published a five-row table that nothing in the repository produced. The
+// assertions around it check that heave collapses *relative to its neighbours* and
+// that the asymptotes are right; none of them says what the table says.
+//
+// Everything below is one `measureRaoAt` per row, at the frequencies the document
+// names, on the barge it names, in head seas. The wavelengths are not searched for:
+// `lambda = 2 pi g / omega^2` exactly, so the "notches at 61.6 m and 29.3 m against a
+// 60 m ship" are the two rows at omega 1.00 and 1.45 and nothing more.
+void testTheBargeSweepMatchesWhatIsPublished() {
+    std::printf("\n   barge sweep, 60 x 16 m box at 4 m draft, head seas\n");
+    std::printf("     %5s %8s %7s %7s %7s %8s %8s %7s\n",
+                "omega", "lambda", "lam/L", "heave", "pitch", "hphase", "pphase", "nonlin");
+    const Ship barge = makeBarge();
+    RaoSettings settings;
+    settings.heading = kPi;
+    double longWaveHeave = 0, shortWaveHeave = 0, pitchLagAtLongWave = 0;
+    for (double omega : {0.25, 0.70, 1.00, 1.45, 2.20}) {
+        const RaoPoint p = measureRaoAt(barge, omega, settings);
+        std::printf("     %5.2f %8.2f %7.3f %7.3f %7.3f %8.1f %8.1f %7.3f\n",
+                    omega, p.waveLength, p.waveLength / 60.0, p.heave, p.pitch,
+                    p.heavePhase * kRadToDeg, p.pitchPhase * kRadToDeg, p.heaveNonlinearity);
+        if (omega == 0.25) {
+            longWaveHeave = p.heave;
+            pitchLagAtLongWave = p.pitchPhase * kRadToDeg;
+        }
+        if (omega == 2.20) shortWaveHeave = p.heave;
+    }
+
+    // The two asymptotes, which are the closed forms the section rests on. A long
+    // wave is ridden one for one, plus the dynamic magnification of an oscillator
+    // below resonance: 1/(1 - (omega/omega_n)^2) with omega_n = sqrt(g/T) for a box
+    // at draft T.
+    const double omegaN = std::sqrt(kGravity / 4.0);
+    const double magnification = 1.0 / (1.0 - (0.25 / omegaN) * (0.25 / omegaN));
+    expectNear("a long wave is ridden one for one, times the below-resonance "
+               "magnification",
+               longWaveHeave, magnification, 0.01);
+    expectTrue("and a wave a fifth of the ship's length is ignored", shortWaveHeave < 0.02);
+
+    // Pitch follows the wave *slope*, which is the derivative of the elevation, so
+    // it lags it by a quarter period. Asserted at the figure the document
+    // publishes rather than at "about 90 degrees".
+    expectNear("pitch lags the surface elevation by 96 degrees", pitchLagAtLongWave, -96.3, 0.5);
+}
+
 // A sweep has to be monotone in the right places and it has to be reproducible.
 void testSweepIsOrderedAndDeterministic() {
     const Ship barge = makeBarge();
@@ -1233,6 +1280,7 @@ void testLargeRollDecayHasAnAmplitudeDependentDecrement() {
 
 void runRaoTests() {
     std::printf("\n--- response amplitude operators ---\n");
+    testTheBargeSweepMatchesWhatIsPublished();
     testHarmonicFitIsExactOnAPureSinusoid();
     testHarmonicFitDoesNotLeakOnAPartialCycle();
     testHarmonicFitReportsNonlinearityAsResidual();

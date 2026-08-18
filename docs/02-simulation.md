@@ -799,13 +799,44 @@ the fifth decimal place.
 
 **What the barge sweep shows.** A 60 m × 16 m box at 4 m draft, head seas:
 
-| ω | λ/L | heave | pitch | heave phase |
-|---|---|---|---|---|
-| 0.25 | 16.4 | 1.03 | 1.07 | −9° |
-| 0.70 | 2.1 | 0.89 | 1.32 | +9° |
-| 1.00 | 0.97 | **0.04** | 0.55 | −71° |
-| 1.45 | 0.49 | **0.02** | 0.08 | −130° |
-| 2.20 | 0.21 | 0.02 | 0.00 | — |
+| ω | λ (m) | λ/L | heave | pitch | heave phase | fit residual |
+|---|---|---|---|---|---|---|
+| 0.25 | 985.87 | 16.431 | 1.034 | 1.073 | −9.5° | 0.002 |
+| 0.70 | 125.75 | 2.096 | 0.899 | 1.352 | −38.4° | **0.151** |
+| 1.00 | 61.62 | 1.027 | **0.036** | 0.517 | −74.7° | 0.036 |
+| 1.45 | 29.31 | 0.488 | **0.019** | 0.076 | −129.4° | 0.005 |
+| 2.20 | 12.73 | 0.212 | 0.015 | 0.004 | −152.9° | 0.001 |
+
+> **Correction, and nothing produced this table.** It read
+>
+> | 0.25 | 16.4 | 1.03 | 1.07 | −9° |
+> | 0.70 | 2.1 | 0.89 | 1.32 | **+9°** |
+> | 1.00 | **0.97** | 0.04 | 0.55 | −71° |
+> | 1.45 | 0.49 | 0.02 | 0.08 | −130° |
+> | 2.20 | 0.21 | 0.02 | 0.00 | — |
+>
+> and `test_rao.cpp` asserted that heave collapses *relative to its neighbours* and
+> that the asymptotes hold — never what the cells say. It now runs the five
+> frequencies and prints them, and `check-figures.sh` gates every one.
+>
+> **Row three's λ/L was upside down.** 0.97 is 60/61.62; every other row is λ/L the
+> right way up, and the notch is at a wavelength 2.7% *longer* than the ship, not
+> shorter. That matters for reading the sinc: the zero of `sin(kL/2)/(kL/2)` is at
+> λ = L exactly, and the measured minimum sits just past it because heave is the
+> response and not the excitation.
+>
+> **Row two's phase is the one that really moved**, +9° against a measured −38.4°,
+> and the new residual column says why it is the least trustworthy row in the table:
+> at ω = 0.70 the single-harmonic fit leaves **0.151** of the motion unexplained,
+> the largest of the five and past the 0.15 that `test_rao.cpp` elsewhere calls the
+> limit of honest linearity. A phase read off a fit that explains 85% of the record
+> is worth less than the amplitude beside it. The remaining differences are small —
+> pitch 1.32 → 1.352 and 0.55 → 0.517, heave 0.02 → 0.015 — and nothing recorded
+> which build produced the originals, so no cause is claimed for them.
+>
+> The λ column is new and is not a measurement: `λ = 2πg/ω²` exactly. It is there
+> because the notch claim below is stated in metres and was otherwise two divisions
+> away from anything printed.
 
 Three features are emergent rather than coded, and each is a closed form:
 
@@ -813,13 +844,13 @@ Three features are emergent rather than coded, and each is a closed form:
   The 3% excess at ω = 0.25 is not error: it is the dynamic magnification of an
   oscillator below resonance, `1/(1 − (ω/ω_n)²) = 1.026` for a heave natural
   frequency of √(g/T) ≈ 1.57 rad/s.
-- **Pitch lags the surface elevation by 96°**, because pitch follows the wave
+- **Pitch lags the surface elevation by 96.3°**, because pitch follows the wave
   *slope*, which is the derivative of elevation — 90° out of phase.
 - **The Froude–Krylov sinc zeros.** A constant-section box integrates the wave
   pressure along its length as `sin(kL/2)/(kL/2)`, which vanishes at `kL = 2π` and
   `4π` — wavelengths of exactly L and L/2, where the crest over one half of the
-  ship cancels the trough over the other. Both notches appear, at 61.6 m and
-  29.3 m against a 60 m ship. This is now the strongest test in the seakeeping
+  ship cancels the trough over the other. Both notches appear, at 61.62 m and
+  29.31 m against a 60 m ship. This is now the strongest test in the seakeeping
   suite: no coefficient can be tuned to produce it, and if the surface
   integration ever stops resolving the hull, or the wave's spatial phase is
   dropped, the notches are the first thing to go while both asymptotes still pass.

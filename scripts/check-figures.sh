@@ -766,7 +766,7 @@ if [ -x "$TESTS" ]; then
   # gate never passes.
   suiteout=$("$TESTS" 2>&1)
   suite=$(printf '%s\n' "$suiteout" | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  expected=200790
+  expected=200793
   check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
         "$expected validation checks" "$FRONT"
   # **The roadmap publishes the same count in a different format**, and it was
@@ -777,6 +777,47 @@ if [ -x "$TESTS" ]; then
   # `$expected` so the two cannot part company.
   hint "$(printf '%s %s closed-form validation checks' \
           "${expected%???}" "${expected#${expected%???}}")" "$DOC"
+
+  # --- the barge RAO sweep, out of the same run -----------------------------------
+  #
+  # **Section 2 says an RAO is "the one place this simulator can be checked against
+  # the outside world", and then published a table nothing produced.** The
+  # assertions around it checked that heave collapses relative to its neighbours
+  # and that the asymptotes hold -- never what the cells say. Re-derived, row
+  # three's `lambda/L` turned out to be upside down (0.97 is 60/61.62) and row
+  # two's phase read +9 against a measured -38.4.
+  #
+  # The wavelength column is not a measurement -- `lambda = 2 pi g / omega^2` -- but
+  # it is gated because the notch claim two paragraphs down is stated in metres and
+  # was otherwise two divisions away from anything printed.
+  raorow() {
+    printf '%s\n' "$suiteout" |
+      awk -v w="$1" -v c="$2" '/barge sweep, 60 x 16 m box/ { f = 1 }
+                               /^ *$/ { if (f && seen) f = 0 }
+                               f && NF == 8 && $1 == w { seen = 1; print $c; exit }'
+  }
+  for row in "0.25 985.87 16.431 1.034 1.073 -9.5" \
+             "0.70 125.75 2.096 0.899 1.352 -38.4" \
+             "1.00 61.62 1.027 0.036 0.517 -74.7" \
+             "1.45 29.31 0.488 0.019 0.076 -129.4" \
+             "2.20 12.73 0.212 0.015 0.004 -152.9"; do
+    set -- $row
+    w=$1
+    ptr="| $w | $2 | $3 |"
+    check "barge RAO omega $w: wavelength (m)" "$2" 5e-3 "$(raorow "$w" 2)" "$ptr" "$SIM_DOC"
+    check "barge RAO omega $w: heave" "$4" 5e-4 "$(raorow "$w" 4)" "$ptr" "$SIM_DOC"
+    check "barge RAO omega $w: pitch" "$5" 5e-4 "$(raorow "$w" 5)" "$ptr" "$SIM_DOC"
+    check "barge RAO omega $w: heave phase (deg)" "$6" 0.05 "$(raorow "$w" 6)" "$ptr" "$SIM_DOC"
+  done
+  # The two claims the section rests on, which are closed forms rather than table
+  # cells: the Froude-Krylov sinc zeros land at a wavelength of L and L/2, and
+  # pitch follows the wave *slope* so it lags the elevation by a quarter period.
+  check "the first sinc notch, at a wavelength of the ship's length (m)" 61.62 5e-3 \
+        "$(raorow 1.00 2)" "at 61.62 m and" "$SIM_DOC"
+  check "and the second, at half of it (m)" 29.31 5e-3 "$(raorow 1.45 2)" \
+        "29.31 m against a 60 m ship" "$SIM_DOC"
+  check "pitch lags the surface elevation (deg)" -96.3 0.05 "$(raorow 0.25 7)" \
+        "lags the surface elevation by 96.3°" "$SIM_DOC"
 
   # --- the hull-form convergence table, out of the same run ----------------------
   #
