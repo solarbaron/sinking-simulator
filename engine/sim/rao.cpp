@@ -4,6 +4,7 @@
 #include "waves.hpp"
 
 #include <cmath>
+#include <limits>
 
 namespace sim {
 namespace {
@@ -21,6 +22,15 @@ bool solve3x3(const double a[3][3], const double b[3], double x[3]) {
     double scale = 0;
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j) scale = std::max(scale, std::abs(a[i][j]));
+    // **A non-finite determinant is a refusal, and `abs(NaN) < x` is false.** The
+    // test below reads as "singular or too small"; without the finiteness check a
+    // NaN passes it, `x[col] = d / det` is `NaN / NaN`, and the function returns
+    // **true**. The `scale` fold has the same shape one line up --
+    // `std::max(scale, x)` drops a NaN -- so `scale` comes back as the largest of
+    // the *finite* entries and cannot rescue it either. Only the all-NaN matrix was
+    // refused, and only by accident: every `max` swallowed, `scale` stayed 0, and
+    // `scale <= 0` fired.
+    if (!std::isfinite(det) || !std::isfinite(scale)) return false;
     if (scale <= 0 || std::abs(det) < 1e-12 * scale * scale * scale) return false;
 
     for (int col = 0; col < 3; ++col) {
@@ -104,6 +114,12 @@ HarmonicFit fitHarmonic(const std::vector<double>& samples, double dt, double om
         sumSquares += e * e;
     }
     fit.residual = std::sqrt(sumSquares / static_cast<double>(n));
+    // Set last, and only if the numbers are numbers: `solve3x3` refuses a
+    // non-finite determinant, but the samples enter through `b` rather than `a`,
+    // so a NaN in the *record* produces a NaN solution from a perfectly good
+    // matrix and nothing above would have noticed.
+    fit.fitted = std::isfinite(fit.amplitude) && std::isfinite(fit.phase) &&
+                 std::isfinite(fit.mean) && std::isfinite(fit.residual);
     return fit;
 }
 
@@ -220,7 +236,12 @@ RaoPoint measureRaoAt(const Ship& prototype, double omega, const RaoSettings& se
     // Normalise against the wave the ship actually saw, not the one requested.
     // They differ if the record is short or the response is not at omega, and
     // using the requested amplitude would quietly absorb that error into the RAO.
-    const double amplitude = waveFit.amplitude > 0 ? waveFit.amplitude : settings.waveAmplitude;
+    // `fitted`, not `amplitude > 0`. A fit that was refused reports an amplitude of
+    // zero and one that produced a NaN reports a NaN, and both fail `> 0` -- so
+    // both silently fell back to the *requested* amplitude, which is exactly the
+    // error the comment above says this line exists to avoid. Falling back is right
+    // when there was no wave to fit; it is wrong when the fit failed.
+    const double amplitude = waveFit.fitted ? waveFit.amplitude : settings.waveAmplitude;
     const double slope = k * amplitude;
 
     point.heave = heaveFit.amplitude / amplitude;
@@ -239,7 +260,18 @@ RaoPoint measureRaoAt(const Ship& prototype, double omega, const RaoSettings& se
     // How much of the motion the single harmonic could not explain. A linear
     // response is a pure sinusoid at the encounter frequency; anything else means
     // the answer is a number, but not an RAO.
+    // **A fit that failed is not a linear response.** This read
+    // `f.amplitude > 0 ? f.residual / f.amplitude : 0.0`, so a refused fit and a
+    // NaN one both reported **0.0** -- and `rao.hpp` documents this field as
+    // "Large values mean the response is not linear". The code could not produce a
+    // large value from a failure; it produced the single most reassuring number it
+    // has, from the one input meaning there is no answer. `test_rao.cpp`'s
+    // `heaveNonlinearity < 0.15` passed on a totally broken fit.
+    //
+    // Zero is kept for the case it is honest about: a fit that succeeded and found
+    // no motion at all has nothing left unexplained.
     const auto nonlinearity = [](const HarmonicFit& f) {
+        if (!f.fitted) return std::numeric_limits<double>::quiet_NaN();
         return f.amplitude > 0 ? f.residual / f.amplitude : 0.0;
     };
     point.heaveNonlinearity = nonlinearity(heaveFit);

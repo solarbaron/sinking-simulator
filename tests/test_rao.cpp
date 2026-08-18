@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -144,6 +145,62 @@ void testHarmonicFitRefusesDegenerateInput() {
     const HarmonicFit zeroFit = fitHarmonic(signal, 0.01, 0.0);
     expectTrue("a zero frequency yields no amplitude", zeroFit.amplitude == 0.0);
     expectTrue("an empty record is handled", fitHarmonic({}, 0.01, 1.0).amplitude == 0.0);
+
+    // **A refused fit says so, and used to be indistinguishable from a real one
+    // that found no motion.** Both report an amplitude and a residual of zero, so
+    // every consumer asking `amplitude > 0` read the first as the second -- and
+    // `nonlinearity`, documented as "large values mean the response is not
+    // linear", returned **0.0** for a fit that had not happened. The most
+    // reassuring number in the range, from the one input meaning there is no
+    // answer.
+    expectTrue("a good fit says it fitted", constantFit.fitted);
+    expectTrue("a zero frequency does not", !zeroFit.fitted);
+    expectTrue("nor an empty record", !fitHarmonic({}, 0.01, 1.0).fitted);
+    expectTrue("nor a record of two samples", !fitHarmonic({1.0, 2.0}, 0.01, 1.0).fitted);
+
+    // A NaN frequency passes `omega <= 0.0`, because that comparison is false for
+    // a NaN, and then poisons the basis and the whole normal-equation matrix.
+    // `solve3x3` refuses it now; it used to return true off `abs(NaN) < x` being
+    // false and hand back `NaN / NaN`.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    expectTrue("a NaN frequency is refused rather than solved", !fitHarmonic(signal, 0.01, nan).fitted);
+
+    // And a NaN in the *record* rather than in the frequency. The matrix is built
+    // from the basis alone, so it stays perfectly well conditioned and the failure
+    // arrives only in the solution -- which is why the flag is set from the
+    // finished numbers and not from `solve3x3`'s return alone.
+    std::vector<double> poisoned = signal;
+    poisoned[poisoned.size() / 2] = nan;
+    const HarmonicFit poisonedFit = fitHarmonic(poisoned, 0.01, 0.5);
+    expectTrue("a NaN sample is refused too", !poisonedFit.fitted);
+
+    // Vacuity: the same record without the NaN must fit, or every refusal above
+    // would hold for a routine that never fits anything.
+    expectTrue("the same record without it fits", fitHarmonic(signal, 0.01, 0.5).fitted);
+
+    // **A refused fit still reports the arithmetic mean**, which is the one field
+    // that needs no solve and is documented as filled either way. It is also what
+    // makes `solve3x3`'s finiteness guard load-bearing rather than decorative:
+    // without it a NaN determinant is accepted, `fit.mean = x[0]` overwrites the
+    // honest mean with `NaN / NaN`, and the header's promise is broken while
+    // `fitted` still reads false.
+    expectTrue("a refused fit keeps the mean it could compute without solving",
+               std::isfinite(fitHarmonic(signal, 0.01, nan).mean));
+    expectTrue("and so does one refused for a zero frequency", std::isfinite(zeroFit.mean));
+
+    // **A measurement too short to fit reports no answer, not a linear one.**
+    // `measureRaoAt` returns a default-constructed point when the record cannot be
+    // fitted, so the *default* has to be honest -- it used to be 0.0, which reads
+    // as a perfectly linear response from a run that never happened.
+    const Ship barge = makeBarge();
+    RaoSettings tooShort;
+    tooShort.heading = kPi;
+    tooShort.recordCycles = 0;
+    tooShort.settleCycles = 0;
+    const RaoPoint refused = measureRaoAt(barge, 1.0, tooShort);
+    expectTrue("a record too short to fit reports no nonlinearity figure at all",
+               std::isnan(refused.heaveNonlinearity) && std::isnan(refused.pitchNonlinearity) &&
+                   std::isnan(refused.rollNonlinearity));
 }
 
 // --- Encounter frequency -----------------------------------------------------

@@ -15,6 +15,7 @@
 
 #include "ship.hpp"
 
+#include <limits>
 #include <vector>
 
 namespace sim {
@@ -30,6 +31,14 @@ struct HarmonicFit {
     double phase = 0;      // rad, in (-pi, pi]
     double mean = 0;       // the drift the wave rides on
     double residual = 0;   // RMS of what the fit could not explain
+
+    // **False means the normal equations were refused**, and the four numbers above
+    // are the defaults rather than a measurement. Without it a refused fit is
+    // indistinguishable from a real one that found no motion: both report an
+    // amplitude and a residual of zero, and every consumer that asked
+    // `amplitude > 0` read the first as the second. `mean` is the exception and is
+    // filled either way, because a mean needs no solve.
+    bool fitted = false;
 };
 
 HarmonicFit fitHarmonic(const std::vector<double>& samples, double dt, double omega);
@@ -53,9 +62,20 @@ struct RaoPoint {
     // Fraction of the recorded motion the single harmonic failed to explain.
     // Large values mean the response is not linear at this amplitude -- the
     // number is still reported, but it is no longer an RAO.
-    double heaveNonlinearity = 0;
-    double pitchNonlinearity = 0;
-    double rollNonlinearity = 0;
+    //
+    // **NaN means there is no answer**, which is a different thing from linear and
+    // used to be reported as 0.0 -- the most reassuring value in the range, from
+    // the one input that means the question was not answered. A threshold test on
+    // this field fails for a NaN, which is the safe direction and was not the old
+    // one.
+    //
+    // Two paths reach it and both used to read 0.0. A *fit* that was refused, and
+    // a *measurement* that was: `measureRaoAt` returns a default-constructed point
+    // when the record is too short to fit at all, so the default itself has to be
+    // the honest value rather than the reassuring one.
+    double heaveNonlinearity = std::numeric_limits<double>::quiet_NaN();
+    double pitchNonlinearity = std::numeric_limits<double>::quiet_NaN();
+    double rollNonlinearity = std::numeric_limits<double>::quiet_NaN();
 };
 
 struct RaoSettings {
