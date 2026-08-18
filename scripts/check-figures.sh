@@ -766,7 +766,7 @@ if [ -x "$TESTS" ]; then
   # gate never passes.
   suiteout=$("$TESTS" 2>&1)
   suite=$(printf '%s\n' "$suiteout" | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  expected=200789
+  expected=200790
   check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
         "$expected validation checks" "$FRONT"
   # **The roadmap publishes the same count in a different format**, and it was
@@ -777,6 +777,52 @@ if [ -x "$TESTS" ]; then
   # `$expected` so the two cannot part company.
   hint "$(printf '%s %s closed-form validation checks' \
           "${expected%???}" "${expected#${expected%???}}")" "$DOC"
+
+  # --- the hull-form convergence table, out of the same run ----------------------
+  #
+  # **`docs/05` had zero gated figures and this script's own header explains why,
+  # wrongly.** It reasons at :78-79 that `05`'s digits "are the fields of a file
+  # format `test_shipfile.cpp` already parses" -- true of §1 and false of §2, which
+  # is nine measured convergence percentages. That is the same document-level
+  # generalisation the header already confesses to about `01`: "A figure is worth
+  # gating here when a *tool* produces it -- which is a question about the line,
+  # not about the file."
+  #
+  # Nothing produced these until now. `test_hullform.cpp` swept the same waterline
+  # counts, computed the middle row as an absolute residual, asserted only that
+  # refining improves it, and printed none of the numbers. Re-derived, they came
+  # back two to five times smaller than what had been published for as long as the
+  # table existed.
+  hullrow() {
+    printf '%s\n' "$suiteout" |
+      awk -v st="$1" -v col="$2" \
+          '/S-175 block-coefficient error/ { f = 1 }
+           /worst \|LCB - asked\|/ { f = 0 }
+           f && NF == 4 && $1 == st { print $col; exit }'
+  }
+  MOD_DOC=docs/05-data-modding-validation.md
+  # Tolerance is the rounding the table publishes at, three decimals of a percent.
+  for row in "21 0.195 0.104 0.180" "41 0.351 0.053 0.022" "161 0.392 0.094 0.019"; do
+    set -- $row
+    st=$1
+    ptr="| $st | $2% | $3% |"
+    check "S-175 Cb error, $st stations, 11 waterlines (%)" "$2" 5e-4 "$(hullrow "$st" 2)" \
+          "$ptr" "$MOD_DOC"
+    check "S-175 Cb error, $st stations, 21 waterlines (%)" "$3" 5e-4 "$(hullrow "$st" 3)" \
+          "$ptr" "$MOD_DOC"
+    check "S-175 Cb error, $st stations, 41 waterlines (%)" "$4" 5e-4 "$(hullrow "$st" 4)" \
+          "$ptr" "$MOD_DOC"
+  done
+  # The two LCB figures are reported apart because they are different claims: the
+  # area curve is refined by stations and not by waterlines, and the document used
+  # to publish the waterline-sweep number as holding "at every resolution".
+  lcb=$(printf '%s\n' "$suiteout" |
+        sed -n 's/.*worst |LCB - asked|: \([0-9.e+-]*\) of Lpp over the waterline sweep, \([0-9.e+-]*\) .*/\1 \2/p' |
+        tail -1)
+  check "worst |LCB - asked| over the waterline sweep (of Lpp)" 4.0e-5 5e-7 \
+        "$(printf '%s\n' "$lcb" | cut -d' ' -f1)" "worst 4.0 × 10⁻⁵ of Lpp over that sweep" "$MOD_DOC"
+  check "and over all nine meshes, where stations move it" 2.3e-4 5e-6 \
+        "$(printf '%s\n' "$lcb" | cut -d' ' -f2)" "2.3 × 10⁻⁴ over all nine meshes" "$MOD_DOC"
 
   # --- Ikeda's viscous roll damping, out of the same run -------------------------
   #

@@ -65,9 +65,14 @@ struct HullParticulars {
 
     // Measured convergence on the S-175 form: the block-coefficient error is
     // dominated by *waterline* count, because that is what resolves the bilge
-    // arc. At 41 stations it runs 0.43% with 11 waterlines, 0.13% with 21 and
-    // 0.06% with 41; going from 41 to 161 stations at fixed waterlines barely
-    // moves it. So the default spends its triangles on waterlines.
+    // arc. At 41 stations it runs 0.351% with 11 waterlines, 0.053% with 21 and
+    // 0.022% with 41; going from 41 to 161 stations at fixed waterlines moves it
+    // only to 0.019%. So the default spends its triangles on waterlines.
+    //
+    // These are the same nine measurements `docs/05` publishes, and both are now
+    // re-derived from `test_hullform.cpp`'s own stdout by the figure gate -- they
+    // read 0.43 / 0.13 / 0.06 here and in that table for as long as neither was
+    // produced by anything.
     int stationCount = 41;     // odd, so one lands exactly on midship
     int waterlineCount = 21;
 };

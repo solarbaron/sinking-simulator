@@ -235,14 +235,41 @@ and any such claim should say which table it used.
 
 | stations | 11 waterlines | 21 | 41 |
 |---|---|---|---|
-| 21 | 0.52% | 0.23% | 0.15% |
-| 41 | 0.43% | 0.13% | 0.06% |
-| 161 | 0.40% | 0.10% | 0.025% |
+| 21 | 0.195% | 0.104% | 0.180% |
+| 41 | 0.351% | 0.053% | **0.022%** |
+| 161 | 0.392% | 0.094% | 0.019% |
 
 The error is dominated by **waterline** count, not station count, because the
-waterlines are what resolve the bilge arc — going 41→161 stations barely moves
-it. The default therefore spends its triangles on waterlines. LCB is analytic and
-lands within 6 × 10⁻⁵ of Lpp at every resolution.
+waterlines are what resolve the bilge arc — going 41→161 stations moves it from
+0.022% to 0.019% where going 11→41 waterlines moves it sixteenfold. The default
+therefore spends its triangles on waterlines.
+
+LCB is analytic off the area curve, so refining *waterlines* leaves it alone:
+worst 4.0 × 10⁻⁵ of Lpp over that sweep. Refining **stations** is refining the
+area curve itself, and it moves — 2.3 × 10⁻⁴ over all nine meshes. This used to
+claim 6 × 10⁻⁵ "at every resolution", which was true of the sweep the test ran and
+not of the table beside it.
+
+> **Correction, and none of these nine numbers had a producer.** The table read
+> 0.52 / 0.23 / 0.15, 0.43 / 0.13 / 0.06, 0.40 / 0.10 / 0.025. Grepping every one
+> of them across `tests/`, `tools/` and `engine/` returned nothing:
+> `test_hullform.cpp` swept the same waterline counts, computed the middle row as
+> an absolute residual, asserted only that refining improves things, and printed
+> none of it. It now prints all nine and `check-figures.sh` gates them.
+>
+> The measured values are two to five times smaller than what was published, and
+> the most likely reason is in the paragraph below this one: the stations were
+> moved off uniform spacing and concentrated in the tapers. The table appears to
+> predate that change. It is offered as the likeliest explanation rather than a
+> demonstrated one — nothing recorded which build produced the old numbers, which
+> is the whole argument for gating a figure instead of measuring it once.
+>
+> **One row is not monotone and that is not a rounding artefact.** At 21 stations
+> the error goes 0.195% → 0.104% → 0.180% as waterlines refine, so more waterlines
+> is briefly *worse*. At 41 and 161 stations it falls monotonically. A coarse
+> station set and a fine waterline set disagree about where the bilge is, and the
+> volume error changes sign somewhere in between; the default is nowhere near that
+> corner, but the table should not be read as "finer is always better".
 
 **Two defects this turned up, both silent.** The first version solved the area
 curve *without* the transom and stem end values, then rescaled the exponents to
