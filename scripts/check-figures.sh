@@ -778,6 +778,55 @@ if [ -x "$TESTS" ]; then
   hint "$(printf '%s %s closed-form validation checks' \
           "${expected%???}" "${expected#${expected%???}}")" "$DOC"
 
+  # --- hull-to-hull contact, out of the same run ----------------------------------
+  #
+  # All eight rows of section 2's "What a ram looks like in numbers", printed by
+  # `test_collision.cpp` on every run and gated by nothing. Two S-175-like hulls,
+  # one struck on her port side 30 m forward of midship at 6 m/s, both floating
+  # free with hydrostatics, damping and drag.
+  #
+  # The patch location is the row that matters most and reads least like a figure:
+  # it is what the structural model consumes, and the paragraph under the table
+  # claims the patch "lands within 5 cm of the station aimed at, on the port side,
+  # inside the hull's depth". Three coordinates, gated at the centimetre.
+  ram1=$(printf '%s\n' "$suiteout" | grep -m1 'ram: closing')
+  ram2=$(printf '%s\n' "$suiteout" | grep -m1 'm penetration over')
+  ram3=$(printf '%s\n' "$suiteout" | grep -m1 'patch at x =')
+
+  check "ram: closing speed (m/s)" 6.0 0.05 \
+        "$(printf '%s\n' "$ram1" | sed -n 's/.*closing \([0-9.]*\) m\/s.*/\1/p')" \
+        "| closing speed | 6.0 m/s |" "$SIM_DOC"
+  check "steps in contact" 162 0 \
+        "$(printf '%s\n' "$ram1" | sed -n 's/.*m\/s, \([0-9]*\) steps.*/\1/p')" \
+        "| 1.62 s (162 steps at dt = 10 ms) |" "$SIM_DOC"
+  check "and the duration that is (s)" 1.62 5e-3 \
+        "$(printf '%s\n' "$ram1" | sed -n 's/.*contact (\([0-9.]*\) s).*/\1/p')" \
+        "| 1.62 s (162 steps at dt = 10 ms) |" "$SIM_DOC"
+  check "peak normal force (MN)" 323 0.5 \
+        "$(printf '%s\n' "$ram1" | sed -n 's/.*peak \([0-9.]*\) MN.*/\1/p')" \
+        "| peak normal force | 323 MN |" "$SIM_DOC"
+
+  check "penetration at peak (m)" 0.398 5e-4 \
+        "$(printf '%s\n' "$ram2" | sed -n 's/ *\([0-9.]*\) m penetration.*/\1/p')" \
+        "| penetration at peak | 0.398 m |" "$SIM_DOC"
+  check "projected patch at peak (m2)" 11.4 0.05 \
+        "$(printf '%s\n' "$ram2" | sed -n 's/.*over \([0-9.]*\) m2.*/\1/p')" \
+        "| projected patch at peak | 11.4 m² |" "$SIM_DOC"
+  check "mean contact pressure at peak (MPa)" 28.3 0.05 \
+        "$(printf '%s\n' "$ram2" | sed -n 's/.*at \([0-9.]*\) MPa.*/\1/p')" \
+        "| mean contact pressure at peak | 28.3 MPa |" "$SIM_DOC"
+  check "energy absorbed (MJ)" 233 0.5 \
+        "$(printf '%s\n' "$ram2" | sed -n 's/.*MPa, \([0-9.]*\) MJ.*/\1/p')" \
+        "| energy absorbed | 233 MJ |" "$SIM_DOC"
+
+  patch="| x = +30.0 m, y = +9.3 m, z = +8.3 m |"
+  check "patch x in the struck ship's frame (m)" 30.0 0.05 \
+        "$(printf '%s\n' "$ram3" | sed -n 's/.*x = +\([0-9.]*\) m.*/\1/p')" "$patch" "$SIM_DOC"
+  check "patch y, which puts it on the port side (m)" 9.3 0.05 \
+        "$(printf '%s\n' "$ram3" | sed -n 's/.*y = +\([0-9.]*\) m.*/\1/p')" "$patch" "$SIM_DOC"
+  check "patch z, which puts it inside the hull's depth (m)" 8.3 0.05 \
+        "$(printf '%s\n' "$ram3" | sed -n 's/.*z = +\([0-9.]*\) m.*/\1/p')" "$patch" "$SIM_DOC"
+
   # --- propulsion and manoeuvring, out of the same run ----------------------------
   #
   # All eight rows of section 7's "Measured behaviour" table. Six were printed by
