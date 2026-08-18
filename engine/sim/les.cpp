@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstddef>
 
 namespace sim::les {
@@ -749,6 +750,8 @@ bool substep(Field& f, double dt, const std::vector<HeatSource>& sources, const 
     const double inverse[3] = {1.0 / (g.h[0] * g.h[0]), 1.0 / (g.h[1] * g.h[1]),
                                1.0 / (g.h[2] * g.h[2])};
     double rhsScale = 0;
+    // Set by any non-finite residual below; one is already fatal to the answer.
+    bool nonFinite = false;
     for (int k = 0; k < g.n[2]; ++k)
         for (int j = 0; j < g.n[1]; ++j)
             for (int i = 0; i < g.n[0]; ++i) {
@@ -824,12 +827,40 @@ bool substep(Field& f, double dt, const std::vector<HeatSource>& sources, const 
                     const double total = neighbourSum(i, j, k, c, &diagonal);
                     const double value = total - diagonal * w.potential[static_cast<std::size_t>(c)] -
                                          w.rhs[static_cast<std::size_t>(c)];
-                    residual = std::max(residual, std::abs(value));
+                    // **A non-finite residual must not vanish into the maximum.**
+                    // `std::max(residual, x)` is `x < residual ? x : residual`, so
+                    // `NaN < residual` is false and the NaN is dropped -- and every
+                    // consequence follows: `residual` comes back 0, `rhsScale`
+                    // above came back 0 the same way so `tolerance` is its 1e-14
+                    // floor, `residual <= tolerance` is true, and the relaxation
+                    // **breaks out after a single sweep** reporting `sweeps = 1`
+                    // and `capped = false` over a field that is not a number.
+                    //
+                    // Same defect and same repair as `flip.cpp`'s pressure
+                    // projection, which is the other Poisson solve in this tree
+                    // and was written from this one. Only this fold is guarded:
+                    // `w.rhs` feeds `value` directly, so a non-finite right-hand
+                    // side reaches here too, and a second test beside `rhsScale`
+                    // would be one no test could tell from its own absence --
+                    // which is what a mutation sweep scored it there.
+                    if (std::isfinite(value))
+                        residual = std::max(residual, std::abs(value));
+                    else
+                        nonFinite = true;
                 }
+        // Breaking here on a non-finite field is right and not a shortcut: the
+        // residual cannot fall, so the remaining sweeps are work that changes
+        // nothing. The report below is what carries the failure.
         if (residual <= tolerance) break;
     }
     const int sweeps = sweep + 1;
-    const bool capped = residual > tolerance;
+    // A relaxation handed a NaN has not converged, and said it had. `capped` rather
+    // than a new flag because every consumer already asserts on it --
+    // `test_promotion.cpp` at two sites -- and "it ran out of sweeps" and "it never
+    // started" are both *the answer is not trustworthy*. The residual is reported
+    // as NaN so that a threshold test on it fails too.
+    const bool capped = nonFinite || residual > tolerance;
+    if (nonFinite) residual = std::numeric_limits<double>::quiet_NaN();
 
     for (int a = 0; a < 3; ++a) {
         const int count[3] = {g.faceCount(a, 0), g.faceCount(a, 1), g.faceCount(a, 2)};

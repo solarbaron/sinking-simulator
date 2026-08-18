@@ -3816,10 +3816,55 @@ void testTheCellBudgetBindsAndTheCostIsMeasured() {
     // range printed beside it and no assertion pretending otherwise.
 }
 
+// **A relaxation handed a NaN reported that it had converged.**
+//
+// `les.cpp`'s Poisson solve folded its residual with `std::max(residual, x)`, which
+// returns the accumulator for a NaN `x` -- the argument order decides, and this one
+// drops it. `rhsScale` was folded the same way, so `tolerance` fell back to its
+// 1e-14 floor; `residual` came back 0; `residual <= tolerance` was true; and the
+// sweep loop **broke after a single pass**, reporting `sweeps = 1` and
+// `capped = false` over a velocity field that is not a number.
+//
+// The same defect and the same repair as `flip.cpp`'s pressure projection -- the
+// other Poisson solve in this tree, and the one this was written from.
+void testANaNFaceIsNotAConvergedRelaxation() {
+    std::printf("\n--- les: a relaxation handed a NaN has not converged ---\n");
+    const les::Params params = coarse();
+    std::vector<les::HeatSource> burning{pool(200e3, 1.0, 0.94)};
+
+    // The control first: the same field, untouched, converges. Without it every
+    // assertion below would hold for a solver that called everything capped.
+    les::Field clean = uniformField(4.0, 3.0, 2.5, params, kTAmbient);
+    les::Account cleanAccount;
+    les::resetAccount(clean, cleanAccount);
+    const les::StepResult good = les::step(clean, 1.0, burning, params, cleanAccount);
+    expectTrue("the reference relaxation converges", !good.projectionCapped);
+    expectTrue("with a finite residual", std::isfinite(good.projectionResidual));
+    expectTrue("and it did some work, so the comparison is not against nothing",
+               good.projectionSweeps >= 1);
+
+    // One face velocity, out of several hundred, set to a NaN.
+    les::Field poisoned = uniformField(4.0, 3.0, 2.5, params, kTAmbient);
+    les::Account poisonedAccount;
+    les::resetAccount(poisoned, poisonedAccount);
+    expectTrue("the poisoned field has faces to poison", !poisoned.velocity[0].empty());
+    poisoned.velocity[0][poisoned.velocity[0].size() / 2] =
+        std::numeric_limits<double>::quiet_NaN();
+    const les::StepResult bad = les::step(poisoned, 1.0, burning, params, poisonedAccount);
+    expectTrue("one NaN face is reported as not converged", bad.projectionCapped);
+    expectTrue("and the residual it reports is not a number, so no threshold passes",
+               std::isnan(bad.projectionResidual));
+    // The specific lie: it used to report exactly zero, which reads as an exact
+    // solve rather than as a solve that stopped after one sweep.
+    expectTrue("in particular it does not report a residual of zero",
+               bad.projectionResidual != 0.0);
+}
+
 }  // namespace
 
 void runPromotionTests() {
     std::printf("\n--- adaptive zone promotion ---\n");
+    testANaNFaceIsNotAConvergedRelaxation();
     testNothingPromotesOnAShipAtRestInStillWater();
     testAUniformlyLoadedShipDoesNotPromoteEverywhere();
     testTheBackgroundIsAMedianAndTheThresholdIsWhereItSays();
