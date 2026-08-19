@@ -4687,8 +4687,21 @@ than this one's.
   hold has twelve stations along x and hundreds round the girth, a slender box is the
   other way round — so three candidates are built and the narrowest kept, including
   `reduction::bandwidthReducingOrder`, which is exposed for this. Getting it wrong
-  cost a 6 240-DOF solve **9.53 s instead of 0.06**, and took the ferry hold's
-  half-bandwidth from 146 to 1 382 — 0.14 s of banded factorisation against 5.3.
+  cost a 6 240-DOF solve **9.53 s instead of 0.06**, and takes the ferry hold's
+  half-bandwidth from 146 to **1 382** — the best the two lexicographic orderings
+  manage on the untied hold, against RCM's 146.
+
+  That 1 382 was, until it was gated, a figure **no invocation could produce**: the
+  chooser keeps the narrowest of its three candidates and discarded the other two
+  scores the moment it had a minimum, so the number could be neither checked nor
+  refuted. `section_probe` now prints all three (2 528 x-fastest, 1 382 y-fastest,
+  146 RCM) and the gate re-derives them. The timings that used to sit on this
+  sentence — "0.14 s of banded factorisation against 5.3" — were **borrowed from
+  the tie comparison below**, where 5.3 s is the cost of the *tied* 1 520 band. Both
+  numbers here are untied solves, and a 1 382 band would cost roughly (1382/146)²
+  of the 146 one. Removed rather than re-measured: forcing the chooser onto its
+  loser to time it is work this claim does not need, and the bandwidths are the
+  claim.
 
 #### What mutation testing found
 

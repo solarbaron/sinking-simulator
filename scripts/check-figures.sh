@@ -1979,6 +1979,30 @@ if [ -x "$SECTION" ]; then
   check "and tied, above both pieces" 2.3026 5e-5 "$(cbmode 'whole, tied')" \
         "the same section is **2.3026 Hz**" "$SECTION_DOC"
 
+  # **The orderings that lost.** `1 382` is quoted in three places as what the node
+  # numbering is worth, and until the chooser was made to keep its losing scores no
+  # invocation could produce it: it kept the narrowest of three candidates and threw
+  # the other two away. It could not be checked and it could not be refuted -- a
+  # *tied* candidate at 1 382 is arithmetically impossible, since the tied winner is
+  # gated at 1 520 and the winner is the smallest. Measured, it is the untied
+  # y-fastest ordering exactly.
+  #
+  # Read on its own prefix rather than on "cut"/"tied", because `tierow` selects on
+  # the first field and takes the first match -- a second line starting with the same
+  # word would have been read as the data row and quietly broken eight figures above.
+  ordering() {  # $1 = cut|tied, $2 = which column
+    printf '%s\n' "$sweep" |
+      awk -v r="orderings-$1" -v c="$2" '$1 == r { print $c; exit }' | tr -d ',;'
+  }
+  check "untied hold: x-fastest ordering" 2528 0 "$(ordering cut 3)" \
+        'half-bandwidth from 146 to **1 382**' "$SECTION_DOC"
+  check "untied hold: y-fastest ordering, the 1382 three documents quote" 1382 0 \
+        "$(ordering cut 5)" 'half-bandwidth from 146 to **1 382**' "$SECTION_DOC"
+  check "untied hold: RCM, which is what it ships with" 146 0 "$(ordering cut 7)" \
+        'half-bandwidth from 146 to **1 382**' "$SECTION_DOC"
+  check "tied hold: best ordering without RCM" 2540 0 "$(ordering tied 11)" \
+        '(2 528 x-fastest, 1 382 y-fastest,' "$SECTION_DOC"
+
   # The junction tie, cut against tied. `GJ` is the figure the tie exists for.
   check "cut section: half-bandwidth" 146 0 "$(tierow cut 2)" "| cut" "$SECTION_DOC"
   check "cut section: components" 7 0 "$(tierow cut 3)" "| cut" "$SECTION_DOC"

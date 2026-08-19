@@ -1060,7 +1060,9 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
     // fastest is what makes a slab of the band twelve nodes deep; a long slender box
     // is the other way round, and getting it backwards cost a 6 240 DOF solve **9.53
     // seconds instead of 0.06**, while leaving the ferry hold's half-bandwidth at
-    // 1 382 instead of 146 cost it 5.3 s instead of 0.14. Three orderings are built
+    // 1 382 instead of 146 costs it roughly (1382/146)^2 of the banded factorisation.
+    // (The 5.3 s once quoted here belongs to the *tied* 1 520 band, not to this
+    // pair; both of these are untied solves.) Three orderings are built
     // -- the two lexicographic ones and `reduction::bandwidthReducingOrder` -- and
     // the narrowest is kept.
     // Comparing is free, a bandwidth being one pass over the sub-quads, and it makes
@@ -1143,8 +1145,13 @@ Section buildSection(const StructuralMesh& structure, const SectionParams& param
         const std::vector<std::uint32_t> candidates[3] = {ranking(true), ranking(false), cuthill};
         std::size_t best = spreadOf(candidates[0]);
         int chosen = 0;
+        section.candidateBandwidth[0] = 3 * (2 * best + 1) - 1;
         for (int k = 1; k < 3; ++k) {
             const std::size_t spread = spreadOf(candidates[static_cast<std::size_t>(k)]);
+            // Kept for every candidate, not just the winner. The losing scores are
+            // what "the ordering is worth a hundredfold" is a claim *about*, and
+            // until now the chooser discarded them the moment it had a minimum.
+            section.candidateBandwidth[static_cast<std::size_t>(k)] = 3 * (2 * spread + 1) - 1;
             if (spread < best) {
                 best = spread;
                 chosen = k;

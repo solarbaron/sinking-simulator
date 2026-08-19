@@ -2117,6 +2117,20 @@ int main(int argc, char** argv) {
                 if (!modes.value.empty())
                     hz = std::sqrt(std::max(0.0, modes.value[0])) / (2.0 * std::numbers::pi);
             }
+            // The two orderings that lost, which is what "the node numbering is a
+            // hundredfold, not a rounding" is a claim *about*. The chooser kept only
+            // the winner, so the figure the documents quote for the alternative --
+            // 1 382 on the untied hold -- could be produced by no invocation at all,
+            // and so could be neither checked nor refuted.
+            // **Not led by "cut"/"tied".** `check-figures.sh`'s `tierow` selects on
+            // the first field and takes the first match, so a second line starting
+            // with the same word would have been read as the data row and quietly
+            // broken eight gated figures.
+            std::printf("  orderings-%-4s x-fastest %zu, y-fastest %zu, RCM %zu;"
+                        " best without RCM %zu\n",
+                        tie ? "tied" : "cut", piece.candidateBandwidth[0],
+                        piece.candidateBandwidth[1], piece.candidateBandwidth[2],
+                        std::min(piece.candidateBandwidth[0], piece.candidateBandwidth[1]));
             std::printf("  %-6s %7zu %6d %9.1f %9.5f %8.2f %12.4e %10.4f %10.2f\n",
                         tie ? "tied" : "cut", piece.halfBandwidth, piece.components,
                         piece.tiedEdges, stretched.axialStiffness / youngs, solveSeconds,

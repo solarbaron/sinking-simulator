@@ -589,10 +589,24 @@ struct Section {
     // The DOF half-bandwidth the node numbering delivers. `solidshell::solveStatic`
     // numbers its free degrees of freedom in the mesh's own order and has no
     // renumbering pass, so this is what a static solve of the section costs -- and it
-    // is not a rounding: the ferry hold measures 146 here against 1 382 before
-    // `reduction::bandwidthReducingOrder` was one of the candidates, which is 5.3 s
-    // of banded factorisation against 0.14.
+    // is not a rounding: the ferry hold measures 146 here against 1 382 without
+    // `reduction::bandwidthReducingOrder` among the candidates. Both are untied
+    // solves; the 5.3 s that used to be quoted alongside them is the *tied* 1 520
+    // band's cost, borrowed from a different comparison.
     std::size_t halfBandwidth = 0;
+
+    // What each of the three candidate orderings would have cost, in the order they
+    // are built: numbering x fastest, numbering y fastest, and
+    // `reduction::bandwidthReducingOrder`. `halfBandwidth` is the smallest.
+    //
+    // **Recorded because the losers were unobservable and one of them is
+    // published.** The comment above quotes "146 against 1 382 before
+    // `bandwidthReducingOrder` was one of the candidates" -- a figure no invocation
+    // could print, since the chooser kept only the winner. It could not be checked,
+    // and it could not be refuted either: a *tied* candidate at 1 382 is impossible,
+    // because the winner is the smallest of the three and the tied winner is gated
+    // at 1 520. Now the claim is a number a run produces.
+    std::size_t candidateBandwidth[3] = {0, 0, 0};
 
     // --- Thickness seams, see §3 -----------------------------------------------
     int    taperedElements = 0;    // elements whose corners do not share a thickness
