@@ -138,8 +138,29 @@ std::vector<double> weightDistribution(const Ship& ship, const std::vector<doubl
 // to zero.
 //
 // Returns false if it cannot balance -- a ship that cannot float on this wave has
-// no hull girder answer to give.
-bool balanceOnWave(Ship& ship, const Sea& sea, int iterations = 40);
+// no hull girder answer to give. `iterationsUsed`, if given, reports how many
+// Newton steps were actually taken; fewer than `iterations` means the two
+// residuals converged rather than the budget running out.
+bool balanceOnWave(Ship& ship, const Sea& sea, int iterations = 40,
+                   int* iterationsUsed = nullptr);
+
+// One Newton step of that balance: solve
+//
+//     [ a  b ] [ dz    ]   [ force  ]
+//     [ c  d ] [ dTrim ] = [ moment ]
+//
+// for the sinkage and trim correction, and refuse rather than divide when the
+// Jacobian is singular *on its own scale*. Separated out because that refusal is
+// the only part of the step with a wrong answer available, and it is otherwise
+// unreachable from a test. On a real hull `a` is the waterplane stiffness, of
+// order 1e7 N/m, and `d` the trim stiffness, of order 1e10 N m/rad; `det` is
+// therefore around 1e17, and even a determinant that has cancelled down to
+// round-off still comes out near 1e2. An absolute floor cannot tell those two
+// apart at any ship's scale -- only an exactly zero Jacobian, which the
+// finiteness check catches anyway -- so the test has to be against the size of
+// the products that cancelled.
+bool solveBalanceStep(double a, double b, double c, double d, double force, double moment,
+                      double& dz, double& dTrim);
 
 // The whole calculation for a ship as she floats. `balance` poises her on the sea
 // first; turn it off only when the caller has already done so.

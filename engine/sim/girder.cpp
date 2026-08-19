@@ -201,10 +201,36 @@ std::vector<double> weightDistribution(const Ship& ship, const std::vector<doubl
     return out;
 }
 
-bool balanceOnWave(Ship& ship, const Sea& sea, int iterations) {
+bool solveBalanceStep(double a, double b, double c, double d, double force, double moment,
+                      double& dz, double& dTrim) {
+    const double det = a * d - b * c;
+    // The size the determinant would have had if nothing had cancelled. Written
+    // as a negated `>` so that a Jacobian which is entirely zero -- no hull in the
+    // water at all, every term exactly 0, and `scale` zero with it -- and a NaN
+    // one both refuse rather than divide. 1e-12 is four decades above double
+    // round-off, so it fires only once the two products agree to within a few
+    // thousand ULP, which is past the point where a Jacobian finite-differenced
+    // from clipped volumes carries any digits at all.
+    const double scale = std::abs(a * d) + std::abs(b * c);
+    if (!(std::abs(det) > 1e-12 * scale)) return false;
+    dz = (force * d - b * moment) / det;
+    dTrim = (a * moment - force * c) / det;
+    // Checked before the caller applies it, so a nonsense correction never
+    // reaches the ship.
+    return std::isfinite(dz) && std::isfinite(dTrim);
+}
+
+bool balanceOnWave(Ship& ship, const Sea& sea, int iterations, int* iterationsUsed) {
+    if (iterationsUsed) *iterationsUsed = 0;
     const Diagnostics d = ship.diagnostics(sea);
     const double weight = d.displacementMass * kGravity;
     if (!(weight > 0)) return false;
+    // A moment residual has to be measured against a lever, and the hull's own
+    // length is the only one the problem offers. A ship with no cached hull
+    // extent has neither a length nor any stations -- girderStations() refuses
+    // the same ship -- so there is nothing here to balance.
+    const double length = ship.hullHi.x - ship.hullLo.x;
+    if (!(length > 0)) return false;
     // Longitudinal centre of gravity, in world coordinates along the ship.
     const Mat3 R0 = ship.state.orientation.toMat3();
     const double lcgWorld = (R0 * d.centreOfGravity + ship.state.position).x;
@@ -236,11 +262,34 @@ bool balanceOnWave(Ship& ship, const Sea& sea, int iterations) {
         return s;
     };
 
+    // Converged when both residuals are small, each against its own scale --
+    // which cannot be one scale, because they are not one quantity. `f0` is a
+    // force in N and `m0` a moment in N m, and testing the moment against
+    // `1e-6 * weight` asked for the centre of buoyancy within a fixed
+    // *micrometre* of the centre of gravity, on a ship of any size at all.
+    //
+    // What that costs was measured rather than assumed, and it is not what it
+    // looks like: the criterion is reachable, because Newton drives the residual
+    // to round-off and the loop does stop. What it is not is scale free. The same
+    // barge at 12 m, 120 m, 360 m and 1200 m stops after 11, 13, 14 and 15 steps
+    // against `weight`, climbing with the hull because a micrometre is a finer
+    // demand on a longer ship, and after 9 steps at every one of those sizes
+    // against `weight * length`. The ferry on a 3 m crest goes from 12 steps to
+    // 10. Each step is three whole-hull clip-and-integrate passes, and
+    // hullGirder() takes this path on every Tier-0 review.
+    //
+    // Against `weight * length` the two legs are the same relative tolerance, and
+    // the moment one reads as "the centre of buoyancy is within 1e-6 of a length
+    // of the centre of gravity".
+    const double forceTolerance = 1e-6 * weight;
+    const double momentTolerance = 1e-6 * weight * length;
+
     double dz = 0.0, dTrim = 0.0;
     for (int i = 0; i < iterations; ++i) {
         double f0 = 0, m0 = 0;
         residuals(shifted(dz, dTrim), f0, m0);
-        if (std::abs(f0) < 1e-6 * weight && std::abs(m0) < 1e-6 * weight) break;
+        if (std::abs(f0) < forceTolerance && std::abs(m0) < momentTolerance) break;
+        if (iterationsUsed) ++*iterationsUsed;
 
         const double hz = 0.01, ht = 1e-4;
         double f1 = 0, m1 = 0, f2 = 0, m2 = 0;
@@ -249,12 +298,11 @@ bool balanceOnWave(Ship& ship, const Sea& sea, int iterations) {
 
         const double a = (f1 - f0) / hz, b = (f2 - f0) / ht;
         const double c = (m1 - m0) / hz, d2 = (m2 - m0) / ht;
-        const double det = a * d2 - b * c;
-        if (std::abs(det) < 1e-30) return false;
+        double sinkage = 0, trim = 0;
+        if (!solveBalanceStep(a, b, c, d2, f0, m0, sinkage, trim)) return false;
         // Damped, because a hull leaving the water makes the Jacobian lie.
-        dz -= 0.7 * (f0 * d2 - b * m0) / det;
-        dTrim -= 0.7 * (a * m0 - f0 * c) / det;
-        if (!std::isfinite(dz) || !std::isfinite(dTrim)) return false;
+        dz -= 0.7 * sinkage;
+        dTrim -= 0.7 * trim;
     }
 
     ship = shifted(dz, dTrim);

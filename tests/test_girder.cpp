@@ -150,22 +150,29 @@ void testImbalanceShowsInTheClosure() {
 
 // --- The distributions, against their defining properties --------------------
 
-Ship barge(double lcgOffset) {
+// A 120 m x 18 m box barge floating at 5 m, scaled by `k` in every length. The
+// scale factor exists for testBalanceConvergesTheSameWayAtEverySize() below:
+// geometrically similar hulls are the same hydrostatic problem written in
+// different units, so anything that behaves differently across `k` is carrying a
+// dimensional mistake.
+Ship scaledBarge(double lcgOffset, double k) {
     Ship s;
     std::vector<Station> stations;
     for (int i = 0; i <= 40; ++i) {
         Station q;
-        q.x = -60.0 + 120.0 * i / 40.0;
-        q.halfBeam = {9.0, 9.0};
+        q.x = k * (-60.0 + 120.0 * i / 40.0);
+        q.halfBeam = {9.0 * k, 9.0 * k};
         stations.push_back(q);
     }
-    s.hull = makeHullFromStations(stations, {0.0, 12.0});
-    s.deckEdgeZ = 12.0;
-    s.lightshipMass = 120.0 * 18.0 * 5.0 * kRhoSeawater;   // floats at 5 m
-    s.lightshipCog = {lcgOffset, 0.0, 6.0};
-    s.gyradii = {6.0, 30.0, 30.0};
+    s.hull = makeHullFromStations(stations, {0.0, 12.0 * k});
+    s.deckEdgeZ = 12.0 * k;
+    s.lightshipMass = k * k * k * 120.0 * 18.0 * 5.0 * kRhoSeawater;   // floats at 5k m
+    s.lightshipCog = {lcgOffset * k, 0.0, 6.0 * k};
+    s.gyradii = {6.0 * k, 30.0 * k, 30.0 * k};
     return s;
 }
+
+Ship barge(double lcgOffset) { return scaledBarge(lcgOffset, 1.0); }
 
 // The trapezoidal lightship curve is an assumption, but it is an assumption with
 // two exact properties: it integrates to the lightship weight and its centroid is
@@ -323,6 +330,122 @@ void testFloodingBendsTheHull() {
                std::abs(after.maxMoment) > 0.01 * reference);
 }
 
+// --- Balancing her on the wave -----------------------------------------------
+
+// The balance drives two residuals to zero, and they are not the same kind of
+// quantity: one is a net force in N, the other a net trimming moment in N m. A
+// tolerance has the dimensions of the thing it bounds, so those two cannot share
+// one -- and this loop gave them one, testing the moment against `1e-6 * weight`.
+// Read as a lever that is asking for the centre of buoyancy within a fixed
+// *micrometre* of the centre of gravity, on a ship of any size at all.
+//
+// The signature of a tolerance whose dimensions are wrong is that it is not
+// scale free, and that is what this checks rather than a step count on one hull.
+// The same barge at four sizes spanning 12 m to 1200 m is one hydrostatic problem
+// written in four sets of units, so a criterion with the right dimensions has to
+// stop it after the same number of Newton steps. Measured: nine steps at every
+// size against `weight * length`, and 11, 13, 14 and 15 -- climbing with the
+// hull, because a micrometre is a finer demand on a longer ship -- against
+// `weight` alone.
+//
+// It is worth a real number: each step is three whole-hull clip-and-integrate
+// passes, and `hullGirder()` takes this path on every Tier-0 review.
+void testBalanceConvergesTheSameWayAtEverySize() {
+    int first = -1;
+    for (double k : {0.1, 1.0, 3.0, 10.0}) {
+        Ship ship = scaledBarge(4.5, k);
+        ship.initialise(0.0);
+        const Sea still(0.0);
+
+        int used = -1;
+        expectTrue("the barge balances at every size", balanceOnWave(ship, still, 40, &used));
+        // Vacuity guard: a ship that was already poised would report no steps at
+        // every size, and the comparison below would be between four zeroes. The
+        // +4.5 m LCG is there to make her trim.
+        expectTrue("and balancing her is a real iteration, not a no-op", used >= 5);
+        if (first < 0) first = used;
+        expectEqual("the same problem takes the same number of steps at every size", used, first);
+        expectTrue("which is the nine measured, not the forty-step budget", used <= 10);
+
+        // What that criterion promises, read back from the balanced ship through
+        // diagnostics() rather than from the integral the solver used: buoyancy
+        // within 1e-6 of weight. Asserted at the tolerance itself and not at the
+        // 7.5e-9 measured, because the loop can exit the moment *both* legs are
+        // inside and it is the moment leg that binds here -- how far past its own
+        // bound the force leg happens to be is luck, and 1e-6 is the promise.
+        const Diagnostics d = ship.diagnostics(still);
+        const double weight = d.displacementMass * kGravity;
+        const double buoyancy = ship.seaDensity * d.buoyantVolume * kGravity;
+        expectTrue("she is floating at all", buoyancy > 0);
+        expectNear("buoyancy equals weight to the tolerance the loop stops on", buoyancy, weight,
+                   1e-6 * weight);
+    }
+}
+
+// The other half of scaling the moment tolerance by a length: there has to *be*
+// a length. `hullLo`/`hullHi` are cached by Ship::initialise(), and on a ship
+// that has never been initialised the tolerance would come out zero -- a
+// criterion `std::abs(m0) < 0` that no residual can ever be under, so the loop
+// would run its whole budget on any ship it did not otherwise give up on. She is
+// refused instead, which is what girderStations() already does with the same ship.
+void testAShipWithNoHullExtentIsRefused() {
+    Ship raw = barge(0.0);   // deliberately not initialise()d
+    expectTrue("the fixture really has no cached hull extent", !(raw.hullHi.x > raw.hullLo.x));
+
+    int used = -1;
+    expectTrue("a ship with no length to measure a moment against is refused",
+               !balanceOnWave(raw, Sea(0.0), 40, &used));
+    // And refused before spending anything, which is what says the refusal came
+    // from the missing length rather than from the iteration failing later.
+    expectEqual("and refused before taking a single Newton step", used, 0);
+    expectTrue("the same ship girderStations() has always refused",
+               girderStations(raw, 41).empty());
+}
+
+// The 2 x 2 Newton solve, and specifically its refusal to divide by a singular
+// Jacobian. That refusal is what the balance falls back on when a hull leaves the
+// water, and it can only work if it is measured against the size of the terms
+// that cancelled: `a` is a waterplane stiffness in N/m and `d` a trim stiffness
+// in N m/rad, so on a real hull their product is around 1e17 and *nothing* the
+// problem produces comes near an absolute floor of 1e-30.
+void testASingularBalanceJacobianIsRefusedOnItsOwnScale() {
+    // A ferry's own numbers: 1.9e7 N/m of waterplane stiffness against 2.2e10
+    // N m/rad of trim stiffness, coupled by the offset of the centre of flotation.
+    const double a = 1.9e7, d = 2.2e10, b = -3.0e8, c = -3.0e8;
+    const double force = 1.0e6, moment = 4.0e7;   // N and N m
+
+    double dz = 0, dTrim = 0;
+    expectTrue("a well conditioned Jacobian solves",
+               solveBalanceStep(a, b, c, d, force, moment, dz, dTrim));
+    // Checked by substitution rather than against a second Cramer's rule, which
+    // would agree with a transposed one.
+    expectNear("and the step satisfies the force row", a * dz + b * dTrim, force,
+               1e-9 * std::abs(force));
+    expectNear("and the moment row", c * dz + d * dTrim, moment, 1e-9 * std::abs(moment));
+
+    // Now the same matrix made singular, at exactly the same scale: `b * c` is
+    // built to sit 1e4 away from `a * d`, so every term is a ship's and the
+    // determinant is nothing but what failed to cancel.
+    const double bSing = 2.0e10, cSing = (a * d - 1.0e4) / bSing;
+    const double det = a * d - bSing * cSing;
+    expectNear("the singular case is built where it was meant to be", det, 1.0e4, 1.0e3);
+    // The two halves of the point, and the first is why the second is needed:
+    // an absolute floor calls a determinant of ten thousand perfectly healthy.
+    expectTrue("an absolute floor of 1e-30 waves that determinant through",
+               std::abs(det) > 1e-30);
+    expectTrue("though it is a part in 4e13 of the products that made it",
+               std::abs(det) < 1e-12 * (std::abs(a * d) + std::abs(bSing * cSing)));
+    dz = dTrim = 0;
+    expectTrue("so a Jacobian singular on its own scale is refused",
+               !solveBalanceStep(a, bSing, cSing, d, force, moment, dz, dTrim));
+
+    // And the degenerate end, which the relative form still has to catch: nothing
+    // of the hull in the water, so every term is exactly zero and the scale it
+    // would be compared against is zero too.
+    expectTrue("a hull out of the water entirely is refused as well",
+               !solveBalanceStep(0, 0, 0, 0, -1.0e8, 0, dz, dTrim));
+}
+
 // --- From moment to stress ---------------------------------------------------
 
 // sigma = M / Z is arithmetic, so it is asserted as arithmetic. The part worth
@@ -407,5 +530,8 @@ void runGirderTests() {
     testAnEvenlyLoadedBargeBarelyBends();
     testCrestHogsAndTroughSags();
     testFloodingBendsTheHull();
+    testBalanceConvergesTheSameWayAtEverySize();
+    testAShipWithNoHullExtentIsRefused();
+    testASingularBalanceJacobianIsRefusedOnItsOwnScale();
     testStressFollowsTheMomentAndItsSign();
 }
