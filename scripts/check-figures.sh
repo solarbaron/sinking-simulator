@@ -657,6 +657,39 @@ if [ -x "$MILESTONE" ]; then
   # above, so the label goes instead and the fields are counted forward: 1 failed,
   # 2 at, 3 steel C, 4 member C, 5 worst u, 6 members, 7 hole, 8 into ER, 9 wet.
   row() { printf '%s\n' "$bulk" | grep "^$1  *" | sed "s/^$1  *//"; }
+
+  # **The second leak path, which is the milestone's other control and was ungated.**
+  # The ferry carries an unsealed 0.04 m2 cable transit through this bulkhead. The
+  # milestone seals it; `--cable-transit` reopens it, and then the water alone fells
+  # the bulkhead at 3645 s with nothing burning -- the figure `06-roadmap.md`
+  # publishes and nothing re-derived.
+  #
+  # **This run exits non-zero on purpose, and that is asserted rather than ignored.**
+  # `bulkhead_probe`'s own `require` says the head alone must not fell the bulkhead,
+  # which is true of the milestone configuration and is exactly what reopening the
+  # transit inverts. So the check is that it fails *once*, for *that* reason: an
+  # ignored exit status would be a hole, and a run that started failing for some
+  # other reason would slip through a bare `|| true`.
+  #
+  # `--duration=3700` rather than the default 3600, because the event is at 3645 and
+  # a run that stops before it reports nothing. 99 s.
+  transit=$("$MILESTONE" --quiet --cable-transit --duration=3700 2>&1)
+  trow() { printf '%s\n' "$transit" | grep "^$1  *" | sed "s/^$1  *//"; }
+  check "cable transit open: the water alone fells the bulkhead at (s)" 3645 0 \
+        "$(trow 'head alone' | awk '{ print $2 }')" \
+        "the **water-only control at 3645 s with nothing burning anywhere**"
+  checks=$((checks + 1))
+  if printf '%s\n' "$transit" | grep -q '^1 check(s) failed$' &&
+     printf '%s\n' "$transit" | grep -q '^  ! the head alone felled the bulkhead$'; then
+    printf '  %s✓%s reopening the cable transit inverts exactly one milestone control\n' \
+           "$green" "$off"
+  else
+    printf '  %s✗%s the cable-transit run did not fail in the one way it is supposed to\n' \
+           "$red" "$off"
+    printf '      %sexpected "1 check(s) failed" and "the head alone felled the bulkhead"%s\n' \
+           "$dim" "$off"
+    fails=$((fails + 1))
+  fi
   window_lo=$(printf '%s\n' "$bulk" | sed -n 's/^restraint window: .* true for \([0-9.]*\) <= r.*/\1/p')
   window_hi=$(printf '%s\n' "$bulk" | sed -n 's/^restraint window: .*<= r < \([0-9.]*\),.*/\1/p')
   check "the restraint window's lower bound" 0.2194 0.0005 "$window_lo" \
@@ -2721,6 +2754,34 @@ if [ -x "$ZONE" ]; then
         "| zone handed the girder's 13.1 MPa | **20.25 MN**, +7.1% |" "$ZONE_DOC"
   check "and the force at 0.078 m under it (MN)" 20.25 0.005 \
         "$(printf '%s\n' "$zone" | awk '$1=="solid-shell" && $2=="FEM" && NF==5 { print $4 }')" \
+        "| zone handed the girder's 13.1 MPa | **20.25 MN**, +7.1% |" "$ZONE_DOC"
+
+  # **The control, which was ungated while its result was gated.** §2's table is two
+  # rows and the finding is the difference between them: 18.90 MN with the patch
+  # told it starts unstressed, 20.25 MN carrying the girder's own 13.1 MPa, +7.1%.
+  # The loaded row and the 13.1 MPa were both gated; the unstressed row was not, so
+  # the *published* half of a two-row comparison stood on a single measurement. 8 s.
+  #
+  # The `preload:` line is read too, because until this commit it announced
+  # `applied 1` on this very run -- `preloadFor`'s verdict that a pre-stress exists,
+  # printed where a reader would take it for what the solve received.
+  bare=$("$ZONE" --radius=3.0 --depth=0.22 --no-preload 2>&1)
+  bareforce=$(printf '%s\n' "$bare" |
+              awk '$1=="solid-shell" && $2=="FEM" && NF==5 { print $4 }')
+  check "the force at 0.078 m with no pre-stress (MN)" 18.90 0.005 "$bareforce" \
+        '| zone told it starts unstressed | **18.90 MN** — the figure this file published |' \
+        "$ZONE_DOC"
+  check "and the solve is told it got none" 0 0 \
+        "$(printf '%s\n' "$bare" | sed -n 's/^preload: .* given to the solve \([0-9]*\)$/\1/p')" \
+        '| zone told it starts unstressed | **18.90 MN** — the figure this file published |' \
+        "$ZONE_DOC"
+  # The +7.1% the table publishes, derived here rather than transcribed: it is the
+  # whole content of the comparison and neither row alone carries it.
+  # 0.06, because both rows are published to two decimals: 18.90 and 20.25 each
+  # carry +/-0.005, which is +/-0.04 on the ratio. Measured 7.14 against a doc that
+  # rounds to 7.1, so the bound is the rounding and nothing more.
+  check "the pre-stress is worth +7.1% at 0.078 m" 7.1 0.06 \
+        "$(awk -v a="$bareforce" -v b="20.25" 'BEGIN { printf "%.2f", 100.0 * (b / a - 1.0) }')" \
         "| zone handed the girder's 13.1 MPa | **20.25 MN**, +7.1% |" "$ZONE_DOC"
 
   # **The two cost estimators, checked against each other and not only against the

@@ -250,11 +250,20 @@ int main(int argc, char** argv) {
     // already carrying before the bow arrives.
     const sim::promotion::PreloadCheck preload =
         sim::promotion::preloadFor(tier.girder, structure, patch);
+    // **`applied` is the check's own verdict, not the solve's.** `preloadFor` says
+    // whether the girder *has* a pre-stress worth applying; whether the solve below
+    // receives it is `--no-preload`, decided ten lines down. The two used to be
+    // printed as one field, so the control run announced `applied 1` on a solve that
+    // got `Preload{}` -- a diagnostic naming a different quantity from the one
+    // computed, which is a defect shape this repo has already been caught by. Both
+    // are printed now, because both are true and they are not the same thing.
     std::printf("preload: M %.3e N m, neutral axis %.2f m -> %.1f MPa through the patch"
-                " (%.0f%% of yield spent before contact); obliquity %.4f rad, applied %d\n",
+                " (%.0f%% of yield spent before contact); obliquity %.4f rad,"
+                " available %d, given to the solve %d\n",
                 preload.moment, preload.neutralAxis, preload.surfaceStress / 1e6,
                 100.0 * std::abs(preload.surfaceStress) / patch.material.yieldStrength,
-                preload.obliquity, static_cast<int>(preload.applied));
+                preload.obliquity, static_cast<int>(preload.applied),
+                static_cast<int>(preload.applied && !options.noPreload));
     for (const std::string& problem : preload.problems) std::printf("       ! %s\n",
                                                                     problem.c_str());
 
