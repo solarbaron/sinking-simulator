@@ -136,8 +136,35 @@ struct WaterCriterion {
     // cell puts `8/h³` = 64 000 there, so a memory figure taken off the estimate
     // is 8.7× light -- the particle *count* is 64× light, but tiles are geometric
     // and do not move with the seeding, so the total is not.
-    // The estimate is what the *budget* is denominated in and it is
-    // self-consistent, but any sentence about bytes has to use the other number.
+    // The estimate is what the *budget* is denominated in and it is self-consistent
+    // in units, and that is as far as it goes. **The tile half is a function of the
+    // wrong variable.** It bills `V / (64 h^3)`, strictly proportional to the water;
+    // the solver allocates 4x4x4 tiles over the compartment's *footprint*, and the
+    // ferry's compartments are wide and shallow. Measured on her forepeak, 232 m2
+    // of plan area:
+    //
+    //     3 m3   billed   375, allocated 12 300  (32.8x, 13 mm deep)
+    //     12 m3  billed  1 500, allocated 12 300  ( 8.2x, 52 mm deep)
+    //
+    // The allocated count does not move, because both fills are thinner than one
+    // tile at h = 0.05, so the count *is* the plan area. The 1.36x quoted below is
+    // measured on a cube by `water_probe --cost`, and a cube is the one shape where
+    // the estimator's variable and the solver's coincide.
+    //
+    // So `tileBudget = 12500` nominally admits 100 m3, and a single forepeak holding
+    // 3 m3 already allocates 12 300 real tiles -- 98% of that capacity for 3% of the
+    // volume. What the budget means depends on the shape of the compartment it is
+    // spent on. That is the same defect this tier was caught by in
+    // `coreSecondsPerCompartment`, mirrored: there a per-compartment constant where
+    // the truth scaled with the water, here a per-volume term where the truth is an
+    // area. `testTheTileEstimatorIsAFunctionOfTheWrongVariable` pins both rows.
+    //
+    // Left as it is rather than repaired, deliberately: correcting the estimator
+    // means giving it the footprint, which means deciding what the budget is *for*,
+    // and `promoteWater` is still behind a TODO in `Ship::step`. Recorded so the
+    // next person to spend this budget knows what they are spending.
+    //
+    // Any sentence about bytes has to use the solver's number, not this one.
     int particleBudget = 100000;        // total, all compartments == 100 m³
     int tileBudget = 12500;             // 4×4×4 tiles, == the same 100 m³
 

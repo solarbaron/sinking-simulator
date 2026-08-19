@@ -946,7 +946,7 @@ if [ -x "$TESTS" ]; then
   # gate never passes.
   suiteout=$("$TESTS" 2>&1)
   suite=$(printf '%s\n' "$suiteout" | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  expected=200871
+  expected=200877
   check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
         "$expected validation checks" "$FRONT"
   # **The roadmap publishes the same count in a different format**, and it was
@@ -1182,6 +1182,28 @@ if [ -x "$TESTS" ]; then
         'root at **0.8426 to 0.8461** depending on `B/d`' "$SIM_DOC"
   check "the eddy fit's Cb root at B/d 4.5" 0.8461 0.0005 "$(eddyroot 3)" \
         'root at **0.8426 to 0.8461** depending on `B/d`' "$SIM_DOC"
+
+  # --- what the tile budget is actually denominated in, out of the same run --------
+  #
+  # The estimator bills tiles per unit *volume*; the solver allocates them over the
+  # compartment's *footprint*. On the ferry's forepeak those differ by 32.8x at 3 m3
+  # and 8.2x at 12 m3 -- and the allocated count is the same 12 300 both times,
+  # because both fills are thinner than one 0.2 m tile. Gated because the numbers
+  # are the argument: a single figure would read as "the estimate is a bit low",
+  # and the pair is what shows it is a function of the wrong variable.
+  tiletbl() {  # $1 = 1 billed small, 2 alloc small, 3 billed large, 4 alloc large
+    printf '%s\n' "$suiteout" |
+      sed -n "s/^ *forepeak tiles, billed against allocated: 3 m3 \([0-9]*\) vs \([0-9]*\) (.*), 12 m3 \([0-9]*\) vs \([0-9]*\) (.*/\\$1/p" |
+      head -1
+  }
+  check "forepeak at 3 m3: tiles the estimator bills" 375 0 "$(tiletbl 1)" \
+        '3 m3   billed   375, allocated 12 300' engine/sim/water_promotion.hpp
+  check "forepeak at 3 m3: tiles the solver allocates" 12300 0 "$(tiletbl 2)" \
+        '3 m3   billed   375, allocated 12 300' engine/sim/water_promotion.hpp
+  check "forepeak at 12 m3: tiles the estimator bills" 1500 0 "$(tiletbl 3)" \
+        '12 m3  billed  1 500, allocated 12 300' engine/sim/water_promotion.hpp
+  check "forepeak at 12 m3: tiles the solver allocates, unmoved" 12300 0 "$(tiletbl 4)" \
+        '12 m3  billed  1 500, allocated 12 300' engine/sim/water_promotion.hpp
 
   # --- the spectral wave field, out of the same run --------------------------------
   #

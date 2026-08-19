@@ -24,6 +24,7 @@
 #include "harness.hpp"
 
 #include "engine/sim/ship.hpp"
+#include "engine/sim/flip.hpp"
 #include "engine/sim/water_promotion.hpp"
 #include "game/prototype/ferry.hpp"
 
@@ -1312,6 +1313,84 @@ void testAZeroThresholdRefusesRatherThanDividingByIt() {
     refused(noAccel);
 }
 
+// **The tile half of `estimateFlipCost` was never compared with anything.** The
+// particle half is checked against the solver's real seeding a few tests up;
+// `predictedTiles` was computed there and dropped on the floor, and the only tile
+// assertions in this file were `tilesPerM3 > 0` and `oneTiles > 0`.
+//
+// `water_promotion.hpp` records a disagreement in prose -- "by the solver's own
+// count rather than the estimator's 12 500, 17 019 tiles" -- and calls the estimate
+// "self-consistent" because the budget is denominated in it. The 1.36x there is
+// measured on a **cube** of water, by `water_probe --cost`. On a real ship
+// compartment it is not 1.36x and it is not a factor at all:
+//
+//     forepeak,  3 m3:  billed 375, allocated 12 300  -- 32.8x
+//     forepeak, 12 m3:  billed 1500, allocated 12 300 --  8.2x
+//
+// **The allocated count is the same at both volumes.** The estimator bills
+// `V / (64 h^3)`, strictly proportional to the water. The solver allocates 4x4x4
+// tiles over the compartment's *footprint*, and the ferry's compartments are wide
+// and shallow -- 3 m3 over the forepeak's 232 m2 is 13 mm deep and 12 m3 is 52 mm,
+// so both are one tile layer thick and the count is the plan area, four times over.
+//
+// So the estimate is not merely low. It is a function of the wrong variable, which
+// is the same defect this tier was already caught by once when `coreSecondsPerCompartment`
+// turned out to be a per-compartment constant where the truth scales with the water.
+// Here it is the mirror image: a per-volume term where the truth is an area.
+//
+// The consequence is the budget. `tileBudget = 12500` nominally admits 100 m3; a
+// single forepeak holding 3 m3 already allocates 12 300 real tiles -- 98% of that
+// capacity for 3% of the volume. What the budget means depends on the shape of the
+// compartment it is spent on, which is the property a budget is supposed not to have.
+void testTheTileEstimatorIsAFunctionOfTheWrongVariable() {
+    const auto measure = [](double volume, int& billed, double& depth) {
+        Ship ferry = ferryAfloat();
+        Compartment& forepeak = ferry.compartments[0];
+        forepeak.waterVolume = volume;
+        const Vec3 span = forepeak.bboxHi - forepeak.bboxLo;
+        depth = volume / std::max(1e-9, span.x * span.y);
+        WaterCriterion crit;
+        int particles = 0;
+        estimateFlipCost(forepeak, crit, particles, billed);
+        auto field = promoteWater(forepeak, ferry, crit);
+        if (!field) return 0;
+        // One step builds the sparse structure; `tiles()` is empty before it.
+        flip::Params params;
+        flip::Solver solver;
+        flip::Account account;
+        solver.step(*field, 0.001, params, account);
+        return solver.tiles();
+    };
+
+    int smallBilled = 0, largeBilled = 0;
+    double smallDepth = 0, largeDepth = 0;
+    const int smallReal = measure(3.0, smallBilled, smallDepth);
+    const int largeReal = measure(12.0, largeBilled, largeDepth);
+    std::printf("     forepeak tiles, billed against allocated: 3 m3 %d vs %d (%.1fx,"
+                " %.0f mm deep), 12 m3 %d vs %d (%.1fx, %.0f mm)\n",
+                smallBilled, smallReal, static_cast<double>(smallReal) / smallBilled,
+                1000.0 * smallDepth, largeBilled, largeReal,
+                static_cast<double>(largeReal) / largeBilled, 1000.0 * largeDepth);
+
+    // Guards first: a refused promotion would make every ratio zero, and the
+    // forepeak refuses below about 2.9 m3 because the water is thinner than the
+    // lowest particle plane -- which is why 3 m3 is the small case and not 1.
+    expectTrue("both volumes promoted", smallReal > 0 && largeReal > 0);
+    expectTrue("and both were billed for something", smallBilled > 0 && largeBilled > 0);
+    // The billed side is exactly proportional to volume, which is the thing being
+    // contrasted. Asserted so the contrast cannot quietly become a comparison of
+    // two quantities that both vary.
+    expectEqual("the estimator bills strictly in proportion to the water",
+                static_cast<long long>(4 * smallBilled), static_cast<long long>(largeBilled));
+    // And the allocated side does not move at all, because both depths are inside
+    // one 4x4x4 tile at h = 0.05, i.e. 0.2 m.
+    expectTrue("both fills are thinner than one tile", largeDepth < 0.2);
+    expectEqual("so the solver allocates the same tiles for four times the water",
+                static_cast<long long>(smallReal), static_cast<long long>(largeReal));
+    expectTrue("and the estimate is short by a large factor at both, not by 1.36x",
+               smallReal > 8 * smallBilled && largeReal > 4 * largeBilled);
+}
+
 void runWaterPromotionTests() {
     std::printf("\n--- water promotion ---\n");
 
@@ -1357,5 +1436,6 @@ void runWaterPromotionTests() {
     testCostReporting();
     testCounters();
     testClearResetsState();
+    testTheTileEstimatorIsAFunctionOfTheWrongVariable();
 }
 
