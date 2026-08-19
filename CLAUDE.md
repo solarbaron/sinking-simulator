@@ -224,6 +224,32 @@ second, and the panel vanished without a word. The stiffener branch survived the
 same query only because it happened to `clamp` its parameter. When two tests in
 sequence decide one thing, they need the same notion of "on the boundary".
 
+**A gate that grows makes an old fix more expensive, and that is the gate working.**
+The ferry's bilge seam is declared at girth fraction 0.28 while the turn of the
+bilge is at 0.511, so the most curved plating on the section is 12.0 mm side strake
+sitting above 14.5 mm flat bottom — and *every structural figure this repository
+publishes is measured on that hull*. The correction is two numbers. It has now been
+attempted three times and reverted three times, and the reason has changed each
+time: first fifteen loosened assertions, then twenty drifted published figures, now
+**sixty**, because the figure gate went from 572 checks to 697 in the meantime.
+
+That is not the gate obstructing a fix. It is the gate charging the real price of
+one, and the price was always there — the earlier attempts simply could not see
+most of it. Three of the sixty are not numbers to substitute: a published finding
+that **reverses sign** (the girder pre-stress goes from adding 7.1% to the plating's
+resistance to removing about 12%, and §2 argues that sign from geometry), a control
+that **stops matching its reference** (§8's jittered torn count and its CPU double
+reference read 162 and 162 today, which is the claim, and 174 and 176 corrected),
+and three parsers that stop matching because the promoted zone changes size.
+
+**So the lesson is about scoping rather than about seams.** "Apply the fix and
+propagate the figures" is the right shape of plan only while the figures are
+independent of each other. Once a published number carries an *argument*, moving it
+is a piece of physics work, and a change that moves sixty of them at once is not one
+task. What the third attempt bought was knowing that: the fix is clean, it is worth
+a factor of 8.3 on the shoulder's meshing error, and it needs its own session with
+the physics in front of it rather than a fourth evening of substitution.
+
 **Writing a lesson down does not make it learned.** The rigid-body threshold above
 is the second time that mistake was made in this repo — the first was recorded, in
 this table, by the work that immediately preceded it.

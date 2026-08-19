@@ -1340,6 +1340,54 @@ Scantlings ferryScantlings() {
     //
     // Both want re-deriving rather than patching, so the seam change waits for
     // them rather than landing on top of fifteen loosened assertions.
+    //
+    // **Third attempt, 2026-08-19. The blocker is not the tests any more, and it is
+    // larger than it was.** `test_reduction.cpp`'s half-bandwidth bound above has
+    // since landed as `3 * renumberedNodeBandwidth() + 6`, which holds under both
+    // geometries, so that half of the paragraph is spent. Applied, the seam is
+    // clean on the code side: eight assertions re-derive, the suite goes green at
+    // 200 878, and the ferry's scantling check falls silent with its coverage moved
+    // to a fixture built to fail.
+    //
+    // It also does something the earlier attempts did not measure. The zone's
+    // excess bending stiffness over the shoulder — the number `README.md`, §2 and
+    // the roadmap all publish as **319%**, all three saying the cure is "a finer
+    // girth layout in the scantlings rather than a finer mesh" — falls to **38%**.
+    // `offset/t` goes 0.1884 to 0.0652. This *is* that cure, and it is worth a
+    // factor of 8.3.
+    //
+    // What stops it is the published record. The figure gate has grown from 572
+    // checks to 697, and with the seam applied it reports **sixty** drifted
+    // figures, not the twenty the second attempt saw. Three of the sixty are not
+    // substitutions:
+    //
+    //   - **The pre-stress finding reverses sign.** §2 publishes 18.90 MN with the
+    //     patch unstressed against 20.25 MN carrying the girder's 13.1 MPa, +7.1%,
+    //     and explains the sign geometrically: the girder's stress runs along x and
+    //     the punch's membrane stress runs vertically, so they are nearly
+    //     orthogonal. Corrected, the pair is 20.29 and 17.90 — the pre-stress now
+    //     *reduces* the resisting force by about 12%. The number is not the claim;
+    //     the argument is, and the argument no longer produces this sign.
+    //   - **§8's jitter control stops matching its reference.** At 3 072 elements
+    //     the CPU double count and the jittered control both read 162 today, and
+    //     that exact match is the load-bearing claim that the torn count is not
+    //     knife-edge. Corrected they are 174 and 176. §8 also states that every
+    //     deterministic cell in it was re-derived and holds.
+    //   - **Three gate parsers stop matching**, because the promoted zone moves
+    //     from 224 elements to 256 and its output changes shape with it — including
+    //     the one feeding the two-cost-estimator comparison, which then reports the
+    //     estimators as having "parted again".
+    //
+    // So this is not a propagation. It is a re-validation of the structural tier's
+    // published record against corrected scantlings, with at least three
+    // conclusions to be re-argued rather than re-typed, and it wants its own
+    // session with the physics in front of it.
+    //
+    // **The part worth carrying forward is what the fault means for everything
+    // already published**: every structural figure in this repository is measured
+    // on a hull whose most curved plating is thinner than the flat bottom beneath
+    // it. That is recorded here rather than in a commit message because it is a
+    // property of the ship, not of an attempt to fix it.
     ShellRegion bottom;
     bottom.name = "bottom";
     bottom.girthFrom = 0.00;
