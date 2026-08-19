@@ -50,7 +50,21 @@ double illinois(const TriMesh& mesh, const Vec3& n, double targetVolume, double 
                 double flo, double fhi, double tol, int iterations) {
     double x = 0.5 * (lo + hi);
     for (int i = 0; i < iterations; ++i) {
-        x = lo - flo * (hi - lo) / (fhi - flo);
+        // The secant step divides by the residual difference. A caller only offers
+        // a bracket with `flo <= 0 <= fhi`, so the two can be equal in exactly one
+        // way -- both zero -- which is what a mesh with a horizontal void gives
+        // whenever the target is the volume below the void: the clipped volume is
+        // flat across the gap, so both probes hit the target dead on. That is 0/0,
+        // and the NaN offset propagates through the compartment's free-surface
+        // level into the ship's mass and heel, arriving looking like a capsize.
+        //
+        // Every offset in a flat span satisfies the request. Water settles at the
+        // lowest of them, so return the foot of the bracket rather than a point
+        // inside the void. Locating the true foot of the span would need a search
+        // this path does not earn.
+        const double denom = fhi - flo;
+        if (denom == 0.0) return lo;
+        x = lo - flo * (hi - lo) / denom;
         const double fx = integrateBelowPlane(mesh, n, x).volume - targetVolume;
         if (std::abs(fx) < tol || hi - lo < 1e-12) break;
         if (fx < 0) { lo = x; flo = fx; fhi *= 0.5; }
@@ -187,7 +201,21 @@ double PlaneSweep::illinois(double targetVolume, double lo, double hi, double fl
                             double tol, int iterations) const {
     double x = 0.5 * (lo + hi);
     for (int i = 0; i < iterations; ++i) {
-        x = lo - flo * (hi - lo) / (fhi - flo);
+        // The secant step divides by the residual difference. A caller only offers
+        // a bracket with `flo <= 0 <= fhi`, so the two can be equal in exactly one
+        // way -- both zero -- which is what a mesh with a horizontal void gives
+        // whenever the target is the volume below the void: the clipped volume is
+        // flat across the gap, so both probes hit the target dead on. That is 0/0,
+        // and the NaN offset propagates through the compartment's free-surface
+        // level into the ship's mass and heel, arriving looking like a capsize.
+        //
+        // Every offset in a flat span satisfies the request. Water settles at the
+        // lowest of them, so return the foot of the bracket rather than a point
+        // inside the void. Locating the true foot of the span would need a search
+        // this path does not earn.
+        const double denom = fhi - flo;
+        if (denom == 0.0) return lo;
+        x = lo - flo * (hi - lo) / denom;
         const double fx = below(x).volume - targetVolume;
         if (std::abs(fx) < tol || hi - lo < 1e-12) break;
         if (fx < 0) { lo = x; flo = fx; fhi *= 0.5; }

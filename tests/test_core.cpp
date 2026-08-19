@@ -183,6 +183,138 @@ void testTheTwoPlaneIntegralsAgree() {
                std::abs(looseHalf.volume - sweepHalf.volume) > 0.1 * sweepHalf.volume);
 }
 
+// The offset solver the ship actually runs is not the one the tests drive.
+//
+// Three implementations answer "where does the surface sit for this volume":
+// `PlaneSweep::solveOffsetForVolume` (geometry.cpp), which every flooded
+// compartment calls twice a tick through `Ship::updateInternalFreeSurfaces`;
+// the free `solvePlaneOffsetForVolume`, which `testVolumeSolveRoundTrip` above
+// drives; and `solvePlaneOffsetForVolumeWarm`, which **has no caller anywhere in
+// the tree**. The tested one is the cold one. The per-tick one had no test that
+// named it, and its residual — the thing that decides whether the answer is an
+// answer — was never looked at from outside.
+//
+// `illinois` runs a fixed iteration count and returns `x` whether or not it
+// converged, so the caller cannot tell a solved offset from an abandoned one.
+// That is fine if the count is generous, and the point of the sweep below is to
+// say by how much rather than to assume it: the worst residual over 90 solves is
+// reported, and asserted at the solver's own declared tolerance.
+void testTheThreeOffsetSolversAgree() {
+    const TriMesh hull = testHull();
+    const double full = integrate(hull).volume;
+    const double tol = 1e-9 * std::max(1.0, full);
+    const Vec3 normals[] = {{0, 0, 1}, normalize(Vec3{0.12, -0.25, 1.0})};
+
+    double worstResidual = 0, worstSpreadRatio = 0, worstDeadRatio = 0;
+    int warmed = 0, fellBack = 0;
+    for (const Vec3& n : normals) {
+        const PlaneSweep sweep(hull, n);
+        for (int i = 1; i < 16; ++i) {
+            const double target = full * i / 16.0;
+
+            // The cold solver, bracketed over the mesh's whole extent.
+            const double cold =
+                solvePlaneOffsetForVolume(hull, n, target, sweep.loOffset(), sweep.hiOffset());
+
+            // The per-tick solver warm-started on last tick's answer. A guess this
+            // good is the common case, and it takes the two-probe bracket.
+            const double warm = sweep.solveOffsetForVolume(target, full, cold);
+            ++warmed;
+
+            // The same solver forced down its fallback: a guess at the foot of the
+            // mesh cannot bracket a root more than `bracket` above it.
+            const double fallback = sweep.solveOffsetForVolume(target, full, sweep.loOffset());
+            if (cold - sweep.loOffset() > 0.35) ++fellBack;
+
+            // And the form nothing calls, on the same question.
+            const double dead = solvePlaneOffsetForVolumeWarm(hull, n, target, full, cold);
+
+            for (double x : {cold, warm, fallback, dead})
+                worstResidual =
+                    std::max(worstResidual, std::abs(sweep.below(x).volume - target));
+
+            // How far apart the answers are *allowed* to be is not a number to
+            // choose: all four stop at `|dV| < tol`, so they may differ by up to
+            // 2*tol/(dV/dx), and dV/dx is the waterplane area at the answer. On
+            // this hull that is ~900 m2, which turns a 1.5e-5 m3 volume tolerance
+            // into 3e-8 m of offset -- close enough to the measured spread that a
+            // typed constant would have been fitted to it rather than derived.
+            const double d = 1e-3;
+            const double slope =
+                (sweep.below(cold + d).volume - sweep.below(cold - d).volume) / (2.0 * d);
+            const double allowed = 2.0 * tol / slope;
+            for (double x : {warm, fallback})
+                worstSpreadRatio = std::max(worstSpreadRatio, std::abs(x - cold) / allowed);
+            worstDeadRatio = std::max(worstDeadRatio, std::abs(dead - cold) / allowed);
+        }
+    }
+    std::printf("     three offset solvers: worst residual %.3e m3 against a %.3e m3"
+                " tolerance on %.1f m3\n", worstResidual, tol, full);
+    std::printf("     offsets agree to %.2f of what that tolerance permits"
+                " (%.2f for the form nothing calls)\n", worstSpreadRatio, worstDeadRatio);
+    std::printf("     warm bracket %d solves, fallback %d\n", warmed, fellBack);
+
+    // This is the convergence check `illinois` does not perform: it runs a fixed
+    // iteration count and returns `x` whether or not it converged, so the caller
+    // cannot tell a solved offset from an abandoned one. Asserted from outside
+    // instead, at the tolerance the solver itself declares.
+    expectTrue("every offset solver lands inside the tolerance it declares",
+               worstResidual <= tol);
+    expectTrue("the warm bracket, the fallback and the cold solver agree to within it",
+               worstSpreadRatio <= 1.0);
+    expectTrue("and so does the warm form nothing calls", worstDeadRatio <= 1.0);
+    // Guards: a sweep that stayed on one branch would leave the other untested,
+    // and a hull that clipped to nothing would satisfy every bound above.
+    expectTrue("the sweep drove both branches of the per-tick solver",
+               warmed > 0 && fellBack > 0);
+    expectTrue("and there was a real volume to solve for", full > 1e3);
+}
+
+// A secant step divides by `fhi - flo`. The warm bracket admits a pair only when
+// `flo <= 0 <= fhi`, so the two can be equal in exactly one way: both zero, which
+// is what a mesh with a horizontal void gives whenever the target volume is the
+// part below the void. The result was 0/0, and `illinois` then iterated on NaN and
+// returned it as an offset -- which becomes a compartment's free-surface level,
+// and from there the ship's mass, centroid and heel.
+//
+// Reaching it needs exact equality, so this was a latent path rather than an
+// observed failure. It reproduced first time: `offset -nan, volume below 0.000000`.
+void testAVoidedMeshDoesNotDriveTheSolverToNaN() {
+    // Two stacked boxes with a 1 m gap: 24 m3 below, void, 24 m3 above.
+    TriMesh mesh = makeBox({0, 0, 0}, {4, 3, 2});
+    mesh.append(makeBox({0, 0, 3}, {4, 3, 5}));
+
+    const PlaneSweep sweep(mesh, {0, 0, 1});
+    const double full = 48.0;
+    // A guess in the middle of the void: both probes land in it, both residuals
+    // are exactly zero, and the secant denominator vanishes.
+    const double off = sweep.solveOffsetForVolume(24.0, full, 2.5, 0.35);
+    std::printf("     voided mesh: offset %.6f, volume below %.6f m3\n", off,
+                sweep.below(off).volume);
+    expectTrue("a vanishing secant denominator does not return NaN", std::isfinite(off));
+    expectNear("and the offset still bounds the requested volume", sweep.below(off).volume,
+               24.0, 1e-9);
+    // What the fix does *not* buy, stated rather than left to be discovered: the
+    // volume criterion does not pin a level inside a flat span at all -- every
+    // offset from 2.0 to 3.0 puts exactly 24 m3 below it, so "solve for the volume"
+    // has a one-metre-wide answer here and the water's real surface at 2.0 is only
+    // one member of it. Returning the foot of the bracket is the best answer
+    // available without a downward search, and it is the conservative one:
+    // `surfaceWorldZ` feeds the head at every opening, so erring low understates
+    // the pressure driving flow out rather than overstating it. The residual error
+    // is bounded by the span's height, not by anything the solver controls.
+    expectTrue("the answer lies within the flat span", off >= 2.0 - 1e-9 && off <= 3.0 + 1e-9);
+    expectTrue("and at the foot of the offered bracket, not above the guess",
+               off <= 2.5 + 1e-9);
+
+    // The guard: the same solve on a solid box has no flat span, so it must still
+    // take the secant path and land in the interior rather than on the bracket.
+    const TriMesh solidBox = makeBox({0, 0, 0}, {4, 3, 5});
+    const PlaneSweep solid(solidBox, {0, 0, 1});
+    const double solidOff = solid.solveOffsetForVolume(24.0, 60.0, 2.5, 0.35);
+    expectNear("a mesh without a void still solves by secant", solidOff, 2.0, 1e-6);
+}
+
 void testClipMatchesIntegral() {
     const TriMesh hull = testHull();
     const Vec3 normals[] = {{1, 0, 0}, {0, 0, 1}, {0, 1, 0},
@@ -2378,6 +2510,8 @@ void runCoreTests() {
     testVolumeSolveRoundTrip();
     testMeshesAreWatertight();
     testTheTwoPlaneIntegralsAgree();
+    testTheThreeOffsetSolversAgree();
+    testAVoidedMeshDoesNotDriveTheSolverToNaN();
     testClipMatchesIntegral();
     testSubdivisionTiles();
     testClippedCompartmentStaysInsideHull();

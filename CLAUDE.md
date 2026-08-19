@@ -142,6 +142,7 @@ most useful thing to know about this codebase:
 | `flip::Particle` documented as "~80 bytes" in a comment that **itemises the sixteen doubles adding to 128** — every megabyte figure in the tier was built on it | `sizeof`, once someone asked. The parenthesis had contradicted itself since it was written |
 | `coreSecondsPerElement = 4.0` in `promotion.hpp`, citing as its source the `zone.hpp` paragraph that names 4.0 as the pre-`cacheRestForms` figure and says "every figure below that predates it is **2.4x pessimistic**" | asking whether the tier's *two* cost estimators agree. They stood 2.35× apart, `zone_probe` printed both on the same run, and nobody had read them side by side |
 | Ikeda's `B0` carrying `m2^2` where every other term in it and in `A0` is degree 2 — a girth times a lever, both over `d` — so the one term setting the bilge keels' hull-pressure damping did not scale like the rest | sweeping `OG/d`, the *only* input the two readings differ in. The check that was there swept frequency and amplitude, nine points, and held the hull at the one `OG/d` where the wrong reading sits within 0.05 of the right one: 3.6% agreement there, **15.6%** at the edge of the same validated range |
+| The offset solver the ship runs twice a tick returning **NaN** from a `0/0` secant step — and a second copy of the same root finder, 140 lines away, carrying the identical bug | asking which of the *three* implementations of "where does the surface sit for this volume" the tests actually drive. It was the one the ship does not call |
 
 **Two estimators for one quantity will disagree, and printing both is not
 comparing them.** Three separate instances here: the water tier's particle and
@@ -154,6 +155,21 @@ they agree** — and drive the real one rather than re-deriving its arithmetic, 
 a test that recomputes the model by hand agrees with a broken model and disagrees
 with nothing. The water tier's budget test claimed in its own comment to assert
 "against the arithmetic rather than the constants" while doing exactly that.
+
+**And a duplicate implementation splits coverage without lowering it.** The
+paragraph above is about two estimators that *disagree*. This is the opposite
+case and it is worse, because nothing looks wrong: three functions answer "where
+does the surface sit for this volume" — `PlaneSweep::solveOffsetForVolume`, which
+every flooded compartment calls twice a tick; the free `solvePlaneOffsetForVolume`,
+which is what `testVolumeSolveRoundTrip` drives; and `solvePlaneOffsetForVolumeWarm`,
+which **has no caller anywhere in the tree**. They agree to 0.89 of what their
+shared volume tolerance permits, so no comparison would ever have flagged them.
+The cost is that the suite's free-surface coverage was pointed at the copy the
+ship does not run, and the `illinois` tail was pasted twice — so the `0/0` secant
+step that returns a NaN free-surface level existed in **both** copies, and fixing
+the one under test would have left the one under the ship. Coverage is not a
+property of a subsystem; ask which *function* the assertions name, and whether
+the caller calls that one.
 
 A green functional test is evidence the code does what you thought of, not that
 it is correct. **Nothing at all tests a comment** — three documents here repeated a
