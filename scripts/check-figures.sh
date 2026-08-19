@@ -913,7 +913,7 @@ if [ -x "$TESTS" ]; then
   # gate never passes.
   suiteout=$("$TESTS" 2>&1)
   suite=$(printf '%s\n' "$suiteout" | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  expected=200861
+  expected=200871
   check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
         "$expected validation checks" "$FRONT"
   # **The roadmap publishes the same count in a different format**, and it was
@@ -1131,6 +1131,24 @@ if [ -x "$TESTS" ]; then
         "$(printf '%s\n' "$suiteout" |
             sed -n 's/^ *flat of side offset.t .*over the shoulder [0-9.]* (+\([0-9]*\)%).*/\1/p' | head -1)" \
         "319% too stiff in bending across this hull's shoulder" "$FRONT"
+
+  # --- where Kawahara's eddy fit dies, out of the same run --------------------------
+  #
+  # A third of the declared validity box has no eddy damping at all, and the root is
+  # inside the published Cb bound. Gated because it is a *limit* rather than a
+  # result: if a future edit to the regression moves it, the paragraph in §2 that
+  # states where the method stops working has to move with it.
+  eddyroot() {  # $1 = 1 centre, 2 at B/d 2.5, 3 at B/d 4.5
+    printf '%s\n' "$suiteout" |
+      sed -n "s/^ *the eddy coefficient goes non-positive at Cb = \([0-9.]*\) (B.d [0-9.]*), \([0-9.]*\) at B.d [0-9.]* and \([0-9.]*\) at .*/\\$1/p" |
+      head -1
+  }
+  check "the eddy fit's Cb root at B/d 3.5" 0.8438 0.0005 "$(eddyroot 1)" \
+        'root at **0.8426 to 0.8461** depending on `B/d`' "$SIM_DOC"
+  check "the eddy fit's Cb root at B/d 2.5" 0.8426 0.0005 "$(eddyroot 2)" \
+        'root at **0.8426 to 0.8461** depending on `B/d`' "$SIM_DOC"
+  check "the eddy fit's Cb root at B/d 4.5" 0.8461 0.0005 "$(eddyroot 3)" \
+        'root at **0.8426 to 0.8461** depending on `B/d`' "$SIM_DOC"
 
   # --- the spectral wave field, out of the same run --------------------------------
   #

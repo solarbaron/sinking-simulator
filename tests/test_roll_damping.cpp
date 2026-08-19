@@ -759,6 +759,158 @@ void testTheTwoBilgeRadiiAgree() {
                bilgeRadiusForMidshipCoefficient(20.0, 6.0, 0.0) > 1.0);
 }
 
+// **The eddy grid swept the two axes the model factors out.**
+// `testEddyIsALinearisedQuadraticMoment` above sweeps four frequencies by four
+// amplitudes at 1e-9 and calls it "the whole operating envelope". It is not:
+// `eddyDamping` forms `4 omegaHat phi_a / (3 pi Cb (B/d)^3) * C_R`, so
+// `eddy / (omega * phi_a)` is a constant of the hull form and those sixteen points
+// are sixteen bit-identical copies of one number. Neither swept axis can move it,
+// and the amplitude axis is already asserted exactly, on its own, further up.
+//
+// This is the bilge-keel defect verbatim -- nine points that were one point, a
+// wrong exponent invisible in all of them -- one function over in the same file,
+// where the repair was never extended. Twice now, which is what CLAUDE.md means by
+// "writing a lesson down does not make it learned".
+//
+// The content is `eddyCoefficientCR`, a twenty-coefficient Kawahara regression in
+// `B/d`, `Cb`, `Cm` and `OG/d`. Unlike the bilge-keel term there is no second
+// implementation to compare against -- this *is* the regression, not a wrapper
+// round a first-principles model -- so what is asserted instead is its own domain:
+// that every one of the four inputs moves it, and that it stays positive across the
+// whole box `validateRollDamping` declares. The second is a real claim and not a
+// formality: `eddyDamping` carries `if (!(cr > 0)) return 0.0`, which silently
+// returns no eddy damping at all, and nothing had ever asked whether that branch is
+// reachable inside the validated range.
+void testTheEddyRegressionMovesOnEveryInputItTakes() {
+    // The box, taken from `validateRollDamping`'s own `range()` calls.
+    constexpr double kCbLo = 0.50, kCbHi = 0.85;
+    constexpr double kBdLo = 2.50, kBdHi = 4.50;
+    constexpr double kCmLo = 0.90, kCmHi = 0.99;
+    constexpr double kOgLo = -1.50, kOgHi = 0.20;
+
+    const auto eddyAt = [](double cb, double bd, double cm, double ogOverD) {
+        RollDampingHull h = roPax();
+        h.draft = 6.5;
+        h.beam = bd * h.draft;
+        h.blockCoeff = cb;
+        h.midshipCoeff = cm;
+        // OG is measured down from the waterline, so KR = d (1 - OG/d).
+        h.rollAxisAboveKeel = h.draft * (1.0 - ogOverD);
+        RollDampingCondition c;
+        c.rollFrequency = 0.45;
+        c.rollAmplitude = 5.0 * kDegToRad;
+        c.forwardSpeed = 0.0;
+        return rollDamping(h, c).eddy;
+    };
+
+    // A 3^4 lattice over the box: corners, edge midpoints and the centre.
+    const double cbs[] = {kCbLo, 0.5 * (kCbLo + kCbHi), kCbHi};
+    const double bds[] = {kBdLo, 0.5 * (kBdLo + kBdHi), kBdHi};
+    const double cms[] = {kCmLo, 0.5 * (kCmLo + kCmHi), kCmHi};
+    const double ogs[] = {kOgLo, 0.5 * (kOgLo + kOgHi), kOgHi};
+
+    const double mid1 = 0.5 * (kBdLo + kBdHi), mid2 = 0.5 * (kCmLo + kCmHi),
+                 mid3 = 0.5 * (kOgLo + kOgHi);
+    const double mid[4] = {0.5 * (kCbLo + kCbHi), mid1, mid2, mid3};
+    double lowest = 1e300, highest = 0;
+    int zeros = 0, points = 0;
+    for (double cb : cbs)
+        for (double bd : bds)
+            for (double cm : cms)
+                for (double og : ogs) {
+                    const double e = eddyAt(cb, bd, cm, og);
+                    ++points;
+                    if (!(e > 0)) ++zeros;
+                    lowest = std::min(lowest, e);
+                    highest = std::max(highest, e);
+                }
+    std::printf("     eddy over the validated box: %d points, %d with no damping at all,"
+                " spread %.4e to %.4e N m s\n", points, zeros, lowest, highest);
+    for (double cb : cbs) {
+        int z = 0, n = 0;
+        for (double bd : bds)
+            for (double cm : cms)
+                for (double og : ogs) { ++n; if (!(eddyAt(cb, bd, cm, og) > 0)) ++z; }
+        std::printf("       Cb %.2f: %d of %d dead\n", cb, z, n);
+    }
+    // Where it dies, to three figures, so the limit is a published number rather
+    // than a surprise. Bisected on the centre line of the other three axes.
+    // Where it dies, to four figures. The root is not a single number -- `aE`
+    // carries a `(B/d - 1.8)^3` term alongside the quartic in Cb -- so it is
+    // bisected at both ends of the beam/draft range as well as the centre.
+    const auto rootAt = [&](double bd) {
+        double alive = kCbLo, dead = kCbHi;
+        for (int i = 0; i < 60; ++i) {
+            const double m = 0.5 * (alive + dead);
+            (eddyAt(m, bd, mid2, mid3) > 0 ? alive : dead) = m;
+        }
+        return dead;
+    };
+    const double dead = rootAt(mid1);
+    std::printf("     the eddy coefficient goes non-positive at Cb = %.4f (B/d %.2f),"
+                " %.4f at B/d %.1f and %.4f at %.1f -- all inside its declared 0.50..0.85\n",
+                dead, mid1, rootAt(kBdLo), kBdLo, rootAt(kBdHi), kBdHi);
+
+    // **The claim the `cr > 0` guard makes.** A regression that goes negative inside
+    // its own published domain would return exactly zero eddy damping for a hull the
+    // validator passes, which is the quietest possible failure: the dominant viscous
+    // term for a bare hull, silently absent.
+    // **It does not, and that is the finding.** Every one of the 27 lattice points at
+    // Cb = 0.85 comes back with no eddy damping at all, and every point at 0.68 and
+    // below is healthy -- the fit's own quartic in Cb has a root just under the top
+    // of the range Kawahara publishes. `eddyDamping` returns that as exactly zero
+    // through `if (!(cr > 0))`, silently, and on a bare hull the eddy term is over
+    // 90% of the viscous total. `validateRollDamping` now says so; this pins the
+    // shape of the hole so it cannot quietly change size.
+    expectTrue("a third of the declared box has no eddy damping at all, all of it at the"
+               " top of the Cb range", zeros == 27);
+    expectTrue("and everything below the root is healthy", highest > 1e6);
+    expectNear("the root sits just inside the declared bound", dead, 0.8438, 0.001);
+    expectTrue("so the whole range below 0.84 is usable",
+               eddyAt(0.84, mid1, mid2, mid3) > 0);
+
+    // And the validator says it, which is the part that reaches a caller.
+    RollDampingHull full = roPax();
+    full.blockCoeff = 0.85;
+    RollDampingCondition at;
+    at.rollFrequency = 0.45;
+    at.rollAmplitude = 5.0 * kDegToRad;
+    bool warned = false;
+    for (const std::string& p : validateRollDamping(full, at))
+        if (p.find("eddy regression is non-positive") != std::string::npos) warned = true;
+    expectTrue("validateRollDamping reports the dead region rather than passing it", warned);
+    RollDampingHull ordinary = roPax();
+    bool quiet = true;
+    for (const std::string& p : validateRollDamping(ordinary, at))
+        if (p.find("eddy regression is non-positive") != std::string::npos) quiet = false;
+    expectTrue("and stays quiet on a hull the fit covers", quiet);
+
+    // Each axis, held at the centre of the others. This is the assertion the
+    // sixteen-point grid could not make: that the input actually reaches the answer.
+
+    const double alongCb = eddyAt(kCbHi, mid[1], mid[2], mid[3]) /
+                           eddyAt(kCbLo, mid[1], mid[2], mid[3]);
+    const double alongBd = eddyAt(mid[0], kBdHi, mid[2], mid[3]) /
+                           eddyAt(mid[0], kBdLo, mid[2], mid[3]);
+    const double alongCm = eddyAt(mid[0], mid[1], kCmHi, mid[3]) /
+                           eddyAt(mid[0], mid[1], kCmLo, mid[3]);
+    const double alongOg = eddyAt(mid[0], mid[1], mid[2], kOgHi) /
+                           eddyAt(mid[0], mid[1], mid[2], kOgLo);
+    std::printf("     end to end along each axis: Cb x%.3f, B/d x%.3f, Cm x%.3f, OG/d x%.3f\n",
+                alongCb, alongBd, alongCm, alongOg);
+
+    // A wrong exponent on any of the four is constant along every axis the old grid
+    // swept and shows up here. Asserted as "moves by more than a rounding" rather
+    // than at a value, because there is no independent reading to pin one to -- the
+    // values themselves are gated as published figures instead.
+    expectTrue("the block coefficient reaches the eddy coefficient",
+               std::fabs(std::log(alongCb)) > 0.05);
+    expectTrue("and so does the beam/draft ratio", std::fabs(std::log(alongBd)) > 0.05);
+    expectTrue("and the midship coefficient", std::fabs(std::log(alongCm)) > 0.05);
+    expectTrue("and OG/d, which is the axis the bilge-keel term was caught on",
+               std::fabs(std::log(alongOg)) > 0.05);
+}
+
 }  // namespace
 
 void runRollDampingTests() {
@@ -769,6 +921,7 @@ void runRollDampingTests() {
     testBilgeKeelNormalForceIsLinearisedPlateDrag();
     testEddyIsALinearisedQuadraticMoment();
     testBilgeKeelPresence();
+    testTheEddyRegressionMovesOnEveryInputItTakes();
     testTheTwoBilgeRadiiAgree();
     testBilgeKeelAgreesWithTheSimplifiedRegression();
     testForwardSpeedEffects();

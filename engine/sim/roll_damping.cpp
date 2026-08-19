@@ -393,6 +393,27 @@ std::vector<std::string> validateRollDamping(const RollDampingHull& hull,
         range("bilge keel breadth / beam", hull.bilgeKeelBreadth / hull.beam, 0.01, 0.06);
         range("bilge keel length / Lpp", hull.bilgeKeelLength / hull.lengthPp, 0.05, 0.4);
     }
+    // **Kawahara's C_R collapses to zero at the top of its own Cb range.** The
+    // quartic in Cb inside `aE` has a root at about 0.844, so a hull at Cb = 0.85
+    // -- which the range check above admits, because 0.85 is the published bound --
+    // comes back with `C_R <= 0`, and `eddyDamping` then returns exactly zero
+    // through its `if (!(cr > 0))` guard. For a bare hull the eddy term is over 90%
+    // of the viscous total, so that is the quietest failure this method has: the
+    // dominant component silently absent on a hull the validator just passed.
+    //
+    // Found by sweeping the four regression inputs across the declared box, which
+    // nothing had ever done -- every point at Cb = 0.85 was dead and every point
+    // below 0.84 was healthy. Reported rather than clamped: the bound is Kawahara's
+    // and moving it would be inventing coverage the fit does not have.
+    if (hull.draft > 0 && hull.beam > 0) {
+        const double ogOverD = (hull.draft - hull.rollAxisAboveKeel) / hull.draft;
+        if (!(eddyCoefficientCR(hull.beam / hull.draft, hull.blockCoeff, hull.midshipCoeff,
+                                ogOverD) > 0))
+            note("the eddy regression is non-positive at this hull's form, so the eddy "
+                 "component -- most of the viscous damping on a bare hull -- comes out "
+                 "as exactly zero; the fit's Cb quartic has a root near 0.844");
+    }
+
     if (hull.midshipCoeff > 0.99)
         note("midship coefficient exceeds 0.99, past the last entry of Ikeda's lift-slope table");
     if (hull.waveDamping <= 0)

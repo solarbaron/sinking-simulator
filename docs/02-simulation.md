@@ -1502,6 +1502,26 @@ supplying both is the same double count that cost 27% of mid-frequency heave.
 omission, and `validateRollDamping()` still reports it as missing for the
 no-radiation case, which is the honest thing for it to say.
 
+**The eddy fit dies just inside its own Cb range, and nothing had asked.** Sweeping
+the four inputs `eddyCoefficientCR` actually takes — `B/d`, `Cb`, `Cm` and `OG/d` —
+across the box `validateRollDamping` declares, a third of the lattice comes back with
+**no eddy damping at all**, and all of it at the top of the block-coefficient range:
+every point at `Cb = 0.85` is dead and every point at 0.68 and below is healthy. The
+`aE` quartic in `Cb` has a root at **0.8426 to 0.8461** depending on `B/d`, against a
+published upper bound of 0.85, and `eddyDamping`'s `if (!(cr > 0)) return 0.0` hands
+that back as exactly zero. On a bare hull the eddy component is over 90% of the
+viscous total, so the failure is the quietest the method has: the dominant term
+absent, on a hull the validator has just passed.
+
+`validateRollDamping` now evaluates the fit at the hull's own point and says so. The
+bound is **not** moved to the root: 0.85 is Kawahara's published figure and narrowing
+it here would be inventing coverage the fit does not have. What was wrong was not the
+number but that the gap between the number and the fit's behaviour was undiscovered —
+because the only test pointed at this term swept frequency and amplitude, and
+`eddy / (ω · φ_a)` is a constant of the hull form, so its sixteen points were sixteen
+copies of one. That is the same defect as the bilge-keel `B0` grid recorded above,
+one function away, after the repair had been written down.
+
 **Validation.** The reference hull for this is a 120 × 22 m ferry-like form at 6 m
 draft — Cb 0.742, Cm 0.910, B/d 3.67, KG 7.2 m (OG/d −0.20), GM 2.09 m, roll
 period 11.94 s, bilge keels 40 × 1.0 m. It is not the box barge the rest of the

@@ -142,6 +142,7 @@ most useful thing to know about this codebase:
 | `flip::Particle` documented as "~80 bytes" in a comment that **itemises the sixteen doubles adding to 128** — every megabyte figure in the tier was built on it | `sizeof`, once someone asked. The parenthesis had contradicted itself since it was written |
 | `coreSecondsPerElement = 4.0` in `promotion.hpp`, citing as its source the `zone.hpp` paragraph that names 4.0 as the pre-`cacheRestForms` figure and says "every figure below that predates it is **2.4x pessimistic**" | asking whether the tier's *two* cost estimators agree. They stood 2.35× apart, `zone_probe` printed both on the same run, and nobody had read them side by side |
 | Ikeda's `B0` carrying `m2^2` where every other term in it and in `A0` is degree 2 — a girth times a lever, both over `d` — so the one term setting the bilge keels' hull-pressure damping did not scale like the rest | sweeping `OG/d`, the *only* input the two readings differ in. The check that was there swept frequency and amplitude, nine points, and held the hull at the one `OG/d` where the wrong reading sits within 0.05 of the right one: 3.6% agreement there, **15.6%** at the edge of the same validated range |
+| Kawahara's eddy fit going **non-positive inside its own published `Cb` range** — the root is at 0.843–0.846 against a stated bound of 0.85 — so `eddyDamping`'s `cr > 0` guard returned exactly zero for a hull the validator had just passed, and on a bare hull that term is over 90% of the viscous total | sweeping the four inputs the regression actually takes. The test pointed at it swept frequency and amplitude, and `eddy / (ω · φ_a)` is a constant of the hull form, so its sixteen points were sixteen copies of one — the *same* defect as the bilge-keel grid three entries up, one function away, found after the repair had been written down |
 | Four refusals returned as `bool` and used as bare statements — `computeRestForms` on the per-tick damage path, leaving a degenerate element's forms at **zero** so it carried no force and no stiffness and the field had a hole that read as compliant plating; `elementTemperatures` in a published-figure tool, leaving a **stale** peak; and `planRectangle` in two of its three callers | asking which `bool`-returning calls in the tree are used as statements. Six across 110 files, and in three of the four cases the *same file* checked an identical refusal a few lines away |
 | Roll amplitude taken as the phase-plane radius about **upright** rather than about the heel the ship is rolling about, so a hull rolling 2° about a 58° loll was damped as though it were rolling 58° — and the eddy and bilge-keel terms are linear in it, so `B44` was several times too large in the *reassuring* direction, at exactly the operating point that decides a capsize | asking which of the model's inputs a *damaged* ship makes different from an intact one. Every test rolled about upright, where the right answer and the wrong one coincide |
 | `OG = d − KR` assembled from a **live `KR` and a frozen `d`** — the tick refreshed the roll axis every step because "it moves as the ship floods", and left the draft at the attach waterline for the same reason it should have refreshed it | reading the two halves of one subtraction and asking where each was taken |
@@ -225,6 +226,16 @@ sequence decide one thing, they need the same notion of "on the boundary".
 **Writing a lesson down does not make it learned.** The rigid-body threshold above
 is the second time that mistake was made in this repo — the first was recorded, in
 this table, by the work that immediately preceded it.
+
+**And the one-point grid is now the third.** `testBilgeKeelAgreesWithTheSimplifiedRegression`
+was repaired by sweeping `OG/d` over the validator's own range, the lesson was written
+into the paragraph below, and `testEddyIsALinearisedQuadraticMoment` — the next
+function in the same file, on the term that dominates a bare hull — was left sweeping
+frequency and amplitude, neither of which its answer depends on. The repair had been
+described in general terms and applied in exactly one place. **When a defect is found
+in one member of a family, the cheap and necessary next step is to enumerate the
+family**: here that was one grep for the other components' tests, and it was not
+done.
 
 **A grid that sweeps only the axes a defect is constant along is a one-point
 grid.** `testBilgeKeelAgreesWithTheSimplifiedRegression` compared Ikeda's sectional
