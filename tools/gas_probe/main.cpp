@@ -43,6 +43,14 @@ int main(int argc, char** argv) {
         if (a.starts_with("--duration=")) duration = std::atof(a.c_str() + 11);
         else if (a.starts_with("--power=")) power = std::atof(a.c_str() + 8) * 1.0e6;
         else if (a.starts_with("--review=")) reviewEvery = std::atof(a.c_str() + 9);
+        // Without this the loop had no `else`, so a mistyped flag was silently
+        // dropped and the run proceeded on its defaults -- and this tool's output
+        // is compared against published figures, so the quiet outcome is a
+        // different experiment handed back under the right name.
+        else {
+            std::printf("unknown option %s\n", a.c_str());
+            return 2;
+        }
     }
 
     Ship ship = game::buildFerry();

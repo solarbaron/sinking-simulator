@@ -242,6 +242,43 @@ if [ "${1:-}" = --selftest-parse ]; then
   exit 0
 fi
 
+# --- a control on this file's own inputs -------------------------------------
+#
+# Every figure below is produced by running a tool with flags. That makes the flag
+# a load-bearing part of the measurement, and two of the eleven tools here that
+# parse arguments had **no `else` on the parse loop**: `gas_probe` and
+# `water_probe` dropped an unrecognised option silently and ran their defaults.
+#
+# The quiet outcome is the dangerous one. A typo in `water_probe --wave=2.0` does
+# not error -- it measures still water, hands the number back under the name of the
+# wave study, and this file compares it against a published figure. Sometimes that
+# goes red and sends the reader hunting for a defect in the model. Sometimes the
+# flag barely moved the answer and it goes green, and the gate has certified an
+# experiment nobody ran.
+#
+# So the tools are asked, before anything is measured, whether they can tell a flag
+# they know from one they do not. This is `verify.sh selftest`'s idea one level
+# down: a negative control on the instrument rather than on the reading. All twelve
+# exit 2 in about 2 ms, so the whole block costs a fortieth of a second.
+refuses() {
+  local tool="$1"
+  [ -x "$tool" ] || return 0
+  checks=$((checks + 1))
+  if "$tool" --not-a-real-flag >/dev/null 2>&1; then
+    printf '  %s✗%s %s accepts an unknown option and runs its defaults instead\n' \
+           "$red" "$off" "$tool"
+    fails=$((fails + 1))
+    return 1
+  fi
+  return 0
+}
+for badflag in ./build/gas_probe ./build/water_probe ./build/section_probe \
+               ./build/zone_probe ./build/zone_gpu_probe ./build/bulkhead_probe \
+               ./build/flip_probe ./build/ram_view ./build/seaway_view \
+               ./build/smoke_view ./build/ferry_view ./build/shipsim; do
+  refuses "$badflag"
+done
+
 # --- the GPU zone solver's published torn counts ---------------------------------
 #
 # `verify.sh` already runs `zone_gpu_probe`, and its comment there says why: every
@@ -340,6 +377,116 @@ if [ -x "$GPU" ]; then
           "$(alpha "$a50f" 4)" "| 7.671e-9 |" "$FEM_DOC"
     check "§8 peak |alpha| at 50 steps, GPU tight" 2.010e-8 1e-11 \
           "$(alpha "$a50t" 4)" "2.010e-8" "$FEM_DOC"
+
+    # --- the compiler's own account of each kernel -------------------------------
+    #
+    # `--stats` was the last output in this tree that nothing ran at all. It is the
+    # sole caller of `gpu::describeElementPipelines`, it has no test, and no script
+    # passed the flag -- so the two tables it produces, §8's register/spill table
+    # and §12's fp64 cost table, were carried on the authority of the single run
+    # that first took them. That is the shape this file exists for, and this is a
+    # cheap instance of it: one shader compile, no dispatch, nothing timed.
+    #
+    # The document says of these rows that they "come from the driver's compiler and
+    # not from a clock, so they are the one part of this section that a busy box
+    # cannot move". That claim is what earns the zero tolerance, and it held: every
+    # one of the fourteen figures came back on the digit.
+    #
+    # `tet_forces.comp` is deliberately absent. §8's footnote already records that
+    # `--stats` does not query it and that its cell therefore has a different
+    # provenance from its neighbours; gating the rest does not change that, and
+    # inventing a check for it here would hide it again.
+    stats=$("$GPU" --stats 2>&1)
+    # Each field label appears in all six blocks, so every reader below is bounded
+    # to one kernel's block and exits at the next `.spv)` header. An unbounded range
+    # would silently take whichever block came last -- which is how a check in this
+    # file once passed by luck on a multi-line value.
+    field() {  # $1 = .spv basename, $2 = first word of the row, $3 = which column
+      printf '%s\n' "$stats" | awk -v s="$1" -v w="$2" -v c="$3" '
+        !k && index($0, "(" s ")") { k = 1; next }
+        k && index($0, ".spv)")    { exit }
+        k && $1 == w               { print $c; exit }'
+    }
+    reg()   { field "$1" Register  3; }
+    shmem() { field "$1" Shared    4; }
+    spill() { field "$1" spill     4; }
+
+    check "§8 calibration registers/thread" 32 0 \
+          "$(reg node_integrate.comp.spv)" \
+          '| `node_integrate.comp` (calibration) | 32 | 0 B |' "$FEM_DOC"
+    check "§8 one invocation per element, registers" 128 0 \
+          "$(reg solidshell_forces.comp.spv)" \
+          '| `solidshell_forces.comp` — one invocation | 128 |' "$FEM_DOC"
+    check "§8 one invocation per element, spill (B)" 1936 0 \
+          "$(spill solidshell_forces.comp.spv)" \
+          '**1 936 B = 484 floats**' "$FEM_DOC"
+    check "§8 one workgroup per element, registers" 64 0 \
+          "$(reg solidshell_forces_wg.comp.spv)" \
+          '| `solidshell_forces_wg.comp` — one workgroup | 64 |' "$FEM_DOC"
+    check "§8 one workgroup per element, spill (B)" 96 0 \
+          "$(spill solidshell_forces_wg.comp.spv)" \
+          '**96 B = 24 floats**' "$FEM_DOC"
+
+    # §12's fp64 ladder: three variants against the float baseline, all three
+    # columns each. Shared memory is in the table and was ungated with the rest.
+    check "§12 fp64 baseline, shared (B)" 2832 0 \
+          "$(shmem solidshell_forces_wg.comp.spv)" \
+          '| `solidshell_forces_wg.comp` | 64 | 96 B | 2 832 B |' "$FEM_DOC"
+    check "§12 fp64 7x7 solve, registers" 72 0 \
+          "$(reg solidshell_forces_wg_f64solve.comp.spv)" \
+          '| + fp64 7×7 solve | 72 | 128 B | 2 928 B |' "$FEM_DOC"
+    check "§12 fp64 7x7 solve, spill (B)" 128 0 \
+          "$(spill solidshell_forces_wg_f64solve.comp.spv)" \
+          '| + fp64 7×7 solve | 72 | 128 B | 2 928 B |' "$FEM_DOC"
+    check "§12 fp64 7x7 solve, shared (B)" 2928 0 \
+          "$(shmem solidshell_forces_wg_f64solve.comp.spv)" \
+          '| + fp64 7×7 solve | 72 | 128 B | 2 928 B |' "$FEM_DOC"
+    check "§12 fp64 condensation, registers" 80 0 \
+          "$(reg solidshell_forces_wg_f64condense.comp.spv)" \
+          '| + fp64 condensation | 80 | 128 B | 2 928 B |' "$FEM_DOC"
+    check "§12 fp64 condensation, spill (B)" 128 0 \
+          "$(spill solidshell_forces_wg_f64condense.comp.spv)" \
+          '| + fp64 condensation | 80 | 128 B | 2 928 B |' "$FEM_DOC"
+    check "§12 fp64 condensation, shared (B)" 2928 0 \
+          "$(shmem solidshell_forces_wg_f64condense.comp.spv)" \
+          '| + fp64 condensation | 80 | 128 B | 2 928 B |' "$FEM_DOC"
+    check "§12 fp64 alpha and Newton, registers" 80 0 \
+          "$(reg solidshell_forces_wg_f64newton.comp.spv)" \
+          '| + fp64 alpha and Newton | 80 | 128 B | 2 960 B |' "$FEM_DOC"
+    check "§12 fp64 alpha and Newton, spill (B)" 128 0 \
+          "$(spill solidshell_forces_wg_f64newton.comp.spv)" \
+          '| + fp64 alpha and Newton | 80 | 128 B | 2 960 B |' "$FEM_DOC"
+    check "§12 fp64 alpha and Newton, shared (B)" 2960 0 \
+          "$(shmem solidshell_forces_wg_f64newton.comp.spv)" \
+          '| + fp64 alpha and Newton | 80 | 128 B | 2 960 B |' "$FEM_DOC"
+
+    # **And the three claims the section actually argues from, which are derived
+    # rather than printed.** Gating the register counts alone would leave the
+    # sentences that use them free to drift, which is the failure this whole file
+    # was written against -- so the arithmetic is done here, off the measured
+    # numbers, rather than trusted. Pascal's register file is 65 536 per SM and a
+    # warp is 32 threads, so warps per SM is 65536/(32*registers), floored.
+    occupancy() { awk -v r="$1" 'BEGIN { printf "%d\n", int(65536 / (32 * r)) }'; }
+    check "§8 warp occupancy, one invocation per element" 16 0 \
+          "$(occupancy "$(reg solidshell_forces.comp.spv)")" \
+          'occupancy goes from 16 of 64 warps per SM to 32' "$FEM_DOC"
+    check "§8 warp occupancy, one workgroup per element" 32 0 \
+          "$(occupancy "$(reg solidshell_forces_wg.comp.spv)")" \
+          'occupancy goes from 16 of 64 warps per SM to 32' "$FEM_DOC"
+    check "§12 warp occupancy under fp64" 25 0 \
+          "$(occupancy "$(reg solidshell_forces_wg_f64newton.comp.spv)")" \
+          'from 32 warps per SM to 25' "$FEM_DOC"
+    # "The remap takes the spill down 20x and halves the register count" -- both
+    # halves, off the same two blocks the rows above read.
+    ratio2() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.4f\n", a / b }'; }
+    check "§8 the remap's spill reduction" 20.1667 0.001 \
+          "$(ratio2 "$(spill solidshell_forces.comp.spv)" \
+                    "$(spill solidshell_forces_wg.comp.spv)")" \
+          'takes the spill down **20×** and halves the register' "$FEM_DOC"
+    check "§8 the remap's register reduction" 2.0 0.001 \
+          "$(ratio2 "$(reg solidshell_forces.comp.spv)" \
+                    "$(reg solidshell_forces_wg.comp.spv)")" \
+          'takes the spill down **20×** and halves the register' "$FEM_DOC"
   fi
 else
   echo "  - zone_gpu_probe not built, skipping the §8 torn counts"
@@ -2039,6 +2186,63 @@ if [ -x "$JOBS" ]; then
       fails=$((fails + 1))
     fi
 
+    # **The tool now computes that span too, so the two are compared rather than
+    # both printed.** `job_bench`'s verdict used to end on a hard-coded "the sweep
+    # above spans roughly 30x" -- a literal in a `printf`, in the one program in a
+    # position to measure it, at a third value the document does not carry and had
+    # explicitly retired. It now tracks best and worst speedup as it sweeps and
+    # prints them. That creates a second route to a number this block already
+    # derives, which is the thing this file distrusts most, so it is closed the way
+    # the repo's own rule says: assert they agree.
+    #
+    # **The relation is one-sided, and the tolerance is a rounding budget rather
+    # than a fudge.** In exact arithmetic the tool's span cannot be smaller: the
+    # block above takes grain 16 as the worst grain, the tool takes the worst of
+    # all eight, so `vspan >= pen` always. But the two do not read the same
+    # numbers. The tool tracks full-precision speedups; this block divides the
+    # **printed** ms column, which carries two decimals. The denominator is the
+    # small one -- 3.64 ms against 144.14 at 23 workers -- so its rounding is worth
+    # 0.005/3.64 = 0.14% of the ratio, and `pen` is then itself rounded to one
+    # decimal. Both push `pen` above the truth, and the first version of this check
+    # allowed a flat 0.05 and went red on 36.84 against 36.9, which is the whole
+    # error and none of the physics.
+    #
+    # So the budget is derived from the printed precision at the values actually
+    # seen, not chosen: half a unit in the last place of each operand, propagated
+    # through the quotient, plus half a unit of `pen`'s own rounding.
+    checks=$((checks + 1))
+    vspan8=$(printf '%s\n' "$bench"  | awk '/^ *grain span:/ { print $3 + 0; exit }')
+    vspan23=$(printf '%s\n' "$bench" | awk '/^ *grain span:/ { print $7 + 0; exit }')
+    slack() {  # $1 = ms at grain 16, $2 = smallest ms in the sweep, $3 = the span
+      # Three terms, one per rounding in the chain and nothing else: the two ms
+      # operands at half a unit in their second decimal, propagated through the
+      # quotient; `pen`'s own `%.1f`; and the tool's `%.2f` on the span it prints.
+      awk -v w="$1" -v b="$2" -v s="$3" \
+          'BEGIN { printf "%.4f\n", s * (0.005 / w + 0.005 / b) + 0.05 + 0.005 }'
+    }
+    worst8=$(sweep 8   | awk '$1 == 16 { print $3; exit }')
+    best8=$(sweep 8    | awk '{ if (b == "" || $3 < b) b = $3 } END { print b }')
+    worst23=$(sweep 23 | awk '$1 == 16 { print $3; exit }')
+    best23=$(sweep 23  | awk '{ if (b == "" || $3 < b) b = $3 } END { print b }')
+    slack8=$(slack "$worst8" "$best8" "$pen8")
+    slack23=$(slack "$worst23" "$best23" "$pen23")
+    if [ -z "$vspan8" ] || [ -z "$vspan23" ]; then
+      printf '  %s✗%s job_bench printed no parseable "grain span:" line\n' "$red" "$off"
+      fails=$((fails + 1))
+    elif awk -v a="$vspan8" -v b="$pen8" -v s="$slack8" \
+             -v c="$vspan23" -v d="$pen23" -v t="$slack23" \
+           'BEGIN { exit !(a >= b - s && c >= d - t) }'; then
+      printf '  %s✓%s job_bench'"'"'s own span agrees with the swept table (%sx/%sx against %sx/%sx)\n' \
+             "$green" "$off" "$vspan8" "$vspan23" "$pen8" "$pen23"
+    else
+      printf '  %s✗%s job_bench'"'"'s verdict span is below the table it printed: %sx/%sx against %sx/%sx\n' \
+             "$red" "$off" "$vspan8" "$vspan23" "$pen8" "$pen23"
+      printf '      %sthe worst of eight grains cannot be smaller than grain 16 alone;\n' "$dim"
+      printf '      allowed %s and %s for the printed table'"'"'s two decimals%s\n' \
+             "$slack8" "$slack23" "$off"
+      fails=$((fails + 1))
+    fi
+
     # **And that the tuner lands in the plateau**, which is the claim §123-129
     # makes and is a relation rather than a millisecond.
     #
@@ -2089,8 +2293,17 @@ fi
 #
 # `tools/flip_probe` is the purest case of the shape this file exists for:
 # `06-roadmap.md`'s Phase 5 item, `engine/sim/flip.hpp` §1-§3 and
-# `flip-escalation-design.md` all quote it, `verify.sh` runs `flip_tests` -- a
-# different target, `CMakeLists.txt:131` -- and nothing has ever run the probe.
+# `flip-escalation-design.md` all quote it, and nothing has ever run the probe.
+#
+# **This comment used to say `verify.sh` runs `flip_tests`, and it does not.**
+# `grep flip scripts/verify.sh` returns nothing at all; `flip_tests`
+# (`CMakeLists.txt:131`) is built by every gate and executed by no script, no CI
+# step and nothing else in the tree. The coverage is not missing -- `test_flip.cpp`
+# is compiled into `shipsim_tests` as well (`CMakeLists.txt:176`), which is what
+# actually runs -- so the target is a developer convenience for running the FLIP
+# tests alone, and is kept as one. What was wrong was the sentence, which named a
+# thing that runs to explain why something else does not, and nothing tests a
+# comment.
 #
 # **Unlike `job_bench` above, every figure here is gateable.** Two 70 s runs diff
 # to nothing but wall-clock columns; filtered of those, three runs are

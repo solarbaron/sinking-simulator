@@ -14,6 +14,7 @@
 #include "engine/core/jobs.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -136,12 +137,21 @@ double measureDispatchOverhead() {
 
 // --- 2. Grain sweep ----------------------------------------------------------
 
-void measureGrainSweep(unsigned workers, std::size_t elements, double baselineMs) {
+// Returns the span between the worst and best grain at this worker count -- the
+// figure `docs/01-architecture.md` §2 publishes a bound on. It used to be printed
+// in the verdict as a hard-coded "roughly 30x", which was neither measured nor the
+// value the document carries: the doc retired the single-figure form outright
+// ("a single figure hides that: ~40x was right for 23 workers and about double
+// the truth at 8") and publishes a bound of at least 15x with medians of 21x and
+// 44x. A literal in a printf is a figure nobody re-derives, in the one program
+// that is in a position to.
+double measureGrainSweep(unsigned workers, std::size_t elements, double baselineMs) {
     std::printf("\n   %u workers:\n", workers);
     std::printf("     %10s %12s %12s %10s %12s\n", "grain", "chunks", "chunk us", "ms", "speedup");
 
     JobSystem jobs(workers);
     std::vector<LaneAccumulator> lanes(jobs.laneCount());
+    double best = 0.0, worst = std::numeric_limits<double>::infinity();
 
     for (std::size_t grain : {std::size_t{16}, std::size_t{64}, std::size_t{256}, std::size_t{1024},
                               std::size_t{4096}, std::size_t{16384}, std::size_t{65536},
@@ -155,9 +165,15 @@ void measureGrainSweep(unsigned workers, std::size_t elements, double baselineMs
 
         const std::size_t chunks = (elements + grain - 1) / grain;
         const double chunkMicros = baselineMs * 1e3 / static_cast<double>(chunks);
+        const double speedup = baselineMs / ms;
+        best = std::max(best, speedup);
+        worst = std::min(worst, speedup);
         std::printf("     %10zu %12zu %12.2f %10.2f %11.2fx\n", grain, chunks, chunkMicros, ms,
-                    baselineMs / ms);
+                    speedup);
     }
+    // A ratio between two timings from the same sweep, which is what survives a
+    // busy box: both ends move together. The absolute ms columns do not.
+    return best / worst;
 }
 
 // --- 3. Worker scaling at a sensible grain -----------------------------------
@@ -248,8 +264,8 @@ int main() {
         std::printf("   NOTE: baseline spread exceeds 25%%; treat the absolute ms columns as the\n"
                     "         reliable measurement and the speedup columns as indicative only.\n");
 
-    measureGrainSweep(8, kElements, baselineMs);
-    measureGrainSweep(23, kElements, baselineMs);
+    const double span8 = measureGrainSweep(8, kElements, baselineMs);
+    const double span23 = measureGrainSweep(23, kElements, baselineMs);
 
     // Grain that puts a chunk near the 50 us target from docs/01-architecture.md.
     const double nsPerElement = baselineMs * 1e6 / kElements;
@@ -269,13 +285,35 @@ int main() {
     std::printf("     at a %.0f us chunk that is %.3f%% of the work\n", chunkMicros,
                 100.0 * overheadFraction);
     std::printf("     Chase-Lev could remove only part of that, so it cannot matter here.\n");
-    std::printf("     Grain is what matters: the sweep above spans roughly 30x between the\n");
-    std::printf("     worst and best grain at a fixed worker count.\n");
+    std::printf("     Grain is what matters. Worst grain against best, this run:\n");
+    // One line, both numbers, fixed columns: `check-figures.sh` re-derives the same
+    // span off the printed sweep table and compares the two, so this has to be
+    // parseable without a multi-line match. A figure the gate cannot read is a
+    // figure back in the class this whole exercise is about.
+    std::printf("     grain span: %.2fx at 8 workers, %.2fx at 23\n", span8, span23);
+    std::printf("     Both move run to run -- the grain-16 row alone varies 3x at 23\n");
+    std::printf("     workers -- so the published claim is the bound over many runs and\n");
+    std::printf("     not either figure here.\n");
 
     // A conservative floor: dispatch must not be so slow that even coarse chunks
     // are dominated by it. This would fail on a genuinely broken queue.
     check("dispatch overhead is below 5% of a 50 us chunk", overheadFraction < 0.05,
           std::to_string(static_cast<int>(overheadNs)) + " ns/job");
+
+    // The bound the document publishes, asserted where it is measured. 15x is not
+    // a round number chosen for comfort: it was 17x on sixteen runs, survived a
+    // further twenty-five at a minimum of 17.80x, and was contradicted once at
+    // 16.51x on a box at load 0.47. It sits below that contradiction deliberately.
+    //
+    // It is also safe in the right direction. The load dependence has a *sign*:
+    // grain-16 is dispatch-bound and the plateau is work-bound, so an idler box
+    // makes the numerator cheaper faster than the denominator and the ratio
+    // **falls**. Ten spinners moved it up to 20.6-28.1x. So contention cannot
+    // falsely fail this check -- only an idle box can approach it, and this is the
+    // one bound in the file for which that is the safe direction.
+    const double span = std::min(span8, span23);
+    check("the grain penalty is at least the 15x docs/01-architecture.md publishes",
+          span >= 15.0, std::to_string(span) + "x");
 
     std::printf("\n%s\n", failures == 0 ? "all checks passed" : "CHECKS FAILED");
     return failures == 0 ? 0 : 1;

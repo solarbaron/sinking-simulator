@@ -156,6 +156,22 @@ a test that recomputes the model by hand agrees with a broken model and disagree
 with nothing. The water tier's budget test claimed in its own comment to assert
 "against the arithmetic rather than the constants" while doing exactly that.
 
+**A figure hard-coded in a `printf` is worse than the same figure in a document,
+because it wears the authority of output.** `job_bench`'s verdict ended on "the
+sweep above spans roughly 30x between the worst and best grain at a fixed worker
+count" — a string literal, printed by the one program in a position to measure it,
+directly beneath the table it claims to summarise. `01-architecture.md` had by
+then retired the single-figure form in as many words ("a single figure hides that:
+`~40x` was right for 23 workers and about double the truth at 8") and publishes a
+bound of at least 15x with medians of 21x and 44x. So the tool printed a fourth
+number, and a reader checking the doc against the tool would have found the tool
+disagreeing with itself two lines apart. Measured, it is 20.5x and 44.4x — the
+document was right and the literal was never anything. **A tool that prints a
+constant is not reporting, it is asserting**, and the fix is to make it compute
+what it claims: `measureGrainSweep` now returns the span and the verdict prints
+both. The same sweep turned up `MUTAFTER` in `06-roadmap.md`, an unsubstituted
+template token standing in bold where a mutation kill rate belongs.
+
 **And a duplicate implementation splits coverage without lowering it.** The
 paragraph above is about two estimators that *disagree*. This is the opposite
 case and it is worse, because nothing looks wrong: three functions answer "where
@@ -388,8 +404,8 @@ Recorded in `docs/01-architecture.md` §1 with full reasoning:
   Recoverable later via 32-bit handles into the frame arena — *not* via epoch
   reclamation.
 - **Chase-Lev revisit cancelled on evidence**: dispatch is 0.2% of a 10 µs chunk,
-  and the sweep shows no dispatch-limited regime. Grain matters at least 17× and
-  worse with more workers (21× at 8, 41× at 23); the queue
+  and the sweep shows no dispatch-limited regime. Grain matters at least 15× and
+  worse with more workers (median 21× at 8, 44× at 23); the queue
   does not.
 
 The renderer targets a **GTX 1070 Ti (Pascal)**: no mesh shaders, no hardware ray

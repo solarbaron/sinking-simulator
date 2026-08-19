@@ -1135,7 +1135,15 @@ should be honest about that.
   asserts one substep per `maxSubstep` of model time, so a collapsed controller
   fails an assertion in seconds instead of running for hours — with a generous
   wall-clock backstop behind it, scaled off the box's own measured clean run.
-  **First pass 40/50; after closing the ten survivors, MUTAFTER.** One kill was a
+  **First pass 40/50; the second pass was never recorded.** The sentence here read
+  "after closing the ten survivors, MUTAFTER" until someone grepped for template
+  tokens: `MUTAFTER` is a placeholder that was never substituted, sitting in bold
+  in the position of a figure, in a document whose whole subject is figures that
+  nobody re-derived. It is left as an absence rather than back-filled, because the
+  suite has moved a long way since and a number taken today would not be the number
+  that sentence was making a claim about. What survives from that pass is the ten
+  survivors and what they taught, which is below and is the part worth having. One
+  kill was a
   **hang** and not a failure, which is this codebase's characteristic kill and the
   reason the bound is not optional. All four controls behaved on both passes.
 

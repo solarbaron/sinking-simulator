@@ -214,6 +214,13 @@ int main(int argc, char** argv) {
         else if (a.starts_with("--period=")) wavePeriod = std::atof(a.c_str() + 9);
         else if (a == "--cost") costOnly = true;
         else if (a.starts_with("--h=")) cellSize = std::atof(a.c_str() + 4);
+        // See `gas_probe`: the missing `else` made a typo run the default study
+        // rather than fail, and this tool's `--wave=` and `--cost` runs both feed
+        // published figures.
+        else {
+            std::printf("unknown option %s\n", a.c_str());
+            return 2;
+        }
     }
     // After the whole argument list, not during it: `--cost` acted immediately
     // once, so `--cost --dt=0.02` measured at the default 0.01 and printed a
