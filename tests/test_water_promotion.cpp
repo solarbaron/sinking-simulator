@@ -1124,11 +1124,193 @@ void testMultipleCompartmentsRankedByScore() {
     expectTrue("first has score", rev.considered[0].score > 0.0);
     expectNear("score is weaker trigger", rev.considered[0].score, 1.5, 1e-6);
 
-    // All should have same score since ship motion is uniform
-    for (size_t i = 1; i < rev.considered.size(); ++i) {
-        if (rev.considered[i].score <= 0) break;  // Only check qualifying candidates
-        expectNear("all scores equal", rev.considered[i].score, rev.considered[0].score, 1e-6);
+    // **The tie is exact, and this loop used to assert it at 1e-6 and then assert
+    // nothing whatever about the order that came out of it** -- a test that named
+    // the hazard and did not check it. `rollRate` and `accel` are properties of
+    // the *ship*, computed once above `waterCandidates`' compartment loop, so
+    // every qualifying compartment divides the same two doubles by the same two
+    // thresholds and takes `std::min` of the same pair. The scores are the same
+    // *bits*, and zero is therefore the tolerance the measurement supports.
+    //
+    // Asserted at zero rather than at 1e-6 for the reason a loose bound is nearly
+    // a vacuous one: a 1e-6 also passes on scores that genuinely differ, and that
+    // is precisely the case in which the order below would be settled by the
+    // score comparison instead of by the tie-break these tests are aimed at.
+    int qualifying = 0;
+    for (const WaterCandidate& c : rev.considered) {
+        if (c.score <= 0) continue;
+        ++qualifying;
+        expectTrue("every qualifying score is bit-identical to the first",
+                   c.score == rev.considered[0].score);
     }
+    expectEqual("and exactly the three flooded compartments qualify", qualifying, 3);
+
+    // Which leaves the whole order to the tie-break -- and the order is what
+    // `review()` spends the budget along, so it is a decision and not a
+    // presentation detail. See `testTiedCandidatesAreOrderedByCompartmentIndex`.
+    expectEqual("the tie is broken by compartment index: first is 0",
+                rev.considered[0].compartment, 0);
+    expectEqual("second is 1", rev.considered[1].compartment, 1);
+    expectEqual("third is 2", rev.considered[2].compartment, 2);
+}
+
+// The order `waterCandidates` hands back is a decision, not a presentation
+// detail: `WaterPromoter::review` walks `considered` from the front, promotes
+// until the particle or tile budget is spent, and then `break`s. It picks the
+// compartments that get FLIP water.
+//
+// And on this tier that sort is almost nothing but ties. The two motion
+// quantities are properties of the ship, computed once above the compartment
+// loop, so `score` takes one of two values over the whole list: one
+// bit-identical number on every qualifying compartment, and zero on all the rest.
+//
+// **Against the implementation this replaced -- `return a.score > b.score` and
+// no second leg -- the resulting order was undefined.** `std::sort` is not
+// stable, and the ferry's 18 compartments are past libstdc++'s 16-element
+// insertion-sort threshold, so introsort partitions the range about a
+// median-of-three pivot and the tied runs come back permuted. Measured on this
+// exact fixture, on GCC 16.1.1 / libstdc++, the old comparator returned
+//
+//     1 2 0 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3
+//
+// where the fixed one returns 0 1 2 3 ... 17. That permutation is a function of
+// the compartment count and of the standard library's internals; nothing about
+// the ship is in it, and it decided which compartments were resolved --
+// `testTheBudgetSpendsTheTieBreakOrder` below is the same fixture with room for
+// one promotion, and it promoted compartment **1** for exactly this reason.
+void testTiedCandidatesAreOrderedByCompartmentIndex() {
+    std::printf("\n   tied candidates are ordered by compartment index\n");
+
+    Ship ferry = ferryAfloat();
+    floodCompartment(ferry, 0, 5.0);
+    floodCompartment(ferry, 1, 5.0);
+    floodCompartment(ferry, 2, 5.0);
+    setRollRate(ferry, 0.15);   // 3x threshold, and the only trigger that fires
+
+    WaterCriterion crit;
+    WaterPromoter promoter(crit);
+    const WaterReview rev = promoter.review(ferry);
+
+    // The non-vacuity guard, and it is about the *length* of the list rather
+    // than its contents. libstdc++ hands any range of 16 or fewer elements
+    // straight to an insertion sort, which is stable by construction -- so on a
+    // fifteen-compartment fixture the old comparator would also have returned
+    // index order and this test would prove nothing at all. The ferry has 18.
+    expectTrue("the fixture is long enough that introsort really partitions it",
+               rev.considered.size() > 16);
+
+    // The expected order is closed-form rather than observed. The three flooded
+    // compartments are the ship's first three and they alone score; every other
+    // compartment is dry and scores exactly zero. Score-descending and
+    // index-ascending therefore agree, and the list must come back as the
+    // identity permutation.
+    bool inIndexOrder = true;
+    bool scoresDescend = true;
+    for (size_t i = 0; i < rev.considered.size(); ++i) {
+        if (rev.considered[i].compartment != static_cast<int>(i)) inIndexOrder = false;
+        if (i > 0 && rev.considered[i].score > rev.considered[i - 1].score) scoresDescend = false;
+    }
+    if (!inIndexOrder) {
+        std::printf("      order was:");
+        for (const WaterCandidate& c : rev.considered) std::printf(" %d", c.compartment);
+        std::printf("\n");
+    }
+    expectTrue("scores are non-increasing along the list", scoresDescend);
+    expectTrue("and every tie is broken by ascending compartment index", inIndexOrder);
+}
+
+// Score is still the primary key; the tie-break only separates equals.
+//
+// Flooding compartments 2 and 5 -- and neither end of the ship -- separates the
+// two orderings. Ranked by score the pair leads; ranked by index alone
+// compartments 0 and 1 would. A comparator that had lost the score leg, or had
+// its two legs the wrong way round, passes the test above and fails here.
+//
+// The zero-score remainder is asserted as well, and that is not padding: with
+// only two compartments scoring, the old comparator happened to leave *those
+// two* in index order on this fixture and scrambled the fifteen behind them.
+// Checking the head alone would have been a green test over a broken sort.
+void testScoreOutranksTheTieBreak() {
+    std::printf("\n   score outranks the tie-break\n");
+
+    Ship ferry = ferryAfloat();
+    floodCompartment(ferry, 2, 5.0);
+    floodCompartment(ferry, 5, 5.0);
+    setRollRate(ferry, 0.15);
+
+    WaterCriterion crit;
+    WaterPromoter promoter(crit);
+    const WaterReview rev = promoter.review(ferry);
+
+    expectTrue("the whole ship is considered", rev.considered.size() > 16);
+    expectEqual("the flooded pair leads, the lower index of the two first",
+                rev.considered[0].compartment, 2);
+    expectEqual("then the other one", rev.considered[1].compartment, 5);
+    expectTrue("both on a positive score", rev.considered[1].score > 0.0);
+    expectTrue("and the third candidate scores zero", rev.considered[2].score == 0.0);
+
+    // The zero-score remainder follows in index order, with the two that were
+    // ranked out of it skipped. Closed-form for the same reason as above: every
+    // one of these scores is exactly zero, so only the tie-break orders them.
+    bool restInIndexOrder = true;
+    int expected = 0;
+    for (size_t i = 2; i < rev.considered.size(); ++i) {
+        while (expected == 2 || expected == 5) ++expected;
+        if (rev.considered[i].compartment != expected) restInIndexOrder = false;
+        ++expected;
+    }
+    if (!restInIndexOrder) {
+        std::printf("      order was:");
+        for (const WaterCandidate& c : rev.considered) std::printf(" %d", c.compartment);
+        std::printf("\n");
+    }
+    expectTrue("and the zero-score remainder is in index order too", restInIndexOrder);
+}
+
+// The consequence, which is why any of this matters. `review()` promotes down
+// `considered` until the budget is exhausted and then stops, so the tie-break is
+// what chooses the compartments that get resolved. Three tied compartments and
+// room for one: the lowest index wins, and it wins on every run and every build
+// rather than on whichever one introsort happened to move to the front.
+void testTheBudgetSpendsTheTieBreakOrder() {
+    std::printf("\n   the budget is spent in tie-break order\n");
+
+    Ship ferry = ferryAfloat();
+    floodCompartment(ferry, 0, 5.0);
+    floodCompartment(ferry, 1, 5.0);
+    floodCompartment(ferry, 2, 5.0);
+    setRollRate(ferry, 0.15);
+
+    WaterCriterion crit;
+    crit.dwell = 1;
+
+    // Room for exactly one, sized off the estimator rather than off a constant,
+    // for the reason `testParticleBudgetEnforcement` gives: a hardcoded number
+    // here is a guess about the estimator's internals, and it lands on the wrong
+    // side of the boundary in silence when they change.
+    int oneParticles = 0, oneTiles = 0;
+    estimateFlipCost(ferry.compartments[0], crit, oneParticles, oneTiles);
+    expectTrue("one compartment needs particles and tiles",
+               oneParticles > 0 && oneTiles > 0);
+    crit.particleBudget = 2 * oneParticles - 1;   // fits one, one short of two
+    crit.tileBudget = 2 * oneTiles - 1;
+
+    WaterPromoter promoter(crit);
+    const WaterReview rev = promoter.review(ferry);
+
+    std::printf("      qualifying order:");
+    for (const WaterCandidate& c : rev.considered)
+        if (c.score > 0) std::printf(" %d", c.compartment);
+    std::printf("\n");
+
+    expectEqual("only one of the three fits", static_cast<int>(rev.promoted.size()), 1);
+    expectTrue("and the budget said so out loud", rev.problems.size() > 0);
+
+    // Read through a guard rather than indexed directly: if the budget ever
+    // admits none, this reports the wrong compartment instead of walking off the
+    // end of the vector, and the check count is the same either way.
+    const int promoted = rev.promoted.empty() ? -1 : rev.promoted[0].compartment;
+    expectEqual("and it is the lowest-index qualifying compartment", promoted, 0);
 }
 
 void testDifferentCompartmentsSeparateHysteresis() {
@@ -1430,6 +1612,9 @@ void runWaterPromotionTests() {
 
     // Section 5: Multiple Compartments
     testMultipleCompartmentsRankedByScore();
+    testTiedCandidatesAreOrderedByCompartmentIndex();
+    testScoreOutranksTheTieBreak();
+    testTheBudgetSpendsTheTieBreakOrder();
     testDifferentCompartmentsSeparateHysteresis();
 
     // Section 6: Cost and Performance

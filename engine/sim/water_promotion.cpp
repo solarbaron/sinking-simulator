@@ -220,10 +220,38 @@ std::vector<WaterCandidate> waterCandidates(const Ship& ship, const WaterCriteri
         candidates.push_back(cand);
     }
 
-    // Sort by score descending: most-urgent compartments first
+    // Most urgent first, and **ties broken by compartment index** -- the same
+    // second leg both sibling tiers carry (`promotion.cpp:332` and `:349` for the
+    // structural zones, `:871` for the gas ones), for the reason written down
+    // above the first of them: "Deterministic ties, by panel index, so two runs
+    // of the same load promote the same patches."
+    //
+    // On this tier a tie is not the unlucky case, it is the only case. `rollRate`
+    // and `accel` are ship-level quantities, computed once above the compartment
+    // loop, so `rollScore` and `accelScore` are the *same two doubles* for every
+    // compartment and `std::min` of them is one bit-identical `score` on every
+    // qualifying compartment, with zero on all the rest. A comparator on `score`
+    // alone therefore ties across the whole list.
+    //
+    // `std::sort` is not stable, so what came back was introsort's permutation
+    // rather than the ship's order. Measured on the ferry -- 18 compartments,
+    // just past libstdc++'s 16-element insertion-sort threshold, so the range is
+    // really partitioned -- three flooded holds at indices 0, 1, 2 came back as
+    // `1 2 0`, and the rest of the list reversed. The order was a function of the
+    // compartment count and of which standard library built it, and of nothing
+    // else; add a compartment to the ferry and it moves.
+    //
+    // That order is load-bearing. `WaterPromoter::review` walks `considered` from
+    // the front, promotes until the particle or tile budget is spent and then
+    // stops, so *which* compartments get FLIP water was being decided by a
+    // tie-break that did not exist -- on the same fixture, with room for one
+    // promotion, it resolved compartment 1 and left compartment 0 quiescent.
+    // `testTiedCandidatesAreOrderedByCompartmentIndex` and
+    // `testTheBudgetSpendsTheTieBreakOrder` pin both halves of that.
     std::sort(candidates.begin(), candidates.end(),
               [](const WaterCandidate& a, const WaterCandidate& b) {
-                  return a.score > b.score;
+                  if (a.score != b.score) return a.score > b.score;
+                  return a.compartment < b.compartment;
               });
 
     return candidates;

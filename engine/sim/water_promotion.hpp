@@ -240,6 +240,16 @@ struct WaterCandidate {
 // Exposed so a caller can see what was considered and rejected (same pattern as
 // `promotion::candidates()` and `promotion::gasCandidates()`).
 //
+// **Ranked by score descending, ties broken by ascending compartment index**, and
+// that second key is part of the contract rather than an implementation accident.
+// `score` is built from two *ship-level* quantities, so it is one bit-identical
+// number across every qualifying compartment and zero across the rest: score
+// alone ties over the whole list, `std::sort` is not stable, and without a
+// tie-break the order was introsort's -- a function of the compartment count and
+// the standard library, not of the ship. `WaterPromoter::review` spends the
+// budget down this list and stops when it runs out, so the order chooses the
+// compartments that get FLIP water. See the sort in `water_promotion.cpp`.
+//
 // `previousVelocity` and `dt` are what the lateral acceleration is differenced
 // from. `dt <= 0` reports zero acceleration rather than inventing one from a
 // single sample, which is the honest answer for a caller reviewing a static ship.
