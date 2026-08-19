@@ -29,7 +29,7 @@ Numerical core, flooding, air, damaged stability, validation harness.
 - Mesh boolean (clip, weld, cap by ear clipping) so compartments are carved out
   of the hull form rather than authored as boxes
 - Watertightness checking and load-time ship definition validation
-- 200 821 closed-form validation checks
+- 200 828 closed-form validation checks
 - A 120 m ferry that lolls over or capsizes depending on what you do — and, since
   GM stopped being sampled at a fixed ±0.03 rad, does not survive any of the three
 - Explicit co-rotational tet FEM, CPU reference plus a Vulkan compute back-end,
@@ -376,7 +376,7 @@ The longest and highest-risk phase.
   eliminated rather than penalised. The ferry's hold goes from seven components to
   one, its `GJ` up 44.9% and its lowest fixed-interface frequency from 0.7785 Hz to
   2.3026 Hz — where untied it was the decks' own frequency to four figures, the shell
-  contributing nothing. It costs the assembled band 146 → 1 520.
+  contributing nothing. It costs the DOF half-bandwidth 146 → 1 520.
   The section
   reduction used to carry plating only, so a collision that opened fourteen bays left
   their longitudinals at full strength — the un-conservative direction, and the last
@@ -388,8 +388,8 @@ The longest and highest-risk phase.
   exact analogue of a plate's thickness. **What it was worth**, on the ferry, for a
   ram opening 125.6 m² of her side and the 163 m of longitudinal in it: the section
   area lost goes 6.861% → **8.455%**, the second moment 5.429% → **6.590%**, the
-  hogging ultimate moment 5.711% → **7.068%** and the sagging one 11.846% →
-  **17.507%**. So about a fifth of what a collision takes out of her hull girder was
+  hogging ultimate moment 5.388% → **6.747%** and the sagging one 12.369% →
+  **17.854%**. So about a fifth of what a collision takes out of her hull girder was
   invisible, and about a third of it in sagging — stiffener loss bites hardest in
   compression, because a panel that has lost its stiffener buckles far earlier than
   one that has merely thinned. At the zone, against the same solve with the control

@@ -913,7 +913,7 @@ if [ -x "$TESTS" ]; then
   # gate never passes.
   suiteout=$("$TESTS" 2>&1)
   suite=$(printf '%s\n' "$suiteout" | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  expected=200821
+  expected=200828
   check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
         "$expected validation checks" "$FRONT"
   # **The roadmap publishes the same count in a different format**, and it was
@@ -924,6 +924,152 @@ if [ -x "$TESTS" ]; then
   # `$expected` so the two cannot part company.
   hint "$(printf '%s %s closed-form validation checks' \
           "${expected%???}" "${expected#${expected%???}}")" "$DOC"
+
+  # --- what a ram takes out of the hull girder, out of the same run ----------------
+  #
+  # `02-simulation.md`'s stiffener-loss table and `06-roadmap.md`'s restatement of
+  # it. These were *printed* all along -- `test_promotion.cpp` emits every one on
+  # every run -- and four of the twelve had still drifted, which is the sharper
+  # version of this file's usual finding: printed is not the same as read.
+  #
+  # What hid it was the assertion around them. The test guards these with one-sided
+  # bounds -- `gap.both_ > gap.plate`, `> 1.15x`, `> 1.35x` -- against actuals of
+  # 1.23x, 1.25x and 1.44x. All still pass. So when `4b35bc7` (the plate's `b`),
+  # `60c96ad` (the column-buckling mode) and `3519e9d` (an explicit yield strength)
+  # each correctly moved `collapseCurve`, the hogging and sagging rows moved with
+  # them and nothing anywhere went red. The section-area and second-moment rows did
+  # *not* move, correctly: they come from `hullGirderSection` and never touch
+  # buckling, which is the cross-check that says the code is right and the table was
+  # three fixes stale.
+  #
+  # The bounds are left alone deliberately. They assert a claim about the physics --
+  # that losing the longitudinals costs strictly more, by a factor and not a
+  # rounding -- and that claim should not be re-tuned every time the collapse model
+  # improves. Pinning the published digits is this file's job, not theirs.
+  #
+  # Free: the suite is already captured above.
+  gap() {  # $1 = row label, $2 = 1 plating alone, 2 with members, 3 the ratio
+    printf '%s\n' "$suiteout" |
+      sed -n "s/^ *$1 *plating alone \([0-9.]*\)%, with the longitudinals \([0-9.]*\)%  (\([0-9.]*\)x)$/\\$2/p" |
+      head -1
+  }
+  check "ram damage: section area lost, plating alone" 6.861 0 "$(gap 'section area' 1)" \
+        '| section area lost | 6.861% | **8.455%** | 1.23× |' "$SIM_DOC"
+  check "ram damage: section area lost, with the longitudinals" 8.455 0 \
+        "$(gap 'section area' 2)" '| section area lost | 6.861% | **8.455%** | 1.23× |' "$SIM_DOC"
+  check "ram damage: section area ratio" 1.23 0 "$(gap 'section area' 3)" \
+        '| section area lost | 6.861% | **8.455%** | 1.23× |' "$SIM_DOC"
+  check "ram damage: second moment lost, plating alone" 5.429 0 "$(gap 'second moment' 1)" \
+        '| second moment lost | 5.429% | **6.590%** | 1.21× |' "$SIM_DOC"
+  check "ram damage: second moment lost, with the longitudinals" 6.590 0 \
+        "$(gap 'second moment' 2)" '| second moment lost | 5.429% | **6.590%** | 1.21× |' "$SIM_DOC"
+  check "ram damage: second moment ratio" 1.21 0 "$(gap 'second moment' 3)" \
+        '| second moment lost | 5.429% | **6.590%** | 1.21× |' "$SIM_DOC"
+  check "ram damage: hogging ultimate moment lost, plating alone" 5.388 0 \
+        "$(gap 'hogging ultimate moment' 1)" \
+        '| hogging ultimate moment lost | 5.388% | **6.747%** | 1.25× |' "$SIM_DOC"
+  check "ram damage: hogging ultimate moment lost, with the longitudinals" 6.747 0 \
+        "$(gap 'hogging ultimate moment' 2)" \
+        '| hogging ultimate moment lost | 5.388% | **6.747%** | 1.25× |' "$SIM_DOC"
+  check "ram damage: hogging ratio" 1.25 0 "$(gap 'hogging ultimate moment' 3)" \
+        '| hogging ultimate moment lost | 5.388% | **6.747%** | 1.25× |' "$SIM_DOC"
+  check "ram damage: sagging ultimate moment lost, plating alone" 12.369 0 \
+        "$(gap 'sagging ultimate moment' 1)" \
+        '| sagging ultimate moment lost | 12.369% | **17.854%** | **1.44×** |' "$SIM_DOC"
+  check "ram damage: sagging ultimate moment lost, with the longitudinals" 17.854 0 \
+        "$(gap 'sagging ultimate moment' 2)" \
+        '| sagging ultimate moment lost | 12.369% | **17.854%** | **1.44×** |' "$SIM_DOC"
+  check "ram damage: sagging ratio" 1.44 0 "$(gap 'sagging ultimate moment' 3)" \
+        '| sagging ultimate moment lost | 12.369% | **17.854%** | **1.44×** |' "$SIM_DOC"
+
+  # The extent of the damage the table is *about*. Both documents quote it, and the
+  # test bounds it only through a derived spacing window wide enough that the area
+  # and the length could move a long way together and still pass.
+  ram() {  # $1 = 1 area m2, 2 panels, 3 length m, 4 members
+    printf '%s\n' "$suiteout" |
+      sed -n "s/^ *the ram opens \([0-9.]*\) m2 of shell over \([0-9]*\) panels and \([0-9.]*\) m of longitudinal over \([0-9]*\) members.*/\\$1/p" |
+      head -1
+  }
+  check "ram damage: shell opened (m2)" 125.6 0.05 "$(ram 1)" \
+        'a ram opening 125.6 m² of side shell' "$SIM_DOC"
+  check "ram damage: panels opened" 72 0 "$(ram 2)" \
+        'over 72 panels and the 163 m of longitudinal running through them' "$SIM_DOC"
+  check "ram damage: longitudinal opened (m)" 163.2 0.05 "$(ram 3)" \
+        'over 72 panels and the 163 m of longitudinal running through them' "$SIM_DOC"
+
+  # And the zone control: the shipped-before model with `fiberFailure` off. Its
+  # four figures are the argument for the criterion existing at all.
+  ctlfibre() {  # $1 = 1 eps_p, 2 the multiple, 3 the failure strain
+    printf '%s\n' "$suiteout" |
+      sed -n "s/^ *the control leaves the longitudinal at eps_p = \([0-9.]*\), \([0-9.]*\)x its own regularised failure strain of \([0-9.]*\).*/\\$1/p" |
+      head -1
+  }
+  unconservative() {  # $1 = 1 force, 2 stored energy, 3 punch work %
+    printf '%s\n' "$suiteout" |
+      sed -n "s/^ *so the un-conservative model claims \([0-9.]*\)x the fibre force, \([0-9.]*\)x the stored energy, and \([0-9.]*\)% more punch work.*/\\$1/p" |
+      head -1
+  }
+  check "fiberFailure off: plastic strain left on the longitudinal" 0.5128 0.0001 \
+        "$(ctlfibre 1)" '`ε_p = 0.513`, **2.83× its own failure strain**' "$SIM_DOC"
+  check "fiberFailure off: multiple of its own failure strain" 2.83 0.005 "$(ctlfibre 2)" \
+        '`ε_p = 0.513`, **2.83× its own failure strain**' "$SIM_DOC"
+  check "fiberFailure off: multiple of the nodal force" 2.23 0.005 "$(unconservative 1)" \
+        'carrying 2.23× the nodal force and 5.74× the stored energy' "$SIM_DOC"
+  check "fiberFailure off: multiple of the stored energy" 5.74 0.005 "$(unconservative 2)" \
+        'carrying 2.23× the nodal force and 5.74× the stored energy' "$SIM_DOC"
+  check "fiberFailure off: extra punch work (%)" 25.3 0.05 "$(unconservative 3)" \
+        '**25.3% more energy to open the same hole**' "$SIM_DOC"
+
+  # **And the roadmap's restatement of the same table**, pinned so the two copies
+  # cannot part company. That is not hypothetical here: the suite count was gated on
+  # the README and loose on the roadmap once already, and went stale by two commits
+  # in a spelling no grep aimed at the README would find. Every figure above appears
+  # again in `06-roadmap.md`'s Phase 3 prose, wrapped differently, so each pointer is
+  # a single line of that wrapping and nothing wider.
+  for h in 'ram opening 125.6 m² of her side and the 163 m of longitudinal in it: the section' \
+           'area lost goes 6.861% → **8.455%**, the second moment 5.429% → **6.590%**, the' \
+           'hogging ultimate moment 5.388% → **6.747%** and the sagging one 12.369% →' \
+           '`ε_p = 0.513` — **2.83× its own failure strain** — still at full section, carrying' \
+           '2.23× the force and costing the ram **25.3% more energy to open the same hole**.'; do
+    hint "$h" "$DOC"
+  done
+
+  # --- the clamped-zone control, out of the same run -------------------------------
+  #
+  # "74% out and 433× too stiff" is published on `README.md`, in the roadmap, and in
+  # `02-simulation.md`'s table with the 625 671 N behind it. The 74% and the 1.47e-4
+  # were printed all along. **The 433× was not**, and the only thing holding it was
+  # the vacuity guard in `test_coupling.cpp` -- `clampedForce > 10.0 * reference`,
+  # a bound forty-three times looser than the figure it stands next to, with its own
+  # comment saying "Measured at 433x, asserted at 10."
+  #
+  # The guard is left where it is: it is a *vacuity* check, and its job is to fail
+  # when an uncoupled zone would pass everything below it, not to pin a published
+  # digit. Pinning the digit is this file's job, and the test now prints the ratio
+  # so there is something to pin.
+  clampedmn=$(printf '%s\n' "$suiteout" |
+              sed -n 's/^ *clamped edge \([0-9.]*\) MN (\([0-9]*\)x the coupled answer).*/\1/p' | head -1)
+  clampedx=$(printf '%s\n' "$suiteout" |
+             sed -n 's/^ *clamped edge \([0-9.]*\) MN (\([0-9]*\)x the coupled answer).*/\2/p' | head -1)
+  missm=$(printf '%s\n' "$suiteout" |
+          sed -n 's/^ *control: the clamped zone misses the monolithic field by \([0-9.e+-]*\) m (\([0-9]*\)%)$/\1/p' | head -1)
+  misspct=$(printf '%s\n' "$suiteout" |
+            sed -n 's/^ *control: the clamped zone misses the monolithic field by \([0-9.e+-]*\) m (\([0-9]*\)%)$/\2/p' | head -1)
+  check "clamped zone: punch reaction (N)" 625671 1 \
+        "$(awk -v m="$clampedmn" 'BEGIN { printf "%.0f", m * 1e6 }')" \
+        '| zone clamped, as before | 625 671 N (**433×**) | 1.47e-4 m out, 74% of peak |' \
+        "$SIM_DOC"
+  check "clamped zone: multiple of the coupled answer" 433 0 "$clampedx" \
+        'clamped zone it replaces is 74% out and 433× too stiff. That it does not merely' \
+        "$FRONT"
+  check "clamped zone: field error at the perimeter (m)" 1.47e-4 1e-6 "$missm" \
+        '| zone clamped, as before | 625 671 N (**433×**) | 1.47e-4 m out, 74% of peak |' \
+        "$SIM_DOC"
+  check "clamped zone: field error as a fraction of peak (%)" 74 0 "$misspct" \
+        '| zone clamped, as before | 625 671 N (**433×**) | 1.47e-4 m out, 74% of peak |' \
+        "$SIM_DOC"
+  # The roadmap's third copy of the same pair.
+  hint 'out and 433× too stiff. The *mesher* that was missing now exists —' "$DOC"
 
   # --- the spectral wave field, out of the same run --------------------------------
   #

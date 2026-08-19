@@ -522,7 +522,15 @@ void testCoupledZoneIsTheWholePlate() {
     // bound however the numbers come out, and asserting it would prove nothing.
     // It is asserted here as the identity it is, and the bracket that carries the
     // content is the edge-following ratio below.
-    std::printf("     clamped edge %.6f MN, free edge %.3e N\n", clampedForce * 1e-6, freeForce);
+    // The ratio is printed, not just the two forces it is taken between. Three
+    // documents publish "433× too stiff" to three figures -- README.md, the
+    // roadmap, and `02-simulation.md`'s table with the 625 671 N behind it -- and
+    // the only thing holding it was the `> 10.0 *` vacuity guard below, a bound
+    // forty-three times looser than the figure it is supposed to protect. A number
+    // nobody prints is a number nobody checks, and a bound that loose is nearly the
+    // same thing as no bound.
+    std::printf("     clamped edge %.6f MN (%.0fx the coupled answer), free edge %.3e N\n",
+                clampedForce * 1e-6, clampedForce / reference.force, freeForce);
     expectTrue("a clamped edge is stiffer than the real one", clampedForce > reference.force);
     expectTrue("a free edge resists a rigid punch with exactly nothing",
                std::fabs(freeForce) < 1e-9 * reference.force);

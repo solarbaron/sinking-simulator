@@ -21,6 +21,7 @@
 //   * and finally the closed form that says what the coefficient *means*: feed
 //     B44 into a linear 1-DOF roll equation, integrate a free decay, and the
 //     logarithmic decrement must be 2 pi zeta / sqrt(1 - zeta^2).
+#include "engine/sim/hullform.hpp"
 #include "engine/sim/roll_damping.hpp"
 #include "harness.hpp"
 
@@ -677,6 +678,87 @@ void testValidityIsReported() {
                rollDamping(broken, c).total, 0.0, 0.0);
 }
 
+// Two implementations of the bilge radius, and nothing had ever set them side by
+// side. `hullform.cpp`'s `bilgeRadiusForMidshipCoefficient` is the one with a test
+// -- a round trip against its own inverse. `RollDampingHull::bilgeRadiusOrDefault`
+// is the one the ship actually runs: `rollDampingHullFromMesh` leaves `bilgeRadius`
+// at its `-1` sentinel, so the derived branch is what production takes, and
+// `derive()` feeds the answer straight into `Geometry::bilgeR`, on which both
+// bilge-keel components are built. It had zero mentions anywhere under `tests/`.
+//
+// They agree, and by algebra rather than by coincidence:
+//
+//     hullform      r = sqrt((1-Cm) B d / (2 (1 - pi/4)))  =  sqrt(2 B d (1-Cm) / (4-pi))
+//     roll damping  r = 2d sqrt(h0 (Cm-1) / (pi-4)),  h0 = B/2d
+//                     = sqrt(4 d^2 B (1-Cm) / (2 d (4-pi)))  =  sqrt(2 B d (1-Cm) / (4-pi))
+//
+// and the clamps coincide too, which is the part that looks like a difference and
+// is not: `h0 >= 1` is `B >= 2d` is `0.5B >= d`, so `h0 >= 1 ? d : 0.5B` *is*
+// `min(0.5B, d)`, written the other way round.
+//
+// None of that is written down anywhere, and neither routine's header mentions the
+// other. This is the repo's own rule applied where it had not been: when a second
+// way to compute something exists, assert they agree rather than trusting that they
+// do.
+void testTheTwoBilgeRadiiAgree() {
+    double worst = 0, largest = 0;
+    int clamped = 0, free_ = 0;
+    for (double beam : {8.0, 14.0, 20.0, 32.0}) {
+        for (double draft : {2.0, 4.0, 6.5, 11.0}) {
+            for (double cm : {0.55, 0.70, 0.85, 0.95, 0.99}) {
+                RollDampingHull hull;
+                hull.beam = beam;
+                hull.draft = draft;
+                hull.midshipCoeff = cm;
+                // Left at the -1 sentinel deliberately: that is the branch the ship
+                // takes, and pinning the other one would test nothing.
+                const double derived = hull.bilgeRadiusOrDefault();
+                const double independent = bilgeRadiusForMidshipCoefficient(beam, draft, cm);
+                worst = std::max(worst, std::fabs(derived - independent));
+                largest = std::max(largest, derived);
+                // Did the section-folding clamp bind? Both apply it, and a sweep
+                // that never reached it would leave the halves of it untested --
+                // which is where the two are written most differently.
+                if (derived >= std::min(0.5 * beam, draft) - 1e-12) ++clamped; else ++free_;
+            }
+        }
+    }
+    std::printf("     the two bilge radii: worst disagreement %.3e m over 80 hulls,"
+                " largest radius %.3f m\n", worst, largest);
+    std::printf("     the fold clamp bound on %d of them and not on %d\n", clamped, free_);
+
+    // Asserted at what was measured. They are the same expression, so the only
+    // difference available is the order of the floating-point operations.
+    expectTrue("the roll-damping default and the hull-form estimator agree",
+               worst <= 1e-12 * std::max(1.0, largest));
+    // Guards: a sweep that clamped everywhere would compare two `min` calls and
+    // nothing else, and one that never clamped would leave the clamp -- the half
+    // written differently in the two files -- unexercised.
+    expectTrue("and the sweep drove both sides of the fold clamp", clamped > 0 && free_ > 0);
+    expectTrue("and there was a real radius to compare", largest > 1.0);
+
+    // The divergence, stated rather than merely known. `bilgeRadiusOrDefault`
+    // refuses a midship coefficient outside (0, 1) and returns zero;
+    // `bilgeRadiusForMidshipCoefficient` clamps the coefficient into range and
+    // answers anyway. Both are defensible and no live caller passes such a hull --
+    // `RollDampingHull` is built from a mesh, and `validateRollDamping` rejects
+    // these before Ikeda sees them -- but the next caller to try one should find
+    // out here rather than from a zero that looks like a very fine bilge.
+    RollDampingHull square;
+    square.beam = 20.0;
+    square.draft = 6.0;
+    square.midshipCoeff = 1.0;  // a box section: no bilge radius at all
+    expectNear("a box section has no bilge radius, both ways",
+               square.bilgeRadiusOrDefault(), 0.0, 1e-12);
+    expectNear("and so it does by the hull-form route",
+               bilgeRadiusForMidshipCoefficient(20.0, 6.0, 1.0), 0.0, 1e-12);
+    square.midshipCoeff = 0.0;  // nonphysical: the section has no area at all
+    expectNear("at a nonphysical Cm the roll-damping route refuses and returns zero",
+               square.bilgeRadiusOrDefault(), 0.0, 1e-12);
+    expectTrue("where the hull-form route clamps the coefficient and answers",
+               bilgeRadiusForMidshipCoefficient(20.0, 6.0, 0.0) > 1.0);
+}
+
 }  // namespace
 
 void runRollDampingTests() {
@@ -687,6 +769,7 @@ void runRollDampingTests() {
     testBilgeKeelNormalForceIsLinearisedPlateDrag();
     testEddyIsALinearisedQuadraticMoment();
     testBilgeKeelPresence();
+    testTheTwoBilgeRadiiAgree();
     testBilgeKeelAgreesWithTheSimplifiedRegression();
     testForwardSpeedEffects();
     testRollDecayLogarithmicDecrement();

@@ -232,6 +232,25 @@ percentages two to five times too large. The three that had not moved a digit �
 strip-theory radiation, propulsion and manoeuvring, hull-to-hull contact — were
 every one of them printed by a test on every run.
 
+**That rule is now known to be too strong, and the counterexample is worth more
+than the rule.** Four figures in `02-simulation.md`'s stiffener-loss table — the
+hogging and sagging ultimate-moment rows, in both columns — are printed by
+`test_promotion.cpp` on every single run, and they had still drifted. `4b35bc7`,
+`60c96ad` and `3519e9d` each correctly moved `collapseCurve`, the rows moved with
+them, and nothing went red: the assertions around them are one-sided bounds
+(`> 1.15x`, `> 1.35x`) against actuals of 1.23x and 1.44x, so a 6% move in the
+published digit is invisible to all of them. The area and second-moment rows in the
+same table did *not* move, correctly — they come from `hullGirderSection` and never
+touch buckling — which is what says the code was right and the table was three
+fixes stale.
+
+So printing is necessary and nowhere near sufficient. **What makes a figure honest
+is something that compares it to the published value** — a tight assertion or a
+gate. A `printf` only creates the opportunity, and an opportunity nobody takes is
+worth exactly as much as the transcription it replaced. The correlation in the
+paragraph above was real and the mechanism was wrong: what the three stable figures
+had was not a `printf`, it was a reader.
+
 The distinction is not the subsystem, the age of the code, or how load-bearing the
 claim is. It is whether anyone sees the number between the day it was written and
 the day it is questioned. **So the repair for a stale figure is not to correct it;

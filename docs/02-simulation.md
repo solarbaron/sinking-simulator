@@ -3150,8 +3150,8 @@ amidships over 72 panels and the 163 m of longitudinal running through them:
 |---|---|---|---|
 | section area lost | 6.861% | **8.455%** | 1.23× |
 | second moment lost | 5.429% | **6.590%** | 1.21× |
-| hogging ultimate moment lost | 5.711% | **7.068%** | 1.24× |
-| sagging ultimate moment lost | 11.846% | **17.507%** | **1.48×** |
+| hogging ultimate moment lost | 5.388% | **6.747%** | 1.25× |
+| sagging ultimate moment lost | 12.369% | **17.854%** | **1.44×** |
 
 So about a fifth of what a collision takes out of her hull girder was invisible, and
 about a third of it in sagging — where it bites hardest because a panel that has lost
