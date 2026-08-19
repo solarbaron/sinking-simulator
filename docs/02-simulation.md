@@ -1453,6 +1453,7 @@ Three inputs are deliberately *not* derived, and the boundary is the point:
 | bilge keels | the caller | a watertight envelope has no appendages in it — there is nothing to measure |
 | bilge radius | left at the "estimate from Cm and B/d" sentinel | Ikeda's keel model idealises the section as vertical side, flat bottom, quarter-circle bilge; a radius measured off a shape that is not that is not the radius the formulae want |
 | roll axis | the live centre of gravity, every tick | it is *loading*, not form, and a flooding ship's loading moves |
+| draft | the live waterline, every tick | **the other half of the same subtraction.** `OG = d − KR`, and refreshing `KR` while freezing `d` takes the two halves at different times — the ferry attaches at her 5.5 m design draft and then floods down past it. 1.5 m of sinkage is 0.27 in `OG/d`, which is the one input the two readings of `B0` differ in at all |
 
 **The operating point — evaluated every tick, and why that is the cheap answer.**
 B44 is an equivalent *linear* coefficient, valid only at the amplitude, frequency
@@ -1476,6 +1477,21 @@ quantities the integrator already holds:
   with no history to keep. Using the heel alone instead reports zero damping every
   time the ship passes through upright, which is where it is rolling fastest;
   substituted deliberately, it breaks the log decrement by 12%.
+
+  **`phi` is measured from the heel she is rolling about, and for a long time it
+  was measured from upright.** The radius is the envelope only for an oscillator
+  swinging about zero, and a damaged ship does not: she carries a list, and the
+  ferry this engine exists for lolls to 58°. Taken from upright, a hull rolling
+  two degrees about a 58° loll reported an amplitude of 1 rad rather than 0.035,
+  and the eddy and bilge-keel terms are both linear in it — so `B44` came out
+  several times too large at exactly the operating point where roll damping
+  decides whether she goes over, and too *much* damping is the reassuring
+  direction. The correction needs no filter state either: `angularStiffness`
+  returns `k = −dM/dθ`, so the hydrostatic restoring moment gives the distance to
+  equilibrium as `M/k` directly. On an upright ship at an upright equilibrium that
+  *is* the heel, so nothing moves where the old reading was right. Measured on a
+  listed hull: a 0.4227 rad list with a 0.0196 rad swing now reports 0.0193, where
+  it used to report the list.
 - **Speed: surge along the ship's own bow**, not `state.velocity.x`, which is a
   world vector — the mistake recorded further up this file.
 
@@ -1586,9 +1602,15 @@ belong to the coupling rather than to the method:
    the barge the two added masses are 0.4% apart and it does not matter at all; on
    the ferry-like hull `A_inf` is 21% below `A(ω_d)`, which is dry inertia plus
    16% against dry plus 20% — a 1.7% error in ω and so in B44.
-3. *Hull form is snapshotted at `attachRollDamping()`* and only the roll axis
-   tracks the ship afterwards, so a hull that floods until its draft and Cb have
-   visibly changed is being damped on its intact form.
+3. *Hull form is snapshotted at `attachRollDamping()`* and only the roll axis and
+   the draft track the ship afterwards, so a hull that floods until its `Cb` has
+   visibly changed is being damped on an intact block coefficient. The draft used
+   to be snapshotted with the rest, which was worse than a stale form: it left
+   `OG = d − KR` built from a live `KR` and a frozen `d`, so the ratio the eddy and
+   bilge-keel terms are most sensitive to drifted with every metre of sinkage.
+   `B/d` and `Cm` remain frozen and are the honest remainder of this limit —
+   refreshing them means re-clipping the mesh every tick, where the draft costs a
+   subtraction the integrator has already done for the quadratic drag.
 
 All three are refinements with a clear route, not gaps in the coupling.
 

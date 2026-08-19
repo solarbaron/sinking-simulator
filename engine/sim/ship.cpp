@@ -1034,6 +1034,12 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
         torque += cross(cbWorld - cogWorld, buoyancy);
     }
 
+    // The hydrostatic restoring moment about the ship's own roll axis, taken
+    // *here* because `torque` carries nothing but buoyancy at this point -- weight
+    // acts at the cog and contributes no moment about it. Read below to find the
+    // heel the ship is rolling *about*, which for a damaged ship is not zero.
+    const double hydrostaticRollMoment = dot(torque, R * Vec3{1, 0, 0});
+
     // --- Damping ------------------------------------------------------------
     // Stiffnesses are measured, not assumed: the waterplane area and the angular
     // restoring rates come from finite-differencing the same hydrostatic integral
@@ -1215,19 +1221,55 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
     //   * speed: surge along the ship's own bow. state.velocity is a *world*
     //     vector and its x component is the ship's speed only while the ship
     //     still points along world x.
+    // Her draft as she floats *now*. Both the roll-damping form and the quadratic
+    // drag below want it, and they used to disagree: the drag computed it live
+    // while Ikeda kept whatever waterline `attachRollDamping` was handed.
+    const double draftNow = std::max(0.1, sea.level - (state.position.z + hullLo.z));
+
     if (rollDampingForm.has_value()) {
         // The roll axis is loading, not form: it moves as the ship floods, so it
         // is taken from the live centre of gravity rather than snapshotted.
         rollDampingForm->rollAxisAboveKeel = mp.cog.z - hullLo.z;
+        // **And so is the draft, which is the other half of the same subtraction.**
+        // `roll_damping.cpp` forms `OG = draft - rollAxisAboveKeel`; refreshing the
+        // roll axis every tick while freezing the draft at whatever waterline
+        // `attachRollDamping` was called with meant the two halves were taken at
+        // different times. The ferry attaches at her 5.5 m design draft and then
+        // floods down past it, and 1.5 m of sinkage is 0.27 in `OG/d` -- which is
+        // the single input the two readings of Ikeda's `B0` differ in at all, and
+        // the axis along which they stand 15.6% apart. `B/d` and `Cm` are genuinely
+        // form and are right to freeze; `d` is loading, exactly like the roll axis.
+        rollDampingForm->draft = draftNow;
         rollDampingForm->seaDensity = seaDensity;
 
         const double omegaRoll = std::sqrt(cachedKRoll_ / std::max(Ieff(0, 0), 1e-9));
         double heel = 0, trim = 0;
         heelTrimFromRotation(R, heel, trim);
 
+        // **Measured about the heel she is rolling about, not about upright.**
+        // `phi_a` is the half-swing the equivalent linearisation is defined at, and
+        // the phase-plane radius is that envelope only for an oscillator swinging
+        // about zero. A damaged ship does not: she carries a list, and the ferry
+        // this engine exists for lolls to 58 degrees. Taken from upright, a hull
+        // rolling two degrees about a 58-degree loll reported an amplitude of 1 rad
+        // instead of 0.035 -- and the eddy and bilge-keel components are both
+        // linear in it, so `B44` came out several times too large exactly at the
+        // operating point where roll damping decides whether she goes over, in the
+        // reassuring direction.
+        //
+        // The displacement from equilibrium needs no filter state and no history.
+        // `angularStiffness` returns `k = -dM/dtheta`, so the restoring moment is
+        // `M = M0 - k theta` and equilibrium sits at `theta = M0/k`. That is the
+        // distance from here to where she would settle, which is the quantity
+        // wanted. On an upright ship at an upright equilibrium it *is* the heel --
+        // `M0 = -k phi` gives `|M0/k| = phi` -- so this changes nothing wherever
+        // the old reading was right, and only parts from it when she is listed.
+        const double fromEquilibrium =
+            cachedKRoll_ > 0 ? hydrostaticRollMoment / cachedKRoll_ : heel;
         rollCondition.rollFrequency = omegaRoll;
         rollCondition.rollAmplitude =
-            omegaRoll > 0 ? std::hypot(heel, wBody.x / omegaRoll) : std::abs(heel);
+            omegaRoll > 0 ? std::hypot(fromEquilibrium, wBody.x / omegaRoll)
+                          : std::abs(fromEquilibrium);
         rollCondition.forwardSpeed = vBody.x;
         rollDampingApplied = rollDamping(*rollDampingForm, rollCondition);
 
@@ -1242,8 +1284,7 @@ void Ship::integrateRigidBody(double dt, const Sea& sea) {
 
     // Quadratic drag on the projected areas of the box around the hull.
     const Vec3 ext = hullHi - hullLo;
-    const double draft = std::max(0.1, sea.level - (state.position.z + hullLo.z));
-    const Vec3 projArea{ext.y * draft, ext.x * draft, ext.x * ext.y};
+    const Vec3 projArea{ext.y * draftNow, ext.x * draftNow, ext.x * ext.y};
     Vec3 dragCoeff{0.10, 1.00, 1.50};
 
     // The same argument as radiation, one deck down. A drag coefficient of 0.10

@@ -1335,6 +1335,96 @@ void testLargeRollDecayHasAnAmplitudeDependentDecrement() {
 
 }  // namespace
 
+// The heel a damaged ship rolls *about* is not zero, and the amplitude Ikeda is
+// asked at is the half-swing about it. `Ship::integrateRigidBody` used to take the
+// phase-plane radius about **upright**, so a listed ship reported her whole list as
+// roll amplitude. The eddy and bilge-keel components are linear in it, so `B44`
+// came out several times too large exactly where roll damping decides whether she
+// goes over -- and too much damping is the reassuring direction, which is the worst
+// one for a mistake to be in.
+//
+// The discriminating case is a ship that is *not rolling at all*. Sitting still at
+// her own equilibrium she has no roll amplitude, whatever heel that equilibrium
+// happens to be at. Taken from upright she appeared to be rolling by her entire
+// list, forever.
+void testAListedShipRollsAboutHerListAndNotAboutUpright() {
+    Ship ship = rollShip();
+    // An off-centre centre of gravity, which is what asymmetric flooding leaves
+    // behind: a permanent heeling moment and an equilibrium away from upright.
+    ship.lightshipCog = {0, -1.1, kRollKg};
+    ship.initialise(0.0);
+    ship.attachRollDamping(kRollWaterline, kRollKeelLength, kRollKeelBreadth);
+
+    const Sea sea(0.0);
+    // Enough for the list to establish and most of the release transient to ring
+    // down. She is lightly damped -- zeta is a few percent, which is what roll is
+    // -- so what is left after this is a small oscillation about a large list,
+    // which is exactly the state the two readings disagree about.
+    for (int i = 0; i < 40000; ++i) ship.step(0.005, sea);
+
+    // Now measure the swing she is actually executing, over about three periods,
+    // and compare it against what she reports. Asserting only that the reported
+    // amplitude is *small* would pass on a reading of zero; this pins the value.
+    double heelLo = 1e30, heelHi = -1e30, reported = 0;
+    for (int i = 0; i < 8000; ++i) {
+        ship.step(0.005, sea);
+        const double h = ship.diagnostics(sea).heelDeg * kDegToRad;
+        heelLo = std::min(heelLo, h);
+        heelHi = std::max(heelHi, h);
+        reported = std::max(reported, ship.rollCondition.rollAmplitude);
+    }
+    const double swing = 0.5 * (heelHi - heelLo);
+    const double list = std::fabs(0.5 * (heelHi + heelLo));
+    std::printf("     a ship rolling about her list: list %.4f rad, true swing %.4f rad,"
+                " reported amplitude %.4f rad\n", list, swing, reported);
+
+    // The vacuity guards, and they carry the whole test. With no list the two
+    // readings coincide; with no swing there is nothing to measure.
+    expectTrue("she is genuinely listed, so the two readings can disagree", list > 0.05);
+    expectTrue("and she is genuinely still rolling", swing > 1e-4);
+    expectTrue("and the list is much larger than the swing, which is the case that"
+               " tells them apart", list > 5.0 * swing);
+
+    // Taken from upright this reported `list`, which is 20x the truth here. Taken
+    // about the equilibrium it is the swing. The envelope decays across the window,
+    // so the reported peak sits at the top of the range rather than on its mean.
+    expectTrue("the reported roll amplitude is the swing she is executing",
+               reported > 0.5 * swing && reported < 2.0 * swing);
+    expectTrue("and not the list she is executing it about", reported < 0.5 * list);
+}
+
+// The other half of the same subtraction. `OG = draft - rollAxisAboveKeel`, and the
+// tick refreshed the roll axis every step -- because it moves as she floods -- while
+// leaving the draft at whatever waterline `attachRollDamping` was handed. `OG/d` is
+// the one input the two readings of Ikeda's `B0` differ in at all, so a stale draft
+// moves that knob silently.
+//
+// Driven by attaching at a deliberately wrong waterline: the answer must come back
+// as the draft she is actually floating at, not the one she was told about.
+void testTheRollDampingDraftFollowsTheShipDown() {
+    Ship ship = rollShip();
+    ship.initialise(0.0);
+    // Two metres shallower than she floats. Nothing rejects it -- that is the point.
+    const RollDampingHull attached = ship.attachRollDamping(kRollWaterline - 2.0,
+                                                            kRollKeelLength,
+                                                            kRollKeelBreadth);
+    const Sea sea(0.0);
+    ship.step(0.01, sea);
+    const double after = ship.rollDampingForm->draft;
+    const Diagnostics diag = ship.diagnostics(sea);
+    std::printf("     roll-damping draft: attached at %.3f m, floating at %.3f m,"
+                " refreshed to %.3f m\n", attached.draft, diag.draftMidship, after);
+
+    expectTrue("the attach draft really was wrong, or this proves nothing",
+               std::fabs(attached.draft - diag.draftMidship) > 0.5);
+    expectNear("one step refreshes it to the draft she is floating at", after,
+               diag.draftMidship, 0.05);
+    // And OG follows it, which is the quantity that actually reaches Ikeda.
+    expectNear("so OG is taken from one waterline rather than two",
+               ship.rollDampingForm->draft - ship.rollDampingForm->rollAxisAboveKeel,
+               diag.draftMidship - ship.rollDampingForm->rollAxisAboveKeel, 0.05);
+}
+
 void runRaoTests() {
     std::printf("\n--- response amplitude operators ---\n");
     testTheBargeSweepMatchesWhatIsPublished();
@@ -1366,4 +1456,6 @@ void runRaoTests() {
     testRollFreeDecayMatchesTheIkedaCoefficient();
     testBilgeKeelsShortenTheRollDecay();
     testLargeRollDecayHasAnAmplitudeDependentDecrement();
+    testAListedShipRollsAboutHerListAndNotAboutUpright();
+    testTheRollDampingDraftFollowsTheShipDown();
 }
