@@ -2333,6 +2333,56 @@ void testAgainstTheMembraneModelOnEnergy() {
 
 }  // namespace
 
+// `zone::Solver` called `computeRestForms` and threw the answer away. It declines
+// on a degenerate element and returns before filling `b`, `g` and `weight` -- which
+// `forms_.resize` had left at zero -- and those zeros are then used every step by
+// `internalForce`, `elementPlasticUpdate` and `elementRotation`. The element carries
+// no force and no stiffness for the whole solve, and the deformation field acquires
+// a hole that reads as compliant plating rather than as a broken mesh.
+//
+// The stiffener path in the same constructor already checked its own refusal and
+// reported it. Nothing made the element path the exception; it was the one call
+// whose answer nobody read. Driven here by collapsing one element onto a point,
+// which `buildPatch` cannot produce and a caller editing `patch.mesh.position`
+// certainly can -- `Patch` is a plain struct and `zone_gpu_probe` never prints
+// `patch.problems` at all.
+void testADegenerateElementIsReportedRatherThanSilentlyZeroed() {
+    const StructuralMesh strip = flatStrip(1.6, 0.8, 0.02, 4, 2);
+    zone::Patch patch = zone::buildPatch(strip, {0, 0, 0}, flatParams(2));
+    expectTrue("the patch meshes before it is broken", patch.elementCount() > 1);
+    expectTrue("and is sound as built", patch.problems.empty());
+
+    // Collapse element 0 onto its own first corner. Every Jacobian in it is zero,
+    // so `computeForms` declines at the element centre.
+    const std::size_t node0 = patch.mesh.index[0];
+    for (int a = 1; a < 8; ++a) {
+        const std::size_t n = patch.mesh.index[static_cast<std::size_t>(a)];
+        for (int k = 0; k < 3; ++k)
+            patch.mesh.position[3 * n + static_cast<std::size_t>(k)] =
+                patch.mesh.position[3 * node0 + static_cast<std::size_t>(k)];
+    }
+
+    zone::SolveParams solve;
+    solve.indenter.halfLength = 0.0;
+    solve.duration = 0.0;
+    solve.cacheRestForms = true;
+    zone::Solver solver(patch, plasticity::shipSteel(), solve);
+
+    bool said = false;
+    for (const std::string& p : solver.result().problems)
+        if (p.find("degenerate") != std::string::npos) said = true;
+    expectTrue("a degenerate element is reported rather than silently zeroed", said);
+
+    // The control, and it is the whole point: the same patch unbroken must say
+    // nothing, or "reports a degenerate element" is a statement about the reporter.
+    const zone::Patch sound = zone::buildPatch(strip, {0, 0, 0}, flatParams(2));
+    zone::Solver clean(sound, plasticity::shipSteel(), solve);
+    bool quiet = true;
+    for (const std::string& p : clean.result().problems)
+        if (p.find("degenerate") != std::string::npos) quiet = false;
+    expectTrue("and a sound patch says nothing of the kind", quiet);
+}
+
 void runZoneTests() {
     std::printf("\n--- damage zone: structure to torn panels ---\n");
     testTheMesherIsExactOnFlatPlating();
@@ -2361,4 +2411,5 @@ void runZoneTests() {
     testDrivingByEnergyReproducesDrivingByTravel();
     testAnInertialPunchCannotOutrunItsOwnEnergy();
     testAgainstTheMembraneModelOnEnergy();
+    testADegenerateElementIsReportedRatherThanSilentlyZeroed();
 }

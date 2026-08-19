@@ -778,12 +778,26 @@ struct GasCandidate {
 // Every tracked compartment that qualifies, ranked, before the budget is applied.
 // Exposed for the same reason `candidates()` is: a caller is entitled to see what
 // was considered and rejected.
-std::vector<GasCandidate> gasCandidates(const fire::Model& model, const GasCriterion& criterion);
+// `problems`, when given, collects what was refused and why. The candidate list
+// carries only compartments that qualify, so a refusal is otherwise indistinguishable
+// from an absence -- and the worst case is not a compartment that narrowly missed but
+// a *criterion* with a zero threshold, which empties the list entirely and reads
+// exactly like "nothing in the ship qualified". That is the shape that made the
+// water tier unreachable for 154 reviews; `water_promotion.cpp` answers it by giving
+// every rejected candidate a `why`, and this answers it without changing what
+// `considered` means, because `GasReview::considered` is ranked and counted.
+std::vector<GasCandidate> gasCandidates(const fire::Model& model, const GasCriterion& criterion,
+                                        std::vector<std::string>* problems = nullptr);
 
 // Half the diagonal of the plan rectangle a compartment's area and perimeter imply
 // -- the distance from a fire at its centre to the farthest corner. Falls back to
 // `sqrt(A/2)`, the square's own half-diagonal, when no rectangle has both.
-double compartmentReach(double floorArea, double perimeter);
+// `fellBackToSquare`, when given, says whether the rectangle existed. It usually
+// does not: a ship compartment's perimeter is its bounding box's while its area is
+// the prismatic equivalent, so the roots are complex and the answer is a square's
+// half-diagonal rather than the plan's. The caller is entitled to know which of the
+// two it was handed, because this sets `spread`, which is the promotion criterion.
+double compartmentReach(double floorArea, double perimeter, bool* fellBackToSquare = nullptr);
 
 struct GasActive {
     int compartment = -1;

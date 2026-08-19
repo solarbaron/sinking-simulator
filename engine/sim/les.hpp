@@ -188,6 +188,13 @@ struct Grid {
     int    n[3]{0, 0, 0};    // cells along x, y, z
     double h[3]{0, 0, 0};    // m, cell edge along each axis
     double lo[3]{0, 0, 0};   // m, the low corner in the body frame
+    // True when `planRectangle` found no rectangle with both the compartment's area
+    // and its perimeter, so the plan is a square of the same area instead. `promote`
+    // reported this and `gridFor` discarded it; the flag travels with the answer so
+    // a caller cannot take the grid without the caveat. Note `gridFor`'s own
+    // `lx > 0 && ly > 0` guard cannot stand in for it -- the fallback writes
+    // `lx = ly = sqrt(A) > 0` before returning false.
+    bool   squareFallback = false;
 
     int cells() const { return n[0] * n[1] * n[2]; }
     bool empty() const { return cells() <= 0; }

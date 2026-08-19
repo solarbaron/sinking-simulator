@@ -646,7 +646,16 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
             std::printf("thermal step refused: %s\n", why.c_str());
             return out;
         }
-        thermal::elementTemperatures(chain.slab.mesh, solver.temperature(), elementT);
+        // Checked, like `solver.step` six lines up. On refusal `elementTemperatures`
+        // *clears* its output, so the loop below runs zero times and `peakSteel`
+        // silently keeps the value it already had -- its initialiser on the first
+        // step, a stale maximum on any later one. `peakSteel` is a published
+        // milestone figure this file's own `require` only bounds from below, so a
+        // partial failure would have published a wrong peak rather than no peak.
+        if (!thermal::elementTemperatures(chain.slab.mesh, solver.temperature(), elementT)) {
+            std::printf("element temperatures refused: the field is not one value per node\n");
+            return out;
+        }
         for (double t : elementT) out.peakSteel = std::max(out.peakSteel, t);
 
         // --- 4. every member of the bulkhead ----------------------------------

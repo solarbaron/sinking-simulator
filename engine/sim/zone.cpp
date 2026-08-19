@@ -735,6 +735,7 @@ Solver::Solver(const Patch& patch, const plasticity::Material& material, const S
     // and it is a function of `rest_`, which nothing after this point moves.
     result_.cachedRestForms = params_.cacheRestForms;
     if (result_.cachedRestForms) forms_.resize(elements);
+    std::size_t degenerateForms = 0;
 
     for (std::size_t e = 0; e < elements; ++e) {
         double nodePosition[kDof];
@@ -744,9 +745,27 @@ Solver::Solver(const Patch& patch, const plasticity::Material& material, const S
         // pre-strain, and forms built from the deformed configuration would silently
         // give every element the wrong B. Mutation testing found this exact edit
         // surviving the whole suite.
-        if (result_.cachedRestForms)
-            solidshell::computeRestForms(nodePosition, solidshell::Formulation::SolidShell,
-                                         forms_[e]);
+        // **Read, not discarded.** `computeRestForms` declines on an inverted or
+        // degenerate element and returns before filling `b`, `g` and `weight` --
+        // which `forms_.resize` left at zero. Those zeros are then used every step
+        // by `internalForce`, `elementPlasticUpdate` and `elementRotation`, so the
+        // element carries no force and no stiffness for the whole solve and the
+        // deformation field acquires a hole that reads as compliant plating. That
+        // is the `reduction::recover` defect again, in a different subsystem.
+        //
+        // The stiffener path twenty lines below already does this: `restFibers`'
+        // `ok` is checked and reported. Nothing about the element path made it the
+        // exception; it was simply the one call whose answer nobody read.
+        //
+        // Reported rather than refused, to match that path. `buildPatch` has
+        // already put its own complaint in `patch.problems` for the meshes it can
+        // see, but it returns the patch anyway and nothing stops a `Solver` being
+        // built on it -- and its screen is `smallestJacobian`, a different test
+        // from the one `computeForms` applies at the element centre.
+        if (result_.cachedRestForms &&
+            !solidshell::computeRestForms(nodePosition, solidshell::Formulation::SolidShell,
+                                          forms_[e]))
+            ++degenerateForms;
         double lumped[kNodes];
         solidshell::elementMass(nodePosition, patch.material.density, lumped);
         for (int a = 0; a < kNodes; ++a)
@@ -760,6 +779,12 @@ Solver::Solver(const Patch& patch, const plasticity::Material& material, const S
                                          &stiffness_[e * kDof * kDof]);
         }
     }
+
+    if (degenerateForms > 0)
+        result_.problems.push_back(
+            std::to_string(degenerateForms) +
+            " element(s) came out degenerate: their rest forms are zero, so they carry no"
+            " internal force and no stiffness and the field has a hole where they are");
 
     // The stiffeners. `rest_`, not `patch.mesh.position`: a `Preload` has already
     // moved the rest configuration by this point, and a fibre whose rest length

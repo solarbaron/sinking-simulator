@@ -150,7 +150,7 @@ Grid gridFor(const fire::GasCompartment& gas, const Params& params) {
     if (!(height > 0) || !(gas.floorArea > 0)) return g;
 
     double lx = 0, ly = 0;
-    planRectangle(gas.floorArea, gas.perimeter, &lx, &ly);
+    g.squareFallback = !planRectangle(gas.floorArea, gas.perimeter, &lx, &ly);
     if (!(lx > 0) || !(ly > 0)) return g;
 
     const int minPer = std::max(1, params.minPerAxis);

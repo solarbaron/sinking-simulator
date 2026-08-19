@@ -3862,6 +3862,98 @@ void testANaNFaceIsNotAConvergedRelaxation() {
 
 }  // namespace
 
+// A refusal you cannot see is indistinguishable from an absence, and the gas tier
+// had four of them. The worst is not a compartment that narrowly missed: it is a
+// *criterion* with a zero threshold, which was tested per compartment inside the
+// loop and so emptied the entire list while reading exactly like a ship where
+// nothing qualified. That is the shape that left the water tier unreachable for 154
+// reviews with nothing to say why, and `promotion.hpp` records the lesson in as many
+// words -- but the repair went into the cell budget and not into these.
+void testTheGasTierSaysWhatItRefusedAndWhy() {
+    promotion::GasCriterion criterion;
+    const fire::Model cold = gasModelWith(20, 8, 5, kTAmbient + 5.0);
+
+    // The candidate list is unchanged: it is ranked, and its length is published.
+    std::vector<std::string> problems;
+    expectTrue("a cold ship still promotes nothing",
+               promotion::gasCandidates(cold, criterion, &problems).empty());
+    expectTrue("but it now says how many it looked at and why they failed",
+               !problems.empty());
+
+    // The misconfiguration. A caller zeroing a threshold to mean "no geometric gate"
+    // got an empty list, which is the opposite of what they asked for.
+    promotion::GasCriterion open = criterion;
+    open.spreadPromote = 0.0;
+    std::vector<std::string> openProblems;
+    const auto none = promotion::gasCandidates(cold, open, &openProblems);
+    expectTrue("a zero threshold still yields nothing", none.empty());
+    expectTrue("and says the criterion is the reason, not the ship",
+               openProblems.size() == 1 &&
+                   openProblems[0].find("non-positive") != std::string::npos);
+
+    // Passing no channel at all must behave exactly as before, since every existing
+    // caller does.
+    expectTrue("and the old two-argument form is unchanged",
+               promotion::gasCandidates(cold, criterion).empty());
+}
+
+// `planRectangle` finds no rectangle with both a compartment's area and its
+// perimeter on any ordinary ship compartment -- its perimeter is its bounding box's
+// while its area is the prismatic equivalent -- and then answers with a square of
+// the same area. `les::promote` reported that; `gridFor` and `compartmentReach`
+// discarded it, so two of the three callers described a shape they had not been
+// given. `reach` sets `spread`, which is the promotion criterion.
+void testTheSquareFallbackIsVisibleToItsCallers() {
+    // A long thin room: area and perimeter that *do* have a rectangle.
+    double lx = 0, ly = 0;
+    const double area = 20.0 * 4.0, perimeter = 2.0 * (20.0 + 4.0);
+    expectTrue("a real rectangle is found when one exists",
+               les::planRectangle(area, perimeter, &lx, &ly));
+    bool square = true;
+    promotion::compartmentReach(area, perimeter, &square);
+    expectTrue("and compartmentReach says so", !square);
+
+    // The fallback case. `t^2 - (P/2) t + A = 0` has a negative discriminant exactly
+    // when `A > (P/4)^2`, i.e. when the area is larger than the largest a rectangle
+    // of that perimeter could enclose -- which is the square's. A compartment whose
+    // perimeter is measured one way and whose area is measured another lands here
+    // routinely, and then no rectangle has both.
+    const double squareArea = (perimeter / 4.0) * (perimeter / 4.0);
+    const double fatArea = 1.5 * squareArea;
+    expectTrue("no rectangle has both once the area exceeds what the perimeter encloses",
+               !les::planRectangle(fatArea, perimeter, &lx, &ly));
+    expectNear("and the fallback is a square of the same area", lx, std::sqrt(fatArea), 1e-12);
+    expectNear("on both axes", ly, std::sqrt(fatArea), 1e-12);
+    square = false;
+    const double reach = promotion::compartmentReach(fatArea, perimeter, &square);
+    expectTrue("compartmentReach reports the fallback rather than hiding it", square);
+    expectNear("and returns the square's own half-diagonal", reach,
+               0.5 * std::sqrt(2.0 * fatArea), 1e-12);
+
+    // The guard that makes the flag worth having: `gridFor`'s own `lx > 0` test
+    // cannot stand in for it, because the fallback writes a positive lx and ly
+    // before returning false.
+    expectTrue("the fallback's own sides are positive, which is why a size check"
+               " could never have detected it", lx > 0 && ly > 0);
+
+    // And the third caller, which returns a `Grid` rather than a number. A first
+    // version of this test asserted the other two and left this one uncovered --
+    // the mutation that drops the flag here survived it.
+    fire::GasCompartment fat = gasStratified(1.0, 1.0, 3.0, 1.2, 400.0, 2.5);
+    fat.floorArea = fatArea;
+    fat.perimeter = perimeter;
+    const les::Grid fatGrid = les::gridFor(fat, les::Params{});
+    expectTrue("gridFor carries the caveat on the grid it hands back", fatGrid.squareFallback);
+    expectTrue("and the grid is usable, so the flag is a caveat and not a refusal",
+               !fatGrid.empty());
+
+    fire::GasCompartment oblong = gasStratified(1.0, 1.0, 3.0, 1.2, 400.0, 2.5);
+    oblong.floorArea = area;
+    oblong.perimeter = perimeter;
+    expectTrue("and does not raise it when a rectangle exists",
+               !les::gridFor(oblong, les::Params{}).squareFallback);
+}
+
 void runPromotionTests() {
     std::printf("\n--- adaptive zone promotion ---\n");
     testANaNFaceIsNotAConvergedRelaxation();
@@ -3905,4 +3997,6 @@ void runPromotionTests() {
     testGasHysteresisAndDwellPreventChatter();
     testWhatAResolvedRunIsHandedAndWhatItReports();
     testTheCellBudgetBindsAndTheCostIsMeasured();
+    testTheGasTierSaysWhatItRefusedAndWhy();
+    testTheSquareFallbackIsVisibleToItsCallers();
 }

@@ -795,18 +795,40 @@ StructuralMesh reduce(const StructuralMesh& structure, const SectionReduction& r
 
 // --- The gas side ---------------------------------------------------------------
 
-double compartmentReach(double floorArea, double perimeter) {
+double compartmentReach(double floorArea, double perimeter, bool* fellBackToSquare) {
+    if (fellBackToSquare) *fellBackToSquare = false;
     if (!(floorArea > 0)) return 0.0;
     double lx = 0, ly = 0;
-    les::planRectangle(floorArea, perimeter, &lx, &ly);
+    // `planRectangle` returns false when no rectangle has both this area and this
+    // perimeter, which `les.hpp` records as the *ordinary* case for a ship
+    // compartment -- its perimeter is its bounding box's while its area is the
+    // prismatic equivalent. It then writes a square of side sqrt(A), which is a
+    // different shape from the one the caller asked about, and `reach` sets
+    // `spread`, which is the promotion criterion. `les::promote` reports this;
+    // this caller discarded it, so the header's description of `radius` as "the
+    // half-diagonal of the plan rectangle" was quietly untrue on most compartments.
+    if (!les::planRectangle(floorArea, perimeter, &lx, &ly) && fellBackToSquare)
+        *fellBackToSquare = true;
     return 0.5 * std::sqrt(lx * lx + ly * ly);
 }
 
-std::vector<GasCandidate> gasCandidates(const fire::Model& model, const GasCriterion& criterion) {
+std::vector<GasCandidate> gasCandidates(const fire::Model& model, const GasCriterion& criterion,
+                                        std::vector<std::string>* problems) {
     std::vector<GasCandidate> out;
+    // **Hoisted out of the loop, where it was a silent `continue` per compartment.**
+    // A zero threshold is a fact about the criterion, not about any compartment, and
+    // inside the loop it emptied the whole list while reading exactly like a ship
+    // where nothing qualified.
+    if (!(criterion.spreadPromote > 0) || !(criterion.risePromote > 0)) {
+        if (problems)
+            problems->push_back("the gas criterion has a non-positive spread or rise threshold,"
+                                " so no compartment can be considered at all");
+        return out;
+    }
+    std::size_t refusedGeometry = 0, refusedSpread = 0, refusedRise = 0, squares = 0;
     for (std::size_t i = 0; i < model.gas.size(); ++i) {
         const fire::GasCompartment& gas = model.gas[i];
-        if (!(gas.floorArea > 0) || !(gas.ceilingZ > gas.floorZ)) continue;
+        if (!(gas.floorArea > 0) || !(gas.ceilingZ > gas.floorZ)) { ++refusedGeometry; continue; }
 
         // The ceiling height is taken above the compartment **floor** and not above
         // any fire's base, because the fires are an input that comes and goes and
@@ -814,7 +836,9 @@ std::vector<GasCandidate> gasCandidates(const fire::Model& model, const GasCrite
         // standing on a flat is closer to the deckhead than this says, which makes
         // the spread smaller and the criterion less eager -- the safe direction.
         const double height = gas.ceilingZ - gas.floorZ;
-        const double reach = compartmentReach(gas.floorArea, gas.perimeter);
+        bool square = false;
+        const double reach = compartmentReach(gas.floorArea, gas.perimeter, &square);
+        if (square) ++squares;
         const double spread = les::ceilingJetSpread(reach, height);
         // **With the compartment's own agent.** `Layer::temperature` defaults to
         // carbon dioxide, and `fire.hpp` says nothing inside the model takes that
@@ -827,9 +851,8 @@ std::vector<GasCandidate> gasCandidates(const fire::Model& model, const GasCrite
         const double rise = gas.upper.temperature(gas.agentSpecies) -
                             gas.lower.temperature(gas.agentSpecies);
 
-        if (!(criterion.spreadPromote > 0) || !(criterion.risePromote > 0)) continue;
-        if (spread < criterion.spreadPromote) continue;
-        if (rise < criterion.risePromote) continue;
+        if (spread < criterion.spreadPromote) { ++refusedSpread; continue; }
+        if (rise < criterion.risePromote) { ++refusedRise; continue; }
 
         GasCandidate c;
         c.compartment = static_cast<int>(i);
@@ -849,6 +872,24 @@ std::vector<GasCandidate> gasCandidates(const fire::Model& model, const GasCrite
         if (a.score != b.score) return a.score > b.score;
         return a.compartment < b.compartment;
     });
+    // What was refused, so an empty list can be told from a ship where nothing
+    // qualified. Counted rather than listed per compartment: the list is ranked and
+    // its length is a published figure, so rejected entries cannot go in it.
+    if (problems) {
+        if (refusedGeometry > 0)
+            problems->push_back(std::to_string(refusedGeometry) +
+                                " compartment(s) refused for having no floor area or no height");
+        if (refusedSpread > 0)
+            problems->push_back(std::to_string(refusedSpread) +
+                                " refused below the ceiling-jet spread threshold");
+        if (refusedRise > 0)
+            problems->push_back(std::to_string(refusedRise) +
+                                " refused below the layer-rise threshold");
+        if (squares > 0)
+            problems->push_back(std::to_string(squares) +
+                                " compartment(s) have no rectangle with both their area and their"
+                                " perimeter, so their reach is a square's of the same area");
+    }
     return out;
 }
 
@@ -875,7 +916,7 @@ GasReview GasPromoter::review(const fire::Model& model) {
     const auto begin = std::chrono::steady_clock::now();
     GasReview out;
     ++reviews_;
-    out.considered = gasCandidates(model, criterion_);
+    out.considered = gasCandidates(model, criterion_, &out.problems);
 
     const auto isCandidate = [&](int compartment) {
         for (const GasCandidate& c : out.considered)
