@@ -2034,6 +2034,57 @@ if [ -x "$SECTION" ]; then
   check "and tied, above both pieces" 2.3026 5e-5 "$(cbmode 'whole, tied')" \
         "the same section is **2.3026 Hz**" "$SECTION_DOC"
 
+  # --- the hull girder on a wave, which nothing ran -------------------------------
+  #
+  # `section_probe --wave` is the only producer of §2's Tier-0-against-Tier-1 table,
+  # and no script passed the flag. Ten published figures, including the two the
+  # section argues from: the deck's *mean* agreeing with the beam to 1.5% says the
+  # moment is arriving, and the worst standing 42% above it says the field is not a
+  # beam. Either alone is a different claim.
+  #
+  # 162 s, of which nearly all is a chain of ten built and solved over the whole
+  # hull. Its two siblings are measured and declined: `--profile=2` is 20 s but
+  # produces the along-the-length window table rather than the planes-apart grid the
+  # document publishes, so gating it would pin numbers §2 does not quote; and
+  # `--whole=5` is **487 s** for the chain-against-monolith table, which is the same
+  # cost bracket as the 1 044 s monolithic solve the document already declines by
+  # name. Both re-derive correctly by hand -- `--whole=5` reproduces EA 1.47255e+11,
+  # z_na 4.97283, EI 2.38679e+12 and all four deltas -- so what is missing there is
+  # budget, not evidence.
+  wave=$("$SECTION" --wave --sweep=0 --no-reduce 2>&1)
+  wrow() {  # $1 = the row's leading words, $2 = Tier 0 (1) or Tier 1 (2)
+    printf '%s\n' "$wave" | grep "^  $1  *" | sed "s/^  $1  *//" | awk -v c="$2" '{ print $c }'
+  }
+  check "hull girder at x=6: Tier 0 deck fibre (MPa)" 82.057 0.005 \
+        "$(wrow 'deck fibre' 1)" '| deck fibre | 82.06 MPa | **118.42 MPa** |' "$SECTION_DOC"
+  check "hull girder at x=6: Tier 1 deck fibre (MPa)" 118.415 0.005 \
+        "$(wrow 'deck fibre' 2)" '| deck fibre | 82.06 MPa | **118.42 MPa** |' "$SECTION_DOC"
+  check "hull girder at x=6: the deck's own mean (MPa)" 83.255 0.005 \
+        "$(printf '%s\n' "$wave" | sed -n 's/^ *its mean over the deck  *(one number)  *\([0-9.]*\).*/\1/p')" \
+        "| the deck's own mean | (one number) | 83.26 MPa |" "$SECTION_DOC"
+  check "hull girder at x=6: Tier 0 keel fibre (MPa)" -66.516 0.005 \
+        "$(wrow 'keel fibre' 1)" '| keel fibre | −66.52 MPa | −88.49 MPa |' "$SECTION_DOC"
+  check "hull girder at x=6: Tier 1 keel fibre (MPa)" -88.489 0.005 \
+        "$(wrow 'keel fibre' 2)" '| keel fibre | −66.52 MPa | −88.49 MPa |' "$SECTION_DOC"
+  check "hull girder at x=6: Tier 0 neutral axis (m)" 6.7132 0.0005 \
+        "$(wrow 'neutral axis' 1)" '| neutral axis | 6.7132 m | 6.7961 m |' "$SECTION_DOC"
+  check "hull girder at x=6: Tier 1 neutral axis (m)" 6.7961 0.0005 \
+        "$(wrow 'neutral axis' 2)" '| neutral axis | 6.7132 m | 6.7961 m |' "$SECTION_DOC"
+  # The two halves of the argument. Tier 0 must be exactly zero -- a beam cannot
+  # carry a field a beam does not have -- and Tier 1's 8.06 is the residual that
+  # says the field is not one.
+  check "hull girder at x=6: what a beam cannot carry, Tier 0" 0 0 \
+        "$(wrow 'what a beam cannot carry' 1)" \
+        '| what a beam cannot carry | 0 | **8.06 MPa rms** |' "$SECTION_DOC"
+  check "hull girder at x=6: what a beam cannot carry, Tier 1 (MPa)" 8.057 0.005 \
+        "$(wrow 'what a beam cannot carry' 2)" \
+        '| what a beam cannot carry | 0 | **8.06 MPa rms** |' "$SECTION_DOC"
+  # And the six rigid restraints, which are determinate and so must carry nothing.
+  check "the six restraints carry (N)" 3847 5 \
+        "$(printf '%s\n' "$wave" |
+           sed -n 's/.*six restraints carry \([0-9.e+]*\) N against.*/\1/p' | head -1)" \
+        'They are determinate, so on a balanced load they' "$SECTION_DOC"
+
   # **The orderings that lost.** `1 382` is quoted in three places as what the node
   # numbering is worth, and until the chooser was made to keep its losing scores no
   # invocation could produce it: it kept the narrowest of three candidates and threw
