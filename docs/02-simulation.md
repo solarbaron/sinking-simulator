@@ -3930,8 +3930,8 @@ way.
 
 - **Zero modes is Guyan static condensation, and static condensation is exact at
   the interface** — for any load, at any mode count. Against
-  `solidshell::solveStatic` on the same problem the two agree to **2 × 10⁻¹⁰ m of
-  a 0.31 m** deflection, and **8 × 10⁻¹⁰ m of 0.027 m** on a real patch of the
+  `solidshell::solveStatic` on the same problem the two agree to **2.3 × 10⁻⁹ m of
+  a 0.31 m** deflection, and **2.5 × 10⁻⁹ m of 0.027 m** on a real patch of the
   ferry's curved side. What limits it is the conditioning of two independent
   solves, not the reduction.
 - **This corrects the usual statement of that property.** "The static interface

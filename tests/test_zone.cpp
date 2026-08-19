@@ -997,6 +997,25 @@ void testAZoneOnTheFerry() {
                shoulder.worstNormalSpread > 5.0 * std::max(flat.worstNormalSpread, 1e-4));
     expectTrue("and says so", !shoulder.problems.empty());
 
+    // **`spuriousStiffness` is the number two documents publish, and nothing
+    // asserted it.** `README.md` and §2 both carry "319% too stiff in bending
+    // across this hull's shoulder"; the quantity was printed on the line above and
+    // guarded only by the spread bound, which the flat patch's exact 0.0000 turns
+    // into `> 5e-4` through the `max` -- 376x looser than the 0.1884 it stands
+    // beside. The spread and the stiffness are not the same quantity: `zone.hpp`
+    // derives one from the other as `90 (offset/t)^2`, so a bound on the spread
+    // does not pin the coefficient, which is the part the documents quote.
+    //
+    // Asserted here at what is measured, and the derivation asserted with it, so a
+    // change to either the geometry or the 90 has to move a number somebody reads.
+    expectNear("the flat of side costs no spurious bending stiffness at all",
+               flat.spuriousStiffness, 0.0, 1e-9);
+    expectNear("and the shoulder costs the 319% both documents publish",
+               shoulder.spuriousStiffness, 3.19, 0.005);
+    expectNear("which is the 90 (offset/t)^2 the header derives, off the same spread",
+               shoulder.spuriousStiffness, 90.0 * shoulder.worstNormalSpread *
+                                               shoulder.worstNormalSpread, 1e-9);
+
     // The stiffener lines are the panel seams, so a subdivision that leaves nothing
     // between them leaves nothing free to bend -- and the patch has to say so
     // rather than solve a zone that cannot move.

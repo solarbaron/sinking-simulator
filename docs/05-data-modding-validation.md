@@ -406,7 +406,7 @@ trajectory one. A comparison that cannot fail is not a measurement.
   asserts that the reduced frequencies bound it **from above** and fall
   monotonically as modes are added, which is stronger than closeness because a
   reduction can only stiffen. Static condensation is checked against
-  `solidshell::solveStatic` on the same problem, to 2 × 10⁻¹⁰ m of a 0.31 m
+  `solidshell::solveStatic` on the same problem, to 2.3 × 10⁻⁹ m of a 0.31 m
   deflection. See `02-simulation.md` §3.
 
 **Fire and thermal**

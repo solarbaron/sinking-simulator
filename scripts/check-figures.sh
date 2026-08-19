@@ -913,7 +913,7 @@ if [ -x "$TESTS" ]; then
   # gate never passes.
   suiteout=$("$TESTS" 2>&1)
   suite=$(printf '%s\n' "$suiteout" | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  expected=200836
+  expected=200841
   check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
         "$expected validation checks" "$FRONT"
   # **The roadmap publishes the same count in a different format**, and it was
@@ -1070,6 +1070,67 @@ if [ -x "$TESTS" ]; then
         "$SIM_DOC"
   # The roadmap's third copy of the same pair.
   hint 'out and 433× too stiff. The *mesher* that was missing now exists —' "$DOC"
+
+  # --- static condensation, out of the same run ------------------------------------
+  #
+  # **The assertion in the test cannot pin these, and that is the point.** They are
+  # conditioning-limited residuals, so the in-test bound has to leave room for the
+  # `-O3` engine build `verify.sh full` also compiles; it was `1e-6` of the peak
+  # against a measurement 132x smaller, and even tightened to `1e-7` it spans the
+  # whole decade the published figure moved across. Four documents said 2e-10 m
+  # while the suite printed 2.34e-9 m, bit-stable, on every run.
+  #
+  # So the property is asserted in the test with headroom, and the *digit* is pinned
+  # here, on the one build this file drives. That split is the honest one: a bound
+  # loose enough to survive two optimisation levels cannot also be a bound tight
+  # enough to notice a tenfold drift.
+  cond() {  # $1 = 1 boundary, 2 interior, 3 peak
+    printf '%s\n' "$suiteout" |
+      sed -n "s/^ *boundary \([0-9.e+-]*\) m, interior \([0-9.e+-]*\) m, of a peak \([0-9.e+-]*\) m$/\\$1/p" |
+      head -1
+  }
+  check "static condensation: interface error at zero modes (m)" 2.34e-9 5e-11 \
+        "$(cond 1)" 'a 0.31 m** deflection' "$SIM_DOC"
+  check "static condensation: interior error for an interface load (m)" 1.90e-9 5e-11 \
+        "$(cond 2)" 'a 0.31 m** deflection' "$SIM_DOC"
+  check "static condensation: the peak it is a fraction of (m)" 3.085e-1 1e-4 \
+        "$(cond 3)" 'a 0.31 m** deflection' "$SIM_DOC"
+  check "static condensation: interface error on the ferry's own plating (m)" 2.47e-9 5e-11 \
+        "$(printf '%s\n' "$suiteout" |
+            sed -n 's/^ *interface response \([0-9.e+-]*\) m of a peak .*/\1/p' | head -1)" \
+        '**2.5 × 10⁻⁹ m of 0.027 m** on a real patch of the' "$SIM_DOC"
+  # The three README copies of the same pair, so they cannot part company again.
+  hint 'static condensation is exact at the interface for *any* load (2.3 × 10⁻⁹ m of a' "$FRONT"
+  hint 'the interface for any load** (2.3 × 10⁻⁹ m of a 0.31 m deflection against an' "$DOC"
+
+  # --- the coupled zone's own figures, same run ------------------------------------
+  #
+  # `0.737` and `1.06e-15` are published to three figures each; both are now pinned
+  # in the test as well, so these are the cross-check that the *document* still says
+  # what the suite measures.
+  check "coupling: the monolithic edge follows the punch by" 0.737 0.0005 \
+        "$(printf '%s\n' "$suiteout" |
+            sed -n 's/^ *the edge follows \([0-9.]*\) of the punch.*/\1/p' | head -1)" \
+        "the plate's own answer is **0.737**" "$SIM_DOC"
+  check "coupling: the coupled field against the monolithic one (m)" 1.06e-15 1e-17 \
+        "$(printf '%s\n' "$suiteout" |
+            sed -n 's/^ *0 modes: .* field to \([0-9.e+-]*\) m of .*/\1/p' | head -1)" \
+        '**1.06e-15 m** of a 2.0e-4 m peak' "$SIM_DOC"
+
+  # --- the shoulder's spurious bending stiffness, same run -------------------------
+  #
+  # The front page's "319% too stiff in bending across this hull's shoulder". It was
+  # printed and asserted nowhere: the only guard was on `worstNormalSpread`, a
+  # different quantity, and the flat patch's exact 0.0000 turned that guard into
+  # `> 5e-4` against a measured 0.1884.
+  check "zone over the shoulder: offset/t" 0.1884 0.0002 \
+        "$(printf '%s\n' "$suiteout" |
+            sed -n 's/^ *flat of side offset.t .*over the shoulder \([0-9.]*\) (.*/\1/p' | head -1)" \
+        '| across the shoulder at z ≈ 4.2 m | 0.188 |' "$SIM_DOC"
+  check "zone over the shoulder: spurious bending stiffness (%)" 319 0.5 \
+        "$(printf '%s\n' "$suiteout" |
+            sed -n 's/^ *flat of side offset.t .*over the shoulder [0-9.]* (+\([0-9]*\)%).*/\1/p' | head -1)" \
+        "319% too stiff in bending across this hull's shoulder" "$FRONT"
 
   # --- the spectral wave field, out of the same run --------------------------------
   #

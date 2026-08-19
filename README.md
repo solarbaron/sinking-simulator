@@ -22,7 +22,7 @@ slice.
 ```sh
 cmake -S . -B build -G Ninja
 ninja -C build
-./build/shipsim_tests                       # 200836 validation checks against closed-form answers
+./build/shipsim_tests                       # 200841 validation checks against closed-form answers
 ./build/shipsim --scenario=none             # 120 m ferry, holed, nobody does anything
 ./build/shipsim --scenario=doors            # close the watertight door
 ./build/shipsim --scenario=full             # full damage control response
@@ -232,7 +232,7 @@ answer at all. `engine/sim/reduction.{hpp,cpp}` is that middle tier:
 freedom exactly and carrying the interior on a handful of fixed-interface modes,
 with the symmetric eigensolvers written out rather than taken from a library. It
 is unusually well supplied with exact answers and they are asserted as identities:
-static condensation is exact at the interface for *any* load (2 × 10⁻¹⁰ m of a
+static condensation is exact at the interface for *any* load (2.3 × 10⁻⁹ m of a
 0.31 m deflection against an independent solve), a free component keeps exactly
 six zero eigenvalues, and the reduced frequencies come down **from above**,
 monotonically, because a reduction can only stiffen. On the same patch of the

@@ -714,11 +714,25 @@ void testGuyanIsExact() {
                                  std::fabs(u[sub.interiorDof()[p]] - uFull[sub.interiorDof()[p]]));
     // In exact arithmetic these are zero. In double they are limited by the
     // conditioning of a plate stiffness at a/t = 100, which is what the printed
-    // figure measures; 1e-6 of the peak is two orders of margin over it and three
-    // orders below any modelling error a reduction could make.
-    expectTrue("zero modes reproduces the full interface response", worstBoundary < 1e-6 * peak);
+    // figure measures.
+    //
+    // **The comment here used to claim 1e-6 was "two orders of margin over it".
+    // It was 132x.** And that slack did what slack does: four documents published
+    // this agreement as 2e-10 m of a 0.31 m deflection, the measurement moved an
+    // order of magnitude to 2.34e-9, and nothing went red. The figure is bit-stable
+    // across runs, so the drift was not noise -- it was simply never compared
+    // against anything.
+    //
+    // Tightened by one order rather than by three, deliberately. This is a
+    // conditioning-limited residual, and `verify.sh full` compiles the engine at
+    // `-O3` as well as `RelWithDebInfo`; a bound sitting 1.3x above the measurement
+    // would be a tripwire the first time contraction or vectorisation moved the
+    // last digits. 1e-7 of the peak is 13x over what is measured here, which leaves
+    // room for that and still fails on the drift above. Pinning the *digit* is the
+    // figure gate's job, on one known build, and it now does that too.
+    expectTrue("zero modes reproduces the full interface response", worstBoundary < 1e-7 * peak);
     expectTrue("and the interior too, for a load applied at the interface",
-               worstInterior < 1e-6 * peak);
+               worstInterior < 1e-7 * peak);
     std::printf("     boundary %.2e m, interior %.2e m, of a peak %.3e m\n", worstBoundary,
                 worstInterior, peak);
 

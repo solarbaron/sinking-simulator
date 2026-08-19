@@ -620,7 +620,7 @@ void testTheSeamRotationStiffnessIsThePlatings() {
                             (12.0 * (1.0 - steel.poissonRatio * steel.poissonRatio));
     const double want = 0.5 * (16.0 * rigidity / span) * phi * phi * run;
 
-    double last = 0;
+    double last = 0, coarsestError = 0;
     for (int refine : {1, 2, 4}) {
         solidshell::HexMesh mesh =
             solidshell::makePlateMesh(run, span, thickness, refine, 8 * refine, 1);
@@ -638,9 +638,9 @@ void testTheSeamRotationStiffnessIsThePlatings() {
         }
         std::vector<double> load(mesh.nodeCount() * 3, 0.0), displacement;
         std::string problem;
-        expectTrue("the seam rotation solves: " + problem,
-                   solidshell::solveStatic(mesh, steel, solidshell::Formulation::SolidShell, load,
-                                           displacement, &problem));
+        const bool seamSolved = solidshell::solveStatic(
+            mesh, steel, solidshell::Formulation::SolidShell, load, displacement, &problem);
+        expectTrue("the seam rotation solves: " + problem, seamSolved);
         double energy = 0;
         for (std::size_t e = 0; e < mesh.elementCount(); ++e) {
             double nodes[solidshell::kDof], u[solidshell::kDof];
@@ -656,10 +656,21 @@ void testTheSeamRotationStiffnessIsThePlatings() {
         }
         std::printf("     %2d x %2d elements: %.6e J against %.6e, ratio %.5f\n", refine,
                     8 * refine, energy, want, energy / want);
+        if (refine == 1) coarsestError = std::fabs(energy - want);
         last = energy;
     }
     expectNear("the seam's rotational stiffness is 16 D / b per unit length", last, want,
                0.01 * want);
+    // **Three solves were run, printed, and two of them discarded.** Asserting the
+    // finest alone cannot tell a formulation that is right throughout from one that
+    // is wildly wrong at 1x and happens to land at 4x -- and losing the convergence
+    // order is the classic locking failure this file is otherwise careful about.
+    // What makes the fine answer evidence is that the coarse one is worse: the
+    // sequence has to be converging *toward* 16 D / b, not merely passing through
+    // it. Measured here the coarsest is an order out and the finest is inside 1%.
+    expectTrue("and the coarse mesh is meaningfully worse, so the sequence converges"
+               " toward it rather than sitting on it",
+               coarsestError > 3.0 * std::fabs(last - want));
     // The point of the number: it is the *plating's*, and a stiffener on that seam
     // does not change it. Recorded as a limit of the formulation rather than as a
     // success -- a real web has its own torsional and warping stiffness and this
@@ -1650,9 +1661,9 @@ void testADistantDofBlockIsNotDroppedOnTheFloor() {
 
     std::string problem;
     std::vector<double> free;
-    expectTrue("the cantilever solves: " + problem,
-               solidshell::solveStatic(mesh, steel, solidshell::Formulation::SolidShell, tipLoad,
-                                       free, &problem));
+    const bool cantileverSolved = solidshell::solveStatic(
+        mesh, steel, solidshell::Formulation::SolidShell, tipLoad, free, &problem);
+    expectTrue("the cantilever solves: " + problem, cantileverSolved);
     const double apart = free[tip * 3 + 2] - free[middle * 3 + 2];
 
     // A stiff spring between the two z degrees of freedom. As its stiffness runs
@@ -1665,9 +1676,9 @@ void testADistantDofBlockIsNotDroppedOnTheFloor() {
                   static_cast<std::uint32_t>(middle * 3 + 2)};
     spring.stiffness = {stiffness, -stiffness, -stiffness, stiffness};
     std::vector<double> tied;
-    expectTrue("the same with the block solves: " + problem,
-               solidshell::solveStatic(mesh, steel, solidshell::Formulation::SolidShell, {spring},
-                                       tipLoad, tied, &problem));
+    const bool blockSolved = solidshell::solveStatic(
+        mesh, steel, solidshell::Formulation::SolidShell, {spring}, tipLoad, tied, &problem);
+    expectTrue("the same with the block solves: " + problem, blockSolved);
     const double together = tied[tip * 3 + 2] - tied[middle * 3 + 2];
     std::printf("     nodes %zu and %zu, %zu degrees of freedom apart: free %.6e / %.6e m,"
                 " tied %.6e / %.6e m (%.3e m apart)\n", middle, tip, 3 * (tip - middle),

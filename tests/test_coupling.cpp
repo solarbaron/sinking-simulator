@@ -558,8 +558,15 @@ void testCoupledZoneIsTheWholePlate() {
     }
     std::printf("     the edge follows %.3f of the punch: clamped says 0, free says 1\n",
                 edgeFollow);
+    // The 0.1..0.9 band says the edge is neither clamped nor free, which is the
+    // qualitative claim and is worth keeping. It is not what §2 publishes: "the
+    // plate's own answer is 0.737", to three figures, against a guard whose half
+    // width is 0.4. The coupled answer is tied to this one at 1e-9 below, so a
+    // coupling regression was caught; a change to the *monolithic* edge -- the mesh,
+    // the punch, the plate -- moved the published number with nothing to say so.
     expectTrue("the real edge is nowhere near clamped", edgeFollow > 0.1);
     expectTrue("and nowhere near free", edgeFollow < 0.9);
+    expectNear("and it follows by the 0.737 the document publishes", edgeFollow, 0.737, 0.0005);
 
     // --- The coupled answer, at three mode counts ----------------------------------
     //
@@ -608,12 +615,20 @@ void testCoupledZoneIsTheWholePlate() {
                 coupledFollow, std::fabs(coupled.zoneField[3 * n + 2]) / kPunchTravel);
         expectNear("and its edge follows the plate by exactly as much as the plate's does",
                    coupledFollow, edgeFollow, 1e-9 * edgeFollow);
-        // Exact, not close. 1e-9 relative is three orders past what "well
-        // converged" would deliver and is what was measured; a 1e-3 assertion here
-        // would pass on a coupling that had lost the property entirely.
+        // Exact, not close. A 1e-3 assertion here would pass on a coupling that had
+        // lost the property entirely.
+        //
+        // **The comment used to say 1e-9 "is what was measured". It was not.** The
+        // field agreement prints as 1.06e-15 m of a 2.0e-4 m peak -- 5.3e-12
+        // relative -- so 1e-9 stood 189x off the measurement it claimed to be, and
+        // §2 publishes the 1.06e-15 to three figures with nothing holding it. This
+        // file already knew: the block at the ductile-tearing end notes that 1e-9
+        // is the loose legacy number for this class and asserts 1e-10 there.
+        // 1e-11 is 19x over what is measured, which leaves room for the -O3 engine
+        // build and still catches a coupling that merely converged well.
         expectNear("and reproduces the monolithic reaction", coupled.force, reference.force,
                    1e-9 * reference.force);
-        expectTrue("and the monolithic displacement field inside the zone", worst < 1e-9 * peak);
+        expectTrue("and the monolithic displacement field inside the zone", worst < 1e-11 * peak);
 
         if (modes == 0) {
             firstForce = coupled.force;

@@ -200,6 +200,20 @@ had lost the property entirely and was merely well converged. When a measurement
 comes back far better than the tolerance, tighten the tolerance to what was
 measured and say why it is allowed to be that tight.
 
+**And a bound loose enough to survive two optimisation levels cannot also be a
+bound tight enough to notice a drift.** The condensation residual was asserted at
+`1e-6` of the peak with a comment claiming "two orders of margin over it"; the
+margin was 132×, and while nobody was looking the measurement moved from the
+2 × 10⁻¹⁰ m that four documents publish to a bit-stable 2.34 × 10⁻⁹ m. Tightening
+the assertion does not fix that, and this is worth being clear about: the quantity
+is conditioning-limited and `full` compiles the engine at `-O3` as well, so the
+in-test bound has to keep an order of headroom — which still spans the whole decade
+the figure moved across. **The two jobs are different and want different
+instruments**: the test asserts the property with room for the compiler, and the
+figure gate pins the digit on one known build. Splitting them is what makes both
+honest; collapsing them is what left a published figure ten times wrong behind a
+green suite.
+
 **A tolerant test followed by an exact one is a trapdoor.** `sectionElements` admitted
 a panel with a `1e-9` membership tolerance and then looked for a sign change with
 exact arithmetic; a query one ULP outside the bay passed the first and failed the

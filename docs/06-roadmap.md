@@ -29,7 +29,7 @@ Numerical core, flooding, air, damaged stability, validation harness.
 - Mesh boolean (clip, weld, cap by ear clipping) so compartments are carved out
   of the hull form rather than authored as boxes
 - Watertightness checking and load-time ship definition validation
-- 200 836 closed-form validation checks
+- 200 841 closed-form validation checks
 - A 120 m ferry that lolls over or capsizes depending on what you do — and, since
   GM stopped being sampled at a fixed ±0.03 rad, does not survive any of the three
 - Explicit co-rotational tet FEM, CPU reference plus a Vulkan compute back-end,
@@ -304,7 +304,7 @@ The longest and highest-risk phase.
 
   Four properties are identities rather than tolerances and are asserted as such:
   zero modes reproduces static condensation and static condensation is **exact at
-  the interface for any load** (2 × 10⁻¹⁰ m of a 0.31 m deflection against an
+  the interface for any load** (2.3 × 10⁻⁹ m of a 0.31 m deflection against an
   independent solve); a free-free substructure keeps exactly six zero eigenvalues;
   the reduced frequencies come down **from above**, monotonically, because a
   reduction can only stiffen; and the reduced pair is `TᵀKT` and `TᵀMT`, formed

@@ -574,8 +574,11 @@ void testEveryTruncationFailsClosed() {
     const std::string valid(kBarge);
     ShipDefinition whole;
     std::string error;
-    expectTrue("the test barge is a valid ship: " + error,
-               sim::parseShipFile(valid, "<barge>", whole, error));
+    // Hoisted, because `expectTrue("..." + error, f(&error))` is unsequenced: the
+    // message may be built before `f` writes `error`, so the diagnostic is empty on
+    // exactly the run where it is wanted.
+    const bool bargeParsed = sim::parseShipFile(valid, "<barge>", whole, error);
+    expectTrue("the test barge is a valid ship: " + error, bargeParsed);
 
     // Whether a prefix is legal is predictable without the loader: it is legal
     // exactly when it carries a stamped format, a complete ship block, a hull
@@ -840,8 +843,8 @@ void testTheFilePathItselfFailsClosed() {
         file << kBarge;
     }
     out = sentinel();
-    expectTrue("a ship written to disk loads back: " + error,
-               sim::loadShipFile(path, out, error));
+    const bool loadedBack = sim::loadShipFile(path, out, error);
+    expectTrue("a ship written to disk loads back: " + error, loadedBack);
     expectTrue("... as the ship it was", out.name == "barge" && out.ship.compartments.size() == 2);
 }
 
@@ -852,11 +855,12 @@ void testLightshipDraftAndMassAgree() {
     ShipDefinition byMass, byDraft;
     std::string error;
     const std::string base(kBarge);
-    expectTrue("the barge loads by mass: " + error,
-               sim::parseShipFile(base, "<mass>", byMass, error));
-    expectTrue("and by draft: " + error,
-               sim::parseShipFile(mutate(base, "lightship_mass 1.2e6", "lightship_draft 2.0"),
-                                  "<draft>", byDraft, error));
+    const bool massParsed = sim::parseShipFile(base, "<mass>", byMass, error);
+    expectTrue("the barge loads by mass: " + error, massParsed);
+    const bool draftParsed =
+        sim::parseShipFile(mutate(base, "lightship_mass 1.2e6", "lightship_draft 2.0"),
+                           "<draft>", byDraft, error);
+    expectTrue("and by draft: " + error, draftParsed);
 
     // Independently derived: the barge's own hull, integrated below z = 2.
     const double volume =
@@ -908,8 +912,8 @@ void testOptionalKeysAreCarried() {
                   "    damping 0.4 0.0 0.25\n"
                   "    added_mass 0.1 0.8 1.2\n"
                   "    added_inertia 0.3 1.1 0.7\n");
-    expectTrue("a ship stating every optional key loads: " + error,
-               sim::parseShipFile(text, "<optional>", def, error));
+    const bool optionalParsed = sim::parseShipFile(text, "<optional>", def, error);
+    expectTrue("a ship stating every optional key loads: " + error, optionalParsed);
     expectNear("sea_density is carried", def.ship.seaDensity, sim::kRhoFresh, 0);
     expectNear("heave damping is carried", def.ship.zetaHeave, 0.4, 0);
     // Zero roll damping is legal and load-bearing: when a radiation model
@@ -921,8 +925,8 @@ void testOptionalKeysAreCarried() {
 
     // Omitted, they leave the engine's values exactly as they were.
     ShipDefinition plain;
-    expectTrue("and a ship stating none of them loads: " + error,
-               sim::parseShipFile(kBarge, "<plain>", plain, error));
+    const bool plainParsed = sim::parseShipFile(kBarge, "<plain>", plain, error);
+    expectTrue("and a ship stating none of them loads: " + error, plainParsed);
     const Ship untouched;
     expectNear("sea density defaults to seawater", plain.ship.seaDensity, untouched.seaDensity, 0);
     expectNear("roll damping keeps the engine's default", plain.ship.zetaRoll,
@@ -965,8 +969,9 @@ hull
 )";
     ShipDefinition def;
     std::string error;
+    const bool reorderedParsed = sim::parseShipFile(forward, "<reordered>", def, error);
     expectTrue("blocks resolve regardless of the order they appear in: " + error,
-               sim::parseShipFile(forward, "<reordered>", def, error));
+               reorderedParsed);
     expectEqual("the forward reference resolved", def.ship.openings.at(0).b, 0);
     expectEqual("and so did the pump's", def.ship.pumps.at(0).compartment, 0);
 }

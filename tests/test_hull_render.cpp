@@ -404,8 +404,9 @@ sim::TriMesh makeQuad(const sim::Vec3& centre, const sim::Vec3& across, const si
 void testMaterialSetIsData() {
     gpu::MaterialLibrary library;
     std::string error;
-    expectTrue("the shipped marine material set loads: " + error,
-               library.load(std::string(SHIPSIM_MATERIAL_DIR) + "/marine.materials", error));
+    const bool marineLoaded =
+        library.load(std::string(SHIPSIM_MATERIAL_DIR) + "/marine.materials", error);
+    expectTrue("the shipped marine material set loads: " + error, marineLoaded);
     if (library.empty()) return;
 
     const char* wanted[] = {"painted_steel_topside", "boot_topping",  "antifouling",
@@ -480,7 +481,8 @@ void testMaterialSetIsData() {
         "    base_colour 0.44 0.33 0.19\n"
         "    roughness   0.71\n"
         "    metalness   0.0\n";
-    expectTrue("a mod loads on top: " + error, library.parse(mod, "<mod>", error));
+    const bool modParsed = library.parse(mod, "<mod>", error);
+    expectTrue("a mod loads on top: " + error, modParsed);
     expectEqual("the mod added exactly one surface", static_cast<long long>(library.size()),
                 static_cast<long long>(sizeBefore) + 1);
     expectEqual("an index resolved before the mod still points at the same surface",
@@ -510,7 +512,8 @@ void testMaterialLoaderFailsClosed() {
     {
         gpu::MaterialLibrary library;
         std::string error;
-        expectTrue("the reference file parses: " + error, library.parse(valid, "<ref>", error));
+        const bool refParsed = library.parse(valid, "<ref>", error);
+        expectTrue("the reference file parses: " + error, refParsed);
         expectEqual("it holds two materials", static_cast<long long>(library.size()), 2);
         expectNear("opacity defaults to one when it is not stated",
                    library[0].opacity, 1.0, 0.0);
