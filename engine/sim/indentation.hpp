@@ -26,6 +26,14 @@
 // in closed form, which is what makes the inverse -- *given* the energy an impact
 // delivered, how far did it get in and did it tear -- exact rather than a search.
 //
+// **Exact as algebra is not exact as arithmetic**, and three of the four lines
+// above are a difference of two nearly equal lengths for a shallow dent. Written
+// as printed they cancel: `sqrt(1 + r^2) - 1` keeps no digits at all below about a
+// micron on a 2.40 m span. So `indentation.cpp` evaluates each of them through its
+// conjugate -- the same number with the subtraction telescoped away -- and states
+// the identity and the measured cost at every site. The forms above are the model;
+// they are not the expressions to type.
+//
 // **What this is not.** It is one panel, struck normally, by something rigid,
 // with the plating already fully plastic and the boundaries held. It has no
 // bending, no stiffeners resisting in their own right, no membrane relief from

@@ -33,6 +33,11 @@ IndentedPanel referencePanel() {
     return p;
 }
 
+// The bounds below are in ulps rather than in metres, because every closed form
+// here is now written without a cancelling subtraction and its error is therefore
+// a fixed handful of roundings at every depth -- see the two round trips.
+constexpr double kUlp = 2.220446049250313e-16;
+
 // --- The closed forms, and their inverses ------------------------------------
 
 void testStrainAndPenetrationInvertExactly() {
@@ -47,13 +52,41 @@ void testStrainAndPenetrationInvertExactly() {
 
     // Round trip, over a wide range. This is the check that cannot be satisfied
     // by two matching mistakes.
-    double worst = 0;
-    for (int i = 1; i <= 200; ++i) {
-        const double d = 0.005 * i * span;
+    //
+    // Geometric, and down to a micron, because a *linear* sweep cannot see this
+    // pair's failure mode. The version that stood here ran d = 0.005 i L for
+    // i = 1..200: every one of its points is within a factor of 200 of the top,
+    // and both closed forms are a difference of two nearly equal lengths whose
+    // conditioning goes as (h/d)^2. Its worst point was its first, 12 mm, where the
+    // round trip was out by 1.4e-14 against a tolerance of 1e-12 L = 2.4e-12 --
+    // 172x of headroom, and the headroom *grew* over the rest of the sweep. Run
+    // against the same code, the sweep below is out by 3.7e-5 relative at its
+    // small end, 1.7e11 ulps and eleven orders past the bound.
+    //
+    // Relative rather than absolute, for the same reason: an absolute bound is
+    // slackest in exactly the corner where the arithmetic is hardest, and a round
+    // trip through a pair of exact inverses is honestly measured in ulps of the
+    // answer rather than in metres.
+    double worst = 0, worstAt = 0;
+    for (int i = 0; i <= 600; ++i) {
+        const double d = 1e-6 * span * std::pow(1e6, i / 600.0);   // 2.4 um to 2.4 m
         const double back = penetrationForStrain(span, membraneStrain(span, d));
-        worst = std::max(worst, std::abs(back - d));
+        if (std::abs(back - d) / d > worst) {
+            worst = std::abs(back - d) / d;
+            worstAt = d;
+        }
     }
-    expectTrue("strain and penetration invert to machine precision", worst < 1e-12 * span);
+    std::printf("     strain round trip over six decades: worst %.2f ulp at d = %.3g m\n",
+                worst / kUlp, worstAt);
+    // 8 ulps, against a measured 1.905 (4.2e-16, at d = 0.53 m). It is allowed to
+    // be this tight because neither direction cancels any more, so the error is the
+    // rounding of four operations and does not grow as the dent shrinks. The 4x
+    // margin is for the compiler and is more than this one needs: 1.905 is
+    // bit-identical at -O0, -O1, -O2, -O3 and -Os, with -ffp-contract=fast and with
+    // -march=native, which spans everything `full` and the sanitizers compile.
+    expectTrue("strain and penetration invert to within a few ulps at every depth",
+               worst < 8.0 * kUlp);
+    expectTrue("and the sweep reached the depths where that is hard", worstAt > 0);
 
     // Small penetrations: the strain goes as 2 (d/L)^2, so halving the
     // penetration quarters the strain. A model that got the geometry linear
@@ -61,6 +94,24 @@ void testStrainAndPenetrationInvertExactly() {
     const double a = membraneStrain(span, 0.02 * span);
     const double b = membraneStrain(span, 0.01 * span);
     expectNear("membrane strain is quadratic in penetration for small dents", a / b, 4.0, 0.02);
+
+    // The same limit asserted where it is hard rather than where it is easy, and
+    // against the series to two terms so the tolerance can be arithmetic rather
+    // than physical: eps = r^2/2 (1 - r^2/4 + r^4/8 - ...), and at r = 2e-6 the
+    // first neglected term is 2e-24, nine orders below an ulp. Measured 0.00 ulp
+    // against that; the cancelling form is out by 2.2e-5.
+    const double tiny = 1e-6 * span;
+    const double r = tiny / (0.5 * span);
+    const double series = 0.5 * r * r * (1.0 - 0.25 * r * r);
+    expectNear("a micron-deep dent strains the plate by r^2/2 (1 - r^2/4)",
+               membraneStrain(span, tiny) / series, 1.0, 8.0 * kUlp);
+    // And the quartering at that depth, to the same standard: the ratio is
+    // 4 (1 - r^2) / (1 - r^2/4) = 4 (1 - 0.75 r^2) to O(r^4). Measured 1.00 ulp,
+    // against 2.8e-5 for the form this replaced.
+    expectNear("and halving a micron-deep dent still quarters it",
+               membraneStrain(span, 2.0 * tiny) / membraneStrain(span, tiny) /
+                   (4.0 * (1.0 - 0.75 * r * r)),
+               1.0, 8.0 * kUlp);
 }
 
 void testEnergyIsTheForceIntegratedOverThePenetration() {
@@ -79,15 +130,54 @@ void testEnergyIsTheForceIntegratedOverThePenetration() {
     expectNear("the closed-form energy is the force integrated", closedForm, quadrature,
                1e-6 * closedForm);
 
-    // And energy inverts back to penetration.
-    double worst = 0;
-    for (int i = 1; i <= 100; ++i) {
-        const double d = 0.003 * i;
+    // And energy inverts back to penetration -- geometrically down to a micron and
+    // relatively, for the reason set out in the round trip above. This is the
+    // worse-conditioned of the two pairs when written directly: `sqrt(h^2 + d^2)
+    // - h` on the way out and `(E/scale + h)^2 - h^2` on the way back both
+    // difference two O(h^2) numbers whose true difference is O(d^2). The sweep that
+    // stood here -- d = 0.003 i, from 3 mm -- began four decades above the trouble
+    // and asserted 1e-9 m absolute, which 3 mm meets with six orders to spare.
+    double worst = 0, worstAt = 0;
+    const double tearing = penetrationForStrain(p.span, p.failureStrain);
+    for (int i = 0; i <= 600; ++i) {
+        const double d = 1e-6 * p.span * std::pow(1e5, i / 600.0);   // 2.4 um to 0.24 m
+        if (d >= tearing) continue;
         const double back = penetrationForEnergy(p, indentationEnergy(p, d));
-        if (d < penetrationForStrain(p.span, p.failureStrain))
-            worst = std::max(worst, std::abs(back - d));
+        if (std::abs(back - d) / d > worst) {
+            worst = std::abs(back - d) / d;
+            worstAt = d;
+        }
     }
-    expectTrue("energy and penetration invert to machine precision", worst < 1e-9);
+    std::printf("     energy round trip over five decades: worst %.2f ulp at d = %.3g m\n",
+                worst / kUlp, worstAt);
+    // 8 ulps against a measured 1.070 (2.4e-16), bit-identical across the same
+    // seven optimisation settings, and tight for the same reason. The cancelling
+    // forms reach 2.6e-5 relative at the small end of this sweep, eleven orders
+    // outside it.
+    expectTrue("energy and penetration invert to within a few ulps at every depth",
+               worst < 8.0 * kUlp);
+    expectTrue("and the sweep reached the depths where that is hard", worstAt > 0);
+
+    // The small-dent limit against its closed form. For d << h the tent is a
+    // parabola and the energy is sigma_y t w d^2 / h -- E = scale h eps -- so the
+    // same two-term series carries it, and the same 2e-24 remainder lets the
+    // tolerance be arithmetic. Measured -0.50 ulp; written as the subtraction it is
+    // out by 3.3e-5, because sqrt(h^2 + d^2) and h agree to eleven digits there.
+    const double tiny = 1e-6 * p.span;
+    const double h = 0.5 * p.span;
+    const double r = tiny / h;
+    const double scale = 2.0 * p.yieldStrength * p.thickness * p.contactWidth;
+    const double eSeries = scale * h * 0.5 * r * r * (1.0 - 0.25 * r * r);
+    expectNear("a micron-deep dent costs sigma_y t w d^2 / h", indentationEnergy(p, tiny) / eSeries,
+               1.0, 8.0 * kUlp);
+    // ...and its inverse, which is the one term this file had no check on at all
+    // below 3 mm: d = sqrt(u (u + 2h)) = sqrt(2 h u) (1 + u/(4h) - ...) with
+    // u = E/scale. Measured 0.00 ulp; the cancelling form is out by 5.1e-6.
+    const double u = indentationEnergy(p, tiny) / scale;
+    expectNear("and that energy puts the dent back at sqrt(2 h E / scale)",
+               penetrationForEnergy(p, indentationEnergy(p, tiny)) /
+                   (std::sqrt(2.0 * h * u) * (1.0 + 0.25 * u / h)),
+               1.0, 8.0 * kUlp);
 }
 
 // The scalings are exact and each isolates one term, so a factor misplaced
