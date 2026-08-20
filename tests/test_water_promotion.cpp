@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
 
 using namespace sim;
 using namespace sim::promotion;
@@ -319,6 +320,95 @@ void testHoldPreventsImmediateDemotion() {
     WaterReview rev3 = promoter.review(ferry);
     expectEqual("demoted after hold", static_cast<int>(promoter.active().size()), 0);
     expectEqual("demotion recorded", static_cast<int>(rev3.demoted.size()), 1);
+}
+
+// **The negative control for `hold` not being floored at one, and the phase it
+// picks is the whole of the design.**
+//
+// `WaterPromoter::review` zeroes `idleReviews` on a compartment whose motion
+// holds and then compares it, so an unfloored `hold <= 0` read `0 >= 0` and
+// demoted the compartment on the very review its criterion said keep it. Both
+// siblings write `max(1, hold)` (`promotion.cpp:430` and `:955`) and cannot reach
+// that state anyway, because a holding zone leaves their loop before any
+// comparison.
+//
+// Two things about it hide from an obvious test, and this is built around both.
+//
+// **It is invisible in `active()`.** The compartment is demoted in step 1 and,
+// its dwell streak having survived b04cf87's separation, promoted again in step 3
+// of the *same* review. So `active()` reads one at the end of every review under
+// the defect exactly as it does under the fix, at every phase, and the natural
+// assertion for "hold prevents demotion" -- the one
+// `testHoldPreventsImmediateDemotion` above makes -- cannot see this at all. What
+// moves is `demoted`, `demotions()` and `promotions()`: one demotion and one
+// promotion per review, forever, which is a caller tearing the compartment's
+// solver down and re-seeding it on every review of a ship that is rolling.
+//
+// **And it cannot express before there is something active to demote**, which is
+// review `dwell + 1`. That is the phase. A two-review test at `dwell = 2` is
+// clean under the defect for the same reason b04cf87's first-draft control was:
+// it sampled before the oscillation started. So `dwell` is swept 1, 2, 3, putting
+// the first expressible review at 2, 3 and 4 -- both parities, and no single
+// offset able to hide it -- and every review of the seven is read rather than the
+// last one.
+void testAHoldOfZeroCannotDemoteACompartmentThatHolds() {
+    std::printf("\n   a hold of zero cannot demote a compartment that holds\n");
+
+    for (int dwell = 1; dwell <= 3; ++dwell) {
+        // `-1` with `0`, because the floor has to be `max(1, .)` and not a test
+        // for zero: a negative hold is not a licence to demote before a
+        // compartment has been idle once, the same argument `dwellNeeded` is
+        // written from at the other end.
+        for (int hold : {0, -1}) {
+            const std::string tag = " (dwell " + std::to_string(dwell) + ", hold " +
+                                    std::to_string(hold) + ")";
+
+            Ship ferry = ferryAfloat();
+            floodCompartment(ferry, 0, 5.0);
+            setRollRate(ferry, 0.10);   // over rollRatePromote and over rollRateHold,
+                                        // so every review both promotes and holds
+
+            WaterCriterion crit;
+            crit.dwell = dwell;
+            crit.hold = hold;
+            WaterPromoter promoter(crit);
+
+            int demotedEver = 0;
+            bool activeEveryReviewAfterPromotion = true;
+            for (int review = 1; review <= 7; ++review) {
+                const WaterReview r = promoter.review(ferry);
+                demotedEver += static_cast<int>(r.demoted.size());
+                if (review >= dwell && promoter.active().size() != 1)
+                    activeEveryReviewAfterPromotion = false;
+            }
+
+            // The two that discriminate, and the measured numbers are in the
+            // comment because they are what the control printed: under the defect
+            // `demotedEver` is `7 - dwell` (6, 5, 4) and `promotions()` is
+            // `8 - dwell` (7, 6, 5), because the compartment is dropped and taken
+            // again on every review past the first that promotes it.
+            expectEqual(("a compartment whose motion holds is never demoted" + tag).c_str(),
+                        demotedEver, 0);
+            expectEqual(("and is promoted exactly once, not rebuilt every review" + tag).c_str(),
+                        promoter.promotions(), 1);
+            // The vacuity guard: a run that promoted nothing would satisfy both of
+            // those and prove nothing at all.
+            expectTrue(("and it really was resolved, on every review after its dwell" + tag).c_str(),
+                       activeEveryReviewAfterPromotion);
+            expectEqual(("with the counter agreeing" + tag).c_str(), promoter.demotions(), 0);
+
+            // The other half of `max(1, .)`, and the reason it is a floor rather
+            // than "ignore a non-positive hold": `hold = 0` must still mean *no*
+            // hold. Stop the motion and the next review demotes, which is exactly
+            // what both siblings do at `hold = 0`.
+            setRollRate(ferry, 0.01);   // under rollRateHold; accel is 0 at dt = 0
+            const WaterReview idle = promoter.review(ferry);
+            expectEqual(("and one idle review is enough to demote it" + tag).c_str(),
+                        static_cast<long long>(idle.demoted.size()), 1);
+            expectEqual(("leaving nothing active" + tag).c_str(),
+                        static_cast<long long>(promoter.active().size()), 0);
+        }
+    }
 }
 
 void testAntiChatterNegativeControl() {
@@ -1478,6 +1568,89 @@ void testTheBudgetSpendsTheTieBreakOrder() {
     expectEqual("and it is the lowest-index qualifying compartment", promoted, 0);
 }
 
+// **Where this tier stops following the siblings, pinned by the one arrangement
+// that can tell the two designs apart.**
+//
+// Both siblings `continue` past a candidate their budget cannot admit and keep
+// packing with smaller ones from further down the ranked list; this one stops
+// promoting and leaves the headroom for the compartment that did not fit. Section
+// 5 of `water_promotion.hpp` argues which and why. What is asserted here is that
+// the code does the thing the header says, and it needs a fixture the other budget
+// test does not provide: `testTheBudgetSpendsTheTieBreakOrder` puts three *equal*
+// compartments in front of room for one, where first-fit and the stop promote the
+// same compartment and refuse the same two. A test that cannot distinguish a
+// design from its alternative does not pin the design.
+//
+// So: a large compartment at the head of the queue that does not fit, and a small
+// one behind it that would. First-fit promotes the small one; the stop promotes
+// nothing and names both starved. There is no phase to vary -- one review after
+// one dwell, and the outcome does not depend on which review it is -- but the
+// fixture has a vacuity trap of its own, which the control at the end closes: if
+// the small one could not have been afforded anyway, "nothing promoted" would be
+// the budget speaking and not the design.
+void testTheBudgetIsHeldForTheHeadOfTheQueue() {
+    std::printf("\n   the budget is held for the head of the queue, not packed behind it\n");
+
+    Ship ferry = ferryAfloat();
+    floodCompartment(ferry, 0, 40.0);   // the head of the ranked list, and too big
+    floodCompartment(ferry, 1, 2.0);    // behind it, and small enough to fit
+    setRollRate(ferry, 0.15);
+
+    WaterCriterion crit;
+    crit.dwell = 1;
+
+    // Sized off the estimator rather than off constants, for the reason
+    // `testParticleBudgetEnforcement` gives: a number written here by hand is a
+    // guess about the estimator's internals and lands on the wrong side of the
+    // boundary in silence when they change.
+    int headParticles = 0, headTiles = 0, tailParticles = 0, tailTiles = 0;
+    estimateFlipCost(ferry.compartments[0], crit, headParticles, headTiles);
+    estimateFlipCost(ferry.compartments[1], crit, tailParticles, tailTiles);
+    crit.particleBudget = headParticles - 1;   // one short of the head
+    crit.tileBudget = headTiles - 1;
+
+    // The fixture's own premises, asserted rather than assumed. Both have to hold
+    // or the run below says nothing about the design.
+    expectTrue("the head of the queue does not fit",
+               headParticles > crit.particleBudget || headTiles > crit.tileBudget);
+    expectTrue("and the one behind it would fit, on its own",
+               tailParticles <= crit.particleBudget && tailTiles <= crit.tileBudget);
+
+    WaterPromoter promoter(crit);
+    const WaterReview rev = promoter.review(ferry);
+
+    // The discriminator. First-fit promotes compartment 1 here; the stop does not.
+    expectEqual("nothing promotes: the headroom is reserved, not repacked from below",
+                static_cast<long long>(rev.promoted.size()), 0);
+    expectEqual("and both are named starved, so the idle budget is visible",
+                static_cast<long long>(rev.starved.size()), 2);
+
+    // Both refusals arrive in the same words, which is the known cost of the stop
+    // recorded in the header: compartment 1 is turned away by the *design* and
+    // reads as though the budget could not afford it. Asserted rather than left
+    // implicit, because the day the two are told apart this line says where to
+    // look.
+    int refusedWithBudgetWording = 0;
+    for (const WaterCandidate& c : rev.considered)
+        if (c.why.find("budget refused it") != std::string::npos) refusedWithBudgetWording++;
+    expectEqual("both carry the same reason, budget and reservation alike",
+                refusedWithBudgetWording, 2);
+
+    // The control, and the guard against a vacuous reading of the assertion above:
+    // compartment 1 was refused by the stop and not by the budget. Take the head
+    // out the only way a caller can from outside -- drain it, which demotes it at
+    // once on the volume guard -- and the budget, untouched, admits compartment 1
+    // on the very next review.
+    floodCompartment(ferry, 0, 0.0);
+    const WaterReview freed = promoter.review(ferry);
+    expectEqual("with the head gone the one behind it promotes at once",
+                static_cast<long long>(freed.promoted.size()), 1);
+    expectEqual("and it is compartment 1, which the budget could afford all along",
+                freed.promoted.empty() ? -1 : freed.promoted[0].compartment, 1);
+    expectEqual("with nothing starved any more",
+                static_cast<long long>(freed.starved.size()), 0);
+}
+
 void testDifferentCompartmentsSeparateHysteresis() {
     std::printf("\n   different compartments have separate hysteresis\n");
 
@@ -1689,6 +1862,66 @@ void testAZeroThresholdRefusesRatherThanDividingByIt() {
 // single forepeak holding 3 m3 already allocates 12 300 real tiles -- 98% of that
 // capacity for 3% of the volume. What the budget means depends on the shape of the
 // compartment it is spent on, which is the property a budget is supposed not to have.
+// **Neither half of `estimateFlipCost` may bill a promotion as free, and only one
+// of them was floored.**
+//
+// The tile count has carried `max(1, .)` since it was written. The particle count
+// did not, so under 0.0005 m3 the rounding returned zero -- and a candidate billed
+// zero particles is one the particle budget cannot refuse at all, because
+// `totalParticles + 0 <= particleBudget` holds however full it is. What kept such
+// a candidate off the list was `minVolume = 1.0`, three and a half orders of
+// magnitude away: a geometric guard standing in for a cost floor, which is one
+// mechanism doing another's job. It stops doing it the moment `minVolume` is
+// lowered, and lowering it is the stated plan -- `minDepth` is the guard this tier
+// means to use, with `minVolume` standing in until `computeWaterDepth` returns
+// something a criterion can be compared against.
+//
+// The sweep therefore runs *below* `minVolume` on purpose. That is the range the
+// two halves disagreed over and the range no other test in this file visits.
+void testNeitherHalfOfTheEstimateCanReadFree() {
+    std::printf("\n   neither half of the flip estimate can bill a promotion as free\n");
+
+    WaterCriterion crit;
+
+    const double volumes[] = {0.0, 1e-9, 1e-6, 1e-4, 4.9e-4, 1e-3, 4e-3, 0.5, 1.0, 10.0};
+    for (double volume : volumes) {
+        Compartment probe;
+        probe.waterVolume = volume;
+        int particles = 0, tiles = 0;
+        estimateFlipCost(probe, crit, particles, tiles);
+        // `%g`, not `std::to_string`: the latter is fixed to six decimals, so
+        // 0 and 1e-9 would wear the same label and a reader could not tell which
+        // volume a FAIL line named.
+        char tag[64];
+        std::snprintf(tag, sizeof tag, " at %g m3", volume);
+        expectTrue((std::string("particles are billed") + tag).c_str(), particles >= 1);
+        expectTrue((std::string("and tiles with them") + tag).c_str(), tiles >= 1);
+    }
+
+    // The vacuity guard, and it is exact rather than a bound: at 1e-4 m3 the rate
+    // rounds to *zero* particles, so a billed count of exactly one can only be the
+    // floor. A test that merely asserted `>= 1` over the sweep above would pass
+    // against an unfloored estimator anywhere the rate happens to reach one.
+    Compartment tiny;
+    tiny.waterVolume = 1e-4;
+    int tinyParticles = 0, tinyTiles = 0;
+    estimateFlipCost(tiny, crit, tinyParticles, tinyTiles);
+    expectEqual("a tenth of a litre rounds to zero particles and is floored to one",
+                tinyParticles, 1);
+    expectEqual("as the tile half already was", tinyTiles, 1);
+
+    // And the floor is a floor, not a new constant: above it the estimate is
+    // unchanged, still the rate the two budgets are denominated in (1000
+    // particles and 1/(64 h^3) = 125 tiles per cubic metre, per `WaterCriterion`).
+    Compartment ten;
+    ten.waterVolume = 10.0;
+    int tenParticles = 0, tenTiles = 0;
+    estimateFlipCost(ten, crit, tenParticles, tenTiles);
+    expectEqual("ten cubic metres is billed at the documented particle rate",
+                tenParticles, 10000);
+    expectEqual("and at the documented tile rate", tenTiles, 1250);
+}
+
 void testTheTileEstimatorIsAFunctionOfTheWrongVariable() {
     const auto measure = [](double volume, int& billed, double& depth) {
         Ship ferry = ferryAfloat();
@@ -1754,6 +1987,7 @@ void runWaterPromotionTests() {
     // Section 2: Hysteresis
     testDwellPreventsImmediatePromotion();
     testHoldPreventsImmediateDemotion();
+    testAHoldOfZeroCannotDemoteACompartmentThatHolds();
     testAntiChatterNegativeControl();
     testAntiChatterWithHysteresis();
 
@@ -1781,12 +2015,14 @@ void runWaterPromotionTests() {
     testTiedCandidatesAreOrderedByCompartmentIndex();
     testScoreOutranksTheTieBreak();
     testTheBudgetSpendsTheTieBreakOrder();
+    testTheBudgetIsHeldForTheHeadOfTheQueue();
     testDifferentCompartmentsSeparateHysteresis();
 
     // Section 6: Cost and Performance
     testCostReporting();
     testCounters();
     testClearResetsState();
+    testNeitherHalfOfTheEstimateCanReadFree();
     testTheTileEstimatorIsAFunctionOfTheWrongVariable();
 }
 

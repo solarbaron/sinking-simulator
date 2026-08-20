@@ -102,7 +102,25 @@ void estimateFlipCost(const Compartment& comp, const WaterCriterion& /*criterion
     // 1000 happens to be exact for the volumes tried here where the tile
     // division is not, so this one loses nothing today -- which is a fact about
     // the arithmetic and not a property worth depending on.
-    particles = static_cast<int>(std::llround(comp.waterVolume * 1000.0));
+    //
+    // **Floored at one on the same terms too, and that was the half that was
+    // missing.** Under 0.0005 m³ the rounding returns zero, and a candidate
+    // billed zero particles is one the particle budget cannot refuse at all:
+    // `totalParticles + 0 <= particleBudget` holds however full the budget is.
+    // What stood between such a candidate and a free promotion was the tile
+    // count -- floored since it was written -- and behind that `minVolume = 1.0`,
+    // three and a half orders of magnitude away. That is a geometric guard doing
+    // a cost floor's job, and it stops doing it the moment `minVolume` is
+    // lowered, which is a live prospect: `minDepth` is the guard this tier means
+    // to use and `minVolume` is standing in for it until `computeWaterDepth`
+    // returns something a criterion can be compared against.
+    //
+    // Nothing a promotion costs is free, so neither half of the estimate may
+    // read zero, and now neither can. No volume at or above `minVolume` moves --
+    // the floor binds under 0.0005 m³ and the tier has never been offered one --
+    // so this is the coupling removed and not a number changed.
+    // `testNeitherHalfOfTheEstimateCanReadFree` pins it.
+    particles = std::max(1, static_cast<int>(std::llround(comp.waterVolume * 1000.0)));
 
     // Tiles: 4×4×4 cells each, cell size from criterion.solver default grid.
     // We don't have a grid yet, so use a reasonable default cell size.
@@ -306,8 +324,39 @@ WaterReview WaterPromoter::review(const Ship& ship, double dt) {
             act.idleReviews = 0;
         }
 
-        // Demote if idle too long OR volume drops below minimum
-        if (act.idleReviews >= criterion_.hold || !volumeHolds) {
+        // `max(1, hold)`, the way both siblings write it (`promotion.cpp:430` for
+        // the structural zones, `:955` for the gas ones). The guard was missing
+        // here, and what it guards against is not the edge of the hysteresis
+        // shifting by a review -- it is the criterion inverting.
+        //
+        // A compartment whose motion **fully holds** takes the `else` above and
+        // sets `idleReviews` to zero. With `hold <= 0` the unguarded comparison
+        // then read `0 >= 0` and demoted it on the very review its own criterion
+        // said keep it -- every active compartment, every review, for as long as
+        // the ship rolled. Neither sibling can reach that state: both `continue` a
+        // holding zone out of the loop before any comparison is made, so their
+        // counter is never tested at zero and the guard on their side is the
+        // belt-and-braces this one was mistaken for.
+        //
+        // It would not have shown up as an empty `active()` either, which is the
+        // part worth writing down. The compartment is demoted in step 1 and, its
+        // streak having survived, promoted again in step 3 of the same review, so
+        // from outside the tier looks settled at one active compartment while
+        // `demotions()` climbs by one per review, and a caller acting on the review
+        // tears the compartment's solver down and re-seeds it every time. `demoted`
+        // and the counters are the only channels that say so, which is what
+        // `testAHoldOfZeroCannotDemoteACompartmentThatHolds` reads instead of
+        // `active()`.
+        //
+        // `hold = 0` and `hold = 1` remain the same criterion -- one idle review
+        // demotes -- because a streak of idle reviews starts at one, which is the
+        // argument `dwellNeeded` below is written from, mirrored. Every `hold >= 1`
+        // is untouched, and that is every default and every published figure.
+        //
+        // The volume guard beside it is deliberately not hysteretic: a compartment
+        // drained below `minVolume` has nothing left to resolve, so it goes at once
+        // rather than serving a hold. `testDrainingACompartmentDemotesItAtOnce`.
+        if (act.idleReviews >= std::max(1, criterion_.hold) || !volumeHolds) {
             result.demoted.push_back(act);
             demotions_++;
         } else {
@@ -381,7 +430,7 @@ WaterReview WaterPromoter::review(const Ship& ship, double dt) {
 
     // --- Step 3: Promotion, down the ranked order, until the budget is spent ---
 
-    // `max(1, dwell)`, the way both siblings write it (`promotion.cpp:475` and
+    // `max(1, dwell)`, the way both siblings write it (`promotion.cpp:473` and
     // `:989`): a streak starts at one, so zero and one are the same criterion, and
     // a negative dwell is not a licence to promote before qualifying. The
     // starvation report below measures against the same value, so what "promotable"
@@ -396,9 +445,21 @@ WaterReview WaterPromoter::review(const Ship& ship, double dt) {
 
     // The budget is spent from the front of the ranked list and promotion stops at
     // the first compartment that does not fit; it is not repacked with a smaller
-    // one from further down, because the order is the priority order and skipping
-    // ahead would resolve a 1 m3 trickle in place of a compartment that just
-    // missed. `testTheBudgetSpendsTheTieBreakOrder` pins that.
+    // one from further down. This is the one place the tier deliberately does not
+    // follow `GasPromoter`, which `continue`s and keeps packing, and the argument
+    // for it -- along with what it costs and when to revisit it -- is section 5 of
+    // `water_promotion.hpp` rather than here, because it is a statement about the
+    // tier and not about this loop.
+    //
+    // **Pinned by `testTheBudgetIsHeldForTheHeadOfTheQueue`, and not by
+    // `testTheBudgetSpendsTheTieBreakOrder`, which this line used to cite.** That
+    // test puts three *equal* compartments in front of room for one, where the
+    // stop and first-fit promote the same compartment and refuse the same two: it
+    // is green under both designs, so it pinned the tie-break order it is named
+    // for and never the stop. Telling them apart needs a compartment at the head
+    // that does not fit with a smaller one behind it that does. Measured by
+    // replacing the stop with a `continue`: the tie-break test stays green and the
+    // new one goes red on five checks.
     //
     // Stopping *promoting* is not the same as stopping *looking*, and the
     // difference is what makes the starvation visible. The scan runs to the end of
