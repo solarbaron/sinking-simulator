@@ -3513,17 +3513,17 @@ reach, which is exactly what that change was for.
    of what the patch can be asked about, with the striker's remaining kinetic
    energy reported exactly as `ImpactDamage::energyUnspent` is on the membrane path.
 
-   **What it costs, measured on the ferry's own patch.** Driving by the 2.755 MJ a
+   **What it costs, measured on the ferry's own patch.** Driving by the 2.762 MJ a
    0.22 m prescribed punch absorbed, as a 153 t striker at 6 m/s, reaches the same
    0.22 m with **11% of its energy unspent**, having done 2.444 MJ of work and torn
-   **42 elements against 80** — no panel past `tearFraction` where the prescribed
+   **38 elements against 96** — no panel past `tearFraction` where the prescribed
    run tore six. On a quasi-static bay the two drives agree on penetration to
    **0.16%**; this run is not quasi-static, and the gap above is what that costs. A
    third of the prescribed run's work is sitting in the plating's velocity, so a
    punch held at 6 m/s to the last millimetre is doing damage a decelerating
    striker does not, and that difference had nowhere to show before. It also costs
    more —
-   45 970 steps against 21 290 — because a striker that has nearly stopped crawls,
+   45 546 steps against 21 290 — because a striker that has nearly stopped crawls,
    and a run that perforates and then coasts at 0.5 m/s took 216 000. Bound an
    inertial run by `duration` for cost and by `stopAt` for reach; they are not the
    same bound.
@@ -3772,12 +3772,12 @@ showed that.** Three findings, each from a different measurement:
 **And at ship scale it makes the zone *stronger*, not weaker.** `tools/zone_probe
 --no-preload` exists so this is a measurement rather than an argument. Driving a
 2 m punch into the ferry's own side at z = 8 m, on the 3 m crest that puts
-13.1 MPa of hogging tension through that plating:
+13.0 MPa of hogging tension through that plating:
 
 | at 0.078 m of penetration | resisting force |
 |---|---|
 | zone told it starts unstressed | **18.90 MN** — the figure this file published |
-| zone handed the girder's 13.1 MPa | **20.25 MN**, +7.1% |
+| zone handed the girder's 13.0 MPa | **20.26 MN**, +7.20% |
 
 The reason is geometry. The girder's stress runs along **x**; the membrane stress
 a punch raises in longitudinally framed side plating runs across the bay, which is
@@ -5637,9 +5637,9 @@ not. Three things had to be right, and each is a place a load can vanish:
 
 | at x = 6.0 m, M = 4.573 × 10⁸ N m | Tier 0 | Tier 1 |
 |---|---|---|
-| deck fibre | 82.06 MPa | **118.42 MPa** |
-| the deck's own mean | (one number) | 83.26 MPa |
-| keel fibre | −66.52 MPa | −88.49 MPa |
+| deck fibre | 82.05 MPa | **118.40 MPa** |
+| the deck's own mean | (one number) | 83.25 MPa |
+| keel fibre | −66.51 MPa | −88.48 MPa |
 | neutral axis | 6.7132 m | 6.7961 m |
 | what a beam cannot carry | 0 | **8.06 MPa rms** |
 

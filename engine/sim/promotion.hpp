@@ -196,8 +196,8 @@
 // **And at ship scale it makes the zone stronger, not weaker**, which no argument
 // from the ratio would have predicted. `tools/zone_probe --no-preload` exists so
 // this is a measurement: a 2 m punch into the ferry's own side resists at
-// **18.90 MN** at 0.078 m told it starts unstressed, and **20.25 MN** carrying her
-// own 13.1 MPa of hogging tension.
+// **18.90 MN** at 0.078 m told it starts unstressed, and **20.26 MN** carrying her
+// own 13.0 MPa of hogging tension.
 //
 // The reason is geometry. The girder's stress runs along x; the membrane stress a
 // punch raises in longitudinally framed side plating runs across the bay, which is

@@ -1362,7 +1362,7 @@ Scantlings ferryScantlings() {
     // substitutions:
     //
     //   - **The pre-stress finding reverses sign.** §2 publishes 18.90 MN with the
-    //     patch unstressed against 20.25 MN carrying the girder's 13.1 MPa, +7.1%,
+    //     patch unstressed against 20.26 MN carrying the girder's 13.0 MPa, +7.20%,
     //     and explains the sign geometrically: the girder's stress runs along x and
     //     the punch's membrane stress runs vertically, so they are nearly
     //     orthogonal. Corrected, the pair is 20.29 and 17.90 — the pre-stress now

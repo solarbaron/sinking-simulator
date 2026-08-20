@@ -29,7 +29,7 @@ Numerical core, flooding, air, damaged stability, validation harness.
 - Mesh boolean (clip, weld, cap by ear clipping) so compartments are carved out
   of the hull form rather than authored as boxes
 - Watertightness checking and load-time ship definition validation
-- 200 937 closed-form validation checks
+- 201 712 closed-form validation checks
 - A 120 m ferry that lolls over or capsizes depending on what you do — and, since
   GM stopped being sampled at a fixed ±0.03 rad, does not survive any of the three
 - Explicit co-rotational tet FEM, CPU reference plus a Vulkan compute back-end,
@@ -635,7 +635,7 @@ The longest and highest-risk phase.
   energy-driven since it was written; the gap was that the *Tier-2* zone had no
   such entry point, so the expensive model could not be asked the question the
   cheap one already answered. What the two now say about the ferry's own side, on
-  the 2.755 MJ a 0.22 m punch costs: the membrane model on the longitudinal span
+  the 2.762 MJ a 0.22 m punch costs: the membrane model on the longitudinal span
   tears the bay outright, and the FEM reaches the same 0.22 m with 11% of the
   striker's energy still unspent, tearing 42 elements where a punch driven at a
   constant 6 m/s tears 80. Replacing the tool's membrane with a zone is a

@@ -307,7 +307,7 @@
 //     and `estimatedCost()` turns that into wall time. An inertial one takes as
 //     long as it takes, and the tail is the expensive part: the step is fixed by
 //     the material, so a striker that has nearly stopped needs many steps per
-//     centimetre. On the ferry's own patch the same 0.22 m cost 45 970 steps by
+//     centimetre. On the ferry's own patch the same 0.22 m cost 45 546 steps by
 //     energy against 21 290 by travel, and a striker that perforated and then
 //     coasted at 0.5 m/s took 216 000. **`stopAt` bounds the reach and `duration`
 //     bounds the cost; they are not the same bound and a run that can perforate
@@ -791,8 +791,13 @@ struct SolveResult {
     // **How far this is from closing at ship scale, which was never written down.**
     // The unit fixtures close it to a fraction of a percent, and that is what the
     // suite asserts. On the ferry's own patch it is **-9.5% before anything tears
-    // and -102% once it does** -- dissipation 4.638 MJ against work 2.755 MJ, so
-    // the dissipation alone exceeds the work. The mechanism is already diagnosed
+    // and -112% once it does** -- dissipation 4.733 MJ against work 2.762 MJ, so
+    // the dissipation alone exceeds the work. (The torn pair was re-measured when
+    // the balance fix moved the balanced attitude. The -9.5% was not: the run
+    // behind it is not named here and the obvious candidate does not reproduce it,
+    // `--depth=0.05 --threads=1` giving -3.04% on a lighter striker.)
+    //
+    // The mechanism is already diagnosed
     // (the co-rotational small-strain measure, which is why the residual does not
     // move with the timestep); what was missing is its *size* on a real run, and a
     // reader who had only seen the unit figures would reasonably take this as a

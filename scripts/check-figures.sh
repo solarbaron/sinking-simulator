@@ -2071,17 +2071,17 @@ if [ -x "$SECTION" ]; then
   wrow() {  # $1 = the row's leading words, $2 = Tier 0 (1) or Tier 1 (2)
     printf '%s\n' "$wave" | grep "^  $1  *" | sed "s/^  $1  *//" | awk -v c="$2" '{ print $c }'
   }
-  check "hull girder at x=6: Tier 0 deck fibre (MPa)" 82.057 0.005 \
-        "$(wrow 'deck fibre' 1)" '| deck fibre | 82.06 MPa | **118.42 MPa** |' "$SECTION_DOC"
-  check "hull girder at x=6: Tier 1 deck fibre (MPa)" 118.415 0.005 \
-        "$(wrow 'deck fibre' 2)" '| deck fibre | 82.06 MPa | **118.42 MPa** |' "$SECTION_DOC"
-  check "hull girder at x=6: the deck's own mean (MPa)" 83.255 0.005 \
+  check "hull girder at x=6: Tier 0 deck fibre (MPa)" 82.047 0.005 \
+        "$(wrow 'deck fibre' 1)" '| deck fibre | 82.05 MPa | **118.40 MPa** |' "$SECTION_DOC"
+  check "hull girder at x=6: Tier 1 deck fibre (MPa)" 118.402 0.005 \
+        "$(wrow 'deck fibre' 2)" '| deck fibre | 82.05 MPa | **118.40 MPa** |' "$SECTION_DOC"
+  check "hull girder at x=6: the deck's own mean (MPa)" 83.245 0.005 \
         "$(printf '%s\n' "$wave" | sed -n 's/^ *its mean over the deck  *(one number)  *\([0-9.]*\).*/\1/p')" \
-        "| the deck's own mean | (one number) | 83.26 MPa |" "$SECTION_DOC"
-  check "hull girder at x=6: Tier 0 keel fibre (MPa)" -66.516 0.005 \
-        "$(wrow 'keel fibre' 1)" '| keel fibre | −66.52 MPa | −88.49 MPa |' "$SECTION_DOC"
-  check "hull girder at x=6: Tier 1 keel fibre (MPa)" -88.489 0.005 \
-        "$(wrow 'keel fibre' 2)" '| keel fibre | −66.52 MPa | −88.49 MPa |' "$SECTION_DOC"
+        "| the deck's own mean | (one number) | 83.25 MPa |" "$SECTION_DOC"
+  check "hull girder at x=6: Tier 0 keel fibre (MPa)" -66.508 0.005 \
+        "$(wrow 'keel fibre' 1)" '| keel fibre | −66.51 MPa | −88.48 MPa |' "$SECTION_DOC"
+  check "hull girder at x=6: Tier 1 keel fibre (MPa)" -88.479 0.005 \
+        "$(wrow 'keel fibre' 2)" '| keel fibre | −66.51 MPa | −88.48 MPa |' "$SECTION_DOC"
   check "hull girder at x=6: Tier 0 neutral axis (m)" 6.7132 0.0005 \
         "$(wrow 'neutral axis' 1)" '| neutral axis | 6.7132 m | 6.7961 m |' "$SECTION_DOC"
   check "hull girder at x=6: Tier 1 neutral axis (m)" 6.7961 0.0005 \
@@ -2096,7 +2096,7 @@ if [ -x "$SECTION" ]; then
         "$(wrow 'what a beam cannot carry' 2)" \
         '| what a beam cannot carry | 0 | **8.06 MPa rms** |' "$SECTION_DOC"
   # And the six rigid restraints, which are determinate and so must carry nothing.
-  check "the six restraints carry (N)" 3847 5 \
+  check "the six restraints carry (N)" 3854 5 \
         "$(printf '%s\n' "$wave" |
            sed -n 's/.*six restraints carry \([0-9.e+]*\) N against.*/\1/p' | head -1)" \
         'They are determinate, so on a balanced load they' "$SECTION_DOC"
@@ -2827,27 +2827,27 @@ if [ -x "$ZONE" ]; then
   check "steps the solve actually took" 21290 0 \
         "$(zfield '^solve *: \([0-9]*\) steps.*')" \
         '| Delivered, 23 workers | 21 290 steps, **2.6 s of wall time**, 0.55 µs/element/step |' "$ZONE_DOC"
-  check "the work the punch cost (MJ)" 2.755 0.0005 \
+  check "the work the punch cost (MJ)" 2.762 0.0005 \
         "$(zfield '^energy *: in \([0-9.]*\) MJ.*')" \
-        'the 2.755 MJ a 0.22 m punch costs' "$DOC"
-  check "elements torn" 80 0 "$(zfield '^damage *: \([0-9]*\) of 224 elements deleted.*')" \
+        'the 2.762 MJ a 0.22 m punch costs' "$DOC"
+  check "elements torn" 96 0 "$(zfield '^damage *: \([0-9]*\) of 224 elements deleted.*')" \
         '| Delivered, 23 workers | 21 290 steps, **2.6 s of wall time**, 0.55 µs/element/step |' "$ZONE_DOC"
-  check "and what the energy-driven drive tears instead" 42 0 \
-        "$(zfield '^ *\([0-9]*\) element(s) torn against 80.*')" \
-        '45 970 steps against 21 290 — because a striker that has nearly stopped crawls,' "$ZONE_DOC"
-  check "the steps that drive takes" 45970 0 \
-        "$(zfield '.*against 6; \([0-9]*\) steps against 21290.*')" \
-        '45 970 steps against 21 290 — because a striker that has nearly stopped crawls,' "$ZONE_DOC"
-  check "the pre-load the girder puts through the patch (MPa)" 13.1 0.05 \
+  check "and what the energy-driven drive tears instead" 38 0 \
+        "$(zfield '^ *\([0-9]*\) element(s) torn against [0-9]*.*')" \
+        '45 546 steps against 21 290 — because a striker that has nearly stopped crawls,' "$ZONE_DOC"
+  check "the steps that drive takes" 45546 0 \
+        "$(zfield '.*against 6; \([0-9]*\) steps against [0-9]*.*')" \
+        '45 546 steps against 21 290 — because a striker that has nearly stopped crawls,' "$ZONE_DOC"
+  check "the pre-load the girder puts through the patch (MPa)" 13.0 0.05 \
         "$(zfield '^preload: .* -> \([0-9.]*\) MPa through the patch.*')" \
-        "| zone handed the girder's 13.1 MPa | **20.25 MN**, +7.1% |" "$ZONE_DOC"
-  check "and the force at 0.078 m under it (MN)" 20.25 0.005 \
+        "| zone handed the girder's 13.0 MPa | **20.26 MN**, +7.20% |" "$ZONE_DOC"
+  check "and the force at 0.078 m under it (MN)" 20.26 0.005 \
         "$(printf '%s\n' "$zone" | awk '$1=="solid-shell" && $2=="FEM" && NF==5 { print $4 }')" \
-        "| zone handed the girder's 13.1 MPa | **20.25 MN**, +7.1% |" "$ZONE_DOC"
+        "| zone handed the girder's 13.0 MPa | **20.26 MN**, +7.20% |" "$ZONE_DOC"
 
   # **The control, which was ungated while its result was gated.** §2's table is two
   # rows and the finding is the difference between them: 18.90 MN with the patch
-  # told it starts unstressed, 20.25 MN carrying the girder's own 13.1 MPa, +7.1%.
+  # told it starts unstressed, 20.26 MN carrying the girder's own 13.0 MPa, +7.20%.
   # The loaded row and the 13.1 MPa were both gated; the unstressed row was not, so
   # the *published* half of a two-row comparison stood on a single measurement. 8 s.
   #
@@ -2864,14 +2864,23 @@ if [ -x "$ZONE" ]; then
         "$(printf '%s\n' "$bare" | sed -n 's/^preload: .* given to the solve \([0-9]*\)$/\1/p')" \
         '| zone told it starts unstressed | **18.90 MN** — the figure this file published |' \
         "$ZONE_DOC"
-  # The +7.1% the table publishes, derived here rather than transcribed: it is the
+  # The +7.20% the table publishes, derived here rather than transcribed: it is the
   # whole content of the comparison and neither row alone carries it.
-  # 0.06, because both rows are published to two decimals: 18.90 and 20.25 each
-  # carry +/-0.005, which is +/-0.04 on the ratio. Measured 7.14 against a doc that
-  # rounds to 7.1, so the bound is the rounding and nothing more.
-  check "the pre-stress is worth +7.1% at 0.078 m" 7.1 0.06 \
-        "$(awk -v a="$bareforce" -v b="20.25" 'BEGIN { printf "%.2f", 100.0 * (b / a - 1.0) }')" \
-        "| zone handed the girder's 13.1 MPa | **20.25 MN**, +7.1% |" "$ZONE_DOC"
+  #
+  # **Both inputs are read from a tool.** `b` was the literal 20.25 until the
+  # balance fix moved the pre-loaded force to 20.26 and this check could not see
+  # it -- it recomputed the same 7.14 from a constant while the figure it claims to
+  # derive had changed. A check that transcribes half its own subject is vacuous in
+  # that half, and the comment above said the opposite.
+  #
+  # 0.06, because both rows are published to two decimals: 18.90 and 20.26 each
+  # carry +/-0.005, which is +/-0.04 on the ratio. Measured 7.20 against a doc that
+  # publishes 7.20, so the bound is the rounding and nothing more.
+  preforce=$(printf '%s\n' "$zone" |
+             awk '$1=="solid-shell" && $2=="FEM" && NF==5 { print $4 }')
+  check "the pre-stress is worth +7.20% at 0.078 m" 7.20 0.06 \
+        "$(awk -v a="$bareforce" -v b="$preforce" 'BEGIN { printf "%.2f", 100.0 * (b / a - 1.0) }')" \
+        "| zone handed the girder's 13.0 MPa | **20.26 MN**, +7.20% |" "$ZONE_DOC"
 
   # **The two cost estimators, checked against each other and not only against the
   # document.** `zone::estimatedCost` works off `kPlasticMicroseconds` and the
