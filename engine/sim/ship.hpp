@@ -557,6 +557,17 @@ public:
 
 private:
     void updateInternalFreeSurfaces(const Sea& sea);
+
+    // Solves the orifice network for one tick.
+    //
+    // **This is the only code that indexes `compartments` by an `Opening` or
+    // `Pump` endpoint, and it checks the index itself rather than assuming
+    // `validate()` has been past.** It cannot assume that: `validate()` is
+    // advisory and nothing on the step path calls it, and `applyBreaches` adds
+    // openings to a ship that is already stepping, so the endpoints read at tick N
+    // are not the set validate() saw. An endpoint that is neither kSea nor a
+    // compartment that exists passes nothing and reports zeros; validate() still
+    // names it. See the derivation in ship.cpp.
     void solveFlowNetwork(double dt, const Sea& sea);
     void integrateRigidBody(double dt, const Sea& sea);
 

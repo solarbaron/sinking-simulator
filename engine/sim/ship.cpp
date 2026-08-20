@@ -633,6 +633,52 @@ void Ship::solveFlowNetwork(double dt, const Sea& sea) {
         return i == kSea ? kTAmbient : compartments[i].gasTemperature;
     };
 
+    // **Every lambda above indexes `compartments` on any endpoint that is not
+    // kSea, so the solver decides here whether an index is one it may read.**
+    //
+    // kSea is a real endpoint and cannot be excluded by range, which is precisely
+    // what leaves every *other* negative unguarded: `kNoCompartment` (-3) from a
+    // name lookup that missed, `kEnclosedVoid` (-2) from a probe inside the hull
+    // and inside no compartment. Neither ever named a space, and neither is a
+    // small error -- `compartments[-3]` is an out-of-bounds read, and `dWater[-3]
+    // -= dv` sixty lines below is an out-of-bounds *write* into a heap vector.
+    // Measured, before `kNoCompartment` existed: renaming one ferry compartment
+    // reached "double free or corruption (out)" and exit 134, not a wrong
+    // flooding curve.
+    //
+    // `Ship::validate()` names the same endpoint, and that is not enough for two
+    // separate reasons. It is advisory and nothing on the step path consults it --
+    // the same shape as the massless-ship guard in integrateRigidBody(). And the
+    // network is not frozen when it runs: `applyBreaches` pushes new openings into
+    // a ship that is already stepping, so the endpoints this loop reads at tick N
+    // are not the set validate() saw at tick 0. A contract of "every endpoint has
+    // been validated" would therefore be false in tools/ram_view and
+    // tools/bulkhead_probe today, which is why the check is here and not written
+    // down as an assumption.
+    //
+    // Refusing is the honest answer rather than a fallback: an endpoint that names
+    // no space has no volume to flood, no gas to vent and no pressure to solve
+    // against, so the opening passes nothing and reports the zeros set above --
+    // "this hole moved nothing" is inspectable, where a plausible flow is not.
+    //
+    // Cost, and it was measured rather than assumed, because this loop is on the
+    // per-tick path. The ferry has 27 openings, so on the ship itself the check is
+    // 54 integer compares against a step that costs 249 us -- unmeasurable by
+    // construction. The instrument is therefore an *inflated* network: the same
+    // ferry with 20 000 extra open openings, where the orifice loop dominates
+    // step(). Three alternating pairs of runs, best of seven each, gave 782/792/784
+    // us unguarded against 788/826/794 us guarded -- 6.0 us between the two minima,
+    // over 40 000 endpoint tests per tick, or 0.15 ns each, and less than a fifth
+    // of the guarded build's own 38 us spread. On the ferry that scales to about
+    // 8 ns a tick, three parts in a hundred thousand.
+    //
+    // That is what two compares on a perfectly predicted branch cost next to a body
+    // holding several square roots and a wave-height lookup. `n` is already in a
+    // register; the branch is taken for every endpoint of every ship that works.
+    const auto endpointExists = [n](int i) {
+        return i == kSea || (i >= 0 && static_cast<std::size_t>(i) < n);
+    };
+
     for (Opening& o : openings) {
         o.lastFlow = 0;
         o.lastGasMassFlow = 0;
@@ -644,6 +690,9 @@ void Ship::solveFlowNetwork(double dt, const Sea& sea) {
         o.lastExchangeMassUp = 0;
         o.lastExchangeUpper = kSea;
         if (!o.open || o.area <= 0) continue;
+        // After the `open` test, not before it: a shut opening indexes nothing
+        // either way, and this is the per-tick path.
+        if (!endpointExists(o.a) || !endpointExists(o.b)) continue;
 
         const Vec3 worldPos = R * o.pos + state.position;
         const SideState sa = sideStateAt(o.a, worldPos, sea);
@@ -935,6 +984,12 @@ void Ship::solveFlowNetwork(double dt, const Sea& sea) {
     for (Pump& p : pumps) {
         p.lastFlow = 0;
         if (!p.on) continue;
+        // The same refusal, and here there is nothing to exempt: a pump draws on a
+        // compartment or on nothing, so kSea is not a legal index for one either.
+        // This half was never reachable from a missed name lookup -- a pump has no
+        // sea to be mistaken for a space -- but it indexes `compartments` and
+        // `dWater` on an author-supplied int exactly as the loop above does.
+        if (p.compartment < 0 || static_cast<std::size_t>(p.compartment) >= n) continue;
         Compartment& c = compartments[static_cast<std::size_t>(p.compartment)];
         // Centrifugal pumps lose output as discharge head rises; overboard discharge
         // means lifting from the compartment's water surface to the sea surface.
