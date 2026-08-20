@@ -1224,6 +1224,10 @@ void testFerryConnectivity() {
 // and re-deriving it by hand from a failing assertion is miserable.
 void testFerryDamageInventory() {
     const FerryDamage& damage = ferryDamage();
+    // A fixed name, and safe as one only because `scratchDir()` is a directory
+    // this process alone owns: it was once the shared $TMPDIR, and a mutation
+    // sweep with four workers on one /tmp then scored a mutant on a *neighbour's*
+    // write. tests/harness.cpp carries the incident.
     const std::string path = testing::scratchDir() + "ferry_damage_map.txt";
     std::FILE* file = std::fopen(path.c_str(), "w");
     expectTrue("the damage inventory can be written", file != nullptr);

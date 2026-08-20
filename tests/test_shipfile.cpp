@@ -27,13 +27,26 @@
 #include "game/prototype/ferry.hpp"
 #include "harness.hpp"
 
+#include <array>
+#include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+// The environment this process was started with, which the copies of it started
+// below inherit with three variables changed.
+extern char** environ;
 
 using sim::Compartment;
 using sim::Diagnostics;
@@ -848,6 +861,273 @@ void testTheFilePathItselfFailsClosed() {
     expectTrue("... as the ship it was", out.name == "barge" && out.ship.compartments.size() == 2);
 }
 
+// --- Two suites at once -------------------------------------------------------
+//
+// The check above writes `barge.ship` into `testing::scratchDir()` and reads it
+// back; `test_breach.cpp` and `test_collision.cpp` do the same with
+// `ferry_damage_map.txt` and `collision_ram.csv`. Under one shared scratch
+// directory those are not three tests, they are three files that N concurrent
+// suites take turns clobbering. That is not a worry, it is a recorded incident:
+// a mutation sweep running `--workers 4` against one /tmp scored a mutant KILLED
+// on `FAIL a ship written to disk loads back: /tmp/barge.ship: empty` -- the
+// check just above this comment, reporting a *neighbour's* write. It deserved
+// killing anyway so the measured rate did not move, which is exactly why it is
+// worth a test: the next one to lose that race could be a control, and a control
+// that dies reads as the instrument being broken rather than as the code being
+// wrong.
+//
+// `testing::scratchDir()` hands each process a directory of its own, so it
+// cannot happen. This is the check that says so, and it asserts the *property*
+// rather than the mechanism: a check that the path contains a pid only restates
+// how it is done today, and would stay green the morning someone swaps in
+// something that collides. So two real suites are started at the same moment --
+// two copies of this binary, exec'd, both handed the same TMPDIR, which is the
+// condition the incident happened under -- and asked whether either can see the
+// other's file.
+//
+// The control at the end runs the identical experiment against the pre-fix
+// behaviour, writing straight into the shared directory, and it must collide. An
+// experiment whose control comes back green proves nothing at all: it would mean
+// the two suites never overlapped and the passing half was free.
+
+constexpr const char* kProbeVariable = "SHIPSIM_TEST_SCRATCH_PROBE";
+constexpr const char* kProbeSharedVariable = "SHIPSIM_TEST_SCRATCH_PROBE_SHARED";
+// Healthy is milliseconds. This is a bound on "the other suite is never coming",
+// so that a broken probe fails the run rather than hanging it -- the failure mode
+// CLAUDE.md records as the expensive one.
+constexpr double kProbeTimeout = 60.0;
+
+bool writeWholeFile(const std::string& path, const std::string& text) {
+    std::FILE* handle = std::fopen(path.c_str(), "wb");
+    if (handle == nullptr) return false;
+    const bool wrote = std::fwrite(text.data(), 1, text.size(), handle) == text.size();
+    return std::fclose(handle) == 0 && wrote;
+}
+
+std::string readWholeFile(const std::string& path) {
+    std::FILE* handle = std::fopen(path.c_str(), "rb");
+    if (handle == nullptr) return {};
+    std::string text;
+    char buffer[512];
+    while (const std::size_t got = std::fread(buffer, 1, sizeof buffer, handle))
+        text.append(buffer, got);
+    std::fclose(handle);
+    return text;
+}
+
+bool waitForFile(const std::string& path, double seconds) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(static_cast<long long>(seconds * 1000));
+    for (;;) {
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec)) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
+// One of the two suites, running as a separate process. It never reaches main:
+// see the hook below.
+[[noreturn]] void runScratchProbe(const std::string& prefix) {
+    std::string directory;
+    if (std::getenv(kProbeSharedVariable) != nullptr) {
+        // The pre-fix `scratchDir()`, reproduced: resolve the variable and write
+        // straight into what it names. This is the control, and it is written
+        // out here rather than reached for in git history so that the thing the
+        // fix is measured against stays in front of the reader.
+        const char* base = std::getenv("SHIPSIM_TEST_TMPDIR");
+        directory = base == nullptr ? "/tmp" : base;
+        if (directory.back() != '/') directory += '/';
+    } else {
+        directory = testing::scratchDir();
+    }
+
+    // The fixed name this file writes, which is the name the false verdict was
+    // reported against.
+    const std::string path = directory + "barge.ship";
+    const std::string token = "written by " + prefix + "\n";
+    const bool wrote = writeWholeFile(path, token);
+    writeWholeFile(prefix + ".wrote", directory + "\n");
+
+    // Both suites are past their write before either reads: the parent opens the
+    // barrier once it has seen both say so. The overlap is *arranged* rather than
+    // hoped for, which is what makes the control collide every time instead of
+    // most times.
+    const bool released = waitForFile(prefix + ".go", kProbeTimeout);
+    const std::string readBack = readWholeFile(path);
+    const char* verdict = !wrote              ? "could not write"
+                          : !released         ? "the barrier never opened"
+                          : readBack == token ? "ok"
+                                              : "collided";
+    writeWholeFile(prefix + ".report", directory + "\n" + verdict + "\n" + readBack);
+    std::fflush(nullptr);
+    // Not exit(): the scratch directory this process made is the test's evidence
+    // and the test removes it, so nothing here should run the harness's own
+    // tidy-up.
+    _exit(0);
+}
+
+// The probe has to answer before any suite runs, so it answers from a static
+// constructor and never reaches `main`. Nothing happens unless the variable is
+// set, and the only thing that sets it is the test below.
+struct ScratchProbeHook {
+    ScratchProbeHook() {
+        if (const char* prefix = std::getenv(kProbeVariable)) runScratchProbe(prefix);
+    }
+};
+[[maybe_unused]] const ScratchProbeHook scratchProbeHook;
+
+struct ProbeResult {
+    bool reported = false;
+    bool exited = false;
+    std::string directory;
+    std::string verdict;
+};
+
+std::string selfExecutable() {
+    char path[4096];
+    const ssize_t got = ::readlink("/proc/self/exe", path, sizeof path - 1);
+    if (got <= 0) return {};
+    path[static_cast<std::size_t>(got)] = '\0';
+    return path;
+}
+
+std::vector<std::string> childEnvironment(const std::string& base, const std::string& prefix,
+                                          bool shared) {
+    static const char* const replaced[] = {"SHIPSIM_TEST_TMPDIR=", "SHIPSIM_TEST_SCRATCH_PROBE=",
+                                           "SHIPSIM_TEST_SCRATCH_PROBE_SHARED="};
+    std::vector<std::string> env;
+    for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+        const std::string text = *entry;
+        bool drop = false;
+        for (const char* name : replaced)
+            if (text.rfind(name, 0) == 0) drop = true;
+        if (!drop) env.push_back(text);
+    }
+    env.push_back("SHIPSIM_TEST_TMPDIR=" + base);
+    env.push_back(std::string(kProbeVariable) + "=" + prefix);
+    if (shared) env.push_back(std::string(kProbeSharedVariable) + "=1");
+    return env;
+}
+
+pid_t spawnSuite(const std::string& name, const std::vector<std::string>& env) {
+    std::vector<char*> argv{const_cast<char*>(name.c_str()), nullptr};
+    std::vector<char*> envp;
+    envp.reserve(env.size() + 1);
+    for (const std::string& entry : env) envp.push_back(const_cast<char*>(entry.c_str()));
+    envp.push_back(nullptr);
+    pid_t pid = -1;
+    // posix_spawn and not fork: the GPU suites have run by the time this does and
+    // the driver keeps threads of its own, and everything between a fork and its
+    // exec in a threaded process has to be async-signal-safe.
+    //
+    // `/proc/self/exe` and not the path it resolves to: it names the running
+    // inode, so a copy still starts when the file underneath has been replaced by
+    // a rebuild in another window. The resolved path is argv[0], for anyone
+    // looking at the process list.
+    if (::posix_spawn(&pid, "/proc/self/exe", nullptr, nullptr, argv.data(), envp.data()) != 0)
+        return -1;
+    return pid;
+}
+
+bool waitForExit(pid_t pid, double seconds) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(static_cast<long long>(seconds * 1000));
+    for (;;) {
+        int status = 0;
+        const pid_t done = ::waitpid(pid, &status, WNOHANG);
+        if (done == pid) return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        if (done < 0) return false;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            ::kill(pid, SIGKILL);
+            ::waitpid(pid, &status, 0);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
+// Start two copies of this binary at once, both told to use `base`, hold them
+// until both have written, then let them read.
+std::array<ProbeResult, 2> runTwoSuitesAtOnce(const std::string& exe, const std::string& base,
+                                              bool shared) {
+    std::error_code ec;
+    std::filesystem::create_directories(base, ec);
+    const std::array<std::string, 2> prefix = {base + "suite-a", base + "suite-b"};
+    std::array<pid_t, 2> pids = {-1, -1};
+    for (std::size_t i = 0; i < 2; ++i)
+        pids[i] = spawnSuite(exe, childEnvironment(base, prefix[i], shared));
+
+    bool bothWrote = true;
+    for (std::size_t i = 0; i < 2; ++i)
+        bothWrote = (pids[i] > 0 && waitForFile(prefix[i] + ".wrote", kProbeTimeout)) && bothWrote;
+    if (bothWrote)
+        for (const std::string& one : prefix) writeWholeFile(one + ".go", "go\n");
+
+    std::array<ProbeResult, 2> results;
+    for (std::size_t i = 0; i < 2; ++i) {
+        if (pids[i] <= 0) continue;
+        results[i].exited = waitForExit(pids[i], kProbeTimeout);
+        std::istringstream report(readWholeFile(prefix[i] + ".report"));
+        std::getline(report, results[i].directory);
+        std::getline(report, results[i].verdict);
+        results[i].reported = !results[i].verdict.empty();
+    }
+    return results;
+}
+
+void testTwoSuitesAtOnceDoNotCollide() {
+    const std::string exe = selfExecutable();
+    expectTrue("the suite can find its own binary, to start a second copy of it", !exe.empty());
+    if (exe.empty()) return;
+
+    std::error_code ec;
+    const std::string root = testing::scratchDir() + "two-suites/";
+    std::filesystem::remove_all(root, ec);
+
+    // The fix, under the condition that broke it: one TMPDIR, two suites at
+    // once, both writing the name this file writes.
+    const std::string given = root + "private/";
+    const std::array<ProbeResult, 2> own = runTwoSuitesAtOnce(exe, given, false);
+    expectTrue("two suites ran at once under one TMPDIR, and both reported",
+               own[0].reported && own[1].reported && own[0].exited && own[1].exited);
+    expectTrue("... each resolving a scratch directory of its own: " + own[0].directory + " vs " +
+                   own[1].directory,
+               !own[0].directory.empty() && own[0].directory != own[1].directory);
+    // Without this the check above would also pass if a suite had quietly given
+    // up on the directory it was handed and gone somewhere else entirely.
+    expectTrue("... both of them inside the TMPDIR the two were given",
+               own[0].directory.rfind(given, 0) == 0 && own[1].directory.rfind(given, 0) == 0);
+    expectTrue("... and both writing the same fixed name into it, as the suite does",
+               std::filesystem::exists(own[0].directory + "barge.ship", ec) &&
+                   std::filesystem::exists(own[1].directory + "barge.ship", ec));
+    // The property, with the neighbour's write already on disk when this one
+    // reads: not one path in common, so neither can be reading the other's file.
+    expectTrue("neither suite read back the other's file: " + own[0].verdict + " / " +
+                   own[1].verdict,
+               own[0].verdict == "ok" && own[1].verdict == "ok");
+    expectTrue("and the shared name they would have raced over was never created",
+               !std::filesystem::exists(given + "barge.ship", ec));
+
+    // The control: the same two suites, the same barrier, writing where the
+    // pre-fix `scratchDir()` put them. If this came back green the experiment
+    // never overlapped and the six checks above would be worth nothing.
+    const std::string common = root + "shared/";
+    const std::array<ProbeResult, 2> raw = runTwoSuitesAtOnce(exe, common, true);
+    expectTrue("the control's two suites ran too", raw[0].reported && raw[1].reported);
+    expectTrue("... sharing one directory, which is what the fix removed: " + raw[0].directory +
+                   " vs " + raw[1].directory,
+               raw[0].directory == common && raw[1].directory == common);
+    const int collided = static_cast<int>(raw[0].verdict == "collided") +
+                         static_cast<int>(raw[1].verdict == "collided");
+    expectTrue("... and one of them read back the other's file, which is the incident: " +
+                   raw[0].verdict + " / " + raw[1].verdict,
+               collided >= 1);
+
+    std::filesystem::remove_all(root, ec);
+    expectTrue("the experiment leaves nothing behind", !std::filesystem::exists(root, ec));
+}
+
 // Two ways to state the same lightship weight, and the format has to mean the
 // same thing by both. `lightship_draft` is the one the ferry uses, because it
 // keeps the hull form and the loading consistent when the offsets are edited.
@@ -988,6 +1268,7 @@ void runShipFileTests() {
     testEveryTruncationFailsClosed();
     testMalformedFilesAreRefusedByName();
     testTheFilePathItselfFailsClosed();
+    testTwoSuitesAtOnceDoNotCollide();
     testLightshipDraftAndMassAgree();
     testOptionalKeysAreCarried();
     testReferencesResolveInAnyOrder();
