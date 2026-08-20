@@ -26,6 +26,7 @@
 #include "../../engine/sim/ship.hpp"
 #include "../../game/prototype/ferry.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -103,11 +104,26 @@ int main(int argc, char** argv) {
     int peakActive = 0, peakCells = 0;
     std::vector<std::pair<std::string, int>> promotedEver;
 
+    // **`t` below is this file's own clock and nothing ever compared it against the
+    // model's.** `fire::Model::step` can return having advanced by less than it was
+    // asked for -- its budget bounds substep *trials*, and a rejected trial spends a
+    // slot without committing time -- and every figure this tool publishes is indexed
+    // by `t`, including the review times and the promotion time it prints in seconds.
+    // Two clocks that have come apart would move all of them and change nothing that
+    // looks wrong. Counted rather than tolerated: on a healthy run these are zero.
+    int shortSteps = 0, pressureCapped = 0;
+    double clockGap = 0;             // s, the worst |model.time - t| ever reached
+
     double t = 0, nextReview = 0;
     while (t < duration) {
         const double step = std::min(2.0, duration - t);
-        model.step(step, ship, sea);
+        const fire::StepResult s = model.step(step, ship, sea);
         t += step;
+        if (s.incomplete) ++shortSteps;
+        // `fire.hpp` publishes this "so that 'should never' can be asserted", and no
+        // tool asserted it.
+        if (s.pressureSolveCapped) ++pressureCapped;
+        clockGap = std::max(clockGap, std::abs(model.time - t));
 
         if (t < nextReview) continue;
         nextReview = t + reviewEvery;
@@ -179,5 +195,17 @@ int main(int argc, char** argv) {
         std::printf("nothing promoted -- the criterion never fired on a real fire\n");
     else
         std::printf("%d promotions on a real ferry\n", promoter.promotions());
+
+    // 1e-6 s against a 600 s run of 2 s ticks. The gap is an arithmetic clock against
+    // a sum of substeps, so a healthy run leaves rounding and nothing else -- measured
+    // 0 s over 300 ticks -- and one dropped substep is 0.25 s, five orders of
+    // magnitude above the bound.
+    if (shortSteps != 0 || pressureCapped != 0 || clockGap >= 1e-6) {
+        std::printf("\n    ! the gas did not advance the time this run indexes its figures by:"
+                    " %d step(s) short of their tick,\n      %d capped pressure solve(s),"
+                    " worst clock gap %.3e s against a %.0f s run\n",
+                    shortSteps, pressureCapped, clockGap, duration);
+        return 1;
+    }
     return 0;
 }

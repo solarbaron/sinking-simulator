@@ -3629,23 +3629,112 @@ void testTheSubstepControllerStaysNearItsArithmeticFloor() {
         // Four per second, because `maxSubstep` is 0.25 s.
         const int floor = static_cast<int>(ticks / r.model.maxSubstep);
         int worst = 0, total = 0;
-        bool capped = false;
+        bool capped = false, fellShort = false;
         for (int i = 0; i < ticks; ++i) {
             const fire::StepResult s = r.model.step(1.0, r.ship, r.sea);
             worst = std::max(worst, s.substeps);
             total += s.substeps;
             capped = capped || s.pressureSolveCapped;
+            fellShort = fellShort || s.incomplete;
         }
         expectEqual("the floor is one substep per maxSubstep of model time", floor, 240);
         expectTrue("the reference room runs within twice its own substep floor",
                    total < 2 * floor);
         expectTrue("and no single tick needs more than a hundred substeps", worst < 100);
         expectTrue("while the pressure solve always brackets its root", !capped);
+        // The count above catches a controller that has collapsed, because that shows
+        // itself as a hang. It cannot catch one that ran out: **`maxSubsteps` is
+        // lowered to 200 here**, so the budget can bind, and a run that hit it would
+        // satisfy every line above by taking fewer substeps than it needed. What was
+        // missing was any statement that the time asked for was actually taken.
+        expectTrue("no tick was short of the time it was asked for", !fellShort);
+        expectNear("and 60 ticks of one second left the model 60 seconds later",
+                   r.model.time, static_cast<double>(ticks), 1e-9);
         // Vacuity: the run has to have been a real fire, or a model that did
         // nothing would pass this trivially.
         expectTrue("and the room really did heat up",
                    r.model.gas[0].upper.temperature() > kTAmbient + 100.0);
     }
+}
+
+// **A step short of the time it was asked for says so.** `maxSubsteps` bounds
+// *trials*, not committed time: a rejected trial spends a slot and halves `h`
+// without moving `remaining`, so the loop can exit with time left over -- and until
+// `StepResult::incomplete` the model it handed back was indistinguishable from one
+// that had taken the whole tick.
+//
+// The test above lowers `maxSubsteps` to 200 and bounds the substep *count*, which
+// is how a collapsed controller shows itself: as a hang. That is a different defect
+// from this one. A controller that has been driven into a corner by the rejection
+// test does not hang and does not fail -- it under-advances, quietly, and the trace
+// stays smooth. `tools/bulkhead_probe` is the caller that pays for it: it steps the
+// gas, the conduction solve and the ship by one `coupling` each and prints all three
+// under a `t` it computes itself, so a short gas step puts three model times on one
+// row.
+//
+// Both ways the budget can bind are exercised, because they leave different
+// evidence: pinned by `maxSubstep`, every trial is accepted and the shortfall is
+// arithmetic; starved by the rejection test, nothing is committed at all.
+void testAStepShortOfTheTimeItWasAskedForSaysSo() {
+    // The control first, and it is what stops the flag being trivially true: with
+    // the budget the model ships with, the reference room never comes near it and
+    // the result's own clock is the time the caller asked it to reach.
+    Room ample = makeRoom(500.0e3, 30.0);
+    for (int i = 0; i < 60; ++i) {
+        const fire::StepResult s = ample.model.step(1.0, ample.ship, ample.sea);
+        expectTrue("a step inside its budget is not incomplete", !s.incomplete);
+        expectNear("and its clock is the time it was asked to reach", s.time,
+                   static_cast<double>(i + 1), 1e-9);
+    }
+    expectTrue("and the control was a real fire and not an empty room",
+               ample.model.gas[0].upper.temperature() > kTAmbient + 100.0);
+    // A tick of no time is not a tick that fell short of one. `step()` returns
+    // before the loop, so this is a statement about the early exit rather than
+    // about the controller.
+    const fire::StepResult none = ample.model.step(0.0, ample.ship, ample.sea);
+    expectTrue("a step of no time was not short of it", !none.incomplete);
+    expectNear("and left the model where it was", none.time, ample.model.time, 0.0);
+
+    // **Pinned by `maxSubstep`.** Three substeps of 0.1 ms against a one-second
+    // tick: every trial is accepted, so the shortfall is the budget's arithmetic
+    // and nothing else, and 0.9997 s of the tick is simply not taken.
+    Room pinned = makeRoom(500.0e3, 30.0);
+    for (int i = 0; i < 10; ++i) pinned.model.step(1.0, pinned.ship, pinned.sea);
+    pinned.model.maxSubstep = 1e-4;
+    pinned.model.maxSubsteps = 3;
+    const double from = pinned.model.time;
+    const fire::StepResult pin = pinned.model.step(1.0, pinned.ship, pinned.sea);
+    expectTrue("a step that ran out of budget says so", pin.incomplete);
+    expectEqual("having taken exactly the substeps it was allowed", pin.substeps, 3);
+    expectNear("and advanced by exactly those and no more", pinned.model.time - from,
+               3e-4, 1e-12);
+    expectNear("the result's clock is the model's, not the tick it was handed", pin.time,
+               pinned.model.time, 0.0);
+    expectTrue("while the pressure solve still bracketed its root", !pin.pressureSolveCapped);
+
+    // **Starved by the rejection test**, which is the shape the flag exists for and
+    // the one no substep count can see: an impossible `maxRelativeChange` rejects
+    // every trial, so twenty budget slots buy twenty halvings and not one second of
+    // model time. Twenty rather than more because `substep` accepts unconditionally
+    // below 1 ns -- the twentieth trial is 0.25 * 2^-19 = 4.8e-7 s, still above it --
+    // so every slot here is genuinely spent on a rejection and nothing is committed.
+    Room starved = makeRoom(500.0e3, 30.0);
+    for (int i = 0; i < 10; ++i) starved.model.step(1.0, starved.ship, starved.sea);
+    const double hot = starved.model.gas[0].upper.temperature();
+    const double stuck = starved.model.time;
+    starved.model.maxRelativeChange = 1e-18;
+    starved.model.maxSubsteps = 20;
+    const fire::StepResult none2 = starved.model.step(1.0, starved.ship, starved.sea);
+    expectTrue("a step whose every trial was rejected says so too", none2.incomplete);
+    expectEqual("having committed nothing", none2.substeps, 0);
+    expectNear("and moved the model not at all", starved.model.time, stuck, 0.0);
+    // A rejection is rejected before anything is written, so the state is bit-for-bit
+    // what it was -- and a model that had simply gone out would also commit nothing,
+    // which is what this second line rules out.
+    expectNear("leaving the state exactly as the last accepted substep left it",
+               starved.model.gas[0].upper.temperature(), hot, 0.0);
+    expectTrue("and the trials it rejected were trials on a real fire",
+               hot > kTAmbient + 50.0);
 }
 
 // **A freeing port cannot drain water the ship does not have.** `substep` reads
@@ -4820,18 +4909,25 @@ void testTheSubstepControllerStaysNearItsFloorWhileFlooding() {
         const int ticks = 300;
         const int floor = static_cast<int>(ticks / s.model.maxSubstep);
         int worst = 0, total = 0;
-        bool capped = false;
+        bool capped = false, fellShort = false;
         for (int i = 0; i < ticks; ++i) {
             const fire::StepResult r = s.model.step(1.0, s.ship, s.sea);
             worst = std::max(worst, r.substeps);
             total += r.substeps;
             capped = capped || r.pressureSolveCapped;
+            fellShort = fellShort || r.incomplete;
         }
         expectEqual("the floor is one substep per maxSubstep of model time", floor, 1200);
         expectTrue("a discharging machinery space stays within twice its own floor",
                    total < 2 * floor);
         expectTrue("and no single tick needs more than a hundred substeps", worst < 100);
         expectTrue("while the pressure solve always brackets its root", !capped);
+        // A discharge is the stiffest thing this file drives the controller with, so
+        // it is also where the lowered budget is nearest to binding. The count says
+        // the controller did not collapse; these two say it did not run out.
+        expectTrue("no tick was short of the time it was asked for", !fellShort);
+        expectNear("and 300 ticks of one second left the model 300 seconds later",
+                   s.model.time, static_cast<double>(ticks), 1e-9);
         // Vacuity: the run has to have been a real discharge into a real fire.
         expectTrue("and the space really did flood", s.model.gas[0].agentFraction() > 0.15);
         expectTrue("with a fire in it", s.model.account.heatReleased > 1e8);
@@ -5435,6 +5531,7 @@ void runFireTests() {
     testTheVentIntegralStillHoldsAtMillipascals();
     testALayerOfMicrogramsStillReportsItsOwnTemperature();
     testTheSubstepControllerStaysNearItsArithmeticFloor();
+    testAStepShortOfTheTimeItWasAskedForSaysSo();
     testThePublishedConstantsAreTheirPublishedValues();
 
     std::printf("\n--- suppression, and its effect on stability ---\n");

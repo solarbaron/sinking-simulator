@@ -1297,6 +1297,21 @@ struct StepResult {
     // happen -- the residual is monotone and unbounded in both directions -- and
     // is published rather than swallowed so that "should never" can be asserted.
     bool   pressureSolveCapped = false;
+    // `maxSubsteps` ran out before the whole `dt` was taken, so the gas is **short
+    // of the time it was asked for** and otherwise indistinguishable from a step
+    // that took all of it. Reachable rather than theoretical: a rejected trial
+    // spends a budget slot and halves `h` *without* advancing `remaining`, so the
+    // budget bounds trials and not committed time, and a defect that drives the
+    // rejection test into a corner does not fail -- it under-advances quietly.
+    // `les::StepResult::incomplete` was added for a loop of exactly this shape and
+    // named this file when it was.
+    //
+    // The exposure is concrete. `tools/bulkhead_probe` steps the gas, the
+    // conduction solve and the ship by one `coupling` each and prints all three
+    // under a `t` it computes itself as `(step + 1) * coupling`; a short gas step
+    // puts three different model times on one row of a trace that stays perfectly
+    // smooth.
+    bool   incomplete = false;
 };
 
 // ---------------------------------------------------------------------------
