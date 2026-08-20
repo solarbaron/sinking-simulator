@@ -224,6 +224,28 @@ second, and the panel vanished without a word. The stiffener branch survived the
 same query only because it happened to `clamp` its parameter. When two tests in
 sequence decide one thing, they need the same notion of "on the boundary".
 
+**A worktree agent starts on the default branch, not on the branch you are working
+on.** Three agents were dispatched into isolated worktrees to fix three independent
+defects. All three were created from `main`, which was **101 commits behind** the
+working branch, so all three were reading and editing code that had been superseded
+— and two of their three owned files had moved substantially in those commits
+(`promotion.cpp` +106 lines, `promotion.hpp` +110, `girder.cpp` +44). A naive merge
+of their diffs would have silently reverted a day's work, and the tests would have
+passed, because the reverted code was itself correct at the time it was written.
+
+One of the three noticed unaided and fast-forwarded before starting. The other two
+did not, and had to be stopped mid-flight and told to reset and re-apply. **The
+detection is cheap and belongs in the brief, not in the reviewer's head**:
+`git rev-list --count <working-branch>..<agent-branch>` and a `git diff --stat` of
+the agent's owned files between the two bases, before a single line is read.
+
+Two smaller ones from the same wave. **Every agent must measure the baseline itself
+rather than being told it** — the branch advances underneath a long-running agent,
+and one of them correctly reported the number in its brief as already stale by the
+time it rebased. And **agents sharing one scratch directory collide**: one agent read
+a check count out of a log another agent was writing, and reported a figure that had
+never been produced by its own run.
+
 **A gate that grows makes an old fix more expensive, and that is the gate working.**
 The ferry's bilge seam is declared at girth fraction 0.28 while the turn of the
 bilge is at 0.511, so the most curved plating on the section is 12.0 mm side strake
