@@ -100,10 +100,59 @@ PropellerState evaluatePropeller(const PropellerParams& p, double surgeSpeed,
     s.deliveredPower = 2.0 * kPi * revsPerSecond * s.torque;
     s.thrustPower = s.thrust * s.advanceSpeed;
 
-    // J, K_T and K_Q are only defined for a turning shaft. Leaving them at zero
-    // rather than dividing by n^2 keeps a locked shaft from poisoning an
-    // instrument panel with infinities.
-    if (std::abs(revsPerSecond) > 1e-9) {
+    // J, K_T and K_Q are the *shaft-normalised* coefficients -- J = Va/(nD),
+    // K_T = T/(rho n^2 D^4), K_Q = Q/(rho n^2 D^5) -- so they mean something only
+    // while the shaft, and not the inflow, sets the resultant the blade sees.
+    // That is the condition this guard has to express, and it is a statement
+    // about a *ratio*, never about n on its own.
+    //
+    // It used to read `std::abs(revsPerSecond) > 1e-9`, which is not scale-free
+    // for the same reason ||r|| is not scale-free in solid_shell.cpp's EAS loop:
+    // 1e-9 is a bare number laid against a frequency in Hz, with no reference
+    // frequency anywhere in the expression to divide it by. Whether a shaft is
+    // "turning" is not a property of n. Measured on the KVLCC2 propeller
+    // (D = 9.86 m) at 6 m/s of headway, with the shaft passing through zero --
+    // which every reversal does, continuously, not as a contrived case:
+    //
+    //     n = 1e-4 Hz   old guard passes   J = 4.0e3   K_T = -1.5e6
+    //     n = 1e-6 Hz   old guard passes   J = 4.0e5   K_T = -1.5e10
+    //     n = 1e-8 Hz   old guard passes   J = 4.0e7   K_T = -1.5e14
+    //
+    // against quantities propulsion.hpp documents as J ~ 0.85 and K_T ~ 0.1-0.4.
+    // It caught n at or within a nanohertz of exactly zero and nothing else, so
+    // the infinities it exists to keep off an instrument panel walked past it.
+    //
+    // The scale-free form. tangentialSpeed = 0.7 pi n D and resultantSq =
+    // Va^2 + tangentialSpeed^2 are computed six lines up in m/s and m^2/s^2, so
+    // their ratio is dimensionless, lies in [0, 1] for any ship, propeller or
+    // unit system, and is exactly "how much of the water the blade meets is put
+    // there by the blade": 1 at bollard pull, 0 for a locked shaft. It is also J
+    // in disguise, since J = Va/(nD) = 0.7 pi Va / tangentialSpeed, so with
+    // Vt^2 > eps (Va^2 + Vt^2) the admitted band is |J| < 0.7 pi sqrt((1-eps)/eps).
+    //
+    // Which fixes eps by arithmetic rather than by taste. coefficientScale above
+    // is (pi/8)(J^2 + (0.7 pi)^2), and at the threshold J^2 + (0.7 pi)^2 reduces
+    // to (0.7 pi)^2 / eps, so the largest coefficient this block can ever report
+    // is exactly
+    //
+    //     |K_T| <= max|C_T*| (pi/8)(0.7 pi)^2 / eps = 0.245 * 1.899 / eps
+    //
+    // max|C_T*| = 0.245 being the disc coefficient's own ceiling, measured by
+    // sweeping the section model over every beta (it is bounded by solidity 0.181
+    // times a normal force saturating at 1.4). eps = 0.1 gives |J| < 6.6 and
+    // |K_T| <= 4.7, about ten times the documented ceiling of 0.4; eps = 1e-6,
+    // the loosest form that is still dimensionally coherent, would give |J| < 2199
+    // and |K_T| <= 4.7e5, which is no better than what it replaces. No threshold
+    // removes the divergence -- it only chooses where to cut it -- and this one
+    // cuts while the number is still the right order of magnitude. Past |J| ~ 7
+    // the propeller is a drag disc and not a propulsor; thrust, torque and power
+    // are computed outside this block and stay finite and correct there.
+    //
+    // Squared rather than `std::abs(n) * D > 1e-3 * std::sqrt(resultantSq)`: same
+    // criterion, no sqrt, and nothing to say about resultantSq == 0, which the
+    // early return above has already taken.
+    constexpr double kMinShaftShareOfResultant = 0.1;
+    if (tangentialSpeed * tangentialSpeed > kMinShaftShareOfResultant * resultantSq) {
         const double nd = revsPerSecond * p.diameter;
         s.advanceRatio = s.advanceSpeed / nd;
         const double d4 = p.diameter * p.diameter * p.diameter * p.diameter;
