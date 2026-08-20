@@ -452,6 +452,15 @@ int main(int argc, char** argv) {
     if (!parse(argc, argv, options)) return 2;
 
     sim::Ship ferry = game::buildFerry();
+    // **What the mesher could not build, which this tool collected and then read
+    // nowhere.** That is the one state worse than passing `nullptr`: a reader who
+    // greps for `&problems` finds the collection and stops, so the code carries the
+    // appearance of handling the channel while the channel reaches no one, and the
+    // omission is invisible in exactly the place someone would look for it.
+    // `makeStructuralMesh` returns its mesh whatever happened -- a description whose
+    // frames will not lay out comes back *empty* -- and says why only through this
+    // pointer, so every figure below, in every mode, is a property of a structure
+    // nobody checked. On the ferry it is never empty; see the print below.
     std::vector<std::string> problems;
     // `--no-frames` strips every athwartships member, and it applies to **every** mode
     // rather than only to `--profile`, because it is the one control that separates a
@@ -469,6 +478,13 @@ int main(int argc, char** argv) {
 
     std::printf("ferry structure: %zu panels, %zu members, frame spacing %.3f m\n",
                 structure.panels.size(), structure.members.size(), structure.frameSpacing);
+    // Directly under the line that counts the structure, because a panel count cannot
+    // say what kind of panels they are: 8 900 with the bilge seam declared at girth
+    // fraction 0.28 while the turn of the bilge is at 0.511 is a different ship from
+    // 8 900 without, and this prints on every run because the ferry is the first of
+    // those. The other four structural-figure tools already say it; this one was the
+    // last still silent, so the wording and the `!` are theirs rather than new.
+    for (const std::string& problem : problems) std::printf("  ! %s\n", problem.c_str());
     std::printf("Tier 0 at x = %.2f m: A = %.5f m^2, neutral axis %.5f m, I = %.5f m^4\n",
                 middle, girder.area, girder.neutralAxis, girder.secondMoment);
     std::printf("             so EA = %.5e N, EI = %.5e N m^2\n\n", youngs * girder.area,
