@@ -13,11 +13,14 @@
 #include "engine/sim/ship.hpp"
 #include "harness.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 using namespace sim;
+using testing::expectEqual;
 using testing::expectNear;
 using testing::expectTrue;
 
@@ -291,7 +294,16 @@ void testEnergyToTearIsAPlausibleSizeForShipStructure() {
 
 // --- Against a real ship -----------------------------------------------------
 
-void testImpactDamageGrowsWithEnergyAndIsLocal() {
+// --- The ship the strike tests are driven against ------------------------------
+
+// Starboard side, amidships, below the waterline.
+const Vec3 kImpact{0.0, -9.0, 4.0};
+
+// The reference ferry's structure. Three tests need the same hull, the same
+// scantlings and the same impact point, and one of them has to find the struck bay
+// *without* asking `impactDamage` which one it was -- so the fixture is built here
+// rather than three times over.
+StructuralMesh ferryStructure() {
     Ship ferry;
     std::vector<Station> stations;
     for (int i = 0; i <= 40; ++i) {
@@ -306,10 +318,38 @@ void testImpactDamageGrowsWithEnergyAndIsLocal() {
     ferry.lightshipCog = {0, 0, 6.0};
     ferry.gyradii = {6, 30, 30};
     ferry.initialise(0.0);
+    return makeStructuralMesh(ferry.hull, ferryScantlings());
+}
 
+// How far a reported panel is from the strike -- the same distance `impactDamage`
+// sorts and bounds on, recomputed from the mesh rather than read back out of it.
+double reachOf(const StructuralMesh& structure, int index) {
+    return length(structure.panels[static_cast<std::size_t>(index)].centroid() - kImpact);
+}
+
+// The bay under the impact point, found by scanning the mesh. Independent of the
+// strike, which is the point: the panel model `impactDamage` builds can only be
+// checked against a panel someone else picked.
+int nearestShellPanel(const StructuralMesh& structure) {
+    int nearest = -1;
+    for (std::size_t i = 0; i < structure.panels.size(); ++i) {
+        if (structure.panels[i].role != PanelRole::Shell) continue;
+        if (nearest < 0 || reachOf(structure, static_cast<int>(i)) < reachOf(structure, nearest))
+            nearest = static_cast<int>(i);
+    }
+    return nearest;
+}
+
+double yieldStrengthOf(const StructuralMesh& structure, const PlatePanel& panel) {
+    return panel.material >= 0 && panel.material < static_cast<int>(structure.materials.size())
+               ? structure.materials[static_cast<std::size_t>(panel.material)].yieldStrength
+               : ah36Steel().yieldStrength;
+}
+
+void testImpactDamageGrowsWithEnergyAndIsLocal() {
     const Scantlings sc = ferryScantlings();
-    const StructuralMesh structure = makeStructuralMesh(ferry.hull, sc);
-    const Vec3 impact{0.0, -9.0, 4.0};   // starboard side, amidships, below the waterline
+    const StructuralMesh structure = ferryStructure();
+    const Vec3 impact = kImpact;
 
     const ImpactDamage nudge = impactDamage(structure, impact, 6.0, 2.0e5, sc);
     const ImpactDamage light = impactDamage(structure, impact, 6.0, 2.0e6, sc);
@@ -368,18 +408,220 @@ void testImpactDamageGrowsWithEnergyAndIsLocal() {
                impactDamage(structure, impact, 3.0, 0.0, sc).panels.empty());
 }
 
+// What the strike actually hands the panel model, against numbers derived here.
+//
+// **Every energy assertion in this file is blind to the span by construction.** A
+// bay tears at `sigma_y t (span x contactWidth) eps_f` and `impactDamage` sets
+// `contactWidth = area / span`, so the span cancels out of the product and a bay
+// that spans the wrong way tears at all but the same energy. The one penetration
+// assertion above is a ratio between two strikes, where it cancels again. Nothing
+// here ever compared a per-panel model input against an independently derived
+// value, only against another strike -- so `span = max(...)` in place of `min`, and
+// a struck width that multiplies by the span where it should divide, both passed
+// the whole file.
+//
+// They are not small. The header records what the zone FEM cost to settle: the
+// hole moves 5%, because the failure strain is nearly flat over this range, but
+// **penetration and resisting force move by 3.4x**, in the direction of reporting
+// the hull far softer than it is. Both witnesses are below.
+void testTheStrikeBuildsThePanelModelItClaimsTo() {
+    const Scantlings sc = ferryScantlings();
+    const StructuralMesh structure = ferryStructure();
+
+    // The two spacings the mesh was built with. A plate spans the *short* way
+    // between its supports, so on this longitudinally framed side the span is the
+    // 0.70 m longitudinal spacing and not the 2.40 m frame spacing; both are named
+    // so what follows rests on which of them is smaller rather than on a constant.
+    expectNear("the ferry is framed transversely at 2.40 m", structure.frameSpacing, 2.40, 1e-12);
+    expectNear("and longitudinally at 0.70 m", sc.longitudinalSpacing, 0.70, 1e-12);
+    const double span = std::min(structure.frameSpacing, sc.longitudinalSpacing);
+
+    // The bay under the impact, picked out of the mesh rather than read back out of
+    // the answer.
+    const int nearest = nearestShellPanel(structure);
+    expectTrue("the impact point has a bay under it", nearest >= 0);
+    const PlatePanel& bay = structure.panels[static_cast<std::size_t>(nearest)];
+    const double sigmaY = yieldStrengthOf(structure, bay);
+
+    // --- witness one: the penetration of a strike too weak to tear anything ------
+    //
+    // Below tearing the failure strain plays no part, so the answer is the membrane
+    // inverse alone. With `w = A/L` and `h = L/2`,
+    //
+    //     scale = 2 sigma_y t w = 2 sigma_y t A / L
+    //     u     = E / scale     = E L / (2 sigma_y t A) = c L,  c = E / (2 sigma_y t A)
+    //     d     = sqrt(u (u + 2h)) = sqrt(c^2 L^2 + c L^2)     = L sqrt(c^2 + c)
+    //
+    // -- **the penetration is exactly proportional to the span.** The two routes the
+    // span takes into the answer, through the half-span and through the struck width
+    // that divides by it, pull the same way instead of cancelling, which is why this
+    // is the term the mistake shows up in and the energy is not. 2.40 / 0.70 = 3.43
+    // is the header's 3.4x, and it is the whole of the difference between 0.686 m of
+    // reported denting and the true 0.205.
+    //
+    // On this bay: A = 1.7136 m2, t = 12.0 mm, sigma_y = 355 MPa, E = 200 kJ, so
+    // c = 200e3 / (2 x 355e6 x 0.012 x 1.7136) = 1.36988e-2 and
+    // d = 0.70 sqrt(c^2 + c) = 82.488 mm. Spanning the long way gives 282.82 mm;
+    // multiplying by the span where the model divides gives 118.67 mm.
+    const double energy = 2.0e5;
+    const ImpactDamage nudge = impactDamage(structure, kImpact, 6.0, energy, sc);
+    expectTrue("a 200 kJ nudge dents one bay and stops in it",
+               nudge.torn.empty() && nudge.panels.size() == 1 && nudge.panels[0] == nearest);
+    const double c = energy / (2.0 * sigmaY * bay.thickness * bay.area());
+    const double expected = span * std::sqrt(c * c + c);
+    std::printf("     a 200 kJ nudge dents the struck bay %.3f mm; derived %.3f mm\n",
+                1e3 * nudge.penetration, 1e3 * expected);
+    expectNear("the strike dents the bay by L sqrt(c^2 + c), c = E / (2 sigma_y t A)",
+               nudge.penetration, expected, 1e-9 * expected);
+
+    // --- witness two: what a torn patch costs -----------------------------------
+    //
+    // The other half of the same finding, and the half the header's "5%, not
+    // tenfold" rests on. A bay tears at `sigma_y t (L w) eps_f` exactly -- at the
+    // tearing depth sqrt(h^2 + d_f^2) = h (1 + eps_f), so the energy collapses to
+    // that -- and `L w` is the bay's own area, so the span reaches the answer only
+    // through the failure-strain regularisation.
+    //
+    // Asserted on the real ship, against an area, a yield strength and a failure
+    // strain written out here. A strike that runs out of *hull* rather than out of
+    // energy tears every bay it can reach and nothing else, so what it absorbed is
+    // the sum of their tearing energies -- a derived total, not a bound.
+    const double radius = 2.0;
+    const ImpactDamage cramped = impactDamage(structure, kImpact, radius, 2.0e8, sc);
+    const plasticity::Material steel = plasticity::shipSteel();
+    double toTear = 0;
+    long long reachable = 0;
+    for (const PlatePanel& p : structure.panels) {
+        if (p.role != PanelRole::Shell) continue;
+        if (length(p.centroid() - kImpact) > radius) continue;
+        ++reachable;
+        // The regularisation written out rather than called: an element no larger
+        // than the plate is thick contains the neck, a bigger one sees it diluted by
+        // t/l, and `l` is the span -- the length the membrane strain is smeared
+        // over. Here t/L = 0.012/0.70 = 1.7143e-2 and eps_f = 0.159564; on the frame
+        // spacing it would be 5.0e-3 and 0.151670. That 5.2% is the entire cost of
+        // the span error on the hole, against 3.4x on the depth of it.
+        const double share = std::min(1.0, p.thickness / span);
+        const double failureStrain =
+            steel.failure.uniformStrain +
+            (steel.failure.fractureStrain - steel.failure.uniformStrain) * share;
+        toTear += yieldStrengthOf(structure, p) * p.thickness * p.area() * failureStrain;
+    }
+    expectTrue("the cramped strike tore every bay it could reach and still had energy left",
+               cramped.torn.size() == static_cast<std::size_t>(reachable) &&
+                   cramped.energyUnspent > 0);
+    // 8 bays of 1.7136 m2 12 mm AH36: 8 x 355e6 x 0.012 x 1.7136 x 0.159564 =
+    // 9.31848e6 J. Spanning the long way makes it 8.85748e6; multiplying by the span
+    // instead of dividing makes it 0.49 of it.
+    std::printf("     %lld bays inside a %.1f m reach tear for %.5e J; the strike absorbed %.5e\n",
+                reachable, radius, toTear, cramped.energyAbsorbed);
+    expectNear("a torn patch costs sigma_y t A eps_f, bay by bay", cramped.energyAbsorbed, toTear,
+               1e-9 * toTear);
+}
+
+// The march itself: how far it may go, and in what order it goes.
+void testTheMarchIsOutwardAndBoundedByTheRadius() {
+    const Scantlings sc = ferryScantlings();
+    const StructuralMesh structure = ferryStructure();
+
+    // --- the radius is a bound on the reach --------------------------------------
+    //
+    // **The only locality check this file had compares two strikes 40 m apart**,
+    // which a 6 m reach and a 12 m reach separate equally well: nothing asserted
+    // that a bay the strike *reached* was inside the radius at all, so doubling the
+    // radius was survived. Asserted on a strike that runs out of hull rather than
+    // out of energy, because then the reached set is the whole reachable set and the
+    // count is two-sided -- no bay outside, and every bay inside.
+    const double radius = 2.0;
+    const ImpactDamage cramped = impactDamage(structure, kImpact, radius, 2.0e8, sc);
+    expectTrue("the strike has energy to spare, so it stops for want of hull and not of energy",
+               cramped.energyUnspent > 0);
+
+    long long reachable = 0;
+    for (const PlatePanel& p : structure.panels)
+        if (p.role == PanelRole::Shell && length(p.centroid() - kImpact) <= radius) ++reachable;
+
+    double farthest = 0;
+    bool inside = true;
+    for (int index : cramped.panels) {
+        const double reach = reachOf(structure, index);
+        farthest = std::max(farthest, reach);
+        if (reach > radius) inside = false;
+    }
+    std::printf("     a %.1f m reach holds %lld bays; the strike touched %zu, out to %.4f m\n",
+                radius, reachable, cramped.panels.size(), farthest);
+    expectTrue("no bay outside the radius is touched", inside);
+    expectEqual("and every bay inside it is", static_cast<long long>(cramped.panels.size()),
+                reachable);
+    // "Inside the radius" is satisfied vacuously by a patch that stops well short of
+    // it, so say that the patch pushes against the bound: 1.62 m of the 2.00 asked
+    // for, the outermost bay centroid the mesh has inside that reach.
+    expectTrue("and the patch reaches most of the way out to the bound", farthest > 0.7 * radius);
+
+    // --- and the energy is spent outward -----------------------------------------
+    //
+    // The outward march was itself the fix for a measured defect -- energy shared
+    // over a fixed patch by area made the hole a property of the contact radius
+    // rather than of the collision -- and every assertion it arrived with is a
+    // count, an area or a total. **None of them names an order**, so spending the
+    // energy on the farthest bay first passed all of them.
+    const ImpactDamage heavy = impactDamage(structure, kImpact, 6.0, 2.0e8, sc);
+    expectTrue("the heavy strike reaches enough bays for an order to exist",
+               heavy.panels.size() > 10);
+    bool outward = true;
+    double previous = -1.0;
+    for (int index : heavy.panels) {
+        const double reach = reachOf(structure, index);
+        if (reach < previous) outward = false;
+        previous = reach;
+    }
+    expectTrue("the bays are reported nearest first, which is the order they are spent in",
+               outward);
+
+    // The same statement where it decides a number rather than an ordering: a strike
+    // too weak to tear anything stops in the bay *nearest* the impact, and the bays
+    // within reach are not alike, so which one it picks is visible in the answer.
+    const ImpactDamage nudge = impactDamage(structure, kImpact, 6.0, 2.0e5, sc);
+    expectTrue("a strike that stops in one bay stops in the nearest one",
+               nudge.panels.size() == 1 && nudge.panels[0] == nearestShellPanel(structure));
+}
+
+// **Which problem, not whether there was one.**
+//
+// The slenderness fixture here was `span = 0.1` with the reference panel's 2.00 m
+// contact width left on it, and that trips *both* refusals: span/thickness of 8,
+// and a contact twenty times the span where the other rule allows four. So
+// `!validateIndentation(stubby).empty()` had been passing for the wrong reason --
+// it asserted that something came back, and deleting the slenderness guard outright
+// left it green, which is exactly what a mutation sweep found. Each fixture below
+// breaks one rule and is asserted against that rule by name; the panel that breaks
+// both is kept, and asserted to be told about both.
 void testValidateCatchesModelAbuse() {
     expectTrue("an ordinary bay raises nothing", validateIndentation(referencePanel()).empty());
 
     IndentedPanel stubby = referencePanel();
-    stubby.span = 0.1;   // span/thickness of 8: a block, not a membrane
-    expectTrue("a span only a few thicknesses long is refused",
-               !validateIndentation(stubby).empty());
+    stubby.span = 0.10;          // span/thickness of 8.3: a block, not a membrane
+    stubby.contactWidth = 0.30;  // and inside 4 x span, so the contact rule stays quiet
+    const std::vector<std::string> stubbyProblems = validateIndentation(stubby);
+    expectEqual("a span only a few thicknesses long is refused, on its own account",
+                static_cast<long long>(stubbyProblems.size()), 1);
+    expectTrue("and what it is told is that the bending it omits is no longer negligible",
+               stubbyProblems.size() == 1 &&
+                   stubbyProblems[0].find("span/thickness below 20") != std::string::npos);
 
     IndentedPanel wide = referencePanel();
-    wide.contactWidth = 100.0;
-    expectTrue("a contact far wider than the span is refused",
-               !validateIndentation(wide).empty());
+    wide.contactWidth = 100.0;   // 42 x the span; span/thickness is a healthy 200
+    const std::vector<std::string> wideProblems = validateIndentation(wide);
+    expectEqual("a contact far wider than the span is refused, on its own account",
+                static_cast<long long>(wideProblems.size()), 1);
+    expectTrue("and what it is told is that the surrounding structure would share the load",
+               wideProblems.size() == 1 &&
+                   wideProblems[0].find("contact much wider than the span") != std::string::npos);
+
+    IndentedPanel both = stubby;
+    both.contactWidth = 2.00;    // the fixture as it stood: stubby *and* over-wide
+    expectEqual("a bay that breaks both rules is told about both",
+                static_cast<long long>(validateIndentation(both).size()), 2);
 }
 
 }  // namespace
@@ -392,5 +634,7 @@ void runIndentationTests() {
     testTearingHappensAtTheFailureStrainAndNotBefore();
     testEnergyToTearIsAPlausibleSizeForShipStructure();
     testImpactDamageGrowsWithEnergyAndIsLocal();
+    testTheStrikeBuildsThePanelModelItClaimsTo();
+    testTheMarchIsOutwardAndBoundedByTheRadius();
     testValidateCatchesModelAbuse();
 }
