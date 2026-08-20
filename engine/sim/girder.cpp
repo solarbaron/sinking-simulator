@@ -231,9 +231,39 @@ bool balanceOnWave(Ship& ship, const Sea& sea, int iterations, int* iterationsUs
     // the same ship -- so there is nothing here to balance.
     const double length = ship.hullHi.x - ship.hullLo.x;
     if (!(length > 0)) return false;
-    // Longitudinal centre of gravity, in world coordinates along the ship.
+    // A fixed world point to take moments about -- **not** the centre of gravity,
+    // which is the trap this line used to be.
+    //
+    // The weight acts at the centre of gravity, and the centre of gravity moves
+    // as she trims. `massProperties()` is orientation-free, so the *body*-frame
+    // cog is fixed for the whole iteration; its world x is `(R * cog + p).x`, and
+    // `R` is one of the two things this loop is solving for. Taking that world x
+    // once, at the entry orientation, and driving the centre of buoyancy onto it
+    // solves for the centre of buoyancy against a **stale** centre of gravity: at
+    // a trim of `t` the stale point sits `xg (cos t - 1) + zg sin t` from the live
+    // one, which is `KG * t` to first order and does not shrink as the residual
+    // does.
+    //
+    // Measured on the barge below -- +4.5 m LCG, 6.0 m KG, 120 m long -- before
+    // this was fixed: the loop converged to 7.5e-9 of her weight in heave and left
+    // the centre of buoyancy **0.11063 m** from the live centre of gravity. That
+    // is 9.2e-4 of her length and 900x the tolerance the loop stops on, and it is
+    // `KG * trim` to four figures (6.0 * 0.0185542 = 0.111325, against 0.110544
+    // once the `xg (cos t - 1)` term is carried too), which is what identifies the
+    // mechanism rather than merely sizing the error. A tight convergence onto the
+    // wrong equilibrium.
+    //
+    // So the moment below is taken about this fixed point with the weight's own
+    // moment about it subtracted. A *fixed* point is the right choice rather than
+    // the live cog: `(force, moment)` is then the net wrench on the ship about one
+    // world axis, which is exactly the pair that has to vanish for `hullGirder()`'s
+    // shear and bending curves to close at the far end. Which point it is matters
+    // only while `force` is nonzero -- moving the reference by `L` moves the moment
+    // by `force * L` -- and the entry LCG keeps that lever short, so the tolerance
+    // below stays a statement about the moment and not about the force.
     const Mat3 R0 = ship.state.orientation.toMat3();
-    const double lcgWorld = (R0 * d.centreOfGravity + ship.state.position).x;
+    const Vec3 cogBody = d.centreOfGravity;
+    const double reference = (R0 * cogBody + ship.state.position).x;
 
     // Two residuals -- net vertical force and net trimming moment -- against two
     // unknowns, sinkage and trim. Newton with a numerical Jacobian; each residual
@@ -250,8 +280,36 @@ bool balanceOnWave(Ship& ship, const Sea& sea, int iterations, int* iterationsUs
                          });
         const double buoyancy = s.seaDensity * kGravity * wet.volume;
         force = buoyancy - weight;
-        // Trimming moment about the centre of gravity.
-        moment = buoyancy * (wet.centroid.x - lcgWorld);
+        // Net trimming moment about `reference`: buoyancy up at the wet centroid,
+        // weight down at the centre of gravity *as she is floating in this trial
+        // attitude*. Both levers are world x because both forces are vertical in
+        // the world, and the live cog costs nothing but a 3x3 multiply -- the
+        // whole-hull integral above is the expensive half of this lambda.
+        //
+        // At a solution the two conditions read `buoyancy == weight` and
+        // `x_B == x_G` in world coordinates, which in hull coordinates is
+        // `xi_B - xi_G = BG_vertical * tan(trim)`: the centre of buoyancy is
+        // *not* at the same station as the centre of gravity on a trimmed ship,
+        // and the frozen point above was quietly asserting that it was.
+        //
+        // **That costs a little on `momentClosure`, and it is worth being clear
+        // about which of the two is the approximation.** `integrateGirder` works
+        // in body-frame stations, so its far-end moment residual is
+        // `W (xi_B - xi_G) = W BG tan(trim)` -- 4.1e-3 of `W L / 8` on the barge
+        // below against 3.4e-3 before, because the old attitude drove `xi_B` onto
+        // `xi_G` and made the beam close by standing the ship somewhere she does
+        // not float. The beam is what is incomplete: resolve each vertical load
+        // into components along and across an inclined hull and the axial parts,
+        // acting at their own height above the axis, contribute exactly
+        // `-W BG sin(trim)`, cancelling the `cos(trim) * W BG tan(trim)` the
+        // transverse parts leave. `integrateGirder` drops them, as every
+        // small-angle girder calculation does. So the residual is the beam
+        // model's own trim approximation surfacing, not the balance failing, and
+        // it is bounded by `BG/L * trim` -- about 1.1e-3 on the ferry, still
+        // water and on a crest alike, which is forty times under
+        // `validateGirder`'s 0.05 threshold.
+        const double lcgWorld = (R * cogBody + s.state.position).x;
+        moment = buoyancy * (wet.centroid.x - reference) - weight * (lcgWorld - reference);
     };
 
     const auto shifted = [&](double dz, double dTrim) {
@@ -308,7 +366,30 @@ bool balanceOnWave(Ship& ship, const Sea& sea, int iterations, int* iterationsUs
     ship = shifted(dz, dTrim);
     double f = 0, m = 0;
     residuals(ship, f, m);
-    return std::abs(f) < 1e-3 * weight;
+    // **Both** residuals. `m` was computed on this line and thrown away, so the
+    // caller was told "balanced" about a ship that had converged in heave and was
+    // still rotating -- and that is not a small error dressed as success. It is
+    // the failure this whole function exists to prevent, reported as success:
+    // `hullGirder()` takes the ship straight from here, and a hull with a net
+    // trimming moment integrates to shear and bending curves that grow towards the
+    // far end instead of closing.
+    //
+    // The moment leg is `1e-3 * weight * length` and not `1e-3 * weight`, for the
+    // reason the loop's own tolerance above is scaled that way: a moment
+    // is bounded by a force times a lever or it is bounded by nothing that means
+    // the same on two hulls. 1e-3 rather than the loop's 1e-6 because this is the
+    // did-it-get-there test and not the stopping criterion -- three decades of
+    // slack, the same slack the force leg already had, so the two legs are one
+    // relative tolerance each against its own scale.
+    //
+    // Measured with the budget starved so the loop *cannot* finish, on the +4.5 m
+    // barge in still water: one Newton step leaves her 8.8e-5 of her weight out in
+    // heave -- inside the force leg by eleven times, so the old return called that
+    // balanced -- and 1.13e-2 of `weight * length` out in moment, eleven times
+    // outside this one, with a bending moment curve that misses closure by 8.7% of
+    // the `W L / 8` reference. Force alone cannot see that; it is the whole of what
+    // the ship is doing wrong.
+    return std::abs(f) < 1e-3 * weight && std::abs(m) < 1e-3 * weight * length;
 }
 
 HullGirder hullGirder(const Ship& ship, const Sea& sea, int stationCount, bool balance) {
