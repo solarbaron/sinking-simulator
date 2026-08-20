@@ -73,6 +73,44 @@ missing. Zero mutants is refused, an unknown index is refused by name, `--only '
 selects nothing rather than everything, and a run containing only controls reports
 that there is no rate rather than dividing by zero.
 
+**A kill can be right for the wrong reason, and the confirmation pass was blind to
+exactly that.** `--confirm` re-runs the verdicts that did *not* match their recorded
+expectation, on the argument that a verdict which matched is not the one at risk.
+That argument is false in one direction and it has already cost us: on the first
+`indentation` sweep, mutant 4 was scored KILLED on `FAIL a ship written to disk
+loads back: /tmp/barge.ship: empty, or not a ship file` -- a failing check about a
+*neighbouring worker's* file, four suites having shared one `/tmp`. The mutant
+deserved killing on its own merits, so the rate did not move and nothing was
+re-run, because the outcome matched expectation. A kill for the wrong reason is
+invisible to a pass that only looks at surprises. The race itself is closed
+(`testing::scratchDir()` now mkdtemps per process), the blindness was not, and the
+next cause will be a different one. Three things now look at kills that surprised
+nobody:
+
+  * the strings that *decided* a verdict -- the failing check that stopped the
+    suite, the warning that failed the build -- are scanned for absolute paths, and
+    a kill whose evidence names a file outside the workspace that produced it is
+    reported and re-run. `/tmp/barge.ship` is not under any workspace; a
+    neighbour's `tmp1/` is not under worker 0's either. This is narrow, and the
+    narrowness is honest: it catches a verdict decided by a file the mutant did not
+    own, and nothing else.
+  * a **sample** of the expected kills is re-run too (`--confirm-kills`, a fraction,
+    default 0.1, rounded up so the pass is never entirely blind). A kill that does
+    not reproduce is FLAKY and leaves the kill count, exactly as an unexpected one
+    does. The sample is chosen by hashing `seed:index`, so it is the same sample on
+    every re-run of the same invocation and the `rerun` line carries the seed.
+  * a re-run that reaches the same verdict is also asked whether it reached it the
+    *same way*. The `/tmp/barge.ship` kill would have reproduced as a kill --
+    mutant 4 was a real mutant -- while its reason changed completely. Outcome
+    equality is a weaker check than it looks, and comparing reasons costs nothing
+    once the re-run has happened.
+
+What none of this can see is a kill that is wrong *and* deterministic *and* names
+no path: an assertion that fails for a reason unrelated to the mutation, every
+time. That needs the third option -- proving the failing check is one the mutated
+code can reach -- and the catalogue does not record which *symbol* it edited, only
+a file and a fragment of text, so there is nothing to start a call graph from.
+
 **The result says how to run itself again, defaults included.** `zone_probe` printed
 the parameters it was *given* rather than the ones it *used*, and two published
 tables lost the defaults they were taken at -- one of them turned out to describe a
@@ -148,7 +186,24 @@ DEFAULTS = {
     # sweep's two false kills, and a false kill inflates the rate while hiding a
     # real gap. Parallelism must not be able to decide a verdict.
     "SCRATCH_ENV": ["TMPDIR", "TMP", "TEMP", "SHIPSIM_TEST_TMPDIR"],
+    # Absolute paths a verdict may legitimately name without owning them: the
+    # read-only roots a toolchain diagnostic points into. `/usr/include/c++/14/bits/
+    # stl_algo.h:1234: warning:` is a real warning about the mutant and must not be
+    # mistaken for a neighbour's scratch file. Everything else absolute and outside
+    # the workspace is foreign, `/tmp` emphatically included -- that is where the
+    # incident happened.
+    "FOREIGN_PATH_EXEMPT": ["/usr/", "/lib/", "/lib64/", "/opt/", "/bin/", "/sbin/",
+                            "/etc/", "/proc/", "/sys/", "/dev/", "/nix/store/",
+                            "/gnu/store/", "/run/"],
 }
+
+
+# A path with at least two components, not preceded by a word character, another
+# slash or a colon -- so `https://host/thing` does not read as `//host/thing`, and a
+# bare `/tmp` mentioned in prose does not read as a file. Trailing punctuation is
+# left out of the character class on purpose: the incident's line was
+# `... loads back: /tmp/barge.ship: empty`, and the path there ends at the colon.
+PATH_IN_TEXT = re.compile(r"(?<![\w/:.~-])(/[\w.+@%-]+(?:/[\w.+@%-]+)+)")
 
 
 # --- running something under a bound -------------------------------------------
@@ -432,6 +487,102 @@ def moved(before, after):
                   | {name for name in set(before) & set(after) if before[name] != after[name]})
 
 
+# --- was this kill about the mutation, or about something else? -------------------
+
+def verdict_evidence(catalogue, reason, build, test):
+    """The untruncated strings a verdict was actually read from.
+
+    Not the whole output. A path scan over a hundred lines of build chatter is a
+    false-positive generator, and `tests/harness.cpp` alone prints `test output kept
+    in /tmp/...` on every run without that line deciding anything. Only lines that
+    *are* a verdict qualify: the failing check that stopped the suite, the warnings
+    that failed the build, and -- when the suite was run to the end and the verdict
+    is a count of failures -- the failing checks themselves. The reason string is
+    included too, but it is truncated to 90 characters and a path can be cut in
+    half by that, which is why the lines it was built from are here as well.
+    """
+    items = [reason]
+    if build is not None:
+        items += list(build.kept)
+    if test is not None:
+        if test.stopped_early:
+            items.append(test.stopped_early)
+        failing = re.compile(catalogue.fail_line)
+        items += [line for line in test.lines if failing.search(line)]
+    return items
+
+
+def paths_outside(items, owned, exempt):
+    """Absolute paths in `items` that no directory in `owned` contains.
+
+    `owned` is *this workspace's* three directories rather than the sweep's scratch
+    root, deliberately: worker 0 being killed by a file under worker 1's `tmp1/` is
+    the original incident with the shared `/tmp` swapped for a shared root, and it
+    would read as "inside the sweep" to a check that only looked at the root.
+    """
+    owned = [str(root).rstrip("/") for root in owned]
+    found = []
+    for text in items:
+        for match in PATH_IN_TEXT.finditer(text or ""):
+            path = match.group(1)
+            # Containment in both directions. The forward test is the question being
+            # asked. The backward one is about truncation: the reason string is cut
+            # at 90 characters, so a workspace path can arrive as
+            # `/tmp/shipsim-mutate-ab/tm` -- which no longer *starts with* any owned
+            # directory and would otherwise be accused of being somebody else's. A
+            # string that could be a prefix of a directory this workspace owns is not
+            # evidence that it is not, and a false accusation here costs more than a
+            # missed one: it is the same asymmetry as a false kill against a survivor.
+            if any(path == root or path.startswith(root + "/") or root.startswith(path)
+                   for root in owned):
+                continue
+            if any(path.startswith(prefix) for prefix in exempt):
+                continue
+            if path not in found:
+                found.append(path)
+    # The reason string is truncated to 90 characters and a path can be cut in half
+    # by that, so the same file can arrive twice -- once whole from the line the
+    # verdict was read from, once as its own prefix. Report the whole one. A
+    # directory named alongside a file inside it collapses the same way, which is
+    # what we want in a report of what a verdict touched.
+    return [path for path in found
+            if not any(other != path and other.startswith(path) for other in found)]
+
+
+# Timings and counts move between two runs of the same verdict for reasons that are
+# not the verdict: `no failing check and no exit after 31s CPU / 44s wall` is the
+# same reason twice. Digits are the only part that legitimately drifts, so they are
+# the only part normalised away -- a *different failing check* still reads as
+# different, which is the whole point.
+DIGITS = re.compile(r"\d+(?:\.\d+)?")
+
+
+def same_reason(first, second):
+    return DIGITS.sub("#", first) == DIGITS.sub("#", second)
+
+
+def confirmation_sample(indices, fraction, seed):
+    """Which of the kills that surprised nobody get re-run anyway.
+
+    Deterministic, and deterministic in a way that does not depend on the Python
+    build: `random.sample` is not specified to give the same answer across versions,
+    and a sample nobody can reproduce would put the `rerun` line back in the state
+    `zone_probe` left its published tables in. Ordering by sha256 of `seed:index` is
+    fully specified by this line.
+
+    Rounded up rather than down, so a fraction above zero always samples at least
+    one kill. Rounding down would make a small catalogue silently fall back to the
+    behaviour this exists to replace.
+    """
+    if not indices or fraction <= 0:
+        return []
+    count = min(len(indices), -(-int(round(fraction * len(indices) * 1000)) // 1000))
+    count = max(1, count)
+    order = sorted(indices,
+                   key=lambda i: hashlib.sha256(f"{seed}:{i}".encode()).hexdigest())
+    return sorted(order[:count])
+
+
 # --- the sweep ---------------------------------------------------------------------
 
 @dataclasses.dataclass
@@ -598,13 +749,19 @@ def invocation(catalogue, args, chosen):
                "cpu_factor": args.cpu_factor, "wall_factor": args.wall_factor,
                "cpu_floor": catalogue.cpu_floor, "wall_floor": catalogue.wall_floor,
                "baseline_runs": args.baseline_runs, "confirm": args.confirm,
+               # The sample is only reproducible if the seed travels with it, and an
+               # unreproducible sample is the state `zone_probe` left its tables in.
+               "confirm_kills": args.confirm_kills, "confirm_seed": args.confirm_seed,
                "early_kill": not args.no_early_kill,
-               "scratch_env": catalogue.scratch_env}
+               "scratch_env": catalogue.scratch_env,
+               "foreign_path_exempt": catalogue.foreign_path_exempt}
     rerun = [sys.executable, str(pathlib.Path(__file__).resolve()), "run", args.catalogue,
              "--workers", str(args.workers), "--cpu-factor", repr(args.cpu_factor),
              "--wall-factor", repr(args.wall_factor), "--cpu-floor", repr(catalogue.cpu_floor),
              "--wall-floor", repr(catalogue.wall_floor),
-             "--baseline-runs", str(args.baseline_runs), "--confirm", str(args.confirm)]
+             "--baseline-runs", str(args.baseline_runs), "--confirm", str(args.confirm),
+             "--confirm-kills", repr(args.confirm_kills),
+             "--confirm-seed", str(args.confirm_seed)]
     if args.only is not None:
         rerun += ["--only", args.only]
     if args.no_early_kill:
@@ -737,6 +894,14 @@ def sweep(catalogue, args):
                 "wall_policy_would_have_hung":
                     bool(test is not None and not test.hung
                          and test.wall > args.cpu_factor * bound.baseline_wall),
+                # Absolute paths in the evidence that this workspace does not own.
+                # Recorded for every verdict, acted on for kills: a survivor whose
+                # output mentions a neighbour's file is a curiosity, a *kill*
+                # decided by one is a verdict about somebody else's mutation.
+                "foreign_paths": paths_outside(
+                    verdict_evidence(catalogue, reason, build, test),
+                    [workspace.src, workspace.build, workspace.tmp],
+                    catalogue.foreign_path_exempt),
             }
             wanted = EXPECTED_OUTCOME[mutant.expect]
             flag = ""
@@ -770,21 +935,76 @@ def sweep(catalogue, args):
         # of the kill count entirely. The re-runs are serial even when the sweep was
         # not: the thing being re-examined may well be load-sensitive, so this is the
         # wrong moment to add load.
+        #
+        # **And the surprises are not the only verdicts at risk.** The argument above
+        # is sound in one direction only. A kill that *matched* its expectation is
+        # never re-examined, so a kill that happened for the wrong reason cannot be
+        # seen at all -- which is not hypothetical: `indentation` mutant 4 was scored
+        # KILLED on a failing check about a neighbouring worker's `/tmp/barge.ship`.
+        # It deserved killing anyway, the rate did not move, and nothing looked. Two
+        # more populations are therefore re-run: the kills whose evidence names a
+        # file outside the workspace that produced them, and a sample of the rest.
+        for record in results:
+            record["kill_names_a_foreign_path"] = bool(record["outcome"] == KILLED
+                                                       and record["foreign_paths"])
+        # Nothing is *marked* for re-checking unless it is going to be re-checked.
+        # `--confirm 0` switches the whole pass off, and a report that named a sample
+        # it never ran would be claiming an examination that did not happen -- the
+        # same shape as the figure gate printing a success line having checked
+        # nothing.
+        settled, sample, recheck = [], [], []
+        if args.confirm > 0:
+            for record in results:
+                if record["outcome"] != EXPECTED_OUTCOME[record["expect"]]:
+                    record["rechecked_because"] = "the verdict did not match its expectation"
+                elif record["kill_names_a_foreign_path"]:
+                    record["rechecked_because"] = ("the failing check names "
+                                                   + ", ".join(record["foreign_paths"][:3])
+                                                   + ", which this workspace does not own")
+            settled = [r["index"] for r in results
+                       if r["expect"] == "kill" and r["outcome"] == KILLED
+                       and "rechecked_because" not in r]
+            sample = confirmation_sample(settled, args.confirm_kills, args.confirm_seed)
+            for record in results:
+                if record["index"] in sample:
+                    record["rechecked_because"] = "sampled from the kills that surprised nobody"
+            recheck = [r for r in results if "rechecked_because" in r]
         surprises = [r for r in results if r["outcome"] != EXPECTED_OUTCOME[r["expect"]]]
-        if surprises and args.confirm > 0:
-            print(f"\nre-running {len(surprises)} unexpected verdict(s) {args.confirm}x "
-                  f"to see whether they reproduce")
+        if recheck:
+            print(f"\nre-running {len(recheck)} verdict(s) {args.confirm}x to see whether they"
+                  f" reproduce: {len(surprises)} unexpected,"
+                  f" {sum(1 for r in recheck if r['kill_names_a_foreign_path'])} naming a path"
+                  f" outside their workspace, {len(sample)} sampled from {len(settled)}"
+                  f" kill(s) that matched expectation")
             index = {m.index: m for m in chosen}
-            for record in surprises:
+            for record in recheck:
                 seen = [record["outcome"]]
+                reasons = [record["reason"]]
                 for _ in range(args.confirm):
-                    seen.append(one(index[record["index"]])["outcome"])
+                    again = one(index[record["index"]])
+                    seen.append(again["outcome"])
+                    reasons.append(again["reason"])
                 record["confirmations"] = seen
+                record["confirmation_reasons"] = reasons
                 if len(set(seen)) > 1:
                     record["outcome"] = FLAKY
                     record["reason"] = ("does not reproduce: " + ", ".join(seen)
                                         + " -- " + record["reason"])
                     print(f"{record['index']:3d} FLAKY    {record['label']}: {record['reason']}")
+                    continue
+                # **The same verdict is not the same measurement.** Mutant 4 above
+                # would have reproduced as a kill -- it was a real mutant, and the
+                # second run would have killed it on its own merits while the
+                # neighbour's file was gone. Outcome equality would have called that
+                # confirmed. Only the digits are normalised away, because a hang's
+                # reason carries its seconds; a *different failing check* still reads
+                # as different, which is the entire point.
+                record["reason_reproduced"] = all(same_reason(reasons[0], other)
+                                                  for other in reasons[1:])
+                if not record["reason_reproduced"]:
+                    print(f"{record['index']:3d} SAME VERDICT, ANOTHER REASON  {record['label']}:")
+                    for line in reasons:
+                        print(f"      {line}")
     finally:
         if args.keep:
             print(f"\nscratch kept at {root}")
@@ -812,6 +1032,17 @@ def summarise(catalogue, results, bound, changed, applied_after, elapsed, args):
     errors = [r for r in results if r["outcome"] == ERROR]
     flaky = [r for r in results if r["outcome"] == FLAKY]
     dead_controls = [r for r in controls if r["outcome"] not in (SURVIVED, FLAKY)]
+    # These three are the confirmation pass's new eyes. `kill_names_a_foreign_path`
+    # is recorded before any re-run can change an outcome, so a foreign-path kill
+    # that then turned FLAKY is still counted here as what it was.
+    foreign = [r for r in results if r.get("kill_names_a_foreign_path")]
+    lying = [r for r in results if r.get("reason_reproduced") is False]
+    sampled = [r for r in results
+               if r.get("rechecked_because", "").startswith("sampled")]
+    expected_kills = [r for r in real if r["expect"] == "kill"
+                      and r["outcome"] in (KILLED, FLAKY)]
+    rechecked_kills = [r for r in expected_kills if "confirmations" in r]
+    unreproduced = [r for r in rechecked_kills if r["outcome"] == FLAKY]
     # Hangs are reported apart from the kill rate rather than folded into it, and
     # *both* readings are printed. A sweep that hides the distinction is reporting a
     # number that depends on where its timeout landed; a sweep that publishes only
@@ -844,6 +1075,23 @@ def summarise(catalogue, results, bound, changed, applied_after, elapsed, args):
         print(f"  ERROR    {record['index']}: {record['label']} -- {record['reason']}")
     for record in flaky:
         print(f"  FLAKY    {record['index']}: {record['label']} -- {record['reason']}")
+    for record in foreign:
+        print(f"  KILLED BY A PATH IT DOES NOT OWN {record['index']}: {record['label']}"
+              f" -- {', '.join(record['foreign_paths'])}")
+    if foreign:
+        print("  a verdict decided by a file outside the workspace is a verdict about"
+              " something other than the mutation")
+    for record in lying:
+        print(f"  SAME VERDICT, ANOTHER REASON {record['index']}: {record['label']}"
+              f" -- {' | '.join(record['confirmation_reasons'])}")
+    if rechecked_kills:
+        print(f"  {len(rechecked_kills)} of {len(expected_kills)} expected kill(s) were re-run"
+              f" ({len(sampled)} of them sampled); {len(unreproduced)} did not reproduce."
+              f" The rate above is not corrected for the"
+              f" {len(expected_kills) - len(rechecked_kills)} that were not re-run")
+    elif expected_kills:
+        print("  no expected kill was re-run: --confirm-kills 0 leaves a kill for the wrong"
+              " reason invisible")
     if changed:
         mutated = {m["file"] for m in results}
         print(f"  THE TREE MOVED DURING THE SWEEP: {len(changed)} file(s) differ from how they"
@@ -890,6 +1138,13 @@ def summarise(catalogue, results, bound, changed, applied_after, elapsed, args):
             "control_death_labels": [r["label"] for r in dead_controls],
             "worst_cpu_ratio_of_a_finishing_mutant": near,
             "wall_policy_false_hangs": [r["index"] for r in false_kills],
+            "kills_naming_a_path_outside_the_workspace": [r["index"] for r in foreign],
+            "foreign_paths_named": sorted({q for r in foreign for q in r["foreign_paths"]}),
+            "kills_whose_reason_did_not_reproduce": [r["index"] for r in lying],
+            "expected_kills": len(expected_kills),
+            "expected_kills_rechecked": [r["index"] for r in rechecked_kills],
+            "expected_kills_sampled": [r["index"] for r in sampled],
+            "expected_kills_that_did_not_reproduce": [r["index"] for r in unreproduced],
             "tree_byte_identical_after": not changed,
             "tree_files_that_moved": changed,
             "a_mutated_file_moved": any(m["file"] in set(changed) for m in results),
@@ -902,8 +1157,11 @@ def summarise(catalogue, results, bound, changed, applied_after, elapsed, args):
             # clear this flag.
             # A sweep with nothing real in it is never clean, whatever else went
             # right: there is no measurement to be clean about.
+            # A kill decided by a file the workspace does not own, and a kill that
+            # reproduced as a kill by a different route, are both results this sweep
+            # cannot stand behind -- whatever the rate came out at.
             "clean": (bool(real) and not dead_controls and not errors and not flaky
-                      and not applied_after and not changed),
+                      and not applied_after and not changed and not foreign and not lying),
         },
         "mutants": results,
     }
@@ -933,6 +1191,13 @@ def main(argv=None):
     parser.add_argument("--confirm", type=int, default=1,
                         help="re-run each unexpected verdict this many times; a verdict that"
                              " does not reproduce is reported FLAKY rather than counted")
+    parser.add_argument("--confirm-kills", type=float, default=0.1,
+                        help="also re-run this fraction of the kills that matched their"
+                             " expectation, rounded up; 0 restores the behaviour that"
+                             " cannot see a kill for the wrong reason")
+    parser.add_argument("--confirm-seed", type=int, default=None,
+                        help="which sample; default is derived from the catalogue's sha256"
+                             " and is recorded in the result")
     parser.add_argument("--no-early-kill", action="store_true",
                         help="run every suite to the end even after a failing check")
     parser.add_argument("--tree", default="", help="which tree to scan (default: the repo)")
@@ -948,6 +1213,15 @@ def main(argv=None):
         catalogue.cpu_floor = args.cpu_floor
     if args.wall_floor is not None:
         catalogue.wall_floor = args.wall_floor
+    if not 0.0 <= args.confirm_kills <= 1.0:
+        raise SystemExit(f"--confirm-kills is a fraction of the expected kills, "
+                         f"between 0 and 1, not {args.confirm_kills!r}")
+    if args.confirm_seed is None:
+        # Derived rather than random, so two runs of the same invocation re-run the
+        # same mutants; different catalogues still get different samples.
+        # `--confirm-seed` is how you ask for a *different* tenth of one catalogue.
+        args.confirm_seed = int(hashlib.sha256(
+            pathlib.Path(catalogue.source).read_bytes()).hexdigest()[:8], 16)
 
     if args.mode == "list":
         for mutant in catalogue.mutants:
