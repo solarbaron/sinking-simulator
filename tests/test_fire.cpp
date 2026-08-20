@@ -29,6 +29,10 @@
 //
 // **Temperatures are in KELVIN**, like `thermal.hpp` and for the same reason.
 #include "engine/sim/fire.hpp"
+// For `kEnclosedVoid` alone: the gas tier's own refusal has to be shown distinct
+// from the other two compartment-index sentinels, and asserting that against the
+// literal -2 would be asserting it against a copy of the thing under test.
+#include "engine/sim/breach.hpp"
 #include "harness.hpp"
 
 #include "../game/prototype/ferry.hpp"
@@ -1337,6 +1341,152 @@ void testAttachDerivesTheGasBoxFromTheShipsOwnCompartment() {
     expectTrue("which is well above the bottom of the space", wet.gas[0].floorZ > fc.bboxLo.z + 1.0);
     expectTrue("and the gas space is about half what it was",
                wet.gas[0].gasVolume < 0.6 * g.gasVolume);
+}
+
+// **"Not tracked here" and "outside the hull" were the same integer.**
+// `gasIndexOf` answered a miss with -1, and -1 is `kSea` -- a *legal* answer of the
+// same function, and the one most of the ferry's vents carry, because a breach, an
+// air pipe and a gooseneck all have one end in the open air. So the two readings
+// that lead to opposite conclusions arrived indistinguishable: the sea is an
+// infinite reservoir at ambient, and a compartment this model does not track is a
+// space it has no claim on at all.
+//
+// This is `ship.hpp`'s `kNoCompartment` argument one tier up, and it is the third
+// instance of the shape in this tree. The distinct value is what makes a refusal
+// nameable; the ambiguity is what let `attach()` need `ga >= 0 ? ga : kSea` to
+// recover the fact it had just thrown away.
+void testAnUntrackedCompartmentIsNotAnsweredWithTheOpenSea() {
+    FerryFire f = makeFerryFire();   // the two engine rooms, and nothing else
+    const int erS = f.ship.findCompartment("engine_room_s");
+    const int vehicleDeck = f.ship.findCompartment("vehicle_deck");
+
+    // Vacuity: the two arguments below have to be a real tracked compartment and a
+    // real untracked one, or the pair proves nothing.
+    expectTrue("the ferry carries both compartments", erS >= 0 && vehicleDeck >= 0);
+    expectTrue("and they are different compartments", erS != vehicleDeck);
+    expectEqual("the tracked one has a gas space", f.model.gasIndexOf(erS),
+                f.model.findGas("engine_room_s"));
+    expectTrue("which is an index into the model", f.model.gasIndexOf(erS) >= 0);
+
+    // The pair that matters, asserted together: either half alone is consistent
+    // with the defect still being there. The sea keeps its answer -- it has to,
+    // `attach()` builds vents on it -- and the untracked compartment stops sharing
+    // it.
+    expectEqual("the sea is still answered with the sea", f.model.gasIndexOf(kSea), kSea);
+    expectEqual("a compartment this model does not track is refused",
+                f.model.gasIndexOf(vehicleDeck), fire::kNoGasSpace);
+    expectTrue("and that refusal is not the open sea",
+               f.model.gasIndexOf(vehicleDeck) != kSea);
+
+    // The cross-space case, which is the reason the value is -4 and not -3: a name
+    // lookup that refused with `kNoCompartment` used to come back out of here as
+    // `kSea`, so a mistyped compartment fed into the gas model resolved to the
+    // atmosphere. It must not echo its own argument back either -- "no compartment
+    // of that name" and "no gas space for it" are different diagnostics.
+    expectEqual("a refused name lookup is refused here too",
+                f.model.gasIndexOf(kNoCompartment), fire::kNoGasSpace);
+    expectEqual("and so is a point inside the hull but inside no compartment",
+                f.model.gasIndexOf(kEnclosedVoid), fire::kNoGasSpace);
+    expectTrue("the sentinel is nobody else's", fire::kNoGasSpace != kSea &&
+                                                    fire::kNoGasSpace != kEnclosedVoid &&
+                                                    fire::kNoGasSpace != kNoCompartment);
+    expectTrue("and is never a legal index into the model", fire::kNoGasSpace < 0);
+
+    // What the ambiguity cost in the one place it was load-bearing: the watertight
+    // door joins the two engine rooms and survives, while the vehicle deck's
+    // downflooding hatch touches a space this model does not hold and is dropped
+    // rather than being wired onto the atmosphere.
+    int onSea = 0, betweenSpaces = 0;
+    for (const fire::Vent& v : f.model.vents) {
+        expectTrue("every vent endpoint is a gas space or the sea",
+                   (v.a >= 0 || v.a == kSea) && (v.b >= 0 || v.b == kSea));
+        if (v.a == kSea || v.b == kSea) ++onSea;
+        else ++betweenSpaces;
+    }
+    expectTrue("the network has vents on the sea", onSea > 0);
+    expectTrue("and vents between two tracked spaces", betweenSpaces > 0);
+}
+
+// **`attach()` dropped a compartment the caller asked for and told nobody.**
+//
+// `validate()` cannot find that on its own and cannot be made to: it inspects what
+// is *in* the model, and a request that was dropped is not in it. A model built
+// over three spaces and a model built over three of which one was refused are the
+// same two-compartment object, so every count taken over it -- reviews, promotions,
+// budget refusals, peak cells -- comes back smaller and entirely plausible. That is
+// the shape the water tier's 154 silent refusals took, and it reads as the
+// criterion working correctly.
+//
+// The two builds are asserted as a pair for `test_ship.cpp`'s reason: the honoured
+// one on its own is consistent with the record never being written, and the refused
+// one on its own is consistent with `attach()` having become simply stricter.
+void testAttachNamesTheRequestItCouldNotHonour() {
+    Ship ship = game::buildFerry();
+    Sea sea{0.0};
+    ship.initialise(sea);
+    const int erS = ship.findCompartment("engine_room_s");
+    const int erP = ship.findCompartment("engine_room_p");
+    expectTrue("the ferry carries both engine rooms", erS >= 0 && erP >= 0);
+
+    // **Read through a bounds-safe accessor, not `[0]`.** The defect under test is
+    // a record that is empty when it should not be, so a raw index on it turns every
+    // named failure below into a segfault that prints no failures at all -- which is
+    // the shape a `grep FAIL` scored as a survivor once already in this repo.
+    constexpr int kNoRecord = -999999;
+    const auto asked = [](const std::vector<int>& v, std::size_t i) {
+        return i < v.size() ? v[i] : kNoRecord;
+    };
+
+    fire::Model honoured;
+    honoured.attach(ship, {erS, erP});
+    expectEqual("a request it can honour builds every space asked for",
+                static_cast<int>(honoured.gas.size()), 2);
+    expectTrue("and leaves nothing unattached", honoured.unattached.empty());
+    expectTrue("so the model validates clean", honoured.validate().empty());
+
+    // The same call with one more compartment on the end, and the extra one is one
+    // no ship has: `compartments.size()` is exactly the first index past the roster.
+    const int past = static_cast<int>(ship.compartments.size());
+    fire::Model refused;
+    refused.attach(ship, {erS, erP, past});
+    expectEqual("a request it cannot honour still builds the ones it can",
+                static_cast<int>(refused.gas.size()), 2);
+    expectEqual("and records the one it did not",
+                static_cast<int>(refused.unattached.size()), 1);
+    expectEqual("naming which one", asked(refused.unattached, 0), past);
+
+    // **Which diagnostic, not merely that there is one.** The message has to carry
+    // the index, because the whole failure is that nothing downstream can tell which
+    // of three compartments went missing.
+    const std::vector<std::string> problems = refused.validate();
+    expectEqual("validate() names it, once", static_cast<int>(problems.size()), 1);
+    const std::string named = problems.empty() ? std::string() : problems[0];
+    expectTrue("and the diagnostic is about the request rather than about a gas space",
+               named.find("attach() was asked to track ship compartment") != std::string::npos);
+    expectTrue("carrying the index it refused",
+               named.find(std::to_string(past)) != std::string::npos);
+
+    // Every way an index can be outside the roster, because `kSea` is the one a
+    // missed name lookup actually produces and it is the one that used to read as a
+    // legal request.
+    fire::Model wild;
+    wild.attach(ship, {kSea, erS, kNoCompartment, -12345, past + 7});
+    expectEqual("the one good index still built its space",
+                static_cast<int>(wild.gas.size()), 1);
+    expectEqual("and all four refusals are recorded, in the order they were asked for",
+                static_cast<int>(wild.unattached.size()), 4);
+    expectEqual("the sea among them", asked(wild.unattached, 0), kSea);
+    expectEqual("a refused name lookup among them", asked(wild.unattached, 1), kNoCompartment);
+    expectEqual("... and the rest", asked(wild.unattached, 2), -12345);
+    expectEqual("... and the rest", asked(wild.unattached, 3), past + 7);
+    expectEqual("with one diagnostic each",
+                static_cast<int>(wild.validate().size()), 4);
+
+    // A second `attach()` clears the record, or a model reattached cleanly would
+    // keep reporting a refusal it no longer has.
+    wild.attach(ship, {erS, erP});
+    expectTrue("re-attaching cleanly clears the record", wild.unattached.empty());
+    expectTrue("and the model validates clean again", wild.validate().empty());
 }
 
 // The ferry's air escapes are authored at the gooseneck on the weather deck,
@@ -3737,6 +3887,67 @@ void testAStepShortOfTheTimeItWasAskedForSaysSo() {
                hot > kTAmbient + 50.0);
 }
 
+// **`incomplete` says the budget ran out; nothing said how much of it a healthy run
+// had already spent.** The rejected trial is the term that makes that exit reachable
+// at all -- it costs a slot and moves `remaining` not at all -- so `maxSubsteps`
+// bounds *trials*, and `substeps + rejections` is the quantity it bounds. A run
+// reporting `incomplete == false` is compatible with one rejection of headroom and
+// with ninety thousand, and those are not the same ship: the first is about to start
+// publishing figures indexed by a clock that has fallen behind.
+//
+// `les::StepResult::rejections` has carried this for the identical loop since it was
+// written, and `les.cpp` names this file when it gives the reason. This is the same
+// count on this side of the boundary.
+void testTheSubstepBudgetCountsTrialsAndSaysHowManyItThrewAway() {
+    // The control: a run nowhere near its budget still reports the margin, and the
+    // margin is the identity the budget is spent under.
+    Room ample = makeRoom(500.0e3, 30.0);
+    int rejected = 0, committed = 0;
+    for (int i = 0; i < 60; ++i) {
+        const fire::StepResult s = ample.model.step(1.0, ample.ship, ample.sea);
+        expectTrue("a tick inside its budget spends no more slots than it has",
+                   s.substeps + s.rejections <= ample.model.maxSubsteps);
+        expectTrue("and is not incomplete", !s.incomplete);
+        rejected += s.rejections;
+        committed += s.substeps;
+    }
+    expectTrue("the control was a real fire", committed > 200);
+    expectTrue("and it is nowhere near the budget it is measured against",
+               rejected < ample.model.maxSubsteps / 100);
+
+    // **Every slot spent on a rejection**, which is the state the count exists to
+    // make visible: an impossible `maxRelativeChange` rejects every trial, so twenty
+    // slots buy twenty halvings and no model time. The same fixture the `incomplete`
+    // test uses, read for the other half of the same loop.
+    Room starved = makeRoom(500.0e3, 30.0);
+    for (int i = 0; i < 10; ++i) starved.model.step(1.0, starved.ship, starved.sea);
+    starved.model.maxRelativeChange = 1e-18;
+    starved.model.maxSubsteps = 20;
+    const fire::StepResult all = starved.model.step(1.0, starved.ship, starved.sea);
+    expectEqual("a tick whose every trial was rejected committed nothing", all.substeps, 0);
+    expectEqual("and reports every one of the trials it threw away", all.rejections, 20);
+    expectEqual("so the budget was spent on trials and not on committed time",
+                all.substeps + all.rejections, starved.model.maxSubsteps);
+    expectTrue("which is exactly when it runs out", all.incomplete);
+
+    // The opposite corner, from the same test's `pinned` case: a budget exhausted
+    // with nothing rejected at all. The two ends together are what say the count is
+    // a count of rejections and not a second name for the substep count.
+    Room pinned = makeRoom(500.0e3, 30.0);
+    for (int i = 0; i < 10; ++i) pinned.model.step(1.0, pinned.ship, pinned.sea);
+    pinned.model.maxSubstep = 1e-4;
+    pinned.model.maxSubsteps = 3;
+    const fire::StepResult pin = pinned.model.step(1.0, pinned.ship, pinned.sea);
+    expectEqual("a tick pinned by its step size accepted every trial", pin.substeps, 3);
+    expectEqual("and rejected none", pin.rejections, 0);
+    expectTrue("while still running out of budget", pin.incomplete);
+
+    // A tick of no time returns before the loop, so it is neither.
+    const fire::StepResult none = ample.model.step(0.0, ample.ship, ample.sea);
+    expectEqual("a tick of no time rejected nothing", none.rejections, 0);
+    expectEqual("and committed nothing", none.substeps, 0);
+}
+
 // **A freeing port cannot drain water the ship does not have.** `substep` reads
 // the ship's water level once and may take many substeps against that one
 // snapshot, so the discharge is capped by what is actually on the deck. At any
@@ -5513,6 +5724,8 @@ void runFireTests() {
     testThePlumeCarriesTheLowerLayersSpeciesUpward();
     testEntrainmentStopsWhenTheLayerReachesTheFloor();
     testAttachDerivesTheGasBoxFromTheShipsOwnCompartment();
+    testAnUntrackedCompartmentIsNotAnsweredWithTheOpenSea();
+    testAttachNamesTheRequestItCouldNotHonour();
     testVentsAreSlidIntoTheGasSpaceBeforeBeingTrimmed();
     testAnOpeningUnderFloodwaterInsideTheShipIsBlockedToo();
     testTheAccountClosesOnTheFerry();
@@ -5532,6 +5745,7 @@ void runFireTests() {
     testALayerOfMicrogramsStillReportsItsOwnTemperature();
     testTheSubstepControllerStaysNearItsArithmeticFloor();
     testAStepShortOfTheTimeItWasAskedForSaysSo();
+    testTheSubstepBudgetCountsTrialsAndSaysHowManyItThrewAway();
     testThePublishedConstantsAreTheirPublishedValues();
 
     std::printf("\n--- suppression, and its effect on stability ---\n");

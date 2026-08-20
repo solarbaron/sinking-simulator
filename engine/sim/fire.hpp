@@ -191,6 +191,30 @@
 
 namespace sim::fire {
 
+// Sentinel meaning "this model has no gas space for that ship compartment" -- the
+// answer `Model::gasIndexOf` refuses with.
+//
+// It has to be distinct from `kSea` for exactly the reason `ship.hpp`'s
+// `kNoCompartment` does: kSea is not a spare integer here, it is a *legal answer*
+// of the same function. Most of the ferry's vents have one end outside the hull,
+// so `gasIndexOf(kSea) == kSea` is the ordinary case and every caller has to let
+// it through -- which means a refusal answered with kSea is indistinguishable from
+// an authored one, and `attach()` would build a vent onto an infinite reservoir of
+// cool air behind a bulkhead rather than dropping it.
+//
+// **It is a fire-local constant rather than `kNoCompartment`, and -4 rather than
+// -3, because the two answer different questions.** `gasIndexOf` returns an index
+// into `Model::gas`, not into `Ship::compartments`: `kNoCompartment` says "no
+// compartment carries that name", a statement about the ship's roster, while this
+// says "that compartment exists and this model does not track it" -- which is the
+// ordinary case, since `attach()` is handed a subset on purpose. Keeping the value
+// off -3 is what stops `gasIndexOf(kNoCompartment)` echoing its own argument back:
+// a refused *name* lookup fed into the gas model comes back as "no gas space", not
+// as "no compartment", and the two are different diagnostics with different fixes
+// -- a bad name against a missing `attach()` argument. -1 is kSea, -2 is
+// `breach.hpp`'s `kEnclosedVoid`, -3 is `ship.hpp`'s `kNoCompartment`.
+inline constexpr int kNoGasSpace = -4;
+
 // Air's caloric constants, derived from `kRAir` and `kGammaAir` rather than
 // quoted, so that `c_p - c_v = R` and `c_p / c_v = gamma` hold *exactly*. The
 // pressure closure `p = (gamma-1) U / V` is only true if they do, and a quoted
@@ -1292,6 +1316,18 @@ struct StepResult {
     // events.
     double oxygenAvailability = 1.0;
     int    substeps = 0;         // how many internal steps the accuracy cap took
+    // Trial substeps thrown away, having changed nothing -- `les::StepResult`'s
+    // wording, for the same field and the same loop shape.
+    //
+    // **This is the margin on the budget, and `incomplete` below is only its
+    // exhaustion.** A rejected trial spends a budget slot and halves `h` *without*
+    // advancing `remaining`, so `maxSubsteps` bounds trials rather than committed
+    // time: `substeps + rejections` is what the budget actually counts, and it is
+    // the only reading that says how close a healthy run came. Without it a run
+    // drifting toward the exit is indistinguishable from one nowhere near it --
+    // both report `incomplete == false` -- and the first evidence anyone gets is
+    // the step that already fell short.
+    int    rejections = 0;
     int    pressureSweeps = 0;   // Gauss-Seidel sweeps the last substep's solve took
     // The pressure solve failed to bracket a root in 80 doublings. Should never
     // happen -- the residual is monotone and unbounded in both directions -- and
@@ -1346,10 +1382,38 @@ public:
     // are dropped -- an untracked space has no gas state to exchange with, and
     // pretending it is the atmosphere would invent an infinite reservoir behind a
     // bulkhead.
+    //
+    // A request it cannot honour is recorded in `unattached` rather than dropped,
+    // and `validate()` names it. See that member for why.
     void attach(const Ship& ship, const std::vector<int>& shipCompartments);
 
-    // Index into `gas` for a ship compartment, or -1.
+    // Ship compartments `attach()` was asked to track and could not, in the order
+    // they were asked for. Cleared by every `attach()`.
+    //
+    // **`validate()` structurally cannot find this on its own**, and that is the
+    // whole reason the record exists: it validates what is *in* the model, and a
+    // compartment that was requested and dropped is not in it. A model built over
+    // three spaces and a model built over three of which one was dropped are the
+    // same two-compartment object, and every figure computed over it -- review
+    // counts, budget refusals, peak cells -- reads exactly like a ship where the
+    // third space never qualified. That is the shape a silent refusal took in the
+    // water tier, where 154 of them read as hysteresis working correctly.
+    //
+    // Indices rather than names, because a request this could not honour is
+    // precisely one that names no compartment.
+    std::vector<int> unattached;
+
+    // Index into `gas` for a ship compartment, `kSea` for the atmosphere outside
+    // the hull, or `kNoGasSpace` when this model does not track that compartment.
+    // Three answers and not two: see `kNoGasSpace` for why the third cannot be
+    // spelled `kSea`.
     int gasIndexOf(int shipCompartment) const;
+
+    // Index into `gas` for a name, or -1. **Not `kNoGasSpace`, and the difference
+    // is not an oversight**: this one's answer domain has no legal negative value
+    // in it, so -1 refuses unambiguously, where `gasIndexOf` has to share its
+    // domain with kSea. Same distinction `ship.hpp` draws between its two
+    // `findCompartment` forms.
     int findGas(std::string_view name) const;
 
     // Zero the account and take the current gas state as its baseline. `attach()`

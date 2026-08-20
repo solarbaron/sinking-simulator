@@ -335,6 +335,19 @@ struct Outcome {
     // required to be zero below, which is the discipline `flip_probe` already keeps
     // over `flip::StepResult::incomplete`.
     int    gasShortSteps = 0;
+    // **The margin on the budget the counter above only reports the exhaustion of.**
+    // `gasShortSteps` is a step that already ran out; these are the trials that get
+    // it there, because a rejected trial spends a slot without committing time. A
+    // run of zero short steps says nothing about whether it was one rejection clear
+    // of the exit or ninety thousand, and that is the difference between a figure
+    // that is safe and a figure that is about to stop being one. Both totals, and
+    // the worst single tick, because the budget is spent per `step()` and it is the
+    // worst tick that binds.
+    int    gasRejections = 0;
+    int    worstTickRejections = 0;
+    // The budget those two are a margin against, read off the model rather than
+    // restated here: a constant printed beside a measurement is an assertion.
+    int    gasSubstepBudget = 0;
     // The gas pressure solve failed to bracket a root. `fire.hpp` publishes this
     // "rather than swallowed so that 'should never' can be asserted", and until now
     // nothing outside `tests/test_fire.cpp` asserted it.
@@ -503,6 +516,29 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
     const int aftS = ship.findCompartment("aft_hold_s");
     const int erP = ship.findCompartment("engine_room_p");
     const int erS = ship.findCompartment("engine_room_s");
+    // **All four, here, and not two of them inside `if (water)` below.** The aft
+    // holds were guarded because the flood is a store and `SIZE_MAX` is a wild
+    // address; the engine rooms were not guarded at all, and the reason the crash
+    // was never seen is that the guard sat under a condition the dry control does
+    // not meet. That control goes on to hand `erP` and `erS` to
+    // `differentialPressure`, which reads `ship.compartments[SIZE_MAX]` twice per
+    // member per step, and to `gas.gas[SIZE_MAX]` in the trace.
+    //
+    // `findCompartment`'s one-argument form answers a miss with `kSea`, which is
+    // -1 and is a legal *endpoint* rather than a sentinel, so `< 0` is the test and
+    // it has to be made on the line after the call. `game/prototype/ferry.cpp`'s
+    // `space()` is the same discipline one file down.
+    {
+        const char* const wanted[] = {"aft_hold_p", "aft_hold_s", "engine_room_p",
+                                      "engine_room_s"};
+        const int found[] = {aftP, aftS, erP, erS};
+        for (std::size_t i = 0; i < 4; ++i)
+            if (found[i] < 0) {
+                std::printf("no compartment named %s: this study has no bulkhead to run on\n",
+                            wanted[i]);
+                return out;
+            }
+    }
     // **The water goes in before `initialise`, and that is not a tidiness point.**
     // `initialise` sets each compartment's air mass from the gas volume it actually
     // has and then solves the flooded equilibrium draft. Filling a hold afterwards
@@ -513,17 +549,10 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
     ship.initialise(sea);   // caches the gross volumes the fill is a fraction of
     if (water) {
         // A grounding aft, both holds together, which is what keeps her upright: the
-        // asymmetric case is a stability problem and this is a structural one.
-        // **Checked, because `findCompartment` returns -1 and this is a store.**
-        // `static_cast<std::size_t>(-1)` is `SIZE_MAX`, so a renamed or missing
-        // compartment writes to a wild address rather than reading a wrong one.
-        // The ferry has been short of an authored compartment before -- her mid
-        // wing tanks were never written -- and `water_probe` guards the same call.
+        // asymmetric case is a stability problem and this is a structural one. The
+        // four names were checked above, where a miss costs the whole study rather
+        // than only the wet half of it.
         for (int c : {aftP, aftS}) {
-            if (c < 0) {
-                std::printf("no aft hold to flood: expected aft_hold_p and aft_hold_s\n");
-                return out;
-            }
             ship.compartments[static_cast<std::size_t>(c)].waterVolume =
                 o.fill * ship.compartments[static_cast<std::size_t>(c)].floodableVolume();
         }
@@ -533,6 +562,30 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
     fire::Model gas;
     gas.attach(ship, {erP, erS});
     const int burning = gas.gasIndexOf(erP);
+    const int neighbour = gas.gasIndexOf(erS);
+    // **What `attach()` was asked for, against what it built.** Both indices above
+    // are in range, so on this ship nothing here can fire -- and that is the whole
+    // reason it was missing: a check that cannot fail on the case in front of you is
+    // exactly the one nobody writes. `attach()` drops a request it cannot honour,
+    // and until it kept `unattached` it dropped it with no channel at all; the model
+    // that came back was a well-formed model over fewer spaces, and every figure
+    // below would have been computed over it without a word.
+    //
+    // `gasIndexOf` is asked separately because it answers three things and not two:
+    // `kSea` here would mean the study had pointed the fire at the open sea, which
+    // `< 0` catches and `attach()` cannot.
+    if (burning < 0 || neighbour < 0) {
+        std::printf("the gas model does not hold both engine rooms: engine_room_p -> %d,"
+                    " engine_room_s -> %d\n", burning, neighbour);
+        return out;
+    }
+    bool illDefined = false;
+    for (const std::string& problem : gas.validate()) {
+        std::printf("fire model: %s\n", problem.c_str());
+        illDefined = true;
+    }
+    if (illDefined) return out;
+    out.gasSubstepBudget = gas.maxSubsteps;
     if (fire) {
         fire::DesignFire d;
         d.name = "machinery";
@@ -582,7 +635,7 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
     std::size_t filmBase[2] = {0, 0};
     std::size_t bandCount[2] = {0, 0};
     for (int h = 0; h < 2; ++h) {
-        const int gi = gas.gasIndexOf(h == 0 ? erP : erS);
+        const int gi = h == 0 ? burning : neighbour;
         const fire::WallExchange x = fire::wallExchange(gas.gas[static_cast<std::size_t>(gi)],
                                                        fireFaceHalf[h], fireTempHalf[h], {},
                                                        chain.slab.dz);
@@ -638,6 +691,8 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
         // this loop's time axis is arithmetic and the gas's is not.
         const fire::StepResult gasStep = gas.step(o.coupling, ship, sea);
         if (gasStep.incomplete) ++out.gasShortSteps;
+        out.gasRejections += gasStep.rejections;
+        out.worstTickRejections = std::max(out.worstTickRejections, gasStep.rejections);
         if (gasStep.pressureSolveCapped) ++out.gasPressureCapped;
         gas.applyTo(ship);
         for (const fire::GasCompartment& g : gas.gas)
@@ -655,7 +710,7 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
                 for (int k = 0; k < 4; ++k) t += nodal[f.node[k]];
                 fireTempHalf[h][i] = 0.25 * t;
             }
-            const int gi = gas.gasIndexOf(h == 0 ? erP : erS);
+            const int gi = h == 0 ? burning : neighbour;
             const fire::WallExchange x = fire::wallExchange(gas.gas[static_cast<std::size_t>(gi)],
                                                             fireFaceHalf[h], fireTempHalf[h], {},
                                                             chain.slab.dz);
@@ -979,6 +1034,16 @@ int main(int argc, char** argv) {
                 " pressure solve %d time(s);\n          worst gap between the gas's clock and"
                 " the printed time axis %.3e s\n",
                 o.coupling, both.gasShortSteps, both.gasPressureCapped, both.gasClockGap);
+    // **The margin, beside the exhaustion.** The line above reports a budget that
+    // ran out; this reports how much of it a run that did not was already spending.
+    // A rejected trial is what makes that exit reachable at all -- it costs a slot
+    // and commits no time -- so `substeps + rejections` against `maxSubsteps` is the
+    // reading that moves before anything above does, and a gap that is exactly zero
+    // over 720 couplings says only that the drift has not started, not that there is
+    // no room for it to.
+    std::printf("          %d substep trial(s) rejected over the run, worst %d in one tick"
+                " against a budget of %d\n",
+                both.gasRejections, both.worstTickRejections, both.gasSubstepBudget);
 
     // --- The same state, decomposed ------------------------------------------------
     //
