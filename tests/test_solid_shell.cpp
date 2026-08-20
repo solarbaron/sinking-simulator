@@ -3229,6 +3229,103 @@ void testBothCriticalTimestepsShareTheirSentinel() {
                fem::criticalTimestep(box, noModulus, 0.5f), 0.0f, 0.0f);
 }
 
+// --- The rest shape matrix of a degenerate tet ------------------------------
+//
+// `fem.cpp`'s M3 inverse is shared by `polarRotation`, which hands it a
+// nondimensional near-rotation with det ~ 1, and by `computeRestState`, which
+// hands it `dm` -- columns are node position *differences* in metres, so
+// det(dm) = 6 * restVolume and the units are m^3. The guard was `|det| > 1e-30f`,
+// an absolute number bounding a quantity that scales as h^3, and on a 0.1 m plate
+// element it was vacuous by twenty-seven decades.
+//
+// A tet flattened to nothing is exactly what the guard exists to catch, and it
+// walked straight through: `restInv` came back with entries ~1e10 m^-1 where
+// healthy is ~1/h ~ 10, so F = Ds * restInv was amplified ~1e9 -- on an element
+// whose restVolume ~ 0 gave it no mass to resist the force that followed.
+//
+// One mesh of one tet is built per case so `computeRestState` runs its real path.
+fem::TetMesh oneTet(const float p[4][3]) {
+    fem::TetMesh m;
+    for (int n = 0; n < 4; ++n)
+        for (int a = 0; a < 3; ++a) m.position.push_back(p[n][a]);
+    m.index = {0, 1, 2, 3};
+    return m;
+}
+
+float largestRestInv(const fem::TetMesh& m) {
+    float biggest = 0;
+    for (float v : m.restInv) biggest = std::max(biggest, std::abs(v));
+    return biggest;
+}
+
+// `== 0.0f` on every entry rather than a zero-tolerance `expectNear` on the
+// largest: the latter is the comparison a NaN passes, and `std::max` propagates
+// nothing from a NaN either, so both of the obvious spellings would hide one.
+bool everyRestInvEntryIsZero(const fem::TetMesh& m) {
+    for (float v : m.restInv)
+        if (!(v == 0.0f)) return false;
+    return !m.restInv.empty();
+}
+
+void testAFlatTetGetsNoRestShapeMatrix() {
+    const fem::Material steel;
+
+    // Healthy reference: a right-angled corner tet of 0.1 m edges. det = 1e-3 m^3.
+    const float healthy[4][3] = {{0, 0, 0}, {0.1f, 0, 0}, {0, 0.1f, 0}, {0, 0, 0.1f}};
+    fem::TetMesh good = oneTet(healthy);
+    good.computeRestState(steel);
+    expectNear("a healthy 0.1 m tet has the volume its edges say", good.restVolume[0],
+               1.0e-3f / 6.0f, 1e-9f);
+    expectNear("and its rest inverse is the reciprocal of its edge length",
+               largestRestInv(good), 10.0f, 1e-3f);
+
+    // The degenerate case: the same 0.1 m footprint, with the fourth node one
+    // *ångström* out of the plane of the other three. det = 1e-12 m^3, which is
+    // eighteen decades above the old 1e-30f floor, so the old guard inverted it.
+    const float flat[4][3] = {{0, 0, 0}, {0.1f, 0, 0}, {0, 0.1f, 0}, {0.033f, 0.025f, 1e-10f}};
+    fem::TetMesh squashed = oneTet(flat);
+    squashed.computeRestState(steel);
+    expectTrue("the flat tet's determinant clears the old absolute floor",
+               6.0f * squashed.restVolume[0] > 1e-30f);
+    expectTrue("but its rest inverse is refused outright", everyRestInvEntryIsZero(squashed));
+
+    // **The two cases that settle it.** Scale the flat tet up to 100 m and its
+    // determinant becomes 1e-3 m^3 -- *identical* to the healthy 0.1 m tet's, and
+    // six decades above a healthy 1 mm tet's 1e-9 m^3. So no threshold on the
+    // determinant alone can accept both healthy elements and reject this one:
+    // the same number has to mean "fine" and "degenerate" at once. Only the ratio
+    // to the element's own size separates them.
+    const float flatBig[4][3] = {{0, 0, 0}, {100, 0, 0}, {0, 100, 0}, {33, 25, 1e-7f}};
+    fem::TetMesh squashedBig = oneTet(flatBig);
+    squashedBig.computeRestState(steel);
+    expectNear("a 100 m flat tet has the same determinant as a healthy 0.1 m one",
+               6.0f * squashedBig.restVolume[0], 1.0e-3f, 1e-9f);
+    expectTrue("and is refused all the same", everyRestInvEntryIsZero(squashedBig));
+
+    const float tiny[4][3] = {{0, 0, 0}, {1e-3f, 0, 0}, {0, 1e-3f, 0}, {0, 0, 1e-3f}};
+    fem::TetMesh small = oneTet(tiny);
+    small.computeRestState(steel);
+    expectNear("a healthy 1 mm tet's determinant is six decades *below* that",
+               6.0f * small.restVolume[0], 1.0e-9f, 1e-15f);
+    expectNear("and it is accepted, with the reciprocal of its edge length",
+               largestRestInv(small), 1.0e3f, 1.0f);
+
+    // A tet whose nodes are exactly coplanar was the one case the old floor did
+    // handle, because its determinant is exactly zero. It must still be refused.
+    const float exact[4][3] = {{0, 0, 0}, {0.1f, 0, 0}, {0, 0.1f, 0}, {0.033f, 0.025f, 0}};
+    fem::TetMesh coplanar = oneTet(exact);
+    coplanar.computeRestState(steel);
+    expectTrue("an exactly coplanar tet is still refused", everyRestInvEntryIsZero(coplanar));
+
+    // A refused element must also be inert rather than merely quiet: restInv of
+    // zero makes F zero, and restVolume of zero leaves it no mass, so the forces
+    // it contributes are zero rather than the ~1e9-amplified ones it used to.
+    float out[12] = {0};
+    fem::tetForces(squashed, 0, steel.lameLambda(), steel.lameMu(), out);
+    for (int k = 0; k < 12; ++k)
+        expectTrue("a refused element contributes no nodal force", out[k] == 0.0f);
+}
+
 }  // namespace
 
 void runSolidShellTests() {
@@ -3264,4 +3361,5 @@ void runSolidShellTests() {
     testDofExpansionRefusesWhatItCannotCompose();
     testConstrainedSolveIsExactWhereTheConstraintIsTrue();
     testBothCriticalTimestepsShareTheirSentinel();
+    testAFlatTetGetsNoRestShapeMatrix();
 }

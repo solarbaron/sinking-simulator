@@ -4,6 +4,7 @@
 // Everything downstream -- flooding rates, stability, capsize -- is only as good
 // as these integrals, so they get checked against algebra rather than eyeballed.
 #include "engine/core/geometry.hpp"
+#include "engine/sim/collision.hpp"
 #include "engine/sim/ship.hpp"
 #include "engine/sim/waves.hpp"
 #include "game/prototype/ferry.hpp"
@@ -2500,6 +2501,200 @@ void testMassConservation() {
     expectNear("no water created or destroyed while settling", heldAfter, held, 1e-6 * held);
 }
 
+// --- The centroid guard ------------------------------------------------------
+//
+// `volume > 1e-12` decided whether a clipped region got a centroid or fell back
+// to the origin. Volume is in m^3 and the round-off floor of the accumulation
+// that produces it scales as L^3, so an absolute constant is wrong at both ends
+// at once, and this pair of tests pins both ends.
+//
+// A closed mesh with every vertex in the plane z = 0 encloses nothing, so every
+// tet the clipper accumulates must cancel. What survives is pure round-off, and
+// on a 300 m sheet the partial sums reach ~4.6e5 m^3, so that residue is ~2.4e-11
+// m^3 -- more than a decade above the old floor, which therefore divided noise by
+// noise. The centroid that came back was (300, 71.8, 4.94): five metres above a
+// mesh that is entirely at z = 0, and outside its footprint besides.
+void testAFlatMeshGetsNoCentroidFromItsOwnRoundOff() {
+    int residuesAboveTheOldFloor = 0;
+    for (const double L : {150.0, 300.0, 600.0}) {
+        // Wound inside-out, so what round-off is left over comes out positive and
+        // clears `volume > 1e-12` rather than failing it on the sign.
+        TriMesh sheet = makeBox({0.3, 0.7, 0.0}, {L, 0.618 * L, 0.0});
+        for (Tri& t : sheet.tris) std::swap(t.b, t.c);
+
+        const VolumeIntegral clipped = integrateBelowPlane(sheet, {0, 0, 1}, 12.34);
+        // It really is round-off: a flat sheet has no volume at all, and anything
+        // this far below its own accumulation is noise by definition.
+        expectTrue("a flat sheet encloses nothing", std::abs(clipped.volume) < 1e-9);
+        if (clipped.volume > 1e-12) ++residuesAboveTheOldFloor;
+        // `== 0.0`, not `expectNear(..., 0.0, 0.0)`: a zero tolerance is exactly
+        // the comparison a NaN passes, and "the fallback was taken" is a
+        // bit-identity claim.
+        expectTrue("so it is given no centroid at all (x)", clipped.centroid.x == 0.0);
+        expectTrue("so it is given no centroid at all (y)", clipped.centroid.y == 0.0);
+        expectTrue("so it is given no centroid at all (z)", clipped.centroid.z == 0.0);
+
+        // The warm-started sweep accumulates the same tets and must agree.
+        const PlaneSweep sweep(sheet, {0, 0, 1});
+        const VolumeIntegral swept = sweep.below(12.34);
+        expectTrue("the sweep sees the same non-volume", swept.volume == clipped.volume);
+        expectTrue("and refuses it a centroid too (x)", swept.centroid.x == 0.0);
+        expectTrue("and refuses it a centroid too (y)", swept.centroid.y == 0.0);
+        expectTrue("and refuses it a centroid too (z)", swept.centroid.z == 0.0);
+    }
+    // Without this the test above could pass on a build where every residue came
+    // out negative or tiny -- that is, with nothing for the old guard to get
+    // wrong, and so with no evidence that the new one is doing anything.
+    expectTrue("at least one flat sheet's round-off cleared the old 1e-12 m^3 floor",
+               residuesAboveTheOldFloor > 0);
+}
+
+// The other end of the same defect. A guard written as an absolute volume makes
+// the routine's answer depend on the units the mesh happens to be modelled in:
+// shrink a compartment and at some point its centroid stops being computed, for
+// no geometric reason. The three live call sites must all be similar under
+// scaling -- volume as s^3, centroid as s -- with no step in them anywhere.
+void testTheCentroidIsSimilarUnderScaling() {
+    for (const double s : {1.0, 1e-3, 1e-5, 1e-6}) {
+        const TriMesh box = makeBox({0, 0, 0}, {20 * s, 8 * s, 4 * s});
+        const double cut = 2 * s;
+        const double wantVolume = 320 * s * s * s;
+        // At s = 1e-5 this volume is 3.2e-13 m^3 -- below the old absolute floor,
+        // so all three of these used to return the origin for a region whose
+        // centroid they had in fact computed exactly.
+        const double tol = 1e-9;
+
+        const VolumeIntegral clipped = integrateBelowPlane(box, {0, 0, 1}, cut);
+        expectNear("clipped volume scales as s^3", clipped.volume, wantVolume, tol * wantVolume);
+        expectNear("clipped centroid scales as s (x)", clipped.centroid.x, 10 * s, tol * s);
+        expectNear("clipped centroid scales as s (y)", clipped.centroid.y, 4 * s, tol * s);
+        expectNear("clipped centroid scales as s (z)", clipped.centroid.z, 1 * s, tol * s);
+
+        const PlaneSweep sweep(box, {0, 0, 1});
+        const VolumeIntegral swept = sweep.below(cut);
+        expectNear("swept volume scales as s^3", swept.volume, wantVolume, tol * wantVolume);
+        expectNear("swept centroid scales as s (x)", swept.centroid.x, 10 * s, tol * s);
+        expectNear("swept centroid scales as s (y)", swept.centroid.y, 4 * s, tol * s);
+        expectNear("swept centroid scales as s (z)", swept.centroid.z, 1 * s, tol * s);
+
+        const VolumeIntegral wet =
+            integrateBelowSurface(box, [cut](double, double) { return cut; });
+        expectNear("submerged volume scales as s^3", wet.volume, wantVolume, tol * wantVolume);
+        expectNear("submerged centroid scales as s (x)", wet.centroid.x, 10 * s, tol * s);
+        expectNear("submerged centroid scales as s (y)", wet.centroid.y, 4 * s, tol * s);
+        expectNear("submerged centroid scales as s (z)", wet.centroid.z, 1 * s, tol * s);
+    }
+}
+
+// --- Inverting an inertia tensor -------------------------------------------
+//
+// `inverse(Mat3)` serves rotations (det == 1, nondimensional) and inertia
+// tensors (det in (kg m^2)^3, ~4e26 on this ferry) from the same three lines, so
+// its refusal threshold has to be a ratio. It used to be `|det| < 1e-300`, which
+// is the underflow floor of `double` -- a fact about the type, not about the
+// matrix -- and on ship-scale inertias it was vacuous by 310 decades.
+//
+// The input that catches it is a tensor that is singular in exact arithmetic but
+// whose determinant is pure round-off. Two point masses on a line through the
+// cog give exactly that: the moment of inertia *about that line* is zero, so the
+// tensor is rank 2, and taking the line off-axis puts the defect inside a dense
+// matrix where the cancellation is numerical rather than structural.
+void testARankTwoInertiaIsRefusedRatherThanAmplified() {
+    const Vec3 axis = normalize(Vec3{1, 2, 3});
+    const double arm = 25.0, lump = 1.5e6;  // m, kg -- ferry scale
+    const Mat3 rankTwo =
+        pointInertia(lump, axis * arm) + pointInertia(lump, axis * -arm);
+
+    // The determinant is not remotely near the old floor: it is a round-off
+    // residue of ~2.7e11 (kg m^2)^3 left over from cofactors ~1e26 cancelling,
+    // and it cleared `1e-300` by three hundred and eleven decades. Assert that,
+    // so this test keeps demonstrating *why* an absolute floor could not work
+    // even if the constant is ever revisited.
+    const double c00 = rankTwo(1, 1) * rankTwo(2, 2) - rankTwo(1, 2) * rankTwo(2, 1);
+    const double c01 = rankTwo(1, 2) * rankTwo(2, 0) - rankTwo(1, 0) * rankTwo(2, 2);
+    const double c02 = rankTwo(1, 0) * rankTwo(2, 1) - rankTwo(1, 1) * rankTwo(2, 0);
+    const double det = rankTwo(0, 0) * c00 + rankTwo(0, 1) * c01 + rankTwo(0, 2) * c02;
+    expectTrue("a numerically singular ferry inertia still has a huge determinant",
+               std::abs(det) > 1e10);
+    // ...and it is a *residue*: sixteen decades below the size the same three
+    // products have before their signs cancel them. That ratio, not the
+    // determinant, is what says the matrix has no inverse.
+    const double scale = std::abs(rankTwo(0, 0) * c00) + std::abs(rankTwo(0, 1) * c01) +
+                         std::abs(rankTwo(0, 2) * c02);
+    expectTrue("but it is round-off against the uncancelled scale", std::abs(det) < 1e-14 * scale);
+
+    // `== 0.0` rather than a zero-tolerance `expectNear`, which is the one
+    // comparison a NaN passes -- and a refused inverse is precisely where a NaN
+    // would arrive if the guard let 0/0 through.
+    const Mat3 refused = inverse(rankTwo);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            expectTrue("a rank-2 inertia inverts to exactly zero, not a 1e7 reciprocal",
+                       refused(i, j) == 0.0);
+
+    // The contract the refusal must not break: a default `ContactBody` is the
+    // immovable one, and `normalImpulse`/`applyImpulse` get the infinite-mass
+    // limit from `inverse(Mat3::zero())` being zero.
+    const Mat3 immovable = inverse(Mat3::zero());
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            expectTrue("an exactly zero inertia still inverts to zero", immovable(i, j) == 0.0);
+
+    // And a healthy tensor of the same magnitude is untouched -- the guard is
+    // about conditioning, not about size.
+    Mat3 healthy = Mat3::zero();
+    healthy(0, 0) = 1.1e8;
+    healthy(1, 1) = 1.9e9;
+    healthy(2, 2) = 1.9e9;
+    const Mat3 inverted = inverse(healthy);
+    expectNear("a healthy ferry inertia still inverts", inverted(0, 0), 1.0 / 1.1e8, 1e-20);
+    expectNear("a healthy ferry inertia still inverts", inverted(1, 1), 1.0 / 1.9e9, 1e-20);
+    expectNear("a healthy ferry inertia still inverts", inverted(2, 2), 1.0 / 1.9e9, 1e-20);
+    expectTrue("and its determinant is 30 decades above the rank-2 one's residue",
+               1.1e8 * 1.9e9 * 1.9e9 > 1e26);
+}
+
+// The same defect where it actually reaches the ship: the impulse solver divides
+// by an effective mass built from `inverse(inertia)`, so an amplified reciprocal
+// does not announce itself as a bad matrix -- it announces itself as a 3000 tonne
+// body that responds to a contact like a speck of dust.
+void testAnUninvertibleInertiaLeavesTheContactMassTranslational() {
+    ContactBody heavy;
+    heavy.mass = 3.0e6;  // kg
+    const Vec3 axis = normalize(Vec3{1, 2, 3});
+    heavy.inertia = pointInertia(1.5e6, axis * 25.0) + pointInertia(1.5e6, axis * -25.0);
+    heavy.cog = Vec3{0, 0, 0};
+
+    const ContactBody immovable;  // zero mass, zero inertia: the quay
+    const Vec3 point{8.0, 3.0, -2.0};
+    const Vec3 normal{0, 0, 1};
+
+    const ImpulseSolution s = normalImpulse(heavy, immovable, point, normal, 0.0);
+
+    // With the inertia refused, the only reciprocal left is 1/m, so the effective
+    // mass at the contact is the body's whole mass. Pre-fix, `inverse()` returned
+    // entries ~1e6 and the rotational term dominated `inverseMass` by fourteen
+    // decades, collapsing this to ~1e-8 kg.
+    expectNear("a body whose inertia cannot be inverted still contacts with its full mass",
+               s.effectiveMass, 3.0e6, 1.0);
+    expectTrue("and not the ~1e-8 kg an amplified reciprocal produced",
+               s.effectiveMass > 1.0e6);
+
+    // A healthy body at the same scale must still get a *reduced* effective mass:
+    // the guard must not have simply switched the rotational term off for
+    // everyone.
+    ContactBody sound = heavy;
+    sound.inertia = Mat3::zero();
+    sound.inertia(0, 0) = 1.1e8;
+    sound.inertia(1, 1) = 1.9e9;
+    sound.inertia(2, 2) = 1.9e9;
+    const ImpulseSolution healthy = normalImpulse(sound, immovable, point, normal, 0.0);
+    expectTrue("a healthy inertia still adds a rotational term",
+               healthy.effectiveMass < 0.999 * s.effectiveMass);
+    expectTrue("and that term is a correction, not a collapse",
+               healthy.effectiveMass > 0.1 * s.effectiveMass);
+}
+
 }  // namespace
 
 void runCoreTests() {
@@ -2548,4 +2743,8 @@ void runCoreTests() {
     testTheGasDatumSitsAtTheMiddleOfTheGasSpace();
     testAVentedSpaceIsCooledByTheAirItDrawsIn();
     testMassConservation();
+    testAFlatMeshGetsNoCentroidFromItsOwnRoundOff();
+    testTheCentroidIsSimilarUnderScaling();
+    testARankTwoInertiaIsRefusedRatherThanAmplified();
+    testAnUninvertibleInertiaLeavesTheContactMassTranslational();
 }
