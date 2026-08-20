@@ -98,9 +98,17 @@ struct PropellerParams {
 struct PropellerState {
     double revsPerSecond = 0;      // n, as supplied; negative is astern rotation
     double advanceSpeed = 0;       // Va = u (1 - w), m/s
-    double advanceRatio = 0;       // J = Va / (n D); zero when n == 0
-    double thrustCoefficient = 0;  // K_T = T / (rho n^2 D^4); zero when n == 0
-    double torqueCoefficient = 0;  // K_Q = Q / (rho n^2 D^5); zero when n == 0
+    // The three shaft-normalised quantities are reported only while the shaft,
+    // rather than the inflow, sets the water speed at the blade -- specifically
+    // while (0.7 pi n D)^2 > 0.1 (Va^2 + (0.7 pi n D)^2), which is |J| < 6.6 and
+    // caps |K_T| at 4.7. Outside that they are zero, which covers a locked shaft
+    // and also a shaft crawling through zero during a reversal: there they are
+    // not merely undefined, they diverge as 1/n^2, and a reversal walks straight
+    // through the divergence. See evaluatePropeller for the derivation. Thrust,
+    // torque and power below are unaffected and stay valid everywhere.
+    double advanceRatio = 0;       // J = Va / (n D)
+    double thrustCoefficient = 0;  // K_T = T / (rho n^2 D^4)
+    double torqueCoefficient = 0;  // K_Q = Q / (rho n^2 D^5)
     double thrust = 0;             // T, N, along +x
     double thrustOnHull = 0;       // (1 - t) T, N -- what the hull actually feels
     double torque = 0;             // Q, N m; positive means the shaft is driven

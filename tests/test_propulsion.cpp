@@ -263,6 +263,155 @@ void testFourQuadrantSigns() {
                1e-9 * 4.0 * std::abs(locked.thrust));
 }
 
+// The shaft-speed guard on J, K_T and K_Q.
+//
+// evaluatePropeller reports the three shaft-normalised coefficients only while
+// the shaft, and not the inflow, sets the water speed at the blade. The guard
+// this exercises used to ask `std::abs(revsPerSecond) > 1e-9`: a bare number laid
+// against a frequency in Hz, with no reference frequency anywhere in the
+// expression to divide it by, so it was not a statement about the flow at all.
+// The case it let through is not exotic -- a shaft reversing passes continuously
+// through every value between service revs and zero -- and at n = 1e-6 Hz with
+// 6 m/s of headway it admitted J = 4.0e5 and K_T = -1.5e10 against quantities
+// propulsion.hpp documents as O(0.85) and O(0.1-0.4).
+//
+// **Every assertion below is a bound or an invariance, and that is the point.**
+// The old guard is right at n = 0 and right at service revs; a test that sampled
+// either -- which is all any test here did -- passes on it unchanged. What
+// separates the two is the behaviour *between* those points and the fact that a
+// scale-free criterion must return the same verdict for two flows that differ
+// only by an overall scale.
+void testShaftGuardIsScaleFree() {
+    PropellerParams p = kvlcc2Propeller();
+    p.wakeFraction = 0.0;  // so the surge speed passed below *is* the advance speed
+
+    // The band the guard admits, as derived in propulsion.cpp from its eps: with
+    // Vt^2 > eps (Va^2 + Vt^2) and Vt = 0.7 pi n D, J = 0.7 pi Va / Vt gives
+    //     |J| < 0.7 pi sqrt((1 - eps)/eps),
+    // and J^2 + (0.7 pi)^2 collapses to (0.7 pi)^2 / eps at the threshold, so
+    // coefficientScale -- and with it the largest coefficient the block can
+    // report -- is max|C*| (pi/8)(0.7 pi)^2 / eps. The two disc-coefficient
+    // ceilings are the section model's own, measured by sweeping beta over the
+    // whole circle: 0.24512 axial and 0.02432 tangential. Written as the algebra
+    // rather than as 6.597 / 4.655 / 0.462 so all three move together with eps.
+    const double eps = 0.1;
+    const double jMax = 0.7 * kPi * std::sqrt((1.0 - eps) / eps);
+    const double ceiling = (kPi / 8.0) * (0.7 * kPi) * (0.7 * kPi) / eps;
+    const double ktMax = 0.24512 * ceiling, kqMax = 0.02432 * ceiling;
+
+    // (1) A commanded reversal, sampled the way a tick samples it: full ahead to
+    // full astern with the ship still making 6 m/s, 4001 samples, one of them
+    // landing on n == 0 exactly. Against the old guard the worst sample in this
+    // sweep reads K_T = -4.3e3 and J = -2.1e2.
+    double worstJ = 0.0, worstKt = 0.0, worstKq = 0.0;
+    int reported = 0, suppressed = 0;
+    for (int i = 0; i <= 4000; ++i) {
+        const double n = 1.86 * (1.0 - i / 2000.0);  // exactly zero at i == 2000
+        const PropellerState s = evaluatePropeller(p, 6.0, n);
+        if (std::abs(s.advanceRatio) > std::abs(worstJ)) worstJ = s.advanceRatio;
+        if (std::abs(s.thrustCoefficient) > std::abs(worstKt)) worstKt = s.thrustCoefficient;
+        if (std::abs(s.torqueCoefficient) > std::abs(worstKq)) worstKq = s.torqueCoefficient;
+        if (s.thrustCoefficient == 0.0) ++suppressed; else ++reported;
+    }
+    expectTrue("a reversal never reports J outside the admitted band",
+               std::abs(worstJ) <= jMax);
+    expectTrue("a reversal never reports K_T outside the admitted band",
+               std::abs(worstKt) <= ktMax);
+    expectTrue("a reversal never reports K_Q outside the admitted band",
+               std::abs(worstKq) <= kqMax);
+    // ...and the bound is not satisfied by suppressing everything. The sweep has
+    // to contain both kinds of sample, and has to reach the top of the band --
+    // otherwise "|K_T| <= 4.66" would also be true of a guard that reported zero
+    // always, which is a different way of lying about the same thing.
+    expectTrue("the reversal sweep straddles the cut", reported > 0 && suppressed > 0);
+    expectTrue("the reversal sweep reaches the top of the admitted band",
+               std::abs(worstKt) > 0.9 * ktMax);
+
+    // (2) Where the cut falls, checked against the algebra rather than against
+    // wherever the sweep above happened to sample. At the threshold Vt^2 =
+    // eps V_R^2, so Vt = Va sqrt(eps/(1 - eps)) and n = Vt / (0.7 pi D).
+    const double va = 6.0;
+    const double edgeN = va * std::sqrt(eps / (1.0 - eps)) / (0.7 * kPi * p.diameter);
+    const PropellerState inside = evaluatePropeller(p, va, edgeN * (1.0 + 1e-9));
+    const PropellerState outside = evaluatePropeller(p, va, edgeN * (1.0 - 1e-9));
+    expectNear("the widest J the guard admits is the derived edge of the band",
+               std::abs(inside.advanceRatio), jMax, 1e-6 * jMax);
+    expectTrue("a hair the other side of that edge, J is suppressed",
+               outside.advanceRatio == 0.0 && outside.thrustCoefficient == 0.0 &&
+                   outside.torqueCoefficient == 0.0);
+    expectTrue("thrust is reported on both sides of the edge, unaffected by it",
+               inside.thrust < 0.0 && outside.thrust < 0.0);
+
+    // (3) The invariance that names the defect. Scaling the shaft speed and the
+    // water speed by the same factor leaves J, K_T and K_Q algebraically
+    // unchanged -- V_R scales with the factor, thrust and torque with its square,
+    // n^2 with its square -- so a criterion that is a statement about the flow
+    // returns the same verdict for both members of the pair, and one that is a
+    // statement about n alone does not. The pair below straddles the old 1e-9 Hz
+    // threshold, which refused 5e-10 and admitted 1.5e-9 with J = 7.9e8.
+    for (double scale : {3.0, 1.0 / 3.0, 1e6}) {
+        const PropellerState slow = evaluatePropeller(p, 3.9, 1.5e-9);
+        const PropellerState fast = evaluatePropeller(p, 3.9 * scale, 1.5e-9 * scale);
+        expectTrue("scaling n and Va together does not change the guard's verdict on J",
+                   slow.advanceRatio == fast.advanceRatio);
+        expectTrue("scaling n and Va together does not change the verdict on K_T",
+                   slow.thrustCoefficient == fast.thrustCoefficient);
+        expectTrue("scaling n and Va together does not change the verdict on K_Q",
+                   slow.torqueCoefficient == fast.torqueCoefficient);
+    }
+    // The control for the three above, which two zeros would otherwise satisfy:
+    // the same invariance inside the band, where the answer is non-zero and the
+    // two must agree to rounding rather than by both being suppressed.
+    const PropellerState band = evaluatePropeller(p, 3.9, 0.4);
+    const PropellerState bandFast = evaluatePropeller(p, 11.7, 1.2);
+    expectTrue("the invariance is being tested on a live coefficient too",
+               std::abs(band.thrustCoefficient) > 0.05);
+    expectNear("inside the band the same scaling leaves K_T alone",
+               bandFast.thrustCoefficient, band.thrustCoefficient,
+               1e-12 * std::abs(band.thrustCoefficient));
+
+    // (4) And it is not invariant under a pure size change either. Doubling D
+    // while halving n holds Va, J, the tangential speed and the resultant fixed,
+    // so every coefficient is fixed too -- but it moves n across 1e-9.
+    PropellerParams twice = p;
+    twice.diameter = 2.0 * p.diameter;
+    const PropellerState small = evaluatePropeller(p, 3.9, 1.5e-9);
+    const PropellerState large = evaluatePropeller(twice, 3.9, 0.75e-9);
+    expectTrue("doubling D and halving n does not change the guard's verdict",
+               small.advanceRatio == large.advanceRatio &&
+                   small.thrustCoefficient == large.thrustCoefficient);
+
+    // (5) The contract the old guard was written for, which must survive: a shaft
+    // stopped in a stream reports no coefficients, and thrust is untouched by the
+    // guard on either side of the crossing.
+    const PropellerState stopped = evaluatePropeller(p, 6.0, 0.0);
+    expectTrue("a stopped shaft reports no J, K_T or K_Q",
+               stopped.advanceRatio == 0.0 && stopped.thrustCoefficient == 0.0 &&
+                   stopped.torqueCoefficient == 0.0 && stopped.efficiency == 0.0);
+    expectTrue("a stopped shaft in a stream still drags", stopped.thrust < 0.0);
+    for (double n : {1e-12, -1e-12})
+        expectNear("thrust is continuous through the crossing",
+                   evaluatePropeller(p, 6.0, n).thrust, stopped.thrust,
+                   1e-9 * std::abs(stopped.thrust));
+
+    // (6) And the working range is untouched by the tightening: at the operating
+    // point the coefficients are still reported, and still equal the
+    // J-parameterised curve they are supposed to equal.
+    for (double j : {0.05, 0.3, 0.5, 0.85}) {
+        const double n = 1.4;
+        const PropellerState s = evaluatePropeller(p, j * n * p.diameter, n);
+        const std::string at = " @ J=" + std::to_string(j);
+        expectNear("the working range still reports J" + at, s.advanceRatio, j, 1e-12);
+        expectNear("the working range still reports K_T" + at, s.thrustCoefficient,
+                   propellerThrustCoefficient(p, j), 1e-12);
+        expectNear("the working range still reports K_Q" + at, s.torqueCoefficient,
+                   propellerTorqueCoefficient(p, j), 1e-12);
+    }
+    std::printf("     shaft guard admits |J| < %.3f, capping |K_T| at %.3f; worst over a "
+                "1.86 -> -1.86 Hz reversal at 6 m/s: J %.3f, K_T %.3f\n",
+                jMax, ktMax, worstJ, worstKt);
+}
+
 // --- Rudder -----------------------------------------------------------------
 
 double fujiiSlope(const RudderParams& r) { return 6.13 * r.aspectRatio / (r.aspectRatio + 2.25); }
@@ -613,6 +762,7 @@ void runPropulsionTests() {
     testOpenWaterEfficiency();
     testPowerConsistency();
     testFourQuadrantSigns();
+    testShaftGuardIsScaleFree();
     testRudderNormalCoefficient();
     testRudderForcesAgainstClosedForm();
     testHullSymmetryAndClosedForm();
