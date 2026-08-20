@@ -1309,6 +1309,10 @@ void testRammingAShip() {
         if (touchingSteps > 0 && !c.touching && time > firstTouch + 0.5) break;
     }
 
+    // A fixed name, and safe as one only because `scratchDir()` is a directory
+    // this process alone owns: it was once the shared $TMPDIR, and a mutation
+    // sweep with four workers on one /tmp then scored a mutant on a *neighbour's*
+    // write. tests/harness.cpp carries the incident.
     const std::string path = testing::scratchDir() + "collision_ram.csv";
     if (std::FILE* f = std::fopen(path.c_str(), "w")) {
         std::fwrite(csv.data(), 1, csv.size(), f);
