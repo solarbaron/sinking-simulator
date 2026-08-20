@@ -553,3 +553,15 @@ whether to measure, not to decide what to do.
   shows none of the FAIL lines that preceded it. Re-run unbuffered before
   believing the signal: the same failure came back as 134 with four named FAILs
   visible, which is a diagnosis rather than a mystery.
+- **Assert *which* diagnostic, never that the problems list is non-empty.** The
+  `stubby` fixture asserted `!validateIndentation(stubby).empty()` and had been
+  green for the wrong reason since it was written: the fixture trips the
+  contact-width rule as well as the slenderness rule it was meant to exercise, so
+  disabling the rule under test changed nothing. Same shape as the grid that
+  sweeps only the axes a defect is constant along — an assertion satisfied by a
+  property other than the one it names.
+- **A test can be green because it sampled the right parity.** A dwell-streak test
+  that freed the budget on review 12 passed against the broken code and failed on
+  review 11; the defect was an oscillation, so half the sampling points hid it.
+  When a fix is about *when* something happens, vary the phase and say in the
+  comment which phase the test picked and why.
