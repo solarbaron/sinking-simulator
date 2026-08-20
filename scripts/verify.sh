@@ -93,6 +93,29 @@ note()    { printf '    %s%s%s\n' "$dim" "$1" "$off"; }
 # possibly still be working", not expectations: the box is usually shared.
 BUILD_TIMEOUT=3600      # a clean rebuild of the whole tree on a busy box
 STEP_TIMEOUT=1800       # any one tool run or test-suite run
+
+# The figure gate needs its own bound, because it is the one step whose healthy
+# runtime is a large fraction of STEP_TIMEOUT rather than a small one. **Measured
+# 1676 s on an idle box**, against the 1800 s above -- a margin of 124 s, or 6.9%.
+# That is not a bound on "this cannot possibly still be working" any more; it is a
+# coin toss, and it came up tails: a sanitize run with four agents building
+# alongside it reported `published figures -- HUNG: no result after 1800 s,
+# killed` with every figure it had reached green and the tsan leg clean.
+#
+# The margin was not deliberately spent -- the gate GREW into it. `--wave` (~162
+# s), the cable-transit run (~99 s) and `zone_gpu_probe --stats` all landed
+# without anyone re-measuring the total, which is the failure mode to guard
+# against here: every one of those was the right thing to add.
+#
+# 3600 s is 2.1x the measured healthy runtime. A genuine hang in this repo is not
+# a slow run, it is an unbounded one -- five mutations in fire.cpp/thermal.cpp
+# turned a nine-second suite into an hours-long one -- so doubling the bound
+# costs nothing in detection and buys the headroom a shared box needs.
+#
+# **Re-measure this when the gate grows.** `time ./scripts/check-figures.sh` on an
+# idle machine; if it passes ~2400 s, raise the bound again rather than letting it
+# converge on the timeout a second time.
+FIGURES_TIMEOUT=3600
 SCENARIO_TIMEOUT=900    # one 900 s flooding scenario, which runs far faster than real time
 
 # ------------------------------------------------------------- reporting ------
@@ -702,8 +725,11 @@ if [ "$GPU" = present ]; then
 else
   figures_ok='^ok — [1-9]'
 fi
+saved_step_timeout=$STEP_TIMEOUT
+STEP_TIMEOUT=$FIGURES_TIMEOUT
 require_built ./scripts/check-figures.sh &&
   expect_ok "published figures" "$figures_ok" ./scripts/check-figures.sh
+STEP_TIMEOUT=$saved_step_timeout
 # The Tier-2 zone at ship scale: solid-shell elements over the ferry's own
 # plating, driven to tearing, and the torn panels fed to breach. The unit suite
 # tests the pieces at unit scale because a real solve is core-minutes; this is the
