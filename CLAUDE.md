@@ -544,3 +544,12 @@ whether to measure, not to decide what to do.
 - A `pgrep -f` predicate matches **the shell running the pgrep**. Guard it
   (`pgrep -f '[c]heck-figures'`) or the check reports its own command line as the
   thing it was looking for. This is the same defect the gate's own waiter had.
+- **`expectNear(x, 0.0)` with a zero tolerance passes a NaN.** `std::abs(NaN - x) >
+  0.0` is false, so the comparison that looks strictest is the one that lets the
+  worst value through — and a run that read uninitialised or out-of-bounds doubles
+  is exactly the run that arrives carrying NaNs. Assert bit-identity with `==`
+  against a reference run when what you mean is "nothing happened".
+- A test suite that dies of heap corruption reports a **buffered** exit 139 and
+  shows none of the FAIL lines that preceded it. Re-run unbuffered before
+  believing the signal: the same failure came back as 134 with four named FAILs
+  visible, which is a diagnosis rather than a mystery.
