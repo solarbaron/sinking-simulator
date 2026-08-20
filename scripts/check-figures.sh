@@ -946,7 +946,7 @@ if [ -x "$TESTS" ]; then
   # gate never passes.
   suiteout=$("$TESTS" 2>&1)
   suite=$(printf '%s\n' "$suiteout" | sed -n 's/^\([0-9]*\) checks, [0-9]* failures$/\1/p' | tail -1)
-  expected=201382
+  expected=201712
   check "closed-form validation checks in the suite" "$expected" 0 "$suite" \
         "$expected validation checks" "$FRONT"
   # **The roadmap publishes the same count in a different format**, and it was
