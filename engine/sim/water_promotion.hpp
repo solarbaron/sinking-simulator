@@ -18,7 +18,12 @@
 //
 // **The criterion (§2):** Ship motion (roll rate, lateral acceleration) crossed
 // with geometric guards (minimum depth, minimum volume). Hysteresis and dwell
-// prevent chatter, following `GasPromoter`'s structure exactly.
+// prevent chatter, following `GasPromoter`'s structure -- including the half this
+// tier claimed and did not implement, that a dwell streak is accumulated before
+// the budget is consulted and is never reset by it. Which of the two readings of
+// "dwell" that is, and the evidence for choosing it, is at `WaterCriterion::dwell`;
+// what a compartment the budget cannot afford looks like from outside is
+// `WaterReview::starved`.
 //
 // **State transfer (§3):**
 //   - Escalation: `Compartment::waterVolume` → `flip::Solver` particles via
@@ -88,6 +93,44 @@ struct WaterCriterion {
 
     // Hysteresis: consecutive reviews a candidate must qualify for (dwell) or
     // an active compartment must fail (hold) before state changes.
+    //
+    // **Dwell counts qualification, not qualification-and-affordability.** That
+    // sentence is what this header did not say while the code implemented the
+    // other reading, and the missing sentence was the deeper half of the defect:
+    // both readings are defensible, so a reader had no way to tell an intended
+    // design from a bug. A compartment accumulates dwell on every review its own
+    // motion and volume clear the criterion, whether or not the particle and tile
+    // budgets could have afforded it that review. The budgets are a throughput
+    // limit on the tier -- a statement about how much water is already resolved --
+    // and not a statement about the compartment, so they do not touch a
+    // per-compartment hysteresis counter. A compartment refused on budget promotes
+    // on the first review that admits it, with no further dwell to serve.
+    //
+    // The evidence, all of it already written down before this was decided:
+    //   * Both siblings build the streak in a pass over the whole ranked candidate
+    //     list *before* any budget is consulted (`promotion.cpp:441` for the
+    //     structural zones, `:967` for the gas ones) and then refuse on budget with
+    //     a `continue` and a `problems` line. Neither lets the budget near the
+    //     count.
+    //   * `Criterion::dwell` and `GasCriterion::dwell` are both defined as the
+    //     "consecutive reviews a candidate must qualify for", with no second
+    //     condition.
+    //   * §3 of `promotion.hpp` derives dwell from chatter alone -- an oscillation
+    //     "wider than the band, provided it is faster than the dwell" -- which is a
+    //     property of the signal and has nothing to say about occupancy.
+    //   * Rule 7 there calls a zone that arrives while the budget is full "refused
+    //     and reported", i.e. a transient condition of the tier.
+    //   * `WaterPromoter::qualifying_` describes itself as "consecutive reviews
+    //     qualifying", and this file's §2 summary claimed the tier followed
+    //     `GasPromoter` exactly. Only the code disagreed.
+    //
+    // The other reading is not rescued by documenting it, which is the second half
+    // of the argument rather than a preference. Under it a compartment starved by a
+    // full budget starves for ever -- its streak restarts every review, so it can
+    // never reach `dwell` however long it qualifies -- and nothing distinguishes
+    // that from a compartment that quietly stopped qualifying. That is the shape of
+    // the 154 silent refusals recorded against `particleBudget` below.
+    // `WaterReview::starved` is the channel either reading would have needed.
     int dwell = 2;
     int hold = 3;
 
@@ -269,10 +312,39 @@ struct WaterActive {
     int idleReviews = 0;                // consecutive reviews below hold threshold
 };
 
+// A compartment that qualified, served its dwell, and was still not promoted --
+// because the particle or tile budget had already been spent on the compartments
+// ranked above it.
+//
+// Reported rather than merely refused, because the two ways a compartment can be
+// absent from `promoted` are different findings. Short of its dwell it is the
+// hysteresis working, and that is the tier behaving. Starved it is the *budget*
+// working, and a budget that turns the same compartment away twenty reviews
+// running is a fact about this tier and not about the ship -- exactly the fact
+// `WaterCriterion::particleBudget` records going unnoticed for 154 refusals of the
+// vehicle deck while a 1 m3 trickle was resolved in its place.
+//
+// `refusedReviews` is the number a reader wants: one is the budget doing its job on
+// a busy review, and a number that climbs on every review is starvation. It counts
+// from the review the compartment first became *promotable*, not from the review it
+// first qualified, so it is `qualifyingReviews` less `max(1, dwell)` plus one.
+struct WaterStarved {
+    int compartment = -1;
+    std::string name;
+    int qualifyingReviews = 0;   // consecutive reviews it has qualified for
+    int refusedReviews = 0;      // consecutive reviews it has been promotable and refused
+};
+
 struct WaterReview {
-    std::vector<WaterCandidate> considered;  // ranked, before budget
+    // Ranked, and holding every compartment considered rather than only those that
+    // qualified -- each carries its own `why`. The ranking and the membership are
+    // fixed before the budget is applied; the `why` of a compartment the budget
+    // then starved is rewritten to say so, because this is the list a caller reads
+    // to find out what happened to a compartment it expected to see promoted.
+    std::vector<WaterCandidate> considered;
     std::vector<WaterActive> promoted;       // newly promoted this review
     std::vector<WaterActive> demoted;        // dropped this review
+    std::vector<WaterStarved> starved;       // qualified, dwelt, and could not be afforded
     int particlesActive = 0;                 // across all active compartments
     int tilesActive = 0;
     double costActive = 0;                   // core-seconds/sim-second total
@@ -314,8 +386,12 @@ private:
     // earlier sample and therefore no acceleration to report.
     Vec3 previousVelocity_{};
     bool havePreviousVelocity_ = false;
-    // Panel index -> consecutive reviews qualifying, ascending (for dwell).
-    // Follows `GasPromoter::qualifying_` pattern exactly.
+    // Compartment index -> consecutive reviews qualifying (for dwell). Rebuilt on
+    // every review from the ranked candidate list, *before* the budget is
+    // consulted, so a budget refusal cannot reset a streak: see
+    // `WaterCriterion::dwell` for which reading of dwell that is and why. Follows
+    // `GasPromoter::qualifying_`, which is where the separation comes from. (It
+    // said "panel index" -- the structural tier's identity, not this one's.)
     std::vector<std::pair<int, int>> qualifying_;
     int reviews_ = 0, promotions_ = 0, demotions_ = 0;
 };

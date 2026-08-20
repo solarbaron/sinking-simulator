@@ -317,69 +317,171 @@ WaterReview WaterPromoter::review(const Ship& ship, double dt) {
 
     active_ = std::move(stillActive);
 
-    // --- Step 2: Check candidates for promotion ---
+    // --- Step 2: Dwell, which counts qualification and nothing else ---
 
-    // Update qualifying_ map: compartments that qualify this review
+    // **Its own pass, ahead of the budget, and that separation is the whole fix.**
+    // `qualifying_` holds the consecutive reviews a compartment has *qualified*
+    // for, which is what its own comment has always said it held. It used to be
+    // built inside the promotion loop below, and that loop stops at the first
+    // candidate the budget cannot admit -- so every candidate ranked below the stop
+    // was never written back. Its streak did not pause there: it went to zero and
+    // restarted at one on the next review. A compartment held under a full budget
+    // could therefore never reach `dwell` however long it qualified. It was not
+    // deferred, it was repeatedly restarted, and restarted by a budget decision
+    // taken about a *different* compartment ranked above it.
+    //
+    // Measured on three tied 5 m3 compartments with room for one and `dwell = 2`.
+    // Compartment 0 promotes on review 2. Compartments 1 and 2 then *oscillated*:
+    // each rebuilt to a streak of two on every even review, was refused there and
+    // dropped in the same breath, and stood at one again on every odd review --
+    // sixteen reviews of continuous qualification and not one promotion. The nastier
+    // consequence is the parity. Whether a starved compartment ever promoted at all
+    // depended on whether the budget happened to free on an even review or an odd
+    // one, which is not a property of the ship, of the water, or of the criterion.
+    //
+    // With the streak kept they stand at nine consecutive refusals by review 10 and
+    // the first of them promotes on the very review that frees the budget, whichever
+    // review that is. `testABudgetStarvedCompartmentKeepsItsDwell` pins both halves
+    // and frees the budget on an odd review on purpose, because an even one passes
+    // against the defect.
+    //
+    // That is the gas tier's defect running backwards. There a refusal was silent
+    // and 154 of them read as hysteresis working correctly; here the hysteresis is
+    // silently *reset* by a decision that says nothing about whether the
+    // compartment qualifies. Both siblings build the streak in a separate pass over
+    // the whole ranked list before any budget is consulted (`promotion.cpp:441` for
+    // the structural zones, `:967` for the gas ones) -- the structure the header
+    // already claimed this tier followed "exactly".
+    //
+    // An already-active compartment leaves the list rather than accumulating,
+    // which is this tier's existing behaviour and is kept as it was. It reads as a
+    // divergence from the siblings, which have no such skip, and it is not one in
+    // outcome: every route out of `active_` here -- motion below the hold
+    // thresholds for `hold` consecutive reviews, or volume below `minVolume` --
+    // also drops the compartment out of the candidate list, so anything demoted has
+    // already had its streak cleared by ceasing to qualify. The skip saves carrying
+    // a count that nothing can read; it does not change when a compartment
+    // re-promotes.
     std::vector<std::pair<int, int>> stillQualifying;
+    for (const WaterCandidate& cand : result.considered) {
+        if (cand.score <= 0) continue;  // didn't qualify this review
 
-    for (const auto& cand : result.considered) {
-        if (cand.score <= 0) continue;  // didn't qualify
-
-        // Is it already active?
-        bool alreadyActive = std::any_of(active_.begin(), active_.end(),
-                                         [&](const WaterActive& a) {
-                                             return a.compartment == cand.compartment;
-                                         });
+        const bool alreadyActive =
+            std::any_of(active_.begin(), active_.end(), [&](const WaterActive& a) {
+                return a.compartment == cand.compartment;
+            });
         if (alreadyActive) continue;
 
-        // Find in qualifying_ list
-        auto it = std::find_if(qualifying_.begin(), qualifying_.end(),
-                               [&](const auto& p) { return p.first == cand.compartment; });
-
-        int streak = (it != qualifying_.end()) ? it->second + 1 : 1;
-
-        if (streak >= criterion_.dwell) {
-            // Promote! But check budget first.
-            int totalParticles = 0, totalTiles = 0;
-            for (const auto& a : active_) {
-                totalParticles += a.particles;
-                totalTiles += a.tiles;
-            }
-
-            if (totalParticles + cand.particles <= criterion_.particleBudget &&
-                totalTiles + cand.tiles <= criterion_.tileBudget) {
-
-                WaterActive newActive;
-                newActive.compartment = cand.compartment;
-                newActive.name = cand.name;
-                newActive.rollRate = cand.rollRate;
-                newActive.accel = cand.accel;
-                newActive.depth = cand.depth;
-                newActive.volume = cand.volume;
-                newActive.score = cand.score;
-                newActive.particles = cand.particles;
-                newActive.tiles = cand.tiles;
-                newActive.cost = cand.cost;
-                newActive.promotedAtReview = reviews_;
-                newActive.idleReviews = 0;
-
-                active_.push_back(newActive);
-                result.promoted.push_back(newActive);
-                promotions_++;
-            } else {
-                // Budget exhausted, stop promoting
-                result.problems.push_back("particle or tile budget exhausted");
-                break;
-            }
-        } else {
-            // Still building dwell streak
-            stillQualifying.push_back({cand.compartment, streak});
-        }
+        const auto it = std::find_if(qualifying_.begin(), qualifying_.end(),
+                                     [&](const auto& p) { return p.first == cand.compartment; });
+        stillQualifying.push_back(
+            {cand.compartment, (it != qualifying_.end()) ? it->second + 1 : 1});
     }
-
     qualifying_ = std::move(stillQualifying);
 
-    // --- Step 3: Compute totals ---
+    // --- Step 3: Promotion, down the ranked order, until the budget is spent ---
+
+    // `max(1, dwell)`, the way both siblings write it (`promotion.cpp:475` and
+    // `:989`): a streak starts at one, so zero and one are the same criterion, and
+    // a negative dwell is not a licence to promote before qualifying. The
+    // starvation report below measures against the same value, so what "promotable"
+    // means cannot drift between the decision and the report.
+    const int dwellNeeded = std::max(1, criterion_.dwell);
+
+    int totalParticles = 0, totalTiles = 0;
+    for (const auto& a : active_) {
+        totalParticles += a.particles;
+        totalTiles += a.tiles;
+    }
+
+    // The budget is spent from the front of the ranked list and promotion stops at
+    // the first compartment that does not fit; it is not repacked with a smaller
+    // one from further down, because the order is the priority order and skipping
+    // ahead would resolve a 1 m3 trickle in place of a compartment that just
+    // missed. `testTheBudgetSpendsTheTieBreakOrder` pins that.
+    //
+    // Stopping *promoting* is not the same as stopping *looking*, and the
+    // difference is what makes the starvation visible. The scan runs to the end of
+    // the list either way, so every compartment that had served its dwell and got
+    // nothing can be named -- not only the first one the budget happened to test.
+    // The loop used to `break`, which is why this was invisible and why the streaks
+    // below it were being destroyed.
+    bool budgetSpent = false;
+    for (WaterCandidate& cand : result.considered) {
+        if (cand.score <= 0) continue;
+
+        const auto it = std::find_if(qualifying_.begin(), qualifying_.end(),
+                                     [&](const auto& p) { return p.first == cand.compartment; });
+        if (it == qualifying_.end()) continue;   // already active, so not a candidate
+        const int streak = it->second;
+        if (streak < dwellNeeded) continue;      // still building its dwell
+
+        if (!budgetSpent && totalParticles + cand.particles <= criterion_.particleBudget &&
+            totalTiles + cand.tiles <= criterion_.tileBudget) {
+            WaterActive newActive;
+            newActive.compartment = cand.compartment;
+            newActive.name = cand.name;
+            newActive.rollRate = cand.rollRate;
+            newActive.accel = cand.accel;
+            newActive.depth = cand.depth;
+            newActive.volume = cand.volume;
+            newActive.score = cand.score;
+            newActive.particles = cand.particles;
+            newActive.tiles = cand.tiles;
+            newActive.cost = cand.cost;
+            newActive.promotedAtReview = reviews_;
+            newActive.idleReviews = 0;
+
+            active_.push_back(newActive);
+            result.promoted.push_back(newActive);
+            promotions_++;
+            totalParticles += cand.particles;
+            totalTiles += cand.tiles;
+            continue;
+        }
+
+        // Starved: it qualified, it served its dwell, and it got nothing. How long
+        // that has been true is the number worth carrying -- one review is the
+        // budget doing its job, and a count that climbs on every review is a
+        // compartment that will never be resolved while the ones above it hold
+        // their water.
+        budgetSpent = true;
+        WaterStarved starved;
+        starved.compartment = cand.compartment;
+        starved.name = cand.name;
+        starved.qualifyingReviews = streak;
+        starved.refusedReviews = streak - dwellNeeded + 1;
+        result.starved.push_back(starved);
+
+        cand.why = "qualifies, and the particle or tile budget refused it on " +
+                   std::to_string(starved.refusedReviews) +
+                   " consecutive review(s); its dwell is retained";
+    }
+
+    // **The refusal gets a channel, on this tier's own terms and on the gas tier's
+    // both.** `considered` is where a rejected candidate says why -- that is
+    // already the answer here for one refused on volume or on grid spacing -- and
+    // `problems` carries the count, which is how `gasCandidates` reports its
+    // refusals after the same defect was found there. The message this replaced,
+    // "particle or tile budget exhausted", named no compartment and said nothing
+    // about how long: it could not tell a busy review from starvation, and those
+    // are the two things a reader of it has to tell apart.
+    //
+    // The word "budget" is load-bearing rather than decorative: `water_probe`
+    // counts the reviews that refused by looking for it in these strings.
+    if (!result.starved.empty()) {
+        const WaterStarved* longest = &result.starved.front();
+        for (const WaterStarved& s : result.starved)
+            if (s.refusedReviews > longest->refusedReviews) longest = &s;
+        result.problems.push_back(
+            "the particle or tile budget refused " + std::to_string(result.starved.size()) +
+            " qualifying compartment(s); nothing already promoted was demoted for them, and their"
+            " dwell is retained, so each promotes on the first review that admits it (longest: '" +
+            longest->name + "', refused on " + std::to_string(longest->refusedReviews) +
+            " consecutive review(s))");
+    }
+
+    // --- Step 4: Compute totals ---
 
     for (const auto& a : active_) {
         result.particlesActive += a.particles;
