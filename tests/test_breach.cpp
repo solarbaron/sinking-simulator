@@ -168,6 +168,14 @@ enum PanelIndex {
     // placed so the two corners fall in different cells of the weld grid.
     kSeamBelow,
     kSeamAbove,
+    // Two strakes of side plating standing on the outboard edge of `kBottom`, so
+    // that the three of them are one torn region running round the bilge corner:
+    // 4 m2 of flat bottom, 2 m2 of side under 4 m2 more. Failing the first two
+    // together and then all three moves the region's balance from horizontal to
+    // vertical without moving a single panel, which is what says the *region* is
+    // classified and not whichever panel came first.
+    kBilgeSideLow,
+    kBilgeSideHigh,
     kPanelCount
 };
 
@@ -250,6 +258,11 @@ Barge makeBarge() {
     above.corner[3] = {-8.0, y, 3.0};
     above.role = PanelRole::Shell;
     panels.push_back(above);
+
+    // Standing on `kBottom`'s outboard edge at y = -10, x = -20..-18, so the
+    // three panels weld into one region round the bilge corner.
+    panels.push_back(panelAtY(y, -20.0, -18.0, 0.0, 1.0));
+    panels.push_back(panelAtY(y, -20.0, -18.0, 1.0, 3.0));
 
     barge.mesh.materials = {ah36Steel()};
     return barge;
@@ -1309,6 +1322,305 @@ void testFerryFloodsThroughItsOwnStructure() {
                damaged.diagnostics(0.0).draftMidship > control.diagnostics(0.0).draftMidship + 0.05);
 }
 
+// --- Which law a torn hole floods under ---------------------------------------
+//
+// `breach.hpp` §4. `Opening::kind` is the whole switch on the counter-current
+// branch of `Ship::solveFlowNetwork` -- `horizontalSidesOf` admits
+// `OpeningKind::Hatch` and nothing else -- so a hole torn through a deck and left
+// at `Breach` gets the single-dp vertical orifice law, which `ship.hpp` spends
+// its opening paragraphs arguing is at rest in exactly that case. The failure is
+// silent by construction: the net through the hole is *the same number* either
+// way, and what the wrong law loses is the two streams that carry it.
+//
+// A rig for that, in the arrangement the header describes: a shallow pool
+// standing on a deck with dry sealed air under it, and one panel of the deck torn
+// out. Nothing else is in the flooding network, so the air the falling water
+// displaces has nowhere to go but up through the hole it is falling through.
+
+constexpr double kDeckZ = 0.0;
+constexpr double kPoolDepth = 0.30;      // m of water standing on the deck
+constexpr double kRigHalfLength = 19.0, kRigHalfBeam = 7.0;
+
+struct DeckRig {
+    Ship ship;
+    StructuralMesh mesh;
+    int lower = 0, upper = 1;
+};
+
+DeckRig makeDeckRig() {
+    DeckRig rig;
+    Ship& s = rig.ship;
+    s.hull = makeBox({-20, -8, -5}, {20, 8, 4});
+    s.deckEdgeZ = 4.0;
+
+    Compartment lower = box("lower", {-kRigHalfLength, -kRigHalfBeam, -5.0},
+                            {kRigHalfLength, kRigHalfBeam, kDeckZ});
+    Compartment upper = box("upper", {-kRigHalfLength, -kRigHalfBeam, kDeckZ},
+                            {kRigHalfLength, kRigHalfBeam, 3.5});
+    // Sealed, both of them, which `box()` is not: the torn deck has to be the only
+    // path between the two spaces or the exchange is not the only thing being
+    // measured.
+    lower.ventedToAtmosphere = false;
+    upper.ventedToAtmosphere = false;
+    // Filled *before* `initialise`, which is what gives the pool the right air.
+    // A compartment filled afterwards keeps the air mass it held while empty, and
+    // the trapped gas that results is metres of head that is not water.
+    upper.waterVolume = 2.0 * kRigHalfLength * 2.0 * kRigHalfBeam * kPoolDepth;
+    s.compartments = {lower, upper};
+
+    s.lightshipMass = 40.0 * 16.0 * 2.0 * kRhoSeawater;
+    s.lightshipCog = {0, 0, -2.0};
+    s.gyradii = {5.0, 12.0, 12.0};
+    s.initialise(0.0);
+
+    // 2 x 2 m of deck, on the body's own axis so that `R * pos` is zero at every
+    // attitude and the hole cannot wander while she trims.
+    rig.mesh.panels.push_back(panelAtZ(kDeckZ, -1.0, 1.0, -1.0, 1.0));
+    rig.mesh.materials = {ah36Steel()};
+    return rig;
+}
+
+// A metre of deck hinged about the x axis: the in-plane direction (0, dy, dz)
+// tilts it out of the horizontal and its normal comes out proportional to
+// (0, -dz, dy), so `dz == dy` is 45 degrees.
+//
+// Exactly 45 degrees, and that matters. Both components leave the same cross
+// product scaled by the same numbers, so at `dz == dy` they are equal bit for
+// bit; `normalize` divides both by one length and `hypot(0, n_y)` is |n_y| by
+// definition. The crossover is therefore a genuine tie rather than a rounding,
+// and which way it falls is a decision this file can pin.
+PlatePanel deckPanelTilted(double dy, double dz) {
+    const double s = 0.5 / std::hypot(dy, dz);   // half a metre along the slope
+    PlatePanel p;
+    p.corner[0] = {-1.0, -dy * s, kDeckZ - dz * s};
+    p.corner[1] = {1.0, -dy * s, kDeckZ - dz * s};
+    p.corner[2] = {1.0, dy * s, kDeckZ + dz * s};
+    p.corner[3] = {-1.0, dy * s, kDeckZ + dz * s};
+    p.thickness = 0.010;
+    p.role = PanelRole::Deck;
+    return p;
+}
+
+OpeningKind kindOfOnly(const BreachSet& set) {
+    if (set.breaches.size() != 1) return OpeningKind::Door;  // never produced here
+    return set.breaches[0].opening.kind;
+}
+
+void testOrientationDecidesWhichLawTheHoleFloodsUnder() {
+    // --- 1. The barge, where every normal is an axis -------------------------
+    const Barge barge = makeBarge();
+    expectTrue("a torn bulkhead is a vertical orifice",
+               kindOfOnly(breachOf(barge, {kBulkhead})) == OpeningKind::Breach);
+    expectTrue("so is torn side plating",
+               kindOfOnly(breachOf(barge, {kGrid})) == OpeningKind::Breach);
+    // The vacuity guard the whole test turns on: tearing only vertical panels
+    // would leave every assertion above passing on code that cannot say anything
+    // else, since `Breach` is also the enumerator zero.
+    expectTrue("a torn flat of bottom is a horizontal one",
+               kindOfOnly(breachOf(barge, {kBottom})) == OpeningKind::Hatch);
+    expectTrue("while the strake standing on its outboard edge is not",
+               kindOfOnly(breachOf(barge, {kBilgeSideLow})) == OpeningKind::Breach);
+
+    // The region, not the panel. `kBottom` alone is a hatch and `kBilgeSideLow`
+    // alone is a breach; welded together they are one hole, and which law it gets
+    // moves with the areas -- 4 m2 of bottom under 2 m2 of side is a hatch, and
+    // 4 m2 more side turns the same region over. Nothing about the panels changed
+    // between the two calls except which of them tore.
+    const BreachSet bilge = breachOf(barge, {kBottom, kBilgeSideLow});
+    expectEqual("bottom and side plating sharing an edge are one hole",
+                static_cast<long long>(bilge.breaches.size()), 1);
+    expectTrue("which the flat of bottom carries", kindOfOnly(bilge) == OpeningKind::Hatch);
+    const BreachSet bilgeTall = breachOf(barge, {kBottom, kBilgeSideLow, kBilgeSideHigh});
+    expectEqual("a taller tear up the same corner is still one hole",
+                static_cast<long long>(bilgeTall.breaches.size()), 1);
+    expectTrue("and the side plating now carries it",
+               kindOfOnly(bilgeTall) == OpeningKind::Breach);
+    if (bilge.breaches.size() == 1 && bilgeTall.breaches.size() == 1)
+        expectTrue("with the taller region genuinely the larger of the two",
+                   bilgeTall.breaches[0].opening.area > bilge.breaches[0].opening.area);
+
+    // `kChord` cuts the corner between the side and the bottom, and it does so at
+    // exactly 45 degrees -- a diagonal of a unit square, so its normal's two
+    // non-zero components come out of one cross product with the same magnitude.
+    // It was built to test the marching probe and it happens to be the crossover
+    // itself, which makes it the one panel in the fixture that says which way the
+    // tie falls. The guard is the first assertion: without it the second would
+    // pass on a panel that had drifted off the diagonal.
+    const Vec3 chordNormal = barge.mesh.panels[kChord].normal();
+    expectTrue("the barge's bilge chord stands exactly on the crossover",
+               std::abs(chordNormal.z) == std::abs(chordNormal.y) && chordNormal.x == 0.0);
+    expectTrue("where the tie goes to the vertical law",
+               kindOfOnly(breachOf(barge, {kChord})) == OpeningKind::Breach);
+
+    // --- 2. The crossover, swept -------------------------------------------
+    //
+    // The tilt is the *only* input the answer depends on, so it is the only axis
+    // worth sweeping: a grid over anything else would be one point repeated. The
+    // pair at 0.999 and 1.001 is what says the switch is at 45 degrees and not
+    // merely somewhere between vertical and horizontal.
+    DeckRig tilt = makeDeckRig();
+    const double slopes[] = {0.0, 0.5, 0.9, 0.999, 1.0, 1.001, 1.1, 2.0, 10.0, 100.0};
+    int hatches = 0, breaches = 0, flips = 0;
+    bool previous = true, agrees = true, connected = true;
+    for (std::size_t i = 0; i < std::size(slopes); ++i) {
+        tilt.mesh.panels[0] = deckPanelTilted(1.0, slopes[i]);
+        const BreachSet set = breachesFromFailedPanels(tilt.ship, tilt.mesh, {0});
+        if (set.breaches.size() != 1) {
+            connected = false;
+            continue;
+        }
+        const bool hatch = set.breaches[0].opening.kind == OpeningKind::Hatch;
+        // Strictly under 45 degrees is a hatch; at it and past it, a breach.
+        if (hatch != (slopes[i] < 1.0)) agrees = false;
+        if (i > 0 && hatch != previous) ++flips;
+        previous = hatch;
+        hatch ? ++hatches : ++breaches;
+    }
+    expectTrue("every tilted panel opens the deck it stands in", connected);
+    expectTrue("a panel is a hatch below 45 degrees and a breach at or above it", agrees);
+    expectEqual("the answer changes exactly once across the sweep", flips, 1);
+    expectTrue("with both answers represented", hatches > 0 && breaches > 0);
+    std::printf("     tilt sweep: %d hatches and %d breaches over %zu slopes, one crossing\n",
+                hatches, breaches, std::size(slopes));
+
+    // --- 3. The consequence, which is not the label --------------------------
+    //
+    // The same rig twice: once with the hole this file produced, once with the
+    // same hole forced back to `Breach`, which is what every torn panel used to
+    // get. Both are stepped from identical state, so the difference between them
+    // is the classification and nothing else.
+    DeckRig produced = makeDeckRig();
+    produced.mesh.panels[0] = panelAtZ(kDeckZ, -1.0, 1.0, -1.0, 1.0);
+    const BreachSet torn = breachesFromFailedPanels(produced.ship, produced.mesh, {0});
+    expectEqual("the torn deck panel makes one opening",
+                static_cast<long long>(torn.breaches.size()), 1);
+    if (torn.breaches.size() != 1) return;
+    expectTrue("between the two spaces it separates",
+               (torn.breaches[0].opening.a == produced.lower &&
+                torn.breaches[0].opening.b == produced.upper));
+    expectTrue("and it is a horizontal one", kindOfOnly(torn) == OpeningKind::Hatch);
+    expectNear("of 4 m2", torn.breaches[0].opening.area, 4.0, 0.0);
+
+    DeckRig asBreach = makeDeckRig();
+    Opening flattened = torn.breaches[0].opening;
+    flattened.kind = OpeningKind::Breach;
+    applyBreaches(produced.ship, torn);
+    asBreach.ship.openings.push_back(flattened);
+
+    // The head over the hole, from public state: both compartments are cold, so
+    // `gasBuoyancyHead` is exactly zero in each and both sit at `kPatm`, leaving
+    // the pool's own depth as the entire net pressure difference.
+    const Vec3 world = produced.ship.state.orientation.toMat3() * flattened.pos +
+                       produced.ship.state.position;
+    const double pool =
+        produced.ship.compartments[static_cast<std::size_t>(produced.upper)].surfaceWorldZ -
+        world.z;
+    expectNear("the pool stands 300 mm deep over the hole", pool, kPoolDepth, 1e-6);
+
+    const double dt = 1e-4;
+    produced.ship.step(dt, 0.0);
+    asBreach.ship.step(dt, 0.0);
+    const Opening& hatch = produced.ship.openings[0];
+    const Opening& vertical = asBreach.ship.openings[0];
+
+    // Non-vacuous first: both streams ran, and in opposite directions.
+    expectTrue("water falls through the torn deck", hatch.lastExchangeDown > 1.0);
+    expectTrue("while air rises through the same hole", hatch.lastExchangeUp > 1.0);
+    expectTrue("with the pool above and the dry space below",
+               hatch.lastExchangeUpper == produced.upper);
+    // ...and the old classification moves neither.
+    expectNear("the same hole called a breach exchanges nothing downwards",
+               vertical.lastExchangeDown, 0.0, 0.0);
+    expectNear("and nothing upwards", vertical.lastExchangeUp, 0.0, 0.0);
+
+    // **The net is identical**, which is why nothing that measured the net could
+    // ever have seen this. The two streams are solved against the single-orifice
+    // rate the vertical law gives, so their difference has to come back as
+    // exactly the flow the breach twin reports -- and the breach twin is the real
+    // solver on the real state, not this file's arithmetic about it.
+    //
+    // The two are algebraically identical, so the tolerance is a bound on
+    // rounding and nothing else: measured at 4.3e-15 of the flow, a handful of
+    // ULPs over about ten operations, and asserted two orders above that so the
+    // compiler has somewhere to stand.
+    const double net = hatch.lastExchangeDown - hatch.lastExchangeUp;
+    expectTrue("the breach twin passes water", vertical.lastFlowWasWater);
+    expectNear("the two streams pass exactly the net a vertical orifice passes", net,
+               std::abs(vertical.lastFlow), 1e-13 * std::abs(vertical.lastFlow));
+    expectTrue("and carry a great deal more than it in each direction",
+               hatch.lastExchangeDown > 1.5 * net && hatch.lastExchangeUp > 0.5 * net);
+    std::printf("     torn deck, 300 mm of water on 4 m2: %.2f m3/s of water down and %.2f of air "
+                "up, against a net of %.2f -- %.0f t/s of water where the vertical law reports "
+                "%.0f, and no air at all (net agrees to %.1e)\n",
+                hatch.lastExchangeDown, hatch.lastExchangeUp, net,
+                hatch.lastExchangeDown * kRhoSeawater / 1000.0,
+                std::abs(vertical.lastFlow) * kRhoSeawater / 1000.0,
+                std::abs(net - std::abs(vertical.lastFlow)) / std::abs(vertical.lastFlow));
+
+    // --- 4. The ferry, where the label and the geometry disagree -------------
+    //
+    // `PanelRole` is not the criterion and this is why: the flat of bottom and the
+    // side plating are both `PanelRole::Shell`, and one of them is a deck the
+    // moment she rolls far enough for the sea to stand on it.
+    const FerryDamage& damage = ferryDamage();
+    int flat = -1, side = -1;
+    for (std::size_t i = 0; i < damage.mesh.panels.size(); ++i) {
+        const PlatePanel& panel = damage.mesh.panels[i];
+        if (panel.role != PanelRole::Shell) continue;
+        const Vec3 n = panel.normal();
+        if (std::abs(panel.centroid().x) > 10.0) continue;
+        if (flat < 0 && std::abs(n.z) > 0.999) flat = static_cast<int>(i);
+        if (side < 0 && std::abs(n.z) < 0.001) side = static_cast<int>(i);
+    }
+    expectTrue("the ferry has flat of bottom amidships", flat >= 0);
+    expectTrue("and side plating amidships", side >= 0);
+    if (flat >= 0 && side >= 0) {
+        expectTrue("both tagged the same way",
+                   damage.mesh.panels[static_cast<std::size_t>(flat)].role ==
+                       damage.mesh.panels[static_cast<std::size_t>(side)].role);
+        expectTrue("her flat of bottom tears as a horizontal opening",
+                   kindOfOnly(breachesFromFailedPanels(damage.ship, damage.mesh, {flat})) ==
+                       OpeningKind::Hatch);
+        expectTrue("and her side plating as a vertical one",
+                   kindOfOnly(breachesFromFailedPanels(damage.ship, damage.mesh, {side})) ==
+                       OpeningKind::Breach);
+    }
+
+    // The weather deck, which `testFerryConnectivity` uses to show that role is
+    // not connectivity. It is also the case this whole section is about: the sky
+    // is above it, so a hole in it is open to the sea, and the sea standing on it
+    // is what drives the exchange.
+    int weather = -1;
+    for (std::size_t i = 0; i < damage.mesh.panels.size() && weather < 0; ++i) {
+        const PlatePanel& panel = damage.mesh.panels[i];
+        if (panel.role != PanelRole::Deck) continue;
+        const Vec3 c = panel.centroid();
+        if (std::abs(c.z - 15.0) < 1e-6 && std::abs(c.x) < 10.0 && std::abs(c.y) < 4.0)
+            weather = static_cast<int>(i);
+    }
+    expectTrue("the ferry has weather deck plating amidships", weather >= 0);
+    if (weather >= 0)
+        expectTrue("a hole in it floods under the horizontal law",
+                   kindOfOnly(breachesFromFailedPanels(damage.ship, damage.mesh, {weather})) ==
+                       OpeningKind::Hatch);
+
+    // And her transverse bulkheads, which are vertical everywhere, must not have
+    // moved: a criterion that called everything a hatch would pass every
+    // assertion above about decks and none of these.
+    int bulkheads = 0, wrong = 0;
+    for (const Breach& breach : damage.everything.breaches) {
+        bool allBulkhead = true;
+        for (int i : breach.panels)
+            if (damage.mesh.panels[static_cast<std::size_t>(i)].role != PanelRole::Bulkhead)
+                allBulkhead = false;
+        if (!allBulkhead) continue;
+        ++bulkheads;
+        if (breach.opening.kind != OpeningKind::Breach) ++wrong;
+    }
+    expectTrue("the ferry tears open along whole bulkheads", bulkheads > 5);
+    expectEqual("every one of which floods under the vertical law", wrong, 0);
+}
+
 }  // namespace
 
 void runBreachTests() {
@@ -1323,4 +1635,5 @@ void runBreachTests() {
     testFerryConnectivity();
     testFerryDamageInventory();
     testFerryFloodsThroughItsOwnStructure();
+    testOrientationDecidesWhichLawTheHoleFloodsUnder();
 }
