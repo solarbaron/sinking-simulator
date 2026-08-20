@@ -2369,6 +2369,209 @@ void testTheDentedCapacityKnockdownIsContinuousAndMonotone() {
                0.5 * (lo + hi), 1e-6 * critical);
 }
 
+// --- The two halves of the dented-capacity root that nothing used to reach ------
+//
+// `dentedCompressiveCapacity` solves `sigma^2 - b sigma + c = 0` for its smaller
+// root, and both of the things that can go wrong there are invisible to a check
+// that brackets the answer to a part in a million. The two tests below are aimed
+// at exactly those two things, and each carries its own guard that the input it
+// uses is in the regime it claims to be in.
+
+// The smaller root, obtained without ever forming the quadratic: bisection on the
+// Perry-Robertson equation itself, in `long double`.
+//
+// This is what the checks below assert against, and it is independent of the
+// implementation in the way that matters -- it forms no `b`, takes no square root,
+// and never subtracts two nearly equal numbers, so it has no way to reproduce the
+// implementation's rounding. `long double` carries 64 mantissa bits against
+// `double`'s 53, so its own error is about 2^-11 of a `double` ulp; measured
+// against the closed form evaluated in the same precision it agrees to 2e-19
+// relative, which is 1e-3 of the ulp the checks below are stated in.
+//
+// `demand` is monotone on [0, sigma_cr) -- zero at the origin, unbounded at the
+// pole -- so the bracket is valid, and `mid` never reaches `hi`, so the pole is
+// never evaluated.
+//
+// On a platform where `long double` *is* `double` this reference would be no
+// better than the thing it checks and the ulp bounds below would be asserting
+// that the implementation agrees with itself, which is why that is a compile
+// error rather than a comment. x86-64 gives 64 mantissa bits, aarch64 113.
+static_assert(std::numeric_limits<long double>::digits >
+                  std::numeric_limits<double>::digits + 8,
+              "the reference root needs a wider format than the answer it checks");
+
+long double perryRobertsonRoot(long double yieldStrength, long double criticalStress,
+                               long double eta) {
+    long double lo = 0.0L, hi = std::min(yieldStrength, criticalStress);
+    for (int i = 0; i < 400; ++i) {
+        const long double mid = 0.5L * (lo + hi);
+        if (mid <= lo || mid >= hi) break;  // adjacent in long double: converged
+        const long double demand = mid * (1.0L + eta / (1.0L - mid / criticalStress));
+        (demand < yieldStrength ? lo : hi) = mid;
+    }
+    return 0.5L * (lo + hi);
+}
+
+// Signed distance from `got` to `want`, in units of the last place of `got`. The
+// tolerance these tests want is a property of the *format*, not of the stress
+// level, and 1e-6 of anything is not it.
+double ulpsFrom(double got, long double want) {
+    const double above = std::nextafter(got, std::numeric_limits<double>::infinity());
+    return static_cast<double>((static_cast<long double>(got) - want) /
+                               (static_cast<long double>(above) - static_cast<long double>(got)));
+}
+
+// A value the optimiser has to compute rather than fold. Both tests below carry a
+// negative control made of the arithmetic they are about -- the superseded root
+// form in one, the discriminant that degenerates in the other -- and GCC folds
+// `sqrt` and the rest on compile-time constants through MPFR, so without this the
+// control could quietly be evaluated at a precision the machine will never run at.
+double opaque(double x) {
+    volatile double v = x;
+    return v;
+}
+
+void testTheDeepDentRootIsCorrectlyRoundedRatherThanMerelyBracketed() {
+    std::printf("\n   the deep-dent root against a long-double bisection\n");
+    const double yieldStrength = 355.0e6, critical = 200.0e6, thickness = 0.012;
+
+    // Four ulps. `2c / (b + sqrt D)` runs through about ten roundings -- `6 dev`,
+    // `/ t`, `1 + eta`, `sigma_cr (1 + eta)`, `+ sigma_y`, `sigma_y sigma_cr`,
+    // `b*b`, the subtraction, the sqrt, the sum, the divide -- and at large eta the
+    // discriminant's own rounding is *damped* rather than amplified, because
+    // sqrt(D) tends to b, so an ulp of `b*b` moves `b + sqrt D` by half an ulp of
+    // the sum. A few ulps is therefore the a-priori worst case, and measured over
+    // 6000 etas from 30 to 30 000 at five values of sigma_cr the largest error is
+    // 2.74 ulps, with and without fma contraction.
+    // Four is that with room, and it is still a factor of ten below the 41 ulps the
+    // superseded form is out by at the *tightest* of the five points below.
+    const double allowedUlps = 4.0;
+
+    for (double eta : {30.0, 100.0, 300.0, 1000.0, 3000.0}) {
+        const double deviation = opaque(eta * thickness / 6.0);
+        // What the implementation will actually use, so the reference solves the
+        // same equation rather than a neighbouring one.
+        const double etaUsed = 6.0 * deviation / thickness;
+        const long double reference = perryRobertsonRoot(yieldStrength, critical, etaUsed);
+        const std::string at = " at eta = " + std::to_string(static_cast<int>(eta));
+
+        // The reference is a root of the *equation*; Vieta says it must also be a
+        // root of the quadratic, because the two roots sum to b and multiply to c,
+        // so the smaller satisfies `sigma (b - sigma) = c`. The bisection knows
+        // nothing of b or c, so this is a second, algebraic reading of the same
+        // number -- and it holds to where a 64-bit mantissa runs out.
+        const long double b = static_cast<long double>(critical) * (1.0L + etaUsed) + yieldStrength;
+        const long double c = static_cast<long double>(yieldStrength) * critical;
+        const double vieta = static_cast<double>((reference * (b - reference) - c) / c);
+        expectTrue("the bisected root also satisfies sigma (b - sigma) = c" + at,
+                   std::abs(vieta) < 1e-18);
+
+        // The regime guard. This test proves nothing unless the subtraction the old
+        // form performed actually cancels at this eta, so measure the cancellation
+        // instead of assuming it: b and sqrt(D) agree to `digitsCancelled` decimal
+        // places, and every place they agree in is a place `b - sqrt(D)` throws
+        // away. Two places at eta = 30, rising to six at eta = 3000.
+        const double bd = opaque(critical) * (1.0 + opaque(etaUsed)) + opaque(yieldStrength);
+        const double cd = opaque(yieldStrength) * opaque(critical);
+        const double discriminant = std::max(0.0, bd * bd - 4.0 * cd);
+        const double surviving = (bd - std::sqrt(discriminant)) / bd;
+        const double digitsCancelled = -std::log10(surviving);
+        expectTrue("b and sqrt(D) agree to at least two decimal places" + at,
+                   digitsCancelled >= 2.0);
+
+        const double superseded = 0.5 * (bd - std::sqrt(discriminant));
+        const double capacity =
+            promotion::dentedCompressiveCapacity(yieldStrength, critical, deviation, thickness);
+        std::printf("     eta %6.0f (dent %6.3f m = %5.0f t): root %.11g, this form %+6.2f ulp,"
+                    " 0.5(b - sqrt D) %+12.1f ulp, %.2f digits cancelled\n",
+                    eta, deviation, deviation / thickness, static_cast<double>(reference),
+                    ulpsFrom(capacity, reference), ulpsFrom(superseded, reference),
+                    digitsCancelled);
+
+        expectNear("the capacity is the root to within four ulp" + at,
+                   ulpsFrom(capacity, reference), 0.0, allowedUlps);
+        // ...and the tolerance is not vacuous, because the form it replaced does
+        // not clear it. Without this the check above would pass on any
+        // implementation accurate to a part in 10^13, which is what the existing
+        // bracket at eta = 5 already accepts.
+        expectTrue("and 0.5(b - sqrt D) is well outside that" + at,
+                   std::abs(ulpsFrom(superseded, reference)) > 4.0 * allowedUlps);
+    }
+}
+
+void testACriticalStressLandingOnTheYieldStressKeepsItsCapacity() {
+    std::printf("\n   sigma_cr within a rounding of sigma_y: the degenerate discriminant\n");
+    // The stocky/slender transition -- a panel proportioned so its elastic critical
+    // stress lands on its yield stress, which is where every buckling code puts its
+    // knee -- carrying a dent that is a rounding of zero. `deviation > 0`, so the
+    // early return does not fire, but `1 + eta == 1`, so b is `sigma_cr + sigma_y`
+    // to the bit and `b*b - 4 sigma_y sigma_cr` is a difference of two numbers near
+    // 5.0e17, where one ulp is 64. The true discriminant there is
+    // `(sigma_cr - sigma_y)^2 + eta sigma_cr (2 sigma_cr + 2 sigma_y + eta
+    // sigma_cr)` = 2.5 Pa^2, forty times below that granularity -- so the
+    // subtraction returns a small multiple of 64 whose *sign* is arbitrary, and a
+    // `discriminant > 0` guard reads a strictly positive quantity as a refusal.
+    const double yieldStrength = 355.0e6, thickness = 0.012, deviation = 1.0e-20;
+    const double eta = 6.0 * deviation / thickness;
+    expectTrue("the dent disappears into 1 + eta, which is what degenerates the discriminant",
+               (1.0 + opaque(eta)) == 1.0);
+
+    // Eight pascals. Measured, the capacity across this band sits within 5.66 Pa of
+    // min(sigma_y, sigma_cr) -- 5.23 Pa with fma contraction -- and that residue is
+    // not the root form, it is the discriminant: the worst spurious value in the
+    // band is 128 Pa^2, and sqrt(128)/2 is 5.66 Pa of shift in `2c/(b + sqrt D)`.
+    // So the bound is a property of `b*b - 4c` at this stress level rather than
+    // anything chosen, it is 2.3e-8 of sigma_y, and it is 4.4e7 times smaller than
+    // the zero a guard on that discriminant returns.
+    const double allowedPascals = 8.0;
+
+    int degenerate = 0;
+    double worstDiscriminant = 0.0, worstError = 0.0;
+    double criticalStress = yieldStrength;
+    for (int i = 0; i < 6; ++i) criticalStress = std::nextafter(criticalStress, 0.0);
+    for (int offset = -6; offset <= 6; ++offset) {
+        const double b = opaque(criticalStress) * (1.0 + opaque(eta)) + opaque(yieldStrength);
+        const double c = opaque(yieldStrength) * opaque(criticalStress);
+        const double discriminant = b * b - 4.0 * c;
+        if (!(discriminant > 0.0)) ++degenerate;
+        worstDiscriminant = std::min(worstDiscriminant, discriminant);
+
+        const double capacity = promotion::dentedCompressiveCapacity(yieldStrength, criticalStress,
+                                                                     deviation, thickness);
+        const double want = std::min(yieldStrength, criticalStress);
+        worstError = std::max(worstError, std::abs(capacity - want));
+        expectNear("a panel at the transition keeps min(sigma_y, sigma_cr), sigma_cr offset " +
+                       std::to_string(offset),
+                   capacity, want, allowedPascals);
+        criticalStress = std::nextafter(criticalStress, 2.0 * yieldStrength);
+    }
+    // The vacuity guard, and the whole point: unless some of those thirteen inputs
+    // really do compute a non-positive discriminant, the band is an ordinary one
+    // and the checks above are asserting that arithmetic works. Measured on a
+    // 4000-point scan across sigma_y it is 1000 strictly negative and another 2000
+    // exactly zero, worst -128 Pa^2 against a true discriminant of 2.5.
+    expectTrue("the band is the degenerate corner: b*b - 4c goes non-positive inside it",
+               degenerate >= 6);
+    std::printf("     %d of 13 doubles spanning sigma_y compute b*b - 4c <= 0 (worst %.0f Pa^2,"
+                " true 2.5); capacity stays within %.3g Pa of min(sigma_y, sigma_cr)\n",
+                degenerate, worstDiscriminant, worstError);
+
+    // sigma_cr exactly on sigma_y is the one input in that band whose arithmetic is
+    // exact in every build: sigma_y^2 = 126 025 000 000 000 000 has a 45-bit odd
+    // part, so it is representable; b = 2 sigma_y is exact; and `b*b - 4c` is
+    // exactly zero whether or not the compiler contracts it into an fma. Clamping
+    // then returns `2c/b` = sigma_y to the bit -- the continuity the header claims
+    // for zero deviation, held at a deviation that is not zero. Guarding on
+    // `discriminant > 0` returns zero: a panel at its own design point reported to
+    // have no compressive strength at all.
+    const double onTop =
+        promotion::dentedCompressiveCapacity(yieldStrength, yieldStrength, deviation, thickness);
+    const double ulp = std::nextafter(yieldStrength, 2.0 * yieldStrength) - yieldStrength;
+    std::printf("     sigma_cr exactly on sigma_y: %.9g Pa of %.9g, %.1f ulp\n", onTop,
+                yieldStrength, (onTop - yieldStrength) / ulp);
+    expectNear("sigma_cr exactly on sigma_y still carries sigma_y", onTop, yieldStrength, ulp);
+}
+
 void testTheElementEstimateOverStatesRatherThanUnder() {
     std::printf("\n   the element estimate the budget is spent against\n");
     // On flat plating the flood fill reaches everything, so the estimate is exact.
@@ -3980,6 +4183,8 @@ void runPromotionTests() {
     testACollapseSweepReachesThePeakOnADamagedSection();
     testTheContactTriggerIsAClosedForm();
     testTheDentedCapacityKnockdownIsContinuousAndMonotone();
+    testTheDeepDentRootIsCorrectlyRoundedRatherThanMerelyBracketed();
+    testACriticalStressLandingOnTheYieldStressKeepsItsCapacity();
     testTheElementEstimateOverStatesRatherThanUnder();
 
     std::printf("\n--- LES promotion for the local compartment ---\n");
