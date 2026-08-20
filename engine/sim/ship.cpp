@@ -382,6 +382,11 @@ std::vector<std::string> Ship::validate() const {
 
     for (const Opening& o : openings) {
         const int n = static_cast<int>(compartments.size());
+        // kSea has to be exempt: a breach or an air pipe legitimately has one end
+        // outside the hull, so there is no reading of an opening under which this
+        // check could catch one. That exemption is the whole reason a name lookup
+        // must refuse with `kNoCompartment` instead -- which is not a legal
+        // endpoint, so it falls through to the range test and gets named here.
         if (o.a != kSea && (o.a < 0 || o.a >= n))
             note("opening '" + o.name + "' references a compartment that does not exist");
         if (o.b != kSea && (o.b < 0 || o.b >= n))
@@ -397,10 +402,21 @@ std::vector<std::string> Ship::validate() const {
     return problems;
 }
 
-int Ship::findCompartment(std::string_view name) const {
+// A miss leaves `index` untouched rather than writing a sentinel into it, so the
+// caller's own initial value is what survives -- there is no value this function
+// could write that some caller would not read as a space.
+bool Ship::findCompartment(std::string_view name, int& index) const {
     for (std::size_t i = 0; i < compartments.size(); ++i)
-        if (compartments[i].name == name) return static_cast<int>(i);
-    return kSea;
+        if (compartments[i].name == name) {
+            index = static_cast<int>(i);
+            return true;
+        }
+    return false;
+}
+
+int Ship::findCompartment(std::string_view name) const {
+    int index = kSea;
+    return findCompartment(name, index) ? index : kSea;
 }
 
 double Ship::totalFloodwaterMass() const {

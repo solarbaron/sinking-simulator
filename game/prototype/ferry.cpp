@@ -2,6 +2,7 @@
 #include "ferry.hpp"
 
 #include <cmath>
+#include <string_view>
 
 namespace game {
 
@@ -69,6 +70,27 @@ Compartment carve(const TriMesh& hull, std::string name, Vec3 lo, Vec3 hi,
     c.permeability = permeability;
     c.ventedToAtmosphere = vented;
     return c;
+}
+
+// The compartment a flow-network endpoint below names, refusing a name the
+// subdivision above does not define.
+//
+// `Ship::findCompartment`'s one-argument form answers a miss with `kSea`, and kSea
+// is not a sentinel -- it is the open sea, a real endpoint of this very network.
+// Seventeen endpoints here are looked up by name, so a renamed or mistyped
+// compartment would not fail: `orifice("cable_transit", erS, aftHoldS, ...)` would
+// become a 0.04 m2 sea-to-engine-room breach 2 m under the waterline, and
+// `orifice("wt_door_er", erS, erP, ...)` a 3.6 m2 hole in the shell -- and the run
+// would still end on an entirely plausible flooding curve, which is why nothing
+// downstream would look wrong.
+//
+// `kNoCompartment` is not an endpoint at all, so a miss stops being a hole and
+// becomes a definition `Ship::validate()` names, by the opening or pump that
+// carries it. That is the whole difference: validate() must let a kSea endpoint
+// past and cannot let this one.
+int space(const Ship& ship, std::string_view name) {
+    int index = kNoCompartment;
+    return ship.findCompartment(name, index) ? index : kNoCompartment;
 }
 
 Opening orifice(std::string name, int a, int b, Vec3 pos, double area, double cd,
@@ -144,23 +166,23 @@ Ship buildFerry() {
         carve(h, "accommodation",     { -40, -20,12.5}, {  34,  20, 15.0}, 0.95, true),
     };
 
-    const int forepeak   = ship.findCompartment("forepeak");
-    const int fwdHoldP   = ship.findCompartment("fwd_hold_p");
-    const int fwdHoldS   = ship.findCompartment("fwd_hold_s");
-    const int erP        = ship.findCompartment("engine_room_p");
-    const int erS        = ship.findCompartment("engine_room_s");
-    const int aftHoldP   = ship.findCompartment("aft_hold_p");
-    const int aftHoldS   = ship.findCompartment("aft_hold_s");
-    const int steering   = ship.findCompartment("steering_gear");
-    const int wingFwdP   = ship.findCompartment("wing_tank_fwd_p");
-    const int wingFwdS   = ship.findCompartment("wing_tank_fwd_s");
-    const int wingMidP   = ship.findCompartment("wing_tank_mid_p");
-    const int wingMidS   = ship.findCompartment("wing_tank_mid_s");
-    const int wingAftP   = ship.findCompartment("wing_tank_aft_p");
-    const int wingAftS   = ship.findCompartment("wing_tank_aft_s");
-    const int dbFwd      = ship.findCompartment("double_bottom_fwd");
-    const int dbAft      = ship.findCompartment("double_bottom_aft");
-    const int vehDeck    = ship.findCompartment("vehicle_deck");
+    const int forepeak   = space(ship, "forepeak");
+    const int fwdHoldP   = space(ship, "fwd_hold_p");
+    const int fwdHoldS   = space(ship, "fwd_hold_s");
+    const int erP        = space(ship, "engine_room_p");
+    const int erS        = space(ship, "engine_room_s");
+    const int aftHoldP   = space(ship, "aft_hold_p");
+    const int aftHoldS   = space(ship, "aft_hold_s");
+    const int steering   = space(ship, "steering_gear");
+    const int wingFwdP   = space(ship, "wing_tank_fwd_p");
+    const int wingFwdS   = space(ship, "wing_tank_fwd_s");
+    const int wingMidP   = space(ship, "wing_tank_mid_p");
+    const int wingMidS   = space(ship, "wing_tank_mid_s");
+    const int wingAftP   = space(ship, "wing_tank_aft_p");
+    const int wingAftS   = space(ship, "wing_tank_aft_s");
+    const int dbFwd      = space(ship, "double_bottom_fwd");
+    const int dbAft      = space(ship, "double_bottom_aft");
+    const int vehDeck    = space(ship, "vehicle_deck");
 
     // --- Flow network ------------------------------------------------------
     ship.openings = {

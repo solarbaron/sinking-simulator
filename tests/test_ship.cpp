@@ -27,6 +27,7 @@
 #include <vector>
 
 using namespace sim;
+using testing::expectEqual;
 using testing::expectNear;
 using testing::expectTrue;
 
@@ -930,6 +931,143 @@ void testAMasslessShipStepsToFiniteStateRatherThanNaN() {
     expectTrue("so she is not reported sunk on account of a NaN", d.afloat);
 }
 
+// **A name the ship does not carry must be refusable, not answered with the sea.**
+//
+// `findCompartment`'s one-argument form answers `kSea` for a miss, and kSea is not
+// a sentinel -- it is a real endpoint of the flow network, the open sea. Seventeen
+// unchecked lookups in the ferry's builder were seventeen chances for a renamed or
+// mistyped compartment to become a hole in the shell that then floods at a
+// completely plausible rate. The refusable form is what makes a miss visible, and
+// it refuses by leaving the caller's index alone rather than by writing an index
+// of its own: there is no value it could write that some caller would not read as
+// a space.
+void testAMissedCompartmentLookupIsRefusedRatherThanAnsweredWithTheSea() {
+    const Ship ship = game::buildFerry();
+
+    // Against a vacuous test: the ferry really does carry one of these names and
+    // really does not carry the other, and the two differ the way a typo differs.
+    int found = kNoCompartment;
+    expectTrue("the ferry carries engine_room_s", ship.findCompartment("engine_room_s", found));
+    expectTrue("... at a compartment that exists",
+               found >= 0 && found < static_cast<int>(ship.compartments.size()));
+
+    constexpr int kUntouched = -12345;
+    int index = kUntouched;
+    expectTrue("a name it does not carry is refused",
+               !ship.findCompartment("engine_room_starboard", index));
+    expectEqual("... leaving the caller's index alone rather than writing the sea into it",
+                index, kUntouched);
+
+    // The one-argument form still answers kSea, which is the contract
+    // `shipfile.cpp`'s resolve() refuses on -- and is exactly why nothing else may
+    // use it without testing for kSea on the next line.
+    expectEqual("the one-argument form still answers the open sea, as its one caller expects",
+                ship.findCompartment("engine_room_starboard"), kSea);
+    expectEqual("and the two forms agree wherever the name is there",
+                ship.findCompartment("engine_room_s"), found);
+}
+
+// **The two answers lead to opposite outcomes, which is what makes them two
+// sentinels rather than two spellings of one.**
+//
+// `Ship::validate()` has to let an opening with one end in the sea past -- the
+// ferry's breach, its three downflooding openings, its sixteen vents and air pipes
+// and its two counterflooding valves are all exactly that -- so a mistyped name
+// resolved to kSea produces a definition that validates clean and floods, and 22
+// of the ferry's 54 endpoints are legitimately indistinguishable from one. The
+// identical opening built from
+// `kNoCompartment` is named, by the opening that carries it. Asserted as a pair,
+// because either half alone is consistent with the defect being present.
+void testAnEndpointFromAMissedLookupIsNamedWhereASeaEndpointCannotBe() {
+    // Initialised, because `validate()`'s overlap check reads the gross volumes
+    // `initialise` integrates and calls every pair of empty boxes an overlap.
+    Ship ferry = game::buildFerry();
+    ferry.initialise(0.0);
+    expectTrue("the ferry as shipped validates clean", ferry.validate().empty());
+
+    int erS = kNoCompartment;
+    expectTrue("the fixture resolves the space the cable transit leaves",
+               ferry.findCompartment("engine_room_s", erS));
+
+    // `cable_transit` as the ferry authors it, with its aft end unresolved: 0.04 m2
+    // at z = 2.0 m, which is 3.5 m under the design waterline.
+    Opening transit;
+    transit.name = "cable_transit";
+    transit.a = erS;
+    transit.pos = {-8, -4.0, 2.0};
+    transit.area = 0.04;
+    transit.dischargeCoeff = 0.60;
+    transit.kind = OpeningKind::Pipe;
+    transit.open = true;
+
+    Ship resolvedToSea = ferry;
+    transit.b = kSea;
+    resolvedToSea.openings.push_back(transit);
+    expectTrue("a miss answered with the sea is a legal opening, and validates clean",
+               resolvedToSea.validate().empty());
+
+    Ship refused = ferry;
+    transit.b = kNoCompartment;
+    refused.openings.push_back(transit);
+    const std::vector<std::string> problems = refused.validate();
+    expectEqual("a miss answered with kNoCompartment is one problem, not none",
+                static_cast<long long>(problems.size()), 1);
+    expectTrue("... naming the opening that carries it",
+               !problems.empty() && problems[0].find("cable_transit") != std::string::npos);
+
+    // A pump has no sea to stand in for a miss -- its index is checked against the
+    // range and nothing else -- so that half was never exposed. It is here to say
+    // the openings half now agrees with the half that was already right.
+    Ship pumped = ferry;
+    pumped.pumps.push_back({"bilge_er_s", kNoCompartment, 0.060, 25.0, false, 0.0});
+    expectEqual("and a pump drawing on a refused name is one problem too",
+                static_cast<long long>(pumped.validate().size()), 1);
+}
+
+// **The refusal must not cost the ferry an opening.**
+//
+// A builder that refused to load, or that quietly dropped an endpoint it could not
+// resolve, would be the original defect wearing a different face. The counts are
+// the cheap half; the load-bearing half is that every endpoint in the network is
+// either the sea or a compartment that exists, and none is the sentinel a miss
+// would leave behind.
+void testTheFerryBuildsItsWholeFlowNetworkFromNamesThatResolve() {
+    Ship ferry = game::buildFerry();
+    ferry.initialise(0.0);
+    expectEqual("the ferry builds all 27 openings", static_cast<long long>(ferry.openings.size()),
+                27);
+    expectEqual("and all 4 pumps", static_cast<long long>(ferry.pumps.size()), 4);
+
+    const int n = static_cast<int>(ferry.compartments.size());
+    bool everyEndpointResolves = true;
+    int seaEndpoints = 0, compartmentEndpoints = 0;
+    for (const Opening& o : ferry.openings)
+        for (const int e : {o.a, o.b}) {
+            if (e == kSea) {
+                ++seaEndpoints;
+                continue;
+            }
+            everyEndpointResolves = everyEndpointResolves && e >= 0 && e < n;
+            ++compartmentEndpoints;
+        }
+    for (const Pump& p : ferry.pumps)
+        everyEndpointResolves = everyEndpointResolves && p.compartment >= 0 && p.compartment < n;
+    expectTrue("every endpoint is the sea or a compartment that exists", everyEndpointResolves);
+
+    // Both populations counted apart and pinned exactly, not merely as non-zero: a
+    // network of pure sea endpoints would satisfy `everyEndpointResolves` on its
+    // own, and so would one with none. The breach, three downflooding openings,
+    // eight vents, eight air pipes and two counterflooding valves put 22 of the 54
+    // endpoints in the sea; the other 32 are the ones a lookup has to get right.
+    expectEqual("22 endpoints are the sea", static_cast<long long>(seaEndpoints), 22);
+    expectEqual("and the other 32 came from a name", static_cast<long long>(compartmentEndpoints),
+                32);
+    expectEqual("which is every endpoint there is",
+                static_cast<long long>(seaEndpoints + compartmentEndpoints),
+                2 * static_cast<long long>(ferry.openings.size()));
+    expectTrue("and the definition it builds validates clean", ferry.validate().empty());
+}
+
 void runShipTests() {
     std::printf("\n--- horizontal openings and buoyant exchange ---\n");
     testHorizontalExchangeMatchesTheCounterflowClosedForm();
@@ -943,4 +1081,9 @@ void runShipTests() {
     testTheFerryAsShippedRunsNoExchangeAtAll();
     testAnOpenEscapeTrunkDrainsTheVehicleDeckIntoADryEngineRoom();
     testAMasslessShipStepsToFiniteStateRatherThanNaN();
+
+    std::printf("\n--- compartment lookup: a miss is not the open sea ---\n");
+    testAMissedCompartmentLookupIsRefusedRatherThanAnsweredWithTheSea();
+    testAnEndpointFromAMissedLookupIsNamedWhereASeaEndpointCannotBe();
+    testTheFerryBuildsItsWholeFlowNetworkFromNamesThatResolve();
 }

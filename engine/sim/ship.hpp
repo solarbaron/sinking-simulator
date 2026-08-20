@@ -48,6 +48,18 @@ namespace sim {
 // Sentinel compartment index meaning "the sea / open atmosphere outside the hull".
 inline constexpr int kSea = -1;
 
+// Sentinel meaning "no compartment carries that name" -- the answer a name lookup
+// refuses with. Distinct from `kSea` for the same reason breach.hpp's
+// `kEnclosedVoid` is distinct from it: kSea is a *real* endpoint of the flow
+// network, so a lookup that reports a miss as kSea does not fail at all, it
+// authors a hole in the shell, and the flooding curve that follows is entirely
+// plausible. The difference that matters is downstream: `Ship::validate()` has to
+// exempt kSea from its range check -- a breach or an air pipe legitimately has one
+// end in the sea -- and has nothing to exempt here, so an endpoint that came from
+// a miss is named and one that came from a mistyped name resolved to kSea is not.
+// -2 is taken; breach.hpp's `kEnclosedVoid` holds it.
+inline constexpr int kNoCompartment = -3;
+
 // The water the ship floats on.
 //
 // Implicitly constructible from a still-water level, so every existing call site
@@ -517,6 +529,18 @@ public:
     std::vector<std::string> validate() const;
 
     // Convenience accessors.
+    //
+    // The two-argument form is the one to reach for. It answers false for a name
+    // no compartment carries and leaves `index` as the caller left it, so a
+    // renamed or mistyped space cannot quietly become a flow-network endpoint.
+    //
+    // The one-argument form answers a miss with `kSea`, which is not a sentinel,
+    // and is only sound where the caller tests for it immediately. It keeps that
+    // answer for `shipfile.cpp`'s resolve(), which does exactly that on the line
+    // after the call and turns a bad name in a `.ship` file into a diagnostic
+    // carrying the line number -- a range check cannot do that job, because kSea
+    // is in range for an opening.
+    [[nodiscard]] bool findCompartment(std::string_view name, int& index) const;
     int findCompartment(std::string_view name) const;
     double totalFloodwaterMass() const;
 
