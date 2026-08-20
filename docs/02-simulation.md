@@ -365,10 +365,11 @@ ship heels. The *sign* of that cosine is what says which endpoint is above, so a
 inverted hull's deckhead correctly acquires the sea on top of it — the authored
 order of `a` and `b` never enters.
 
-**What it is worth on the ferry: nothing, and that is measured rather than
-hoped.** Every hatch she has is an escape trunk from an engine room to the vehicle
-deck, and both are shut in `ships/ferry.ship`, in `game/prototype/ferry.cpp` and
-in all three scenarios — so no published figure can move, and `check-figures.sh`
+**What it is worth on the ferry: nothing through a hatch anyone authored, and that
+is measured rather than hoped.** Every hatch she is *authored* with is an escape
+trunk from an engine room to the vehicle deck, and both are shut in
+`ships/ferry.ship`, in `game/prototype/ferry.cpp` and in all three scenarios — so
+no published figure can move through one, and `check-figures.sh`
 confirms it: every tonnage, heel, draft, GM, trapped-air pressure, fill fraction
 and verdict is unchanged. Forced *open*, they still never fire. Instrumenting both
 trunks at every step of all three scenarios for 1800 s each — six runs — the
@@ -378,6 +379,21 @@ deckhead, which is the vehicle deck's floor, so the space *below* the hatch floo
 past it long before any water reaches the deck above. `escape_er_s` under
 `--scenario=doors` spends 152.6 s with air on both sides, 42.9 s with air lying on
 water — the stable order — and 1604.5 s with water on both sides.
+
+That enumeration is over the ship *files*, and it stopped being the whole
+population when `breachesFromFailedPanels` began classifying a torn region by the
+orientation it measures the region to have. A hole torn through a deck is now an
+`OpeningKind::Hatch` that no file authored, and `zone_probe`, `bulkhead_probe` and
+`ram_view` all reach that code from the gate. **The geometric argument above does
+not cover those**, and cannot be stretched to: it turns on where an escape trunk
+sits relative to the deck it pierces, and nothing about that constrains where a
+shell plate fails under load. A ship with no authored hatches at all can acquire
+one by being damaged.
+
+So the second leg is not an argument but the gate. `check-figures.sh` drives all
+three damage tools, so a change in how a torn region is classified either moves a
+published figure there or it does not, and which of those happened is recorded in
+the commit that made the change rather than reasoned about here.
 
 So the mechanism is dormant on this ship. It earns its place anyway, and the
 distinction matters: **this is a missing mechanism, not a small term.** When the
