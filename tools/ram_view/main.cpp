@@ -134,7 +134,15 @@ int main(int argc, char** argv) {
     sim::Ship ferry = game::buildFerry();
     ferry.initialise(0.0);
     const sim::Scantlings scantlings = sim::ferryScantlings();
-    const sim::StructuralMesh structure = sim::makeStructuralMesh(ferry.hull, scantlings);
+    // **The mesher always returns something, and the reason it is thin goes here.**
+    // `makeStructuralMesh` hands back the mesh whatever happened -- a description
+    // whose frames will not lay out comes back *empty* -- and says why only through
+    // this pointer, so a caller that passes none publishes a penetration and a hole
+    // area off whatever structure it happened to get. This tool has to care more
+    // than most: every figure below is counted off `structure.panels`.
+    std::vector<std::string> meshProblems;
+    const sim::StructuralMesh structure =
+        sim::makeStructuralMesh(ferry.hull, scantlings, &meshProblems);
 
     sim::Ship bow = striker();
     bow.initialise(0.0);
@@ -143,6 +151,12 @@ int main(int argc, char** argv) {
     std::printf("=== ram the ferry ===\n");
     std::printf("struck : 120 m ro-pax, %.0f t, GM %.2f m, %zu structural panels\n",
                 before.displacementMass / 1000.0, before.gmTransverse, structure.panels.size());
+    // Under the line that counts them, in the same `!` the breach account below
+    // uses, because a panel count says nothing about what kind of panels they are:
+    // 8 900 of them with a strake seam declared in the wrong place is a different
+    // ship from 8 900 without, and the damage figures below cannot tell them apart.
+    for (const std::string& problem : meshProblems)
+        std::printf("         ! %s\n", problem.c_str());
     std::printf("striker: 90 m hull, %.0f t, closing at %.1f m/s, aimed at x = %+.0f m\n",
                 bow.diagnostics(0.0).displacementMass / 1000.0, options.speed, options.aim);
 
