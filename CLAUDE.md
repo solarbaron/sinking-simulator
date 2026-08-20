@@ -575,3 +575,9 @@ whether to measure, not to decide what to do.
   comparison: splice it into the captured output *at maximum density* and replay
   the readers against that. Otherwise you have shown the code is safe while
   silent, which is the one case you already knew.
+- **Re-running a flaky verdict confirms the outcome, not the reason.** The kill
+  scored on a neighbour's `/tmp/barge.ship` would have reproduced perfectly: the
+  mutant was real and died on its own merits the second time, so outcome equality
+  cleared it. What catches it is comparing *why* the two runs decided — normalise
+  the digits so a hang's seconds do not read as instability, and compare the rest.
+  This applies to any retry-based confirmation, not just mutation testing.
