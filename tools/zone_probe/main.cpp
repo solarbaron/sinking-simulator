@@ -200,6 +200,19 @@ int main(int argc, char** argv) {
         for (const sim::promotion::Candidate& c : r.considered)
             std::printf("         panel %d, %s, score %.2f: %s\n", c.panel,
                         sim::promotion::name(c.trigger), c.score, c.why.c_str());
+        // **A budget refusal and a criterion that did not fire are the same output
+        // until this line prints.** `Promoter::review` drops a candidate the element
+        // budget had no room for into `problems` and nowhere else: it is absent from
+        // `promoted`, nothing already running was evicted for it, and the candidate
+        // line above still carries the `why` that says it qualified. Without the
+        // channel the review reads as hysteresis doing its job -- one number smaller
+        // on the headline -- and the verdict a few lines down then states the wrong
+        // cause outright, "the criterion did not fire" about a criterion that fired
+        // and was overruled. It is printed inside the loop so it stands *before* that
+        // verdict rather than after it. Same shape as the refusals `gasCandidates`
+        // reports through its own `problems`, found there first.
+        for (const std::string& problem : r.problems)
+            std::printf("       ! %s\n", problem.c_str());
     }
     if (promoter.active().empty() && !options.force) {
         std::printf("nothing promoted: the criterion did not fire\n");
