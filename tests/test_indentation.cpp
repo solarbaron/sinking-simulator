@@ -423,7 +423,13 @@ void testImpactDamageGrowsWithEnergyAndIsLocal() {
 // They are not small. The header records what the zone FEM cost to settle: the
 // hole moves 5%, because the failure strain is nearly flat over this range, but
 // **penetration and resisting force move by 3.4x**, in the direction of reporting
-// the hull far softer than it is. Both witnesses are below.
+// the hull far softer than it is. All four witnesses are below.
+//
+// The force was for a while the half of that finding no assertion could reach:
+// `ImpactDamage` reported a depth, an absorbed energy, a torn area and an unspent
+// energy, and no force at all, so a 3.4x on the resistance had to be pinned
+// through the other two. `peakForce` is the field that closes it, and witnesses
+// two and four are the ones that read it.
 void testTheStrikeBuildsThePanelModelItClaimsTo() {
     const Scantlings sc = ferryScantlings();
     const StructuralMesh structure = ferryStructure();
@@ -474,7 +480,56 @@ void testTheStrikeBuildsThePanelModelItClaimsTo() {
     expectNear("the strike dents the bay by L sqrt(c^2 + c), c = E / (2 sigma_y t A)",
                nudge.penetration, expected, 1e-9 * expected);
 
-    // --- witness two: what a torn patch costs -----------------------------------
+    // --- witness two: how hard the bay pushed back at that depth -----------------
+    //
+    // The other half of the recorded finding, and the half nothing could assert
+    // until `ImpactDamage` grew a force to assert it against. The force is
+    // `scale d / sqrt(h^2 + d^2)`, and the slant collapses: with d = L sqrt(c^2 + c)
+    // and h = L/2,
+    //
+    //     h^2 + d^2 = L^2 (c^2 + c + 1/4) = L^2 (c + 1/2)^2
+    //
+    // -- a bare square, because c^2 + c + 1/4 completes -- so sqrt(h^2 + d^2) is
+    // exactly L (c + 1/2) and
+    //
+    //     F = (2 sigma_y t A / L) sqrt(c^2 + c) / (c + 1/2).
+    //
+    // **Inversely proportional to the span, where the penetration is proportional
+    // to it.** That is the whole content of "3.4x on both": one factor of
+    // 2.40 / 0.70 upward on the depth and the same factor downward on the
+    // resistance, and it is why reading the span the long way reports the hull as
+    // softer twice over. On this bay F = 4.78451 MN; spanning the long way gives
+    // 1.39548 MN, and multiplying by the span where the model divides gives
+    // 3.28155 MN.
+    //
+    // Derived, not a ratio -- a ratio between two strikes is what let the span hide
+    // in the first place, and F/d against another strike would cancel it again.
+    //
+    // **And be exact about what this witness is worth, because it is less than it
+    // looks.** Multiply the two closed forms together and the span leaves:
+    //
+    //     F d = E (c + 1) / (c + 1/2)                      -- no L in it at all
+    //
+    // (394 667 J on this bay, whichever span the model takes). So below tearing the
+    // force is the *reciprocal image* of the depth, and the 3.4x it moves by is the
+    // 3.4x on the depth read backwards, not a second measurement of it. Measured:
+    // stripping this assertion and witness four back out leaves mutants 16 and 17
+    // dying to the depth and the energy exactly as before, and stripping the depth
+    // and the energy out instead leaves them dying to the force -- each set kills
+    // both, neither adds a kill to the other. What this pair buys is not coverage
+    // but reach and margin: `indentationForce` had never been on the strike's path
+    // at all (catalogue mutants 7 and 8 were killed only by the quadrature check on
+    // the reference panel, and now fail here too), and on the torn strike below the
+    // force is out by 3.50x where the energy -- the only other absolute assertion
+    // there -- is out by 4.9%.
+    const double expectedForce =
+        (2.0 * sigmaY * bay.thickness * bay.area() / span) * std::sqrt(c * c + c) / (c + 0.5);
+    std::printf("     it pushes back with %.5f MN; derived %.5f MN\n", 1e-6 * nudge.peakForce,
+                1e-6 * expectedForce);
+    expectNear("and resists at (2 sigma_y t A / L) sqrt(c^2 + c) / (c + 1/2)", nudge.peakForce,
+               expectedForce, 1e-9 * expectedForce);
+
+    // --- witness three: what a torn patch costs ---------------------------------
     //
     // The other half of the same finding, and the half the header's "5%, not
     // tenfold" rests on. A bay tears at `sigma_y t (L w) eps_f` exactly -- at the
@@ -490,6 +545,7 @@ void testTheStrikeBuildsThePanelModelItClaimsTo() {
     const ImpactDamage cramped = impactDamage(structure, kImpact, radius, 2.0e8, sc);
     const plasticity::Material steel = plasticity::shipSteel();
     double toTear = 0;
+    double tearingForce = 0;
     long long reachable = 0;
     for (const PlatePanel& p : structure.panels) {
         if (p.role != PanelRole::Shell) continue;
@@ -506,6 +562,23 @@ void testTheStrikeBuildsThePanelModelItClaimsTo() {
             steel.failure.uniformStrain +
             (steel.failure.fractureStrain - steel.failure.uniformStrain) * share;
         toTear += yieldStrengthOf(structure, p) * p.thickness * p.area() * failureStrain;
+        // And what it was carrying at the instant it let go. At the tearing depth
+        // sqrt(h^2 + d_f^2) = h (1 + eps_f), so the slant cancels out of the force
+        // as cleanly as it does out of the energy and
+        //
+        //     F_f = 2 sigma_y t w sqrt(eps_f (eps_f + 2)) / (1 + eps_f),   w = A / L
+        //
+        // -- 1/L again, where the depth it tears at, (L/2) sqrt(eps_f (eps_f + 2)),
+        // goes as L. The tearing depth has no contact width in it at all, so on a
+        // torn strike `penetration` is blind to `contactWidth` outright and the
+        // energy is the only other thing that can see it -- but the energy sees it
+        // through `L w`, which is the bay's own area, so the *span* reaches it only
+        // through the failure-strain regularisation and moves it by 4.9% where it
+        // moves this force by 3.50x. Same defect, seventy times the signal.
+        const double stretch = std::sqrt(failureStrain * (failureStrain + 2.0));
+        tearingForce =
+            std::max(tearingForce, 2.0 * yieldStrengthOf(structure, p) * p.thickness *
+                                       (p.area() / span) * stretch / (1.0 + failureStrain));
     }
     expectTrue("the cramped strike tore every bay it could reach and still had energy left",
                cramped.torn.size() == static_cast<std::size_t>(reachable) &&
@@ -517,6 +590,29 @@ void testTheStrikeBuildsThePanelModelItClaimsTo() {
                 reachable, radius, toTear, cramped.energyAbsorbed);
     expectNear("a torn patch costs sigma_y t A eps_f, bay by bay", cramped.energyAbsorbed, toTear,
                1e-9 * toTear);
+
+    // --- witness four: what the hardest-hit bay was resisting with when it went --
+    //
+    // 10.55862 MN on the short span for this model against 3.01750 MN on the long
+    // one -- a factor of 3.4991, which is the force half of "3.4x on both", and the
+    // pair `impactDamage` writes down as 10.35 and 2.96 MN. Those two are each
+    // about 2% out and are now printed on every run rather than transcribed;
+    // `docs/06-roadmap.md` carries the same pair, so correcting them is a
+    // documentation pass and not this test's business. Multiplying by the span
+    // where the model divides gives 5.17372 MN.
+    //
+    // Not directly comparable with the zone FEM's 18.9 MN: that is the same hull at
+    // 0.078 m of penetration and this is a bay at the 0.205 m it tears at, so the
+    // FEM/membrane factor the header argues lives in a comparison at one depth.
+    std::printf("     and let go at %.5f MN; derived %.5f MN\n", 1e-6 * cramped.peakForce,
+                1e-6 * tearingForce);
+    expectNear("a bay lets go carrying 2 sigma_y t w sqrt(eps_f (eps_f + 2)) / (1 + eps_f)",
+               cramped.peakForce, tearingForce, 1e-9 * tearingForce);
+    // Non-vacuous: the two forces this test derives are different numbers, so
+    // neither assertion can be passing on the other one's value. A dent that has
+    // not torn is carrying less than half of what the bay finally lets go with.
+    expectTrue("and a bay that has not torn is nowhere near that force",
+               nudge.peakForce < 0.6 * cramped.peakForce);
 }
 
 // The march itself: how far it may go, and in what order it goes.

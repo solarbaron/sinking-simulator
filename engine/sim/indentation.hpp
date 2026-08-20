@@ -162,6 +162,33 @@ struct ImpactDamage {
     std::vector<int> panels;       // indices into StructuralMesh::panels
     std::vector<int> torn;         // the subset that tore
     double penetration = 0;        // m, of the worst-struck panel
+    // The hardest the plating pushed back: the resisting force at the depth each
+    // bay ended at, maximised over the bays the strike reached. `penetration` is a
+    // maximum over the same set and the two need not fall on the same bay, because
+    // the failure strain is regularised per panel and a thicker bay tears deeper.
+    //
+    // **It is here because the finding this model was corrected by is half force.**
+    // The zone FEM settled the span from outside -- 18.9 MN at 0.078 m into the
+    // ferry's side -- and the correction moved penetration and resisting force by
+    // the same 3.4x in *opposite* directions, which is what a 1/L against an L
+    // looks like. With `w = A/L` and `h = L/2` the two closed forms are
+    //
+    //     d = L sqrt(c^2 + c)                             c = E / (2 sigma_y t A)
+    //     F = (2 sigma_y t A / L) sqrt(c^2 + c) / (c + 1/2)
+    //
+    // below tearing, and at the tearing depth F = 2 sigma_y t (A/L) sqrt(eps_f
+    // (eps_f + 2)) / (1 + eps_f) -- 10.55862 MN on the short span against 3.01750
+    // on the long one, measured on the struck bay and printed by the suite. Without
+    // this field the force half could not be asserted at all and the span defect
+    // had to be pinned through depth and energy alone.
+    //
+    // **Do not read it as a second, independent measurement of the span below
+    // tearing**: multiply the two forms above and `F d = E (c + 1) / (c + 1/2)`,
+    // with no L in it, so down there the force is the depth's reciprocal image and
+    // catches exactly what the depth catches. Where it stands alone is the *torn*
+    // strike, whose depth is `(L/2) sqrt(eps_f (eps_f + 2))` and carries no contact
+    // width at all. `tests/test_indentation.cpp` measures both halves of that.
+    double peakForce = 0;          // N
     double energyAbsorbed = 0;     // J, total over the patch
     double tornArea = 0;           // m^2, the hole that results
     // Energy the strike still had when it ran out of reachable panels. Non-zero

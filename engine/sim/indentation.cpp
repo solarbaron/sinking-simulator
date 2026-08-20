@@ -205,19 +205,37 @@ ImpactDamage impactDamage(const StructuralMesh& structure, const Vec3& impact, d
         const double toTear = energyToTear(model);
         damage.panels.push_back(index);
 
+        // The depth this bay ends at, and the force it was carrying there, both
+        // reported as maxima over the patch. The span leaves them in opposite
+        // directions -- below tearing the depth is `L sqrt(c^2 + c)` and the force
+        // is `(2 sigma_y t A / L) sqrt(c^2 + c) / (c + 1/2)` -- which is the shape
+        // of the finding that corrected the span, worth 3.4x on each and in the
+        // direction of reporting the hull both softer and less resistant than it
+        // is. Their *product* is `E (c + 1) / (c + 1/2)` and carries no span at
+        // all, so down here the force restates the depth rather than checking it;
+        // where it stands on its own is past tearing, because the tearing depth is
+        // `(L/2) sqrt(eps_f (eps_f + 2))` and has no struck width in it while the
+        // force does. Past that point both saturate together at what the bay could
+        // carry before it let go.
         if (remaining >= toTear && toTear > 0) {
             // Through it, and on to the next.
             remaining -= toTear;
             damage.energyAbsorbed += toTear;
             damage.torn.push_back(index);
             damage.tornArea += panel.area();
-            damage.penetration = std::max(damage.penetration,
-                                          penetrationForStrain(model.span, model.failureStrain));
+            // Named rather than nested, because the force is taken at the same
+            // depth. Not `reached`: the stopped branch below uses that name, and
+            // two identical statements here would leave the mutation catalogue's
+            // anchor for this line ambiguous.
+            const double tearingDepth = penetrationForStrain(model.span, model.failureStrain);
+            damage.penetration = std::max(damage.penetration, tearingDepth);
+            damage.peakForce = std::max(damage.peakForce, indentationForce(model, tearingDepth));
         } else {
             // Stopped here: this panel takes what is left and holds.
             const double reached = penetrationForEnergy(model, remaining);
             damage.energyAbsorbed += indentationEnergy(model, reached);
             damage.penetration = std::max(damage.penetration, reached);
+            damage.peakForce = std::max(damage.peakForce, indentationForce(model, reached));
             remaining = 0.0;
             break;
         }
