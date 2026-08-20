@@ -26,6 +26,7 @@
 #include "../../engine/sim/ship.hpp"
 #include "../../game/prototype/ferry.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -58,10 +59,31 @@ int main(int argc, char** argv) {
     const Sea sea;
     ship.initialise(sea);
 
+    // **The three compartments this study is about, and the study is a study of
+    // three.** Both halves of that were unchecked. `findCompartment`'s one-argument
+    // form answers a name it does not carry with `kSea`, which is -1 and is a legal
+    // endpoint rather than a sentinel, and `attach()` drops a request it cannot
+    // honour -- so a renamed `vehicle_deck` left a two-compartment model behind, and
+    // every figure below it is computed over `model.gas`. `reviews`,
+    // `everQualified`, `budgetRefusals` and `peakCells` would all have come back
+    // smaller and entirely plausible, and a ship missing the largest space in the
+    // study would have read exactly like a ship where that space never qualified.
+    // That is the shape the water tier's 154 silent refusals took: not a wrong
+    // number, a number about a different experiment.
+    const char* const wanted[] = {"engine_room_s", "engine_room_p", "vehicle_deck"};
+    std::vector<int> requested;
+    for (const char* name : wanted) {
+        int index = kNoCompartment;
+        if (!ship.findCompartment(name, index)) {
+            std::printf("the ferry has no compartment named %s: this study is about three\n",
+                        name);
+            return 1;
+        }
+        requested.push_back(index);
+    }
+
     fire::Model model;
-    model.attach(ship, {ship.findCompartment("engine_room_s"),
-                        ship.findCompartment("engine_room_p"),
-                        ship.findCompartment("vehicle_deck")});
+    model.attach(ship, requested);
 
     fire::DesignFire blaze;
     blaze.name = "machinery";
@@ -73,8 +95,23 @@ int main(int argc, char** argv) {
     blaze.steadyDuration = duration * 2.0;
     model.fires.push_back(blaze);
 
-    for (const std::string& problem : model.validate())
+    // **Printed and stepped over, until now.** `validate()` now names an `attach()`
+    // request it could not honour -- the one fact about the model that cannot be
+    // recovered by inspecting it, because a model over two compartments is a model
+    // over two compartments whether the caller asked for two or three -- and every
+    // figure this tool publishes is a count taken over `model.gas`. A diagnostic on
+    // stderr under a table of plausible numbers on stdout is not a channel; it is
+    // the quiet outcome with a paper trail.
+    bool illDefined = false;
+    for (const std::string& problem : model.validate()) {
         std::fprintf(stderr, "  fire model: %s\n", problem.c_str());
+        illDefined = true;
+    }
+    if (blaze.compartment < 0) {
+        std::fprintf(stderr, "  fire model: the fire is in no gas space this model holds\n");
+        illDefined = true;
+    }
+    if (illDefined) return 1;
 
     promotion::GasPromoter promoter;
     const auto& crit = promoter.criterion();
@@ -112,6 +149,15 @@ int main(int argc, char** argv) {
     // Two clocks that have come apart would move all of them and change nothing that
     // looks wrong. Counted rather than tolerated: on a healthy run these are zero.
     int shortSteps = 0, pressureCapped = 0;
+    // **The margin `shortSteps` is only the exhaustion of.** A rejected trial spends
+    // a budget slot and halves the internal step without advancing the tick, so
+    // `substeps + rejections` is what `maxSubsteps` actually bounds. Zero short
+    // steps is compatible with a run one rejection clear of the exit and with one
+    // that never came near it, and those are different ships; the count is what
+    // separates them. Reported rather than required, because there is no bound here
+    // worth choosing -- what is worth having is the number moving where a reader
+    // can see it.
+    int rejections = 0, worstTickRejections = 0;
     double clockGap = 0;             // s, the worst |model.time - t| ever reached
 
     double t = 0, nextReview = 0;
@@ -120,6 +166,8 @@ int main(int argc, char** argv) {
         const fire::StepResult s = model.step(step, ship, sea);
         t += step;
         if (s.incomplete) ++shortSteps;
+        rejections += s.rejections;
+        worstTickRejections = std::max(worstTickRejections, s.rejections);
         // `fire.hpp` publishes this "so that 'should never' can be asserted", and no
         // tool asserted it.
         if (s.pressureSolveCapped) ++pressureCapped;
@@ -167,6 +215,9 @@ int main(int argc, char** argv) {
     std::printf("    peak cells active                     %8d   (budget %d)\n",
                 peakCells, crit.cellBudget);
     std::printf("    reviews that refused on budget        %8d\n", budgetRefusals);
+    std::printf("    substep trials rejected               %8d   (worst %d in one tick"
+                " of a %d-trial budget)\n",
+                rejections, worstTickRejections, model.maxSubsteps);
 
     if (!promotedEver.empty()) {
         std::printf("\n    compartments promoted at least once:\n");

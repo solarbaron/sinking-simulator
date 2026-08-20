@@ -959,11 +959,17 @@ void applyStream(int fromGas, int toGas, const VentSide& donor, const VentSide& 
 // Model
 // ---------------------------------------------------------------------------
 
+// The sea is answered with the sea, and everything this model does not track with
+// `kNoGasSpace`. Those were the same integer until now -- `kSea` is -1 and so was
+// the miss -- so "outside the hull" and "behind a bulkhead I know nothing about"
+// arrived at every caller as one answer, and they are opposite: one is an infinite
+// reservoir of air at ambient, the other is a space whose state this model has no
+// claim on at all.
 int Model::gasIndexOf(int shipCompartment) const {
     if (shipCompartment == kSea) return kSea;
     for (std::size_t i = 0; i < gas.size(); ++i)
         if (gas[i].shipCompartment == shipCompartment) return static_cast<int>(i);
-    return -1;
+    return kNoGasSpace;
 }
 
 int Model::findGas(std::string_view name) const {
@@ -975,9 +981,20 @@ int Model::findGas(std::string_view name) const {
 void Model::attach(const Ship& ship, const std::vector<int>& shipCompartments) {
     gas.clear();
     vents.clear();
+    unattached.clear();
 
     for (int idx : shipCompartments) {
-        if (idx < 0 || idx >= static_cast<int>(ship.compartments.size())) continue;
+        // **Recorded, not dropped.** A request this cannot honour used to leave no
+        // trace anywhere: the model that came back was a perfectly well-formed
+        // model over fewer compartments, `validate()` had nothing to look at
+        // because it inspects what is *in* the model, and every count taken over
+        // the result read like a ship whose third space simply never did anything.
+        // The caller is the only one who knows what it asked for, so the only
+        // honest thing this can do is hand back the list of what it refused.
+        if (idx < 0 || idx >= static_cast<int>(ship.compartments.size())) {
+            unattached.push_back(idx);
+            continue;
+        }
         const Compartment& c = ship.compartments[static_cast<std::size_t>(idx)];
         GasCompartment g;
         g.shipCompartment = idx;
@@ -1009,17 +1026,25 @@ void Model::attach(const Ship& ship, const std::vector<int>& shipCompartments) {
         // about: dropped on purpose. Treating an untracked compartment as the
         // atmosphere would put an infinite reservoir of cool air behind a
         // bulkhead, which is worse than having no path at all.
-        const bool aOk = (ga >= 0) || (o.a == kSea);
-        const bool bOk = (gb >= 0) || (o.b == kSea);
-        if (!aOk || !bOk) continue;
-        if (ga < 0 && gb < 0) continue;
+        //
+        // Asked of `gasIndexOf`'s own answer now, rather than of the opening's
+        // endpoint a second time: the two tests were duplicated here only because
+        // a miss and the sea came back as one integer.
+        if (ga == kNoGasSpace || gb == kNoGasSpace) continue;
+        // Both ends outside the hull. Nothing to exchange with a gas space this
+        // model holds, so it is not a vent of this network.
+        if (ga == kSea && gb == kSea) continue;
 
         const VentShape shape = ventShapeFor(o);
         Vent v;
         v.opening = static_cast<int>(i);
         v.name = o.name;
-        v.a = ga >= 0 ? ga : kSea;
-        v.b = gb >= 0 ? gb : kSea;
+        // Straight through, where this used to re-derive kSea from a negative
+        // answer. That expression was the defect being worked around at a call
+        // site: with one integer for "the sea" and "not tracked" there was no
+        // other way to say which of the two `ga` had come back as.
+        v.a = ga;
+        v.b = gb;
         v.width = shape.width;
         v.area = o.area;
         v.horizontal = shape.horizontal;
@@ -1054,6 +1079,15 @@ void Model::resetAccount() {
 
 std::vector<std::string> Model::validate() const {
     std::vector<std::string> problems;
+    // **The one thing here that is not a property of the model.** Everything below
+    // reads what the model holds; this reads what `attach()` was asked for and did
+    // not get, because that is a fact no inspection of the result can recover. A
+    // model over two compartments is a model over two compartments whether the
+    // caller wanted two or three, and the second reading is the one that publishes
+    // counts nobody can tell from a quiet ship.
+    for (int idx : unattached)
+        problems.push_back("attach() was asked to track ship compartment " +
+                           std::to_string(idx) + ", which this ship does not have");
     for (const GasCompartment& g : gas) {
         if (g.gasVolume <= 0) problems.push_back("gas space '" + g.name + "' has no volume");
         if (g.ceilingZ <= g.floorZ)
@@ -1182,6 +1216,12 @@ StepResult Model::step(double dt, const Ship& ship, const Sea& sea) {
             // `tests/test_fire.cpp` asserts the floor rather than the factor.
             h = std::min(h * 1.5, maxSubstep);
         } else {
+            // Counted, on the same terms `les.cpp` counts it: a rejected trial is
+            // the term that makes the budget's exit reachable at all, so it is also
+            // the only measurement of how near a healthy run is to it. `incomplete`
+            // below says the budget ran out; nothing said how much of it a run that
+            // did not run out had already spent.
+            ++out.rejections;
             h *= 0.5;
         }
     }
