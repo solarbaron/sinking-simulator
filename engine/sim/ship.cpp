@@ -1524,6 +1524,17 @@ void Ship::step(double dt, const Sea& sea) {
     // - Handle demoted list: read state back via promotion::demoteWater, delete field, remove from map
     // - Step active FLIP fields: for each in activeWaterFields_, create flip::Solver, call solver.step(dt)
     // - Update compartment waterVolume from FLIP state when active
+    //
+    // **Before this lands, read `water_promotion.hpp` §5 and empty it.** That
+    // section is the list of decisions the tier has taken that nothing currently
+    // exercises -- the budget's first-fit-with-stop, what a starved compartment is
+    // told, which refusals get a channel. Every one of them is latent precisely
+    // because `review()` is not called from here, and closing this TODO converts
+    // the whole list from latent to live in a single commit, on a path that feeds
+    // published flooding figures. Two defects have already been found in that file
+    // by inspection alone (a dwell streak restarted by budget starvation, a `hold`
+    // of zero demoting every active compartment every review); neither could move a
+    // figure, and both would have on the day this line was written.
 
     integrateRigidBody(dt, sea);
 }
