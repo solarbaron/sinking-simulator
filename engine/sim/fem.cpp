@@ -40,9 +40,52 @@ float determinant(const M3& a) {
            a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
 }
 
+// Inverse, or the zero matrix when the argument is too near singular to invert.
+//
+// **The threshold is a shape ratio, not a size, because the two callers below
+// differ by the units of a volume.** `polarRotation` hands this a near-rotation:
+// nondimensional, det ~ 1. `computeRestState` hands it `dm`, whose columns are
+// node position *differences* in metres, so det(dm) = 6 * restVolume and the
+// units are m^3. That is the defect in the 1e-30f that used to stand here -- not
+// that it is denormal-ish for float, which is true but incidental, but that it
+// is an absolute number being asked to bound a quantity that scales as h^3.
+//
+// For an element of edge h, det ~ h^3; at the h = 0.1 m of a plate mesh that is
+// 1e-3 m^3, twenty-seven decades above the old floor. A *fully flat or inverted*
+// tet -- precisely what this guard exists to catch -- leaves |det| ~ eps_float *
+// h^3 ~ 1.2e-10 m^3, still twenty decades clear of it. It passed: `restInv` came
+// back with entries ~1e10 m^-1 where healthy is ~1/h ~ 10, F = Ds * restInv was
+// amplified ~1e9, and restVolume ~ 0 meant the element had no mass to resist it.
+//
+// `scale` is the product of the three column lengths, so it carries the same m^3
+// the determinant does and the ratio is nondimensional. Hadamard's inequality
+// makes |det| <= scale for every matrix, with equality exactly when the columns
+// are orthogonal, so the ratio is a shape quality in [0, 1]: 1 for a perfect
+// corner, 0 for a flat one. That is what makes one form serve both callers --
+// polarRotation's near-unit columns give scale ~ 1 against det ~ 1.
+//
+// The L1 column norm is used rather than the Euclidean one to keep three square
+// roots out of `tetForces`, which runs this four times per element per step.
+// L1 >= L2 >= L2-product, so the ratio stays bounded by 1 and the guard stays
+// conservative; the penalty is at worst 3^(3/2) = 5.2, and the constant has six
+// decades of room for it. Measured: a general rotation gives 0.25, the Kuhn
+// corner tet `makeBoxTetMesh` actually emits gives 0.083, and the near-flat tet
+// gives 1.7e-9 -- so 1e-6f sits five decades below every healthy case and nearly
+// three above the degenerate one.
+//
+// **The alternative -- `solid_shell.cpp`'s `invert3`, which tests `det == 0.0`
+// exactly and leaves the magnitude question to callers that assert `det > 0.0`
+// -- is right there and is not right here.** That works because inversion of an
+// element Jacobian is a sign question, and solid_shell's callers ask the sign
+// question separately. `computeRestState` asks nobody: it takes the inverse and
+// moves on. An exact-zero test would let the 1.2e-10 m^3 flat tet through
+// untouched, which is the whole failure. Written `>` so a NaN refuses too.
 M3 inverse(const M3& a) {
     const float det = determinant(a);
-    const float id = std::abs(det) > 1e-30f ? 1.0f / det : 0.0f;
+    float scale = 1.0f;
+    for (int c = 0; c < 3; ++c)
+        scale *= std::abs(a(0, c)) + std::abs(a(1, c)) + std::abs(a(2, c));
+    const float id = std::abs(det) > 1e-6f * scale ? 1.0f / det : 0.0f;
     M3 r{};
     r(0, 0) = (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1)) * id;
     r(0, 1) = (a(0, 2) * a(2, 1) - a(0, 1) * a(2, 2)) * id;

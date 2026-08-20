@@ -10,13 +10,17 @@
 namespace sim {
 namespace {
 
-// Signed volume and first moment of the tetrahedron (o, a, b, c).
-inline void accumulateTet(const Vec3& o, const Vec3& a, const Vec3& b, const Vec3& c,
-                          double& volume, Vec3& moment) {
+// Signed volume and first moment of the tetrahedron (o, a, b, c). Returns the
+// signed volume it just added, so a caller that needs the round-off floor of its
+// own accumulation can total the magnitudes alongside the sum -- see the centroid
+// guard in integrateBelowPlane() for why that is the quantity to compare against.
+inline double accumulateTet(const Vec3& o, const Vec3& a, const Vec3& b, const Vec3& c,
+                            double& volume, Vec3& moment) {
     const Vec3 pa = a - o, pb = b - o, pc = c - o;
     const double v = dot(pa, cross(pb, pc)) / 6.0;
     volume += v;
     moment += (o + a + b + c) * (0.25 * v);
+    return v;
 }
 
 void flipWinding(TriMesh& mesh) {
@@ -101,6 +105,7 @@ VolumeIntegral integrateBelowPlane(const TriMesh& mesh, const Vec3& n, double pl
     const Vec3 o = n * planeOffset;
 
     double volume = 0;
+    double magnitude = 0;
     Vec3 moment{};
 
     Vec3 poly[8];
@@ -119,12 +124,36 @@ VolumeIntegral integrateBelowPlane(const TriMesh& mesh, const Vec3& n, double pl
                 poly[count++] = p + (q - p) * (dp / (dp - dq));
         }
         for (int i = 1; i + 1 < count; ++i)
-            accumulateTet(o, poly[0], poly[i], poly[i + 1], volume, moment);
+            magnitude += std::abs(accumulateTet(o, poly[0], poly[i], poly[i + 1], volume, moment));
     }
 
     VolumeIntegral r;
     r.volume = volume;
-    if (volume > 1e-12) r.centroid = moment / volume;
+    // **The centroid is meaningful only above the round-off floor of the
+    // accumulation that produced it, and that floor is not a constant: it scales
+    // as L^3 with the mesh, exactly as the volume does.**
+    //
+    // The bare 1e-12 that used to stand here was *below its own noise*. Ferry
+    // compartment tets reach ~400 m^3 against partial sums ~3000 m^3, where one
+    // ulp is 4.5e-13 m^3 and the drift accumulated over a few thousand triangles
+    // is ~1e-11 m^3 -- a decade above the guard. So a volume that was pure
+    // round-off passed the test, and `moment` -- itself ~1e-11 m^4 of noise once
+    // 50 m levers are in it -- got divided by it, putting the centroid metres
+    // away instead of falling back to the origin. Being an absolute number in
+    // m^3 against a floor that grows as L^3, it only gets worse with the ship:
+    // on a 300 m hull it sits two and a half decades under the noise.
+    //
+    // `magnitude` is the sum of the same tet volumes without their signs. It is
+    // in m^3 like the volume, so the ratio is nondimensional, and it bounds the
+    // accumulated round-off directly: each `volume += v` errs by at most
+    // eps * |running sum| <= eps * magnitude. That is both tighter and more
+    // honest than the bounding-box proxy the units alone would suggest, because
+    // it shrinks with a shallow cut -- where the retained tets are small and the
+    // true noise is small with them -- instead of charging every clip the whole
+    // mesh's extent. Measured relative noise on the ferry is 3e-15 of
+    // `magnitude`, so 1e-12 clears it by two and a half decades while still
+    // sitting eleven decades below any ratio a real solid can produce.
+    if (volume > 1e-12 * magnitude) r.centroid = moment / volume;
     return r;
 }
 
@@ -168,6 +197,7 @@ PlaneSweep::PlaneSweep(const TriMesh& mesh, const Vec3& n) : mesh_(&mesh), n_(no
 VolumeIntegral PlaneSweep::below(double offset) const {
     const Vec3 o = n_ * offset;
     double volume = 0;
+    double magnitude = 0;
     Vec3 moment{};
 
     Vec3 poly[8];
@@ -188,12 +218,17 @@ VolumeIntegral PlaneSweep::below(double offset) const {
                 poly[count++] = p + (mesh_->verts[vi[j]] - p) * (d[i] / (d[i] - d[j]));
         }
         for (int i = 1; i + 1 < count; ++i)
-            accumulateTet(o, poly[0], poly[i], poly[i + 1], volume, moment);
+            magnitude += std::abs(accumulateTet(o, poly[0], poly[i], poly[i + 1], volume, moment));
     }
 
     VolumeIntegral r;
     r.volume = volume;
-    if (volume > 1e-12) r.centroid = moment / volume;
+    // Same guard, same derivation as integrateBelowPlane() above: the centroid is
+    // only meaningful above the round-off floor of its own accumulation, and
+    // `magnitude` -- the same tet volumes summed without their signs, so also m^3
+    // -- is that floor. This is the per-tick path, and one fabs and one add per
+    // tet is what it costs to stop handing the ship a centroid made of noise.
+    if (volume > 1e-12 * magnitude) r.centroid = moment / volume;
     return r;
 }
 

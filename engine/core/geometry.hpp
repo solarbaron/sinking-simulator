@@ -132,6 +132,7 @@ Vec3 waterplaneMoments(const TriMesh& mesh, const Vec3& n, double planeOffset);
 template <typename HeightField>
 VolumeIntegral integrateBelowSurface(const TriMesh& mesh, HeightField&& height) {
     double volume = 0;
+    double magnitude = 0;
     Vec3 moment{};
 
     // Evaluate the surface once per *vertex*, not once per triangle corner. On a
@@ -186,14 +187,24 @@ VolumeIntegral integrateBelowSurface(const TriMesh& mesh, HeightField&& height) 
                 meanMoment.y += q.y * below;
                 meanMoment.z += 0.5 * (q.z * q.z - surface * surface);
             }
-            volume += areaZ * meanDepth / 3.0;
+            const double contribution = areaZ * meanDepth / 3.0;
+            volume += contribution;
+            magnitude += std::abs(contribution);
             moment += meanMoment * (areaZ / 3.0);
         }
     }
 
     VolumeIntegral result;
     result.volume = volume;
-    if (volume > 1e-12) result.centroid = moment / volume;
+    // Same guard, same derivation as integrateBelowPlane(): the centroid is
+    // meaningful only above the round-off floor of its own accumulation, which
+    // scales as L^3 and so cannot be a constant in m^3. `magnitude` is the same
+    // per-panel contributions summed without their signs -- also m^3, so the
+    // ratio is nondimensional -- and it bounds that floor, each `volume +=` being
+    // in error by at most eps * |running sum|. Panels above and below the surface
+    // enter with opposite signs here, so the cancellation this protects against
+    // is if anything larger than in the plane case.
+    if (volume > 1e-12 * magnitude) result.centroid = moment / volume;
     return result;
 }
 

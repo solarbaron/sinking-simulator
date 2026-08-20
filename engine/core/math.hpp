@@ -101,13 +101,58 @@ struct Mat3 {
     static constexpr Mat3 zero() { Mat3 r; r.m.fill(0); return r; }
 };
 
+// Inverse, or the zero matrix when the argument is too near singular to invert.
+//
+// **The refusal threshold has to be relative, because this one routine serves
+// two kinds of caller whose determinants live thirty decades apart.** Rotations
+// arrive from `Quat::toMat3` and `polarRotation` nondimensional, det == 1.
+// Inertia tensors arrive from `ContactBody::inertia` and `Ship`'s `Ieff`
+// carrying (kg m^2)^3: the ferry's I_xx ~ 1.1e8 and I_yy = I_zz ~ 1.9e9 kg m^2
+// give det ~ 4.0e26. No absolute constant is a small number for both, and the
+// 1e-300 that used to stand here was a small number for neither -- it is the
+// underflow floor of the type, which is a fact about `double` and not a
+// statement about the matrix.
+//
+// What that cost, measured on the ferry: the cofactors of its inertia are ~1e26,
+// so double round-off leaves a residue ~1e10 in the determinant. A tensor
+// cancelled to *complete* numerical singularity still reports det ~ 1e10 and
+// clears the old floor by 310 decades. Its cofactors ~1e17 divided by that
+// residue give inverse entries ~1e7 where healthy is ~5e-9 -- a 1e15
+// amplification of `alphaBody` in `Ship::step`, every step, delivered as a
+// number rather than as a NaN.
+//
+// `scale` is the size the determinant would have had if nothing had cancelled:
+// the same three products of the row-0 expansion, summed without their signs. It
+// carries exactly the units `det` does -- (kg m^2)^3 for an inertia, none for a
+// rotation -- so the ratio is nondimensional and the threshold is a statement
+// about conditioning alone. Rotations give scale == det == 1 *exactly*: for an
+// orthogonal R the cofactor matrix is R itself, so the three products are
+// a(0,i)^2 and cannot cancel. Inertias give scale ~ 1e27 against det ~ 4e26. One
+// form, both callers.
+//
+// This detects cancellation in the determinant, which is not the same as
+// bounding the condition number -- a near-singular matrix whose defect misses
+// the row-0 expansion is not caught here. That is the cheap half of the problem
+// and it is the half that fires in practice; `fem.cpp`'s M3 inverse needs the
+// stronger column-norm form because its degeneracy hides inside the 2x2 minors,
+// where this sum cannot see it.
+//
+// Written `!(|det| > eps * scale)` rather than `|det| < eps * scale` so the two
+// refusals that must not silently become inversions survive. An exactly zero
+// matrix gives `0 > 0`, false, so it still returns zero -- that is load-bearing:
+// `ContactBody::inertia` defaults to `Mat3::zero()` so a default-constructed
+// body is the *immovable* one, and `normalImpulse` and `applyImpulse` rely on
+// this returning zero there to get the infinite-mass limit. A NaN determinant
+// compares false against everything, so it refuses too rather than propagating.
 inline Mat3 inverse(const Mat3& a) {
     const double c00 = a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1);
     const double c01 = a(1, 2) * a(2, 0) - a(1, 0) * a(2, 2);
     const double c02 = a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0);
     const double det = a(0, 0) * c00 + a(0, 1) * c01 + a(0, 2) * c02;
+    const double scale =
+        std::abs(a(0, 0) * c00) + std::abs(a(0, 1) * c01) + std::abs(a(0, 2) * c02);
     Mat3 r = Mat3::zero();
-    if (std::abs(det) < 1e-300) return r;
+    if (!(std::abs(det) > 1e-12 * scale)) return r;
     const double id = 1.0 / det;
     r(0, 0) = c00 * id;
     r(1, 0) = c01 * id;
