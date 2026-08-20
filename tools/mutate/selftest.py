@@ -40,6 +40,21 @@ The known answers, one per failure mode the harness has to separate:
                                                          control, which is the
                                                          number a harness without
                                                          it publishes
+  * one killed for a reason that is a *lie* -- a
+    failing check naming a file the mutation never
+    touched, planted so that the verdict is right
+    and its reason is not                             -> flagged, re-run despite
+                                                         having matched its
+                                                         expectation, and reported
+                                                         as a kill whose reason did
+                                                         not reproduce even though
+                                                         its outcome did
+  * an expected kill that only reproduces sometimes   -> FLAKY once it is sampled;
+                                                         with the sample switched
+                                                         off the same fixture
+                                                         publishes 1/1, which is the
+                                                         rate a harness that only
+                                                         re-runs surprises reports
   * a catalogue pattern that no longer matches        -> refused before anything runs
   * a substitution that replaces text with nothing    -> refused at load: it could
                                                          not be told later from a
@@ -60,6 +75,11 @@ and four properties rather than outcomes:
   * two workers cannot write the same file: each gets its own $TMPDIR, which the
     first real sweep needed after one worker's `barge.ship` scored a kill on
     another's mutant
+  * a path outside the workspace is found in a verdict, and one inside it is not --
+    the negative control the case above needs, since a detector that fires on every
+    absolute path would pass the positive case while measuring nothing
+  * the sample of expected kills is the same sample twice, a different one under a
+    different seed, and neither the whole catalogue nor none of it
 
 Run it with no arguments. It writes nothing outside /tmp.
 """
@@ -332,6 +352,61 @@ def with_tmpdir_marker(test):
         '            std::fclose(handle);\n'
         '        }\n'
         '    }', 1)
+
+
+def with_planted_failure(test, counter, root_expression):
+    """A suite that fails, once, naming a file it never wrote.
+
+    This is `indentation` mutant 4 rebuilt as a fixture. That mutant was scored
+    KILLED on `FAIL a ship written to disk loads back: /tmp/barge.ship: empty, or
+    not a ship file` -- a failing check about a *neighbouring worker's* file. It was
+    a real mutant and it would have been killed anyway, so the rate did not move and
+    the verdict matched its expectation, which meant `--confirm` never looked at it.
+    A kill for the wrong reason is invisible to a pass that only re-runs surprises.
+
+    The lie fires on the third run of the suite and no other. The two baseline runs
+    are the first two, so the harness meets it exactly where it hurts -- while
+    scoring a mutant -- and the *re-run* sees the mutant's own honest failure
+    instead. Same verdict both times, different reason: a confirmation pass that
+    compares outcomes alone would call that reproduced.
+
+    `root_expression` is C++ text, which is what makes the negative control
+    possible: the identical fixture points the identical lie at a file under the
+    workspace's own `$TMPDIR`, where it is nobody else's.
+    """
+    return test.replace(
+        "#include <cstdio>", "#include <cstdio>\n#include <cstdlib>", 1).replace(
+        '    std::printf("toy validation\\n");',
+        '    std::printf("toy validation\\n");\n'
+        '    {\n'
+        '        int plants = 0;\n'
+        f'        if (FILE* handle = std::fopen("{counter}", "r")) {{\n'
+        '            if (std::fscanf(handle, "%d", &plants) != 1) plants = 0;\n'
+        '            std::fclose(handle);\n'
+        '        }\n'
+        '        ++plants;\n'
+        f'        if (FILE* handle = std::fopen("{counter}", "w")) {{\n'
+        '            std::fprintf(handle, "%d", plants);\n'
+        '            std::fclose(handle);\n'
+        '        }\n'
+        '        if (plants == 3) {\n'
+        '            char scratch[512];\n'
+        '            std::snprintf(scratch, sizeof scratch, "%s/barge.ship",\n'
+        f'                          {root_expression});\n'
+        '            ++checks;\n'
+        '            ++failures;\n'
+        '            std::printf("  FAIL %-40s %s: empty, or not a ship file\\n",\n'
+        '                        "a ship written to disk loads back", scratch);\n'
+        '        }\n'
+        '    }', 1)
+
+
+# The two ends of the negative control. Neither directory is ever created and
+# neither file is ever opened -- the fixture only *names* them, which is all the
+# incident did to earn its verdict.
+NOT_A_WORKSPACE = '"/tmp/shipsim-mutate-not-a-workspace"'
+THE_WORKSPACE_ITSELF = ('(std::getenv("TMPDIR") != nullptr ? std::getenv("TMPDIR")'
+                        ' : "/tmp")')
 
 
 EXPECTED = {
@@ -666,13 +741,20 @@ def case_the_result_says_how_to_rerun_itself(root):
     options = record.get("options", {})
     # The defaults are the point: none of these was named on the command line.
     for field, value in (("workers", 1), ("cpu_factor", 4.0), ("wall_factor", 6.0),
-                         ("baseline_runs", 2), ("confirm", 1), ("early_kill", True)):
+                         ("baseline_runs", 2), ("confirm", 1), ("early_kill", True),
+                         ("confirm_kills", 0.1)):
         check_equal(f"the default it actually used for {field} is recorded",
                     options.get(field), value)
+    # The seed is the one option that is *derived* rather than defaulted, and a
+    # sample nobody can reproduce is a sample nobody can check.
+    check_equal("the sample's seed is recorded, and is the one the catalogue implies",
+                options.get("confirm_seed"),
+                int(hashlib.sha256(pathlib.Path(catalogue).read_bytes()).hexdigest()[:8], 16))
     check("the rerun line names the options explicitly rather than relying on defaults",
           all(flag in record.get("rerun", "")
               for flag in ("--workers", "--cpu-factor", "--wall-factor", "--cpu-floor",
-                           "--wall-floor", "--baseline-runs", "--confirm", "--only")),
+                           "--wall-floor", "--baseline-runs", "--confirm", "--only",
+                           "--confirm-kills", "--confirm-seed")),
           record.get("rerun", ""))
     check("the catalogue is pinned by content, not just by name",
           record.get("catalogue_sha256") == hashlib.sha256(
@@ -930,6 +1012,331 @@ def case_workers_do_not_share_a_scratch_directory(root):
                 {0: "KILLED", 2: "KILLED", 6: "SURVIVED", 7: "SURVIVED"})
 
 
+def case_a_kill_for_the_wrong_reason(root):
+    """A kill whose reason is a lie, and a confirmation pass that can now see it.
+
+    `--confirm` re-runs the verdicts that did *not* match their expectation. That is
+    blind in exactly one direction, and the blindness has already fired: on the first
+    `indentation` sweep, mutant 4 was scored KILLED on `FAIL a ship written to disk
+    loads back: /tmp/barge.ship: empty, or not a ship file` -- a failing check about
+    a neighbouring worker's file under a shared `/tmp`. The mutant deserved killing,
+    so the rate did not move, so the verdict matched its expectation, so nothing was
+    re-run. The next one to lose that race could be a control.
+
+    This is that verdict rebuilt with the cause under control. The mutant is a real
+    one whose own honest failure is `mean of four values`; the planted lie fires
+    first, on the third suite run only, so the fixture produces a kill that is right
+    for a reason that is not. Note what the *outcome* does on the re-run: it
+    reproduces. Mutant 0 is a real mutant and the second run kills it on its own
+    merits. Comparing outcomes alone would have called this confirmed.
+    """
+    counter = root / "planted-count"
+    tree = write_toy(root, test=with_planted_failure(TEST_CPP, counter, NOT_A_WORKSPACE))
+    check("the planted failure landed in the fixture",
+          "not-a-workspace" in (tree / "test.cpp").read_text())
+    catalogue = write_catalogue(root, tree, "planted_catalogue.py")
+    result = root / "planted.json"
+    # `--confirm-kills 0`: the sample of expected kills is switched *off*, so the
+    # only thing that can force this re-run is the path in the failing check.
+    done, _ = harness("run", str(catalogue), "--only", "0", "--json", str(result),
+                      "--scratch", str(root), "--confirm-kills", "0", timeout=900)
+    print(done.stdout)
+    if not check("the planted sweep ran", result.exists(), done.stderr[-800:]):
+        return
+    report = json.loads(result.read_text())
+    record, summary = report["mutants"][0], report["summary"]
+
+    # First, that this really is the invisible case and not some other one.
+    check_equal("the lying kill is still scored KILLED", record["outcome"], "KILLED")
+    check_equal("...and matched its expectation, so nothing surprised the harness",
+                summary["unexpected"], [])
+    # Named by the check, not by the file: the reason is truncated at 90 characters
+    # and cuts the path in half, which is the case the whole-path report below is
+    # for.
+    check("...and the reason it was killed for is the planted one",
+          "a ship written to disk loads back" in record["reason"], record["reason"])
+
+    # Then, that the harness saw it anyway.
+    check_equal("the kill is flagged as one decided outside its own workspace",
+                summary["kills_naming_a_path_outside_the_workspace"], [0])
+    check_equal("...and the file is named in full, not as the truncated reason cuts it",
+                summary["foreign_paths_named"],
+                ["/tmp/shipsim-mutate-not-a-workspace/barge.ship"])
+    check("...and that is why it was re-run, with the sample switched off",
+          "does not own" in record.get("rechecked_because", ""),
+          record.get("rechecked_because", "(not re-run at all)"))
+
+    # And the part a pass comparing outcomes cannot reach.
+    check_equal("the outcome reproduces -- it is a real mutant, killed twice",
+                record.get("confirmations"), ["KILLED", "KILLED"])
+    check_equal("but the reason does not", record.get("reason_reproduced"), False)
+    check_equal("...and the sweep says which mutant lied",
+                summary["kills_whose_reason_did_not_reproduce"], [0])
+    reasons = record.get("confirmation_reasons", ["", ""])
+    check("the first reason is the neighbour's file", "not-a-workspace" in reasons[0],
+          str(reasons))
+    check("the second is the mutation's own failing check",
+          "mean of four values" in reasons[-1], str(reasons))
+    check_equal("a sweep carrying a kill like this is not clean", summary["clean"], False)
+    check_equal("...and says so in its exit status", done.returncode, 1)
+
+
+def case_the_same_lie_inside_the_workspace_is_not_flagged(root):
+    """The negative control for *where*: the identical lie, a file of one's own.
+
+    A detector that fired on every absolute path would pass the case above while
+    measuring nothing -- the toy suite prints paths, and so does the real one
+    (`tests/harness.cpp` announces its scratch directory on every run). So the same
+    fixture is pointed at `$TMPDIR/barge.ship`, which is the workspace the harness
+    handed this mutant, and the path flag must stay down.
+
+    The lie is still a lie, and the *other* new detector still catches it: the
+    reason changes between the two runs. That the two fire independently is the
+    point of running this variant with the sample switched on.
+    """
+    counter = root / "own-count"
+    tree = write_toy(root, test=with_planted_failure(TEST_CPP, counter,
+                                                     THE_WORKSPACE_ITSELF))
+    catalogue = write_catalogue(root, tree, "own_catalogue.py")
+    result = root / "own.json"
+    done, _ = harness("run", str(catalogue), "--only", "0", "--json", str(result),
+                      "--scratch", str(root), "--confirm-kills", "1.0", timeout=900)
+    print(done.stdout)
+    if not check("the own-scratch sweep ran", result.exists(), done.stderr[-800:]):
+        return
+    report = json.loads(result.read_text())
+    record, summary = report["mutants"][0], report["summary"]
+    # Without this the check below is vacuous: "no foreign path" would be satisfied
+    # by a fixture that named no path at all.
+    check("the fixture did name a file in its failing check",
+          re.search(r"/[\w.-]+/[\w.-]+", record["reason"]) is not None, record["reason"])
+    check_equal("a file under the workspace's own scratch is not a foreign path",
+                summary["kills_naming_a_path_outside_the_workspace"], [])
+    check_equal("...and the kill stands", record["outcome"], "KILLED")
+    check_equal("but the reason still did not reproduce, which the other check sees",
+                summary["kills_whose_reason_did_not_reproduce"], [0])
+
+
+def case_an_ordinary_kill_is_re_run_and_says_nothing(root):
+    """The negative control for *whether*: a kill that is honest must stay quiet.
+
+    Both new checks are negatives -- they report by not firing -- and a negative is
+    worth nothing until something proves the instrument was pointed at the thing.
+    So this runs the same mutant with no lie planted, with the sample at 1.0 so it
+    is certainly re-run, and asserts the re-run happened *and* found nothing.
+    """
+    tree = write_toy(root)
+    catalogue = write_catalogue(root, tree, "honest_catalogue.py")
+    result = root / "honest.json"
+    done, _ = harness("run", str(catalogue), "--only", "0", "--json", str(result),
+                      "--scratch", str(root), "--confirm-kills", "1.0", timeout=900)
+    if not check("the honest sweep ran", result.exists(), done.stderr[-800:]):
+        return
+    report = json.loads(result.read_text())
+    record, summary = report["mutants"][0], report["summary"]
+    check_equal("the expected kill was re-run", summary["expected_kills_rechecked"], [0])
+    check_equal("...as a sample rather than as a surprise",
+                summary["expected_kills_sampled"], [0])
+    check_equal("...and it reproduced", record.get("confirmations"), ["KILLED", "KILLED"])
+    check_equal("...for the same reason both times", record.get("reason_reproduced"), True)
+    check_equal("nothing is flagged as decided outside the workspace",
+                summary["kills_naming_a_path_outside_the_workspace"], [])
+    check_equal("nothing is flagged as killed by another route",
+                summary["kills_whose_reason_did_not_reproduce"], [])
+    check_equal("and the sweep is clean", summary["clean"], True)
+
+
+def case_an_expected_kill_that_does_not_reproduce(root):
+    """The kill rate moves from 1/1 to 0/1 by re-running the kill it is made of.
+
+    The flaky fixture again -- a check that passes on both baseline runs and then
+    disagrees with itself -- but pointed at a mutant the catalogue *expects* to die.
+    That is the whole blind spot in one fixture: the verdict matches, so the
+    confirmation pass never looked, so a suite failure that has nothing to do with
+    the mutation is counted as evidence the suite catches it.
+
+    The negative control is the same sweep with `--confirm-kills 0`, which is what
+    this harness did until now, and which publishes 100%.
+    """
+    tree = write_toy(root)
+    marker = root / "expected-kill-count"
+    body = CATALOGUE.format(tree=str(tree)).replace(
+        '"-I", "{src}", "{src}/sim.cpp", "{src}/test.cpp"]',
+        f'"-I", "{{src}}", "-DFLAKY_PATH=\\"{marker}\\"",'
+        ' "{src}/sim.cpp", "{src}/test.cpp"]').replace(
+        '    ("CONTROL: twice as a sum rather than a product", SIM,',
+        '    ("an edit the catalogue calls a real mutant", SIM,').replace(
+        '     "double twice(double x) { return x + x; }", "survive"),',
+        '     "double twice(double x) { return x + x; }", "kill"),')
+    check("the flaky fixture was configured", "FLAKY_PATH" in body)
+    check("...and mutant 6 is recorded as an expected kill",
+          '"double twice(double x) { return x + x; }", "kill"),' in body)
+    catalogue = write_catalogue(root, tree, "expected_kill_catalogue.py", body)
+
+    result = root / "expected-kill.json"
+    done, _ = harness("run", str(catalogue), "--only", "6", "--json", str(result),
+                      "--scratch", str(root), "--confirm-kills", "1.0", timeout=900)
+    print(done.stdout)
+    if not check("the sampled sweep ran", result.exists(), done.stderr[-800:]):
+        return
+    report = json.loads(result.read_text())
+    record, summary = report["mutants"][0], report["summary"]
+    # `summary["unexpected"]` is taken after the re-run, by which time FLAKY is
+    # itself unexpected -- so the claim that nothing surprised the harness *during
+    # the sweep* has to be read off why the mutant was re-run at all.
+    check("the verdict matched its expectation, so nothing surprised the harness",
+          record.get("rechecked_because", "").startswith("sampled"),
+          record.get("rechecked_because", "(it was never re-run)"))
+    check_equal("...and it is the sample, not a surprise, that re-ran it",
+                summary["expected_kills_sampled"], [6])
+    check_equal("an expected kill that does not reproduce is FLAKY, not a kill",
+                record["outcome"], "FLAKY")
+    check_equal("both verdicts are kept", record.get("confirmations"),
+                ["KILLED", "SURVIVED"])
+    check_equal("...and it is named as one that did not reproduce",
+                summary["expected_kills_that_did_not_reproduce"], [6])
+    check_equal("the kill rate is what is left after taking it out",
+                summary["kill_rate_text"], "0/1")
+    check_equal("and the sweep is not clean", summary["clean"], False)
+
+    # The negative control for the sample itself: this is the number the harness
+    # published before, on the same fixture, in the same second.
+    marker.unlink(missing_ok=True)
+    naive = root / "unsampled.json"
+    done, _ = harness("run", str(catalogue), "--only", "6", "--json", str(naive),
+                      "--scratch", str(root), "--confirm-kills", "0", timeout=900)
+    if check("the unsampled sweep ran", naive.exists(), done.stderr[-800:]):
+        naive_report = json.loads(naive.read_text())
+        check_equal("without the sample the same flaky check reads as a clean kill",
+                    naive_report["mutants"][0]["outcome"], "KILLED")
+        check_equal("...and publishes a full kill rate",
+                    naive_report["summary"]["kill_rate_text"], "1/1")
+        check_equal("...having re-run nothing at all",
+                    naive_report["summary"]["expected_kills_rechecked"], [])
+        check_equal("...because nothing about it looked unexpected",
+                    naive_report["summary"]["unexpected"], [])
+        check_equal("...and calls the sweep clean",
+                    naive_report["summary"]["clean"], True)
+
+    # And `--confirm 0` switches the whole pass off, sample included. A report that
+    # named a sample it never ran would be claiming an examination that did not
+    # happen -- which is the figure gate printing a success line having checked
+    # nothing, in a different tool.
+    marker.unlink(missing_ok=True)
+    off = root / "confirm-off.json"
+    done, _ = harness("run", str(catalogue), "--only", "6", "--json", str(off),
+                      "--scratch", str(root), "--confirm", "0", "--confirm-kills", "1.0",
+                      timeout=900)
+    if check("the sweep with confirmation off ran", off.exists(), done.stderr[-800:]):
+        off_report = json.loads(off.read_text())
+        check_equal("--confirm 0 samples nothing, whatever --confirm-kills asks for",
+                    off_report["summary"]["expected_kills_sampled"], [])
+        check_equal("...and re-runs nothing",
+                    off_report["summary"]["expected_kills_rechecked"], [])
+        check("...and does not claim a mutant was re-run",
+              "confirmations" not in off_report["mutants"][0],
+              json.dumps(off_report["mutants"][0])[:300])
+
+
+def case_the_path_check_knows_a_neighbour_from_its_own(root):
+    """The detector on its own, over the lines it is meant to read.
+
+    Both halves matter equally: the incident's own line must be flagged, and the
+    lines a healthy sweep produces by the thousand -- a warning pointing into a
+    toolchain header, a check naming the workspace's own scratch -- must not be.
+    """
+    sys.path.insert(0, str(HERE))
+    import mutate as engine
+
+    exempt = engine.DEFAULTS["FOREIGN_PATH_EXEMPT"]
+    owned = ["/tmp/shipsim-mutate-ab/src0", "/tmp/shipsim-mutate-ab/build0",
+             "/tmp/shipsim-mutate-ab/tmp0"]
+
+    def outside(line):
+        return engine.paths_outside([line], owned, exempt)
+
+    check_equal("the incident's own failing check names a file it does not own",
+                outside("  FAIL a ship written to disk loads back: /tmp/barge.ship:"
+                        " empty, or not a ship file"), ["/tmp/barge.ship"])
+    check_equal("the same file under this workspace's scratch is its own",
+                outside("  FAIL loads back: /tmp/shipsim-mutate-ab/tmp0/barge.ship: empty"),
+                [])
+    # The case scratch isolation does *not* close: same sweep, same root, other
+    # worker. "Inside the sweep" is not the same question as "mine".
+    check_equal("a neighbouring worker's scratch is still not this one's",
+                outside("  FAIL loads back: /tmp/shipsim-mutate-ab/tmp1/barge.ship: empty"),
+                ["/tmp/shipsim-mutate-ab/tmp1/barge.ship"])
+    check_equal("a warning in the mutated source is not foreign",
+                outside("/tmp/shipsim-mutate-ab/src0/engine/sim/x.cpp:14:5: warning: unused"),
+                [])
+    check_equal("a warning inlined from a toolchain header is not foreign either",
+                outside("/usr/include/c++/14/bits/stl_algo.h:1234:9: warning: here"), [])
+    check_equal("a URL in a message is not a path",
+                outside("see https://example.com/docs/thing"), [])
+    check_equal("a failing check that names no file at all flags nothing",
+                outside("  FAIL mean of four values                 got +2 want +3"), [])
+    check_equal("a crash reason flags nothing",
+                outside("no summary line: crashed at exit -6 (signal 6)"), [])
+    # The truncation the 90-character reason performs, and the untruncated line it
+    # was built from, are both in the evidence. The file is reported once, whole.
+    check_equal("a path cut in half by the truncated reason is reported whole",
+                engine.paths_outside(["failing check: FAIL loads back /tmp/barge.sh",
+                                      "  FAIL loads back /tmp/barge.ship: empty"],
+                                     owned, exempt), ["/tmp/barge.ship"])
+    # And the direction that costs more if it is wrong. A workspace path cut at 90
+    # characters no longer starts with any directory this workspace owns, and
+    # accusing it would put a false positive in front of every long scratch path --
+    # the same asymmetry as a false kill, which inflates a rate while proving
+    # nothing. The negative control for the relaxation is the line under it: a
+    # neighbour's directory truncated at the same place is still not this one's.
+    check_equal("an owned path truncated by the reason is not accused",
+                outside("failing check: FAIL loads back /tmp/shipsim-mutate-ab/tm"), [])
+    check_equal("...but a neighbour's, truncated the same way, still is",
+                outside("failing check: FAIL loads back /tmp/shipsim-mutate-ab/tmp1/ba"),
+                ["/tmp/shipsim-mutate-ab/tmp1/ba"])
+
+
+def case_the_sample_is_a_sample(root):
+    """Reproducible, seed-dependent, and neither everything nor nothing.
+
+    A sampler that returned the whole list would satisfy "the same sample twice" and
+    would silently turn the default into a full re-run; one that returned nothing
+    would satisfy it too and restore the blindness. Both ends are checked.
+    """
+    sys.path.insert(0, str(HERE))
+    import mutate as engine
+
+    twenty = list(range(20))
+    first = engine.confirmation_sample(twenty, 0.1, 7)
+    check_equal("a tenth of twenty kills is two of them", len(first), 2)
+    check_equal("...the same two on a second call",
+                engine.confirmation_sample(twenty, 0.1, 7), first)
+    check("...and a different tenth under a different seed",
+          engine.confirmation_sample(twenty, 0.1, 8) != first, str(first))
+    check("every sampled index is one of the kills it was given",
+          set(first) <= set(twenty), str(first))
+    # Rounded up, so a fraction above zero never samples nothing: the whole defect
+    # being repaired is a pass that looks at no expected kill at all.
+    check_equal("a tenth of a single kill is still that kill",
+                engine.confirmation_sample([7], 0.1, 1), [7])
+    check_equal("a tenth of sixty-five kills is seven",
+                len(engine.confirmation_sample(list(range(65)), 0.1, 1)), 7)
+    check_equal("zero samples nothing, which is the old behaviour by request",
+                engine.confirmation_sample(twenty, 0.0, 1), [])
+    check_equal("one samples every kill", engine.confirmation_sample(twenty, 1.0, 1),
+                twenty)
+    check_equal("and there is nothing to sample from an empty sweep",
+                engine.confirmation_sample([], 0.1, 1), [])
+    # And the flag refuses a fraction that is not one.
+    tree = write_toy(root)
+    catalogue = write_catalogue(root, tree, "fraction_catalogue.py")
+    done, _ = harness("run", str(catalogue), "--only", "0", "--confirm-kills", "5",
+                      "--scratch", str(root), timeout=300)
+    check("a --confirm-kills above one is refused",
+          "fraction" in (done.stdout + done.stderr), (done.stdout + done.stderr)[-300:])
+    check("...before building anything", "baseline:" not in done.stdout)
+
+
 def main():
     started = time.time()
     root = pathlib.Path(tempfile.mkdtemp(prefix="shipsim-mutate-selftest-"))
@@ -962,6 +1369,13 @@ def main():
         case_the_repository_is_never_written_to(root / "unwritten")
         print("\n--- parallelism must not be able to decide a verdict ---")
         case_workers_do_not_share_a_scratch_directory(root / "workers")
+        print("\n--- a kill that is right for the wrong reason ---")
+        case_the_path_check_knows_a_neighbour_from_its_own(root / "paths")
+        case_the_sample_is_a_sample(root / "sample")
+        case_a_kill_for_the_wrong_reason(root / "planted")
+        case_the_same_lie_inside_the_workspace_is_not_flagged(root / "own")
+        case_an_ordinary_kill_is_re_run_and_says_nothing(root / "honest")
+        case_an_expected_kill_that_does_not_reproduce(root / "sampled")
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print(f"\n{checks} checks, {failures} failures ({time.time() - started:.0f}s)")
