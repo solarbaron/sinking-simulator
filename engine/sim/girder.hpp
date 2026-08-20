@@ -137,8 +137,20 @@ std::vector<double> weightDistribution(const Ship& ship, const std::vector<doubl
 // gave a moment curve that peaked at the forward perpendicular and never returned
 // to zero.
 //
+// **The centre of gravity moves as she trims, and the balance has to follow it.**
+// The weight acts there; the body-frame cog is fixed for the whole solve, but its
+// world x is not, and freezing it at the entry orientation solves for the centre
+// of buoyancy against a stale centre of gravity. The error is `KG * trim` to first
+// order, so it does not vanish as the residual does: measured on a 120 m barge at
+// a +4.5 m LCG, the balance converged to 7.5e-9 of her weight in heave and stopped
+// with the centre of buoyancy 0.11 m from the live centre of gravity -- 9.2e-4 of
+// her length, and 900x the tolerance the loop stops on. What that buys is a tight
+// convergence onto the wrong attitude, which is the harder kind of wrong to see.
+//
 // Returns false if it cannot balance -- a ship that cannot float on this wave has
-// no hull girder answer to give. `iterationsUsed`, if given, reports how many
+// no hull girder answer to give. **Both** residuals decide that, because a ship
+// balanced in heave alone is still rotating and the paragraph above is what a
+// rotating ship does to the curves. `iterationsUsed`, if given, reports how many
 // Newton steps were actually taken; fewer than `iterations` means the two
 // residuals converged rather than the budget running out.
 bool balanceOnWave(Ship& ship, const Sea& sea, int iterations = 40,

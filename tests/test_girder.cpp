@@ -446,6 +446,151 @@ void testASingularBalanceJacobianIsRefusedOnItsOwnScale() {
                !solveBalanceStep(0, 0, 0, 0, -1.0e8, 0, dz, dTrim));
 }
 
+// The trim residual is small **about the right point**, which is not the same
+// claim as the residual being small.
+//
+// The loop solves for the attitude, and the centre of gravity's world position is
+// a function of the attitude: the body-frame cog is fixed, but the ship rotates
+// underneath it. Reading that world position once, at the orientation the ship
+// entered with, and then driving the centre of buoyancy onto it is a balance
+// against a stale target, and the staleness is `xg (cos t - 1) + zg sin t` -- to
+// first order `KG * trim`, and independent of how well the loop converged.
+//
+// That is exactly the failure a convergence test cannot see, so this asserts the
+// geometry instead: after balancing, the centre of buoyancy is under the centre
+// of gravity **as she is now floating**. Measured against the frozen point the
+// old code aimed at, the barge below stopped 0.11 m away -- 9.2e-4 of her length,
+// 900x the tolerance the loop stops on, and `6.0 * 0.018554 = 0.1113` to four
+// figures, which is what names the mechanism rather than merely sizing the error.
+//
+// Swept over size for the same reason the step-count test above is: geometric
+// similarity makes the offset a fixed fraction of the length, so a defect that
+// carries a stray absolute term shows up as a fraction that moves with `k`.
+void testTheBalanceFollowsTheCentreOfGravityAsSheTrims() {
+    double firstFraction = 0.0;
+    bool haveFirst = false;
+    for (double k : {0.1, 1.0, 3.0, 10.0}) {
+        Ship entry = scaledBarge(4.5, k);
+        entry.initialise(0.0);
+        const Sea still(0.0);
+        const double length = entry.hullHi.x - entry.hullLo.x;
+
+        // The frozen point, computed exactly as the balance used to compute it:
+        // the world x of the centre of gravity at the *entry* orientation.
+        // `massProperties()` is orientation-free, so the body-frame cog this is
+        // built from is the same one the balanced ship reports below.
+        const Diagnostics before = entry.diagnostics(still);
+        const Mat3 R0 = entry.state.orientation.toMat3();
+        const double frozen = (R0 * before.centreOfGravity + entry.state.position).x;
+        // Precondition for the closed form at the end: she enters upright, so the
+        // frozen reading is the body-frame LCG and the drift below is the whole of
+        // what trimming does to it.
+        expectNear("the fixture enters upright", (R0 * Vec3{1, 0, 0}).z, 0.0, 1e-15);
+
+        Ship ship = entry;
+        expectTrue("the barge balances", balanceOnWave(ship, still));
+
+        const Diagnostics d = ship.diagnostics(still);
+        const Mat3 R = ship.state.orientation.toMat3();
+        const double lcgLive = (R * d.centreOfGravity + ship.state.position).x;
+        const double lcb = (R * d.centreOfBuoyancy + ship.state.position).x;
+        const double trim = std::asin(-(R * Vec3{1, 0, 0}).z);
+
+        // Vacuity guard, and the whole reason the fixture carries a +4.5 m LCG: on
+        // a ship that does not trim the live point and the frozen one are the same
+        // point, and every assertion below is satisfied by arithmetic.
+        expectTrue("the offset LCG really trims her", std::abs(trim) > 0.015);
+
+        // What the balance promises. 1e-6 of a length is the loop's own moment
+        // tolerance read back as a distance, and it is asserted at the tolerance
+        // rather than at the 7.4e-7 measured because the loop stops the moment
+        // *both* legs are inside -- how far past its own bound the binding leg
+        // happens to land is luck.
+        expectNear("the centre of buoyancy sits under the live centre of gravity", lcb, lcgLive,
+                   1e-6 * length);
+
+        // And what aiming at the frozen point cost, closed form rather than
+        // remembered.
+        const double drift = lcgLive - frozen;
+        expectNear("the frozen point is KG*trim away from the live one, exactly", drift,
+                   d.centreOfGravity.x * (std::cos(trim) - 1.0) +
+                       d.centreOfGravity.z * std::sin(trim),
+                   1e-12 * length);
+        expectTrue("which is hundreds of times the tolerance the loop converges to",
+                   std::abs(drift) > 500.0 * 1e-6 * length);
+
+        // Geometric similarity: one problem in four sets of units, so the offset
+        // is one fraction of the length. A stray absolute term would not be.
+        const double fraction = drift / length;
+        if (!haveFirst) { firstFraction = fraction; haveFirst = true; }
+        expectNear("and it is the same fraction of the length at every size", fraction,
+                   firstFraction, 1e-9);
+    }
+}
+
+// **The success the function reports has to be about both residuals**, because a
+// ship converged in heave and still rotating is precisely the state `girder.hpp`
+// says destroys the result: the shear and bending curves grow towards the far end
+// instead of closing. The moment was computed on the way out and dropped.
+//
+// Starving the budget is how to build that state deliberately. `initialise()`
+// leaves the barge at the draft her weight asks for and no trim, so the force
+// residual starts near zero and stays near zero, while one Newton step is nowhere
+// near enough for the +4.5 m LCG's 1.9 degrees of trim. Measured: 8.8e-5 of her
+// weight out in heave -- eleven times *inside* the force leg -- against 1.13e-2 of
+// `weight * length` out in moment, eleven times outside the moment one.
+void testABalanceStillRotatingIsNotReportedAsSuccess() {
+    const Sea still(0.0);
+    Ship starved = barge(4.5);
+    starved.initialise(0.0);
+    const double length = starved.hullHi.x - starved.hullLo.x;
+
+    int used = -1;
+    expectTrue("one Newton step is not a balance, and is not reported as one",
+               !balanceOnWave(starved, still, 1, &used));
+    expectEqual("and it is the budget that ran out, not the step refusing", used, 1);
+
+    // The leg the old return could see. Asserted explicitly, because it is the
+    // reason the old return said yes -- and so the reason reverting the moment leg
+    // turns this test red rather than leaving it green for some other cause.
+    const Diagnostics d = starved.diagnostics(still);
+    const double weight = d.displacementMass * kGravity;
+    const double buoyancy = starved.seaDensity * d.buoyantVolume * kGravity;
+    expectTrue("she is comfortably inside the force leg all the same",
+               std::abs(buoyancy - weight) < 1e-3 * weight);
+
+    // The leg it could not. Taken about the live centre of gravity from
+    // `diagnostics()`, which shares no expression with the residual the solver
+    // formed, so this is a second route to the same quantity rather than a copy.
+    const Mat3 R = starved.state.orientation.toMat3();
+    const double lcg = (R * d.centreOfGravity + starved.state.position).x;
+    const double lcb = (R * d.centreOfBuoyancy + starved.state.position).x;
+    expectTrue("while the trimming moment is an order of magnitude outside its own",
+               std::abs(buoyancy * (lcb - lcg)) > 5e-3 * weight * length);
+
+    // And the physical consequence, which is what makes the verdict worth having:
+    // the curves the caller would have integrated off this ship.
+    const HullGirder ruined = hullGirder(starved, still, 41, false);
+    expectTrue("so the bending moment does not close at the forward perpendicular",
+               std::abs(ruined.momentClosure) > 0.05);
+    const std::vector<std::string> said = validateGirder(ruined);
+    bool named = false;
+    for (const std::string& p : said)
+        if (p.find("bending moment does not close") != std::string::npos) named = true;
+    expectTrue("and validateGirder() names that, not something else", named);
+
+    // The control, without which "returns false" is satisfied by a function that
+    // always returns false: the same ship, the same code, given the budget.
+    Ship poised = barge(4.5);
+    poised.initialise(0.0);
+    expectTrue("the same ship with the default budget does balance",
+               balanceOnWave(poised, still, 40, &used));
+    expectTrue("using far less of it than the starved run was given", used > 1 && used < 20);
+    const HullGirder good = hullGirder(poised, still, 41, false);
+    expectTrue("and her bending moment closes", std::abs(good.momentClosure) < 0.01);
+    expectTrue("with nothing for validateGirder() to report", validateGirder(good).empty());
+}
+
 // --- From moment to stress ---------------------------------------------------
 
 // sigma = M / Z is arithmetic, so it is asserted as arithmetic. The part worth
@@ -533,5 +678,7 @@ void runGirderTests() {
     testBalanceConvergesTheSameWayAtEverySize();
     testAShipWithNoHullExtentIsRefused();
     testASingularBalanceJacobianIsRefusedOnItsOwnScale();
+    testTheBalanceFollowsTheCentreOfGravityAsSheTrims();
+    testABalanceStillRotatingIsNotReportedAsSuccess();
     testStressFollowsTheMomentAndItsSign();
 }
