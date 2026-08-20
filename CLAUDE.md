@@ -535,3 +535,12 @@ whether to measure, not to decide what to do.
   failure looked like a bug in working code.
 - `git add -A` once swept agent worktrees into a commit. `.gitignore` covers it
   now, and `scripts/install-git-hooks.sh` installs a pre-commit check.
+- **Run the figure gate alone.** It is the one gate whose *results*, not just its
+  runtime, depend on what else is on the box: `job_bench`'s plateau grain read
+  4096 against a published 1024 during a wave of parallel builds and re-derived to
+  1024 on a quiet machine. A gate run beside a wave of agents can report a red
+  that says nothing about the code, and — worse — the reflex is to go looking for
+  the defect it named. Sequence waves and gates; do not overlap them.
+- A `pgrep -f` predicate matches **the shell running the pgrep**. Guard it
+  (`pgrep -f '[c]heck-figures'`) or the check reports its own command line as the
+  thing it was looking for. This is the same defect the gate's own waiter had.
