@@ -23,7 +23,9 @@
 // the budget is consulted and is never reset by it. Which of the two readings of
 // "dwell" that is, and the evidence for choosing it, is at `WaterCriterion::dwell`;
 // what a compartment the budget cannot afford looks like from outside is
-// `WaterReview::starved`.
+// `WaterReview::starved`. Where the structure is deliberately *not* the gas tier's
+// is §5 below -- read it before adding to the list of differences, because it is
+// the list.
 //
 // **State transfer (§3):**
 //   - Escalation: `Compartment::waterVolume` → `flip::Solver` particles via
@@ -35,8 +37,94 @@
 // compartments. Unlike structural elements (per-zone) and gas cells (per-compartment),
 // particles are the memory bottleneck and must be globally bounded.
 //
+// **Where this tier does not follow `GasPromoter`, and why (§5).** The summary
+// above says the structure is the gas tier's, and it is -- but this header said
+// "exactly" for a long time while four differences stood underneath it, so a
+// reader had no way to tell a design from a drift. Two of the four were neither:
+//
+//   * the demotion test compared `idleReviews` against a raw `criterion.hold`
+//     where both siblings write `max(1, .)`, which at `hold <= 0` demoted every
+//     compartment whose motion held -- the criterion inverted, not shifted; and
+//   * `estimateFlipCost` floored its tile count at one and not its particle
+//     count, so a candidate under 0.0005 m³ was billed *zero* particles and only
+//     `minVolume` kept it off the list -- a second mechanism doing the first
+//     one's job.
+//
+// Both are closed, each with the reasoning at the line it changed. What is left is
+// the two below, and each is a decision with a reason. **An undocumented
+// divergence is the thing this file has been caught by; a documented one is a
+// design** -- so the rule this section sets is that the list is exhaustive: a
+// difference from `promotion.hpp` either appears here with an argument, or it is
+// a defect that has not been noticed yet.
+//
+//   1. **The budget stops where the siblings pack.** Both siblings `continue` past
+//      a candidate their budget cannot admit and go on filling with smaller ones
+//      from further down the ranked list. This one stops promoting at the first
+//      compartment that does not fit, and leaves the rest of the budget unspent.
+//      That is a reservation: the head of the queue holds the headroom until a
+//      demotion frees enough for it, instead of watching it be eaten from below.
+//
+//      The reason is what this tier is *for*. Free-surface effect is what capsizes
+//      a ro-pax and it scales with the water, so the compartments worth resolving
+//      are the large ones -- and under first-fit the compartments that fit are
+//      always the small ones. First-fit would make policy of the exact outcome
+//      `WaterCriterion::particleBudget` records happening by accident: the 462 m3
+//      vehicle deck refused 154 times while a 1 m3 trickle in a forward hold was
+//      resolved in its place. Nor is the siblings' `continue` a settled answer this
+//      one drifted from -- `GasCriterion::cellBudget` records the mirror of it,
+//      one machinery space taking 64% of the budget and the second refused 35 times
+//      while the fire spreads between them.
+//
+//      It is not free, and the cost is now visible instead of argued.
+//      `WaterReview::starved` names every compartment the stop turned away, so
+//      budget standing idle behind a compartment that will not fit can be read from
+//      outside. What a reader still cannot tell is *which* of two refusals a named
+//      compartment got: "the budget could not admit me" and "the budget is being
+//      held for the compartment above me" arrive in the same words, and only the
+//      second is this design's doing. That is the known cost of the stop, recorded
+//      here rather than left to be re-derived.
+//
+//      Revisit it when `score` stops tying. `rollRate` and `accel` are ship-level,
+//      so today every qualifying compartment carries the same score and the
+//      ranking this reservation protects is compartment index and nothing else --
+//      the weakest part of the argument, stated here rather than left for the next
+//      reader to find. When `minDepth` becomes enforceable (`computeWaterDepth`'s
+//      TODO) the score becomes a per-compartment quantity, the head of the queue
+//      becomes the compartment that most deserves the headroom, and this stops
+//      being an argument and becomes a guarantee.
+//
+//      `testTheBudgetIsHeldForTheHeadOfTheQueue` is where the decision is pinned,
+//      because it is the test that can tell the two designs apart:
+//      `testTheBudgetSpendsTheTieBreakOrder` puts three *equal* compartments in
+//      front of room for one, where first-fit and the stop promote the same one.
+//
+//   2. **`waterCandidates` has no `problems` out-parameter; `gasCandidates` does.**
+//      Same job, two shapes, and the reason is that `considered` does not mean the
+//      same thing on the two tiers. `GasReview::considered` carries only
+//      compartments that *qualify* -- it is ranked and its length is a published
+//      figure, so a rejected entry cannot go in it -- and there a refusal is
+//      otherwise indistinguishable from an absence, which is what the out-parameter
+//      is for. `WaterReview::considered` carries **every** compartment reviewed,
+//      each with its own `why`, so a refusal here is already in the list a caller
+//      reads. `promotion.hpp` says as much above `gasCandidates`, naming this
+//      file's per-candidate `why` as the other answer to the same need. Adding the
+//      out-parameter would duplicate what `considered` already carries; making
+//      `considered` mean what the gas tier's means would throw it away.
+//
+//      The one thing a per-candidate `why` cannot report is a fault in the
+//      *criterion* on a ship with no compartment to hang it on -- a non-positive
+//      `rollRatePromote` reviewed against an empty compartment list says nothing,
+//      where `gasCandidates` would say it outright. That ship promotes nothing
+//      under any criterion, so the gap costs a diagnosis and never a decision.
+//      That is the whole of the difference, and it is the reason to leave it.
+//
 // **Not here yet:**
-//   - Integration into `Ship::step()` — that wiring is in `ship.cpp`.
+//   - Integration into `Ship::step()` — that wiring is in `ship.cpp`, behind a
+//     TODO, and nothing in this tier can move a published figure until it closes.
+//     That is what made §5 cheap to settle and what will make the next such
+//     divergence expensive: closing that TODO turns every latent decision in this
+//     file into a live one in the same commit. Anything left undecided here should
+//     be decided *before* it, not with it.
 //   - FLIP solver ownership — `Ship` will hold `std::map<int, flip::Solver*>`.
 //   - Boundary conditions — FLIP sees AABB initially, TriMesh in Phase 2.
 //   - Openings — quiescent network handles inter-compartment flow for now.
@@ -132,6 +220,16 @@ struct WaterCriterion {
     // the 154 silent refusals recorded against `particleBudget` below.
     // `WaterReview::starved` is the channel either reading would have needed.
     int dwell = 2;
+
+    // **Both are floored at one where they are read**, so `0` and `1` are the same
+    // criterion on either: a streak starts at one, and neither "promote before you
+    // have qualified once" nor "demote before you have been idle once" is a thing a
+    // negative number could mean. `dwell` was written that way from the start;
+    // `hold` was not, and the difference was not the edge case it looks like. The
+    // comparison ran against a counter that is *reset to zero* by a compartment
+    // whose motion holds, so at `hold <= 0` the test read `0 >= 0` and demoted every
+    // active compartment on every review -- the criterion inverted, not shifted.
+    // See the comparison in `water_promotion.cpp`, which is where the arithmetic is.
     int hold = 3;
 
     // Budget: shared across all active compartments.
