@@ -12,18 +12,45 @@ double half(double span) { return 0.5 * std::max(span, 1e-12); }
 
 }  // namespace
 
+// A dent is small compared with the bay it is in, and every closed form in this
+// file is a difference of two nearly equal lengths when it is. Written the way the
+// algebra reads, each one cancels: `sqrt(1 + r^2) - 1` at r = 1e-5 subtracts two
+// numbers that agree to eleven digits and keeps the noise. Multiplying above and
+// below by the conjugate telescopes the numerator and leaves the identical value
+// with the subtraction gone -- `(sqrt(A) - B)(sqrt(A) + B) = A - B^2`, so
+// `sqrt(A) - B = (A - B^2) / (sqrt(A) + B)` whenever `sqrt(A) + B > 0`, and here
+// `A - B^2` is a bare square that no cancellation touches. These are the same
+// numbers, not approximations of them; the measured cost of the direct forms is
+// quoted at each one and swept in `tests/test_indentation.cpp`.
+
 double membraneStrain(double span, double penetration) {
     if (!(span > 0)) return 0.0;
     const double ratio = penetration / half(span);
-    return std::sqrt(1.0 + ratio * ratio) - 1.0;
+    // eps = sqrt(1 + r^2) - 1 = ((1 + r^2) - 1) / (sqrt(1 + r^2) + 1) = r^2 / (1 + sqrt(1 + r^2)).
+    //
+    // The direct form loses the answer into the 1: sqrt(1 + r^2) rounds to within
+    // half an ulp of 1 while the answer is r^2/2, so the relative error is about
+    // 2.2e-16 / r^2. On the 2.40 m reference span that is 2.0e-12 at a 12 mm dent,
+    // 3.6e-9 at 0.12 mm, 8.3e-8 at 12 um and 2.3e-2 at 0.12 um -- no digits left at
+    // all a little below a micron, where the true strain is still a clean 1e-14.
+    return ratio * ratio / (1.0 + std::sqrt(1.0 + ratio * ratio));
 }
 
 double penetrationForStrain(double span, double strain) {
     if (!(span > 0) || strain <= 0) return 0.0;
-    // Inverting eps = sqrt(1 + (d/h)^2) - 1 gives d = h sqrt((1+eps)^2 - 1),
+    // Inverting eps = sqrt(1 + (d/h)^2) - 1 gives d = h sqrt((1 + eps)^2 - 1),
     // exactly. No search, and no tolerance to argue about.
-    const double stretched = 1.0 + strain;
-    return half(span) * std::sqrt(std::max(0.0, stretched * stretched - 1.0));
+    //
+    // (1 + eps)^2 - 1 = eps^2 + 2 eps = eps (eps + 2), identically -- the 1 that
+    // carries no information is never formed. It is the same cancellation as
+    // above, in the other direction and just as expensive: forming `1.0 + strain`
+    // rounds away everything below eps * 2.2e-16 / eps = 2.2e-16 absolute, so the
+    // strain arrives with a relative error of 2.2e-16 / eps and the square root
+    // halves it into the answer -- 3.0e-9 of the returned penetration at eps = 5e-9
+    // (a 0.12 mm dent on the reference span), 1.1e-2 at eps = 5e-15.
+    //
+    // `strain > 0` above is what makes both roots real, so no clamp is needed.
+    return half(span) * std::sqrt(strain) * std::sqrt(strain + 2.0);
 }
 
 double indentationForce(const IndentedPanel& p, double penetration) {
@@ -39,10 +66,26 @@ double indentationEnergy(const IndentedPanel& p, double penetration) {
     if (!(p.span > 0) || !(p.thickness > 0) || penetration <= 0) return 0.0;
     const double h = half(p.span);
     // The force integrates in closed form: d/dd of sqrt(h^2 + d^2) is exactly
-    // d / sqrt(h^2 + d^2), which is the shape of the force. That is what makes
-    // the inverse below exact too.
+    // d / sqrt(h^2 + d^2), which is the shape of the force. So the energy is
+    // scale * (sqrt(h^2 + d^2) - h), and `penetrationForEnergy` inverts that by
+    // solving rather than by searching.
+    //
+    // This comment used to end "that is what makes the inverse below exact too",
+    // which is a statement about the algebra wearing the clothes of one about the
+    // arithmetic. The closed form is exact; *evaluating* it as that subtraction is
+    // not, and for a shallow dent it is not even close, because sqrt(h^2 + d^2) and
+    // h agree to their first 2 log10(h/d) digits and the answer is what is left.
+    // Measured on the reference bay (h = 1.20 m): the energy carries a relative
+    // error of 2.0e-12 at a 12 mm dent, 4.3e-11 at 1.2 mm, 1.1e-8 at 0.12 mm and
+    // 8.3e-8 at 12 um -- about nine of its sixteen digits gone at 12 um and all but
+    // three at 0.12 um. Nothing about the closed form prevents that; only writing
+    // it without the subtraction does.
+    //
+    // sqrt(h^2 + d^2) - h = ((h^2 + d^2) - h^2) / (sqrt(h^2 + d^2) + h)
+    //                     = d^2 / (sqrt(h^2 + d^2) + h),
+    // identically, and h > 0 so the denominator cannot vanish.
     return 2.0 * p.yieldStrength * p.thickness * p.contactWidth *
-           (std::sqrt(h * h + penetration * penetration) - h);
+           (penetration * penetration / (std::sqrt(h * h + penetration * penetration) + h));
 }
 
 double penetrationForEnergy(const IndentedPanel& p, double energy) {
@@ -51,8 +94,21 @@ double penetrationForEnergy(const IndentedPanel& p, double energy) {
     const double scale = 2.0 * p.yieldStrength * p.thickness * p.contactWidth;
     if (scale <= 0) return 0.0;
     // E = scale (sqrt(h^2 + d^2) - h)  =>  d = sqrt((E/scale + h)^2 - h^2).
-    const double slant = energy / scale + h;
-    const double penetration = std::sqrt(std::max(0.0, slant * slant - h * h));
+    //
+    // With u = E/scale the bracket is (u + h)^2 - h^2 = u^2 + 2 h u = u (u + 2h),
+    // identically -- and that matters here more than anywhere else in the file,
+    // because the direct form differences two O(h^2) numbers whose true difference
+    // is only 2 h u. A 12 um dent on the reference bay has u = 6e-11 m against
+    // h = 1.20 m, so (u + h)^2 and h^2 agree to ten digits and the answer is the
+    // rounding; the round trip through `indentationEnergy` comes back 2.7e-7 out
+    // there, and 8.8e-7 at the worst point in that decade, against about one ulp
+    // for the form below.
+    //
+    // Split as two roots rather than sqrt(u * (u + 2h)): both factors are positive
+    // (energy > 0 and scale > 0 give u > 0, and h > 0), it is the same value, and
+    // neither factor can overflow when the other is large.
+    const double u = energy / scale;
+    const double penetration = std::sqrt(u) * std::sqrt(u + 2.0 * h);
     // Past tearing the model has nothing further to say: the membrane is gone and
     // what happens next is a different mechanism. Report the tearing penetration
     // rather than extrapolating a torn plate's resistance.

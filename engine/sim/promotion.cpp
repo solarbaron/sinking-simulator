@@ -1020,15 +1020,49 @@ double dentedCompressiveCapacity(double yieldStrength, double criticalStress, do
                                  double thickness) {
     if (!(yieldStrength > 0) || !(criticalStress > 0)) return 0.0;
     if (!(thickness > 0) || !(deviation > 0)) return std::min(yieldStrength, criticalStress);
-    // sigma^2 - sigma (sigma_cr (1 + eta) + sigma_y) + sigma_y sigma_cr = 0, the
-    // smaller root. At eta = 0 the discriminant is exactly (sigma_cr - sigma_y)^2
-    // and the root is min(sigma_cr, sigma_y), which is the continuity that makes
-    // this a knockdown rather than a separate model.
+    // sigma^2 - b sigma + c = 0 with b = sigma_cr (1 + eta) + sigma_y and
+    // c = sigma_y sigma_cr, the smaller root. At eta = 0 the discriminant is
+    // exactly (sigma_cr - sigma_y)^2 and the root is min(sigma_cr, sigma_y), which
+    // is the continuity that makes this a knockdown rather than a separate model.
+    //
+    // Taken as `0.5 (b - sqrt(D))`, which is how the smaller root is usually
+    // written. That form is the one that cancels, and it cancels worst exactly
+    // where this function earns its keep: b > 0 here, so the two terms approach
+    // each other as the root gets small, and the root gets small when the dent gets
+    // deep. The roots multiply to c, so the same number is 2c / (b + sqrt(D)) --
+    // identically, with the subtraction replaced by an addition of two positives.
+    // Measured against a long-double reference at sigma_y = 355 MPa and
+    // sigma_cr = 200 MPa, the direct form is out by 1.1e-15 at eta = 5, 7.0e-15 at
+    // eta = 30 (a dent five plate thicknesses deep, which is what this exists to
+    // model: 1.8 digits), 2.4e-13 at eta = 300 and 3.3e-10 at eta = 3000. The form
+    // below is correctly rounded at every one of them.
+    //
+    // The `discriminant > 0` guard is gone with it, and it was not merely dead: D
+    // is (sigma_cr - sigma_y)^2 + eta sigma_cr (2 sigma_cr + 2 sigma_y + eta
+    // sigma_cr), so it is never truly negative, but `b*b - 4 y cr` *computes*
+    // negative when sigma_cr is within a rounding of sigma_y and eta is small
+    // enough to disappear into `1 + eta` -- 1065 of 4000 points on a scan of
+    // sigma_cr through sigma_y come out negative, worst -128 Pa^2 against a true
+    // 3.6e-15. The guard turned every one of those into a capacity of *zero* for a
+    // panel whose true capacity is min(sigma_y, sigma_cr). Clamping instead is what
+    // that corner wants: b >= sigma_cr + sigma_y > 0, so the denominator is safe
+    // without any test, and at D = 0 the answer falls out as 2c/b = min(sigma_y,
+    // sigma_cr), which is the continuity the paragraph above claims.
+    //
+    // **Nothing in the suite can see either of these.** Restoring the cancelling
+    // form and rebuilding leaves the suite green at 200 901 checks, 0 failures --
+    // the one check on this function
+    // (`testTheDentedCapacityKnockdownIsContinuousAndMonotone`) brackets it against
+    // a bisection root at eta = 5 to 1e-6 of sigma_cr, which is 200 Pa, and the
+    // error it is blind to is 1.1e-15 relative there, about 5e-7 Pa: nine orders
+    // of slack. Its four sibling mutants in `indentation.cpp` are all killed. What
+    // would reach this one is a check against a higher-precision root at large eta,
+    // in `test_promotion.cpp`, at a tolerance in ulps rather than in 1e-6.
     const double eta = 6.0 * deviation / thickness;
     const double b = criticalStress * (1.0 + eta) + yieldStrength;
-    const double discriminant = b * b - 4.0 * yieldStrength * criticalStress;
-    if (!(discriminant > 0)) return 0.0;
-    return 0.5 * (b - std::sqrt(discriminant));
+    const double c = yieldStrength * criticalStress;
+    const double discriminant = std::max(0.0, b * b - 4.0 * c);
+    return 2.0 * c / (b + std::sqrt(discriminant));
 }
 
 }  // namespace sim::promotion
