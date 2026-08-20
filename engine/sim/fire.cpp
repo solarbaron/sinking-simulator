@@ -1185,6 +1185,14 @@ StepResult Model::step(double dt, const Ship& ship, const Sea& sea) {
             h *= 0.5;
         }
     }
+    // **Say so when the budget ran out**, rather than returning a model short of the
+    // time it was asked for that looks like every other one. This is the loop
+    // `les.cpp` names when it gives the reason: the halving above is what makes the
+    // exit reachable, because a rejected trial spends a budget slot without moving
+    // `remaining`, so `maxSubsteps` bounds trials rather than committed time. Every
+    // caller here integrates the gas against something else on the same tick, and a
+    // gas that is short says nothing about it through the state alone.
+    out.incomplete = remaining > 1e-12 * dt;
     out.time = time;
     for (const DesignFire& f : fires) out.heatRelease += f.heatRelease(time);
     return out;

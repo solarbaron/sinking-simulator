@@ -265,6 +265,13 @@ int main(int argc, char** argv) {
                 "T_u K", "z_i m", "k 1/m", "tau", "S m", "emit R", "file");
 
     double smokeMs = 0, opaqueMs = 0;
+    // The frame loop below polls `model.time`, so a step that advanced less than it
+    // was asked for does not skew a frame -- it simply goes round again. A step that
+    // advances **nothing** never leaves, and the characteristic failure in this repo
+    // is a hang with no failing assertion rather than a failing assertion. So the
+    // budget's own report is the way out, and it is a check rather than a `break`
+    // alone: a picture rendered off a clock that stopped is still a picture.
+    int shortGasSteps = 0, cappedPressure = 0;
     double firstInterface = 0, lastInterface = 0, lowestInterface = 1e30;
     double firstOpacity = 0, lastOpacity = 0, peakTemperature = 0, peakEmission = 0;
     core::Image image;
@@ -272,8 +279,15 @@ int main(int argc, char** argv) {
 
     for (int frame = 0; frame < frameCount; ++frame) {
         const double targetTime = duration * frame / std::max(1, frameCount - 1);
-        while (model.time < targetTime - 1e-9)
-            model.step(std::min(2.0, targetTime - model.time), ship, sea);
+        while (model.time < targetTime - 1e-9) {
+            const sim::fire::StepResult stepped =
+                model.step(std::min(2.0, targetTime - model.time), ship, sea);
+            if (stepped.pressureSolveCapped) ++cappedPressure;
+            if (stepped.incomplete) {
+                ++shortGasSteps;
+                break;
+            }
+        }
 
         const std::vector<gpu::SmokeVolume> volumes = gpu::volumesFromFire(model, ship, shading);
         const gpu::SmokeVolume& hot = volumes[static_cast<std::size_t>(burning)];
@@ -336,6 +350,15 @@ int main(int argc, char** argv) {
     }
 
     std::printf("\n4. What it costs and what it shows\n");
+    // Every frame's header, its temperatures and its optical depth are read off the
+    // model at `model.time`, so a gas that stopped advancing would publish the same
+    // picture under a later `t` and every check below it would still pass.
+    check("no gas step was short of the time it was asked for", shortGasSteps == 0,
+          shortGasSteps == 0 ? "" : std::to_string(shortGasSteps) + " short step(s)");
+    // Published by `fire.hpp` "so that 'should never' can be asserted"; nothing
+    // outside `tests/test_fire.cpp` asserted it.
+    check("and the gas pressure solve always bracketed its root", cappedPressure == 0,
+          cappedPressure == 0 ? "" : std::to_string(cappedPressure) + " capped solve(s)");
     // **The layer descends and then recovers**, so the assertion is about the
     // descent and the recovery separately. It reaches its lowest point as the fire
     // stops growing and then rises a little as the room settles into its vented

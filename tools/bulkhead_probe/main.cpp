@@ -313,6 +313,25 @@ struct Outcome {
     int    couplingSteps = 0, thermalFactorisations = 0;
     double wallSeconds = 0;
 
+    // **The three solves are stepped by one `o.coupling` each and printed under one
+    // `t`, and only one of them could fall behind without saying so.** `gas.step()`
+    // may return having advanced less than it was asked for -- its substep budget
+    // bounds trials, and a rejected trial spends a slot without committing time --
+    // so the gas temperature, the interface height and the steel temperature on a
+    // single row of the trace above would be readings at three different model
+    // times, and the row would look exactly like every other one. Counted here and
+    // required to be zero below, which is the discipline `flip_probe` already keeps
+    // over `flip::StepResult::incomplete`.
+    int    gasShortSteps = 0;
+    // The gas pressure solve failed to bracket a root. `fire.hpp` publishes this
+    // "rather than swallowed so that 'should never' can be asserted", and until now
+    // nothing outside `tests/test_fire.cpp` asserted it.
+    int    gasPressureCapped = 0;
+    // The worst disagreement between the gas's own clock and the `t` this loop
+    // prints. Zero to rounding on a healthy run; it is the direct measurement of
+    // the failure the two counters above only imply.
+    double gasClockGap = 0;          // s
+
     // Every (equivalent uniform temperature, lateral moment) this run ever put into
     // a member, so that the restraint window can be found from the run itself rather
     // than from a summary of it. The two peaks do not happen at the same moment --
@@ -596,7 +615,11 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
     const int steps = static_cast<int>(std::lround(o.duration / o.coupling));
     for (int step = 0; step < steps; ++step) {
         // --- 1. the gas -------------------------------------------------------
-        gas.step(o.coupling, ship, sea);
+        // Read rather than discarded, for the reason `Outcome::gasShortSteps` gives:
+        // this loop's time axis is arithmetic and the gas's is not.
+        const fire::StepResult gasStep = gas.step(o.coupling, ship, sea);
+        if (gasStep.incomplete) ++out.gasShortSteps;
+        if (gasStep.pressureSolveCapped) ++out.gasPressureCapped;
         gas.applyTo(ship);
         for (const fire::GasCompartment& g : gas.gas)
             out.peakGas = std::max(out.peakGas, g.upper.temperature());
@@ -660,6 +683,8 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
 
         // --- 4. every member of the bulkhead ----------------------------------
         const double now = (step + 1) * o.coupling;
+        // The printed axis against the model that is meant to be on it.
+        out.gasClockGap = std::max(out.gasClockGap, std::abs(gasStep.time - now));
         for (std::size_t k = 0; k < chain.column.size(); ++k) {
             const Column& col = chain.column[k];
             const bool port = col.y > 0;
@@ -920,6 +945,10 @@ int main(int argc, char** argv) {
                 both.exchange > 0 ? 100.0 * both.worstLinearisation / both.exchange : 0.0);
     std::printf("cost    : %.2f s wall for the pair, %d coupling steps, %d factorisations\n",
                 both.wallSeconds, both.couplingSteps, both.thermalFactorisations);
+    std::printf("clocks  : the gas fell short of its %.1f s tick %d time(s) and capped its"
+                " pressure solve %d time(s);\n          worst gap between the gas's clock and"
+                " the printed time axis %.3e s\n",
+                o.coupling, both.gasShortSteps, both.gasPressureCapped, both.gasClockGap);
 
     // --- The same state, decomposed ------------------------------------------------
     //
@@ -1040,6 +1069,33 @@ int main(int argc, char** argv) {
             "a purely additive check would have failed too: the coupling bought nothing");
     require(std::abs(both.filmHeat - both.enthalpyGain) <= 1e-6 * std::abs(both.filmHeat),
             "the steel's energy account does not close");
+    // **The one way this tool can publish a wrong number while every check above
+    // passes.** The gas, the steel and the ship are each stepped by one `o.coupling`
+    // and printed under a `t` this file computes as `(step + 1) * o.coupling`; only
+    // the gas can advance by less than it was asked for, and if it does, the three
+    // columns of a row are readings at three different model times and the trace
+    // stays perfectly smooth. `flip_probe` keeps the same guard over
+    // `flip::StepResult::incomplete` and states it the same way.
+    //
+    // All three runs, not just `both`: a control that under-advanced is not a
+    // control, and "the fire alone does not fell it" would then be a statement about
+    // a fire that ran for less time than it was given.
+    require(both.gasShortSteps == 0 && fireOnly.gasShortSteps == 0 &&
+                waterOnly.gasShortSteps == 0,
+            "a gas step was short of the time it was asked for: the three solves are no"
+            " longer on one clock");
+    // 1e-6 s against a 5 s coupling. The gap is the difference between an arithmetic
+    // axis and a sum of substeps, so on a healthy run it is rounding and nothing
+    // else -- measured 0 s over 720 couplings -- and the bound is six orders of
+    // magnitude below the smallest shortfall a single dropped substep could produce.
+    require(both.gasClockGap < 1e-6 && fireOnly.gasClockGap < 1e-6 &&
+                waterOnly.gasClockGap < 1e-6,
+            "the gas's clock and the printed time axis have come apart");
+    // Published by `fire.hpp` "so that 'should never' can be asserted", and until now
+    // asserted only by `tests/test_fire.cpp` and by none of its three tools.
+    require(both.gasPressureCapped == 0 && fireOnly.gasPressureCapped == 0 &&
+                waterOnly.gasPressureCapped == 0,
+            "the gas pressure solve failed to bracket its root");
     require(fireOnly.peakSteel > kTAmbient + 100.0,
             "the fire-alone control was not a fire (vacuous survival)");
     require(waterOnly.peakMoment > 1.0e3,
