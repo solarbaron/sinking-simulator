@@ -207,16 +207,100 @@ Influence panelInfluence(const Panel& p, double qx, double qy, double nu, bool o
 
 // --- Small dense linear algebra ----------------------------------------------
 
+// **The rank test, and why it is relative to the column rather than to zero.**
+//
+// Both factorisations below used to refuse only on a pivot under 1e-300 -- that
+// is, on a pivot that had underflowed to nothing at all. The absolute form is the
+// right *kind* of test here and the units were never the defect: these matrices
+// really are nondimensional. The BEM influence matrix is O(1)-O(pi), and
+// fitStateSpace() divides its linear-prediction matrix through by the peak of K
+// before handing it over.
+//
+// It could not do its job anyway, because a rank-deficient matrix does not
+// produce a pivot near 1e-300. It produces one near the rounding error of the
+// entries it was built from, which is twenty-eight decades away.
+//
+// Measured, on the case fitStateSpace() genuinely meets -- K a pure exponential
+// and order > 1, so the matrix of shifted copies of K has rank 1 whatever the
+// order: at order 2 the second column arrives with norm 3.606 and its pivot comes
+// out at 3.63e-16, a ratio of 1.005e-16. The 1e-300 test passes. Back
+// substitution then divides by that 3.63e-16, and the caller gets a fit whose
+// *reported* relative rms is 2e-15 and whose impulse response is wrong by 1.46 --
+// 146% of K(0) -- everywhere between the samples. The amplified mode is a
+// Nyquist-frequency sinusoid, identically zero at every sample point and O(1)
+// between them, so every residual the fit computes about itself is blind to it.
+// Confident and wrong, and `RadiationForce::step` evaluates exactly the between-
+// sample behaviour that is wrong.
+//
+// So each pivot is compared against the norm its own column had **on entry**,
+// before any elimination touched it. That is the only scale in the problem
+// guaranteed to be the right one: it is what the column would have contributed
+// had it been independent, so the ratio reads directly as how much of the column
+// survived being projected off the columns before it.
+//
+// For the Householder QR the reading is exact -- a reflector is orthogonal, so
+// the whole column's norm is invariant under the sweep and the shrinkage of the
+// part below the diagonal is entirely loss of independence. For the LU it is the
+// usual growth-bounded reading: partial pivoting holds every multiplier at or
+// below 1, so a pivot far under its column's entry norm means the column was
+// nearly spanned rather than merely badly scaled.
+//
+// **The constant.** Its floor is rounding. Householder QR of an m x n matrix
+// returns the exact factorisation of a matrix within c(m,n)*eps of A, with
+// eps = 2^-53 = 1.11e-16; a pivot ratio at 1e-16 therefore carries no information
+// whatever, which is precisely what the pure-exponential measurement above shows.
+// Dividing by a pivot at ratio r amplifies that rounding by 1/r, so at 1e-12 a
+// coefficient still carries about 1e-16/1e-12 = 1e-4 relative accuracy -- four
+// significant digits, enough that the fit's own residual can then judge it. At
+// 1e-14 there is one digit left; at 1e-16, none.
+//
+// Its ceiling is what the production matrices actually reach, and that was
+// measured rather than assumed: every pivot of every luFactor() and
+// leastSquares() call the whole test suite makes was printed and reduced. That is
+// the Ursell sweep, the ferry and barge tables, the Froude-scaling pairs, the
+// convergence sweeps, and both `Ship::attachRadiation` calls in the RAO suite --
+// 142 208 LU pivots and 452 QR pivots. The minima:
+//
+//   LU pivot / its column's entry norm            4.844e-02
+//   QR pivot / its column's entry norm            5.488e-07   (order 8, last column)
+//   QR column entry norm / largest column         3.143e-01
+//
+// The worst of the three is the last column of the order-8 linear-prediction
+// matrix for the ferry's own K33 -- 392 x 8, the most ill-conditioned system this
+// code is asked to solve for real, and still five and a half decades clear.
+//
+// 1e-12 therefore sits about four decades above the noise floor and between five
+// and ten decades below anything real. Both margins have to be wide, and for
+// different reasons: too lax and the amplified-residue fit above comes back, too
+// eager and a refusal here does not fail loudly -- it drops a state-space model
+// and silently degrades every RAO built on it.
+constexpr double kRankTolerance = 1e-12;
+
 // In-place LU with partial pivoting; `pivot` records the row swaps.
 bool luFactor(std::vector<Complex>& a, int n, std::vector<int>& pivot) {
     pivot.resize(static_cast<std::size_t>(n));
+
+    // Column norms as the matrix arrives. See kRankTolerance above.
+    std::vector<double> entryNorm(static_cast<std::size_t>(n), 0.0);
+    for (int j = 0; j < n; ++j) {
+        double sum = 0;
+        for (int i = 0; i < n; ++i) sum += std::norm(a[static_cast<std::size_t>(i) * n + j]);
+        entryNorm[static_cast<std::size_t>(j)] = std::sqrt(sum);
+    }
+
     for (int k = 0; k < n; ++k) {
         int best = k;
         for (int i = k + 1; i < n; ++i)
             if (std::abs(a[static_cast<std::size_t>(i) * n + k]) >
                 std::abs(a[static_cast<std::size_t>(best) * n + k]))
                 best = i;
-        if (std::abs(a[static_cast<std::size_t>(best) * n + k]) < 1e-300) return false;
+        // Written as a negated `>` rather than as `<`, so that an identically
+        // zero column -- where both sides are zero and `<` would be false --
+        // refuses instead of going on to divide by it, and so that a NaN pivot
+        // refuses rather than propagating.
+        if (!(std::abs(a[static_cast<std::size_t>(best) * n + k]) >
+              kRankTolerance * entryNorm[static_cast<std::size_t>(k)]))
+            return false;
         pivot[static_cast<std::size_t>(k)] = best;
         if (best != k)
             for (int j = 0; j < n; ++j)
@@ -252,15 +336,44 @@ void luSolve(const std::vector<Complex>& lu, int n, const std::vector<int>& pivo
 }
 
 // Least squares by Householder QR: min ||A x - b||, A stored row-major.
+//
+// Returns false on a rank-deficient A rather than a least-norm solution: every
+// caller here would rather have no fit than a fit it cannot tell is wrong. See
+// kRankTolerance for the test and its measurement.
 bool leastSquares(std::vector<double> a, std::vector<double> b, int rows, int cols,
                   std::vector<double>& x) {
     if (rows < cols) return false;
+
+    // Column norms as the matrix arrives, plus the largest of them. Two ways a
+    // column can carry no information about its own coefficient, and they need
+    // different scales:
+    //
+    //   * it is a combination of the columns before it -- caught by the pivot
+    //     against this column's own entry norm, below;
+    //   * it arrives numerically empty next to the rest of the matrix -- against
+    //     which the ratio test is useless, because it divides by that emptiness
+    //     and reads 1. That is not hypothetical: the residue basis built from a
+    //     Nyquist-frequency pole has a sine column of exp(-sigma t) sin(pi n),
+    //     whose entries are the rounding error of sin at a multiple of pi. It
+    //     measures 4.58e-16 against a largest column of 3.61, and it is what
+    //     carried the spurious residue of 1.83 described above.
+    std::vector<double> entryNorm(static_cast<std::size_t>(cols), 0.0);
+    double largestColumn = 0;
+    for (int j = 0; j < cols; ++j) {
+        double sum = 0;
+        for (int i = 0; i < rows; ++i) sum += sqr(a[static_cast<std::size_t>(i) * cols + j]);
+        entryNorm[static_cast<std::size_t>(j)] = std::sqrt(sum);
+        largestColumn = std::max(largestColumn, entryNorm[static_cast<std::size_t>(j)]);
+    }
+
     std::vector<double> v(static_cast<std::size_t>(rows));
     for (int k = 0; k < cols; ++k) {
+        if (!(entryNorm[static_cast<std::size_t>(k)] > kRankTolerance * largestColumn))
+            return false;
         double norm = 0;
         for (int i = k; i < rows; ++i) norm += sqr(a[static_cast<std::size_t>(i) * cols + k]);
         norm = std::sqrt(norm);
-        if (norm < 1e-300) return false;
+        if (!(norm > kRankTolerance * entryNorm[static_cast<std::size_t>(k)])) return false;
         if (a[static_cast<std::size_t>(k) * cols + k] > 0) norm = -norm;
         double vv = 0;
         for (int i = k; i < rows; ++i) {
@@ -268,7 +381,12 @@ bool leastSquares(std::vector<double> a, std::vector<double> b, int rows, int co
             if (i == k) v[static_cast<std::size_t>(i)] -= norm;
             vv += sqr(v[static_cast<std::size_t>(i)]);
         }
-        if (vv < 1e-300) continue;
+        // Unreachable given the test above, and kept relative so it stays that
+        // way if the test moves: v_k = a_kk + sign(a_kk)*||x||, so |v_k| >= ||x||
+        // and vv >= norm^2 > (kRankTolerance * entryNorm)^2 always. It is a
+        // `continue` rather than a refusal because a null reflector is the
+        // identity, not a singularity.
+        if (vv < sqr(kRankTolerance * entryNorm[static_cast<std::size_t>(k)])) continue;
         for (int j = k; j < cols; ++j) {
             double s = 0;
             for (int i = k; i < rows; ++i)
@@ -289,7 +407,12 @@ bool leastSquares(std::vector<double> a, std::vector<double> b, int rows, int co
         for (int j = i + 1; j < cols; ++j)
             sum -= a[static_cast<std::size_t>(i) * cols + j] * x[static_cast<std::size_t>(j)];
         const double diagonal = a[static_cast<std::size_t>(i) * cols + i];
-        if (std::abs(diagonal) < 1e-300) return false;
+        // R(i,i) is the signed pivot norm the sweep above already accepted, so
+        // this is that same test read a second time -- kept because it is the
+        // division that would actually do the damage, and because the `vv` skip
+        // above can in principle leave a column the sweep never reflected.
+        if (!(std::abs(diagonal) > kRankTolerance * entryNorm[static_cast<std::size_t>(i)]))
+            return false;
         x[static_cast<std::size_t>(i)] = sum / diagonal;
     }
     return true;
@@ -480,6 +603,33 @@ SectionCoefficients solveSection(const LewisSection& section, double omega, doub
 // oscillate arbitrarily fast at large t (or large omega), and a quadrature rule
 // that samples them would need a mesh refined without limit, while the exact
 // per-interval formula is as accurate at t = 100 s as at t = 0.
+// **The small-argument guards below compare a rad/s (or a s) against a pure
+// number, and that was examined and left alone rather than overlooked.** The
+// dimensionally coherent smallness is |argument| * max(|lo|, |hi|), because what
+// the guard is really protecting is the (cos hi - cos lo)/t^2 term: both cosines
+// are O(1) and they differ by about t^2 (hi^2 - lo^2)/2, so the subtraction keeps
+// only 2 eps / (t hi)^2 of its digits and the closed form loses all of them below
+// t*hi ~ 1.5e-8. Two things follow, and they point opposite ways from the
+// obvious repair:
+//
+//   * Swapping in the coherent form *at the same constant* would make this worse,
+//     not better, for the caller that dominates. `retardationFunction` passes
+//     argument = t with segments over omega, so hi ~ 4 rad/s: the present test
+//     fires for |t| < 1e-12 while the coherent one would fire only below 2.5e-13,
+//     and in the gap it would select the closed form -- which at t*hi = 4e-12 is
+//     nine decades past being meaningless. Where these two tests disagree, this
+//     one is right.
+//   * The real gap is the constant, in either form. Nothing fires between
+//     t*hi = 4e-12 and the 1.5e-8 where the closed form actually breaks down.
+//     Reaching it needs dt < 4e-9 s in `retardationFunction` -- a femtosecond
+//     sampling of a 20 s memory -- or omega < 1e-10 rad/s in the two inverse
+//     legs, a period of two thousand years, against a grid whose lowest point is
+//     0.12. Nothing in the tree comes within eight decades, and `n = 0` gives
+//     t = 0 exactly, which both forms handle identically.
+//
+// So it is left as it is, with the derivation written down: the incoherence is
+// real, the proposed correction is not the one to make, and the band where any of
+// it matters is not one a ship can ask for.
 struct LinearSegment { double lo = 0, hi = 0, valueLo = 0, valueHi = 0; };
 
 double integrateLinearTimesCos(const LinearSegment& s, double argument) {
@@ -1076,6 +1226,20 @@ void RadiationForce::step(const std::array<double, 6>& velocity, double dt) {
                 e.state[at + 1] = decayFactor * (-s * x0 + c * x1) + g1 * v;
                 at += 2;
             } else {
+                // The same dimensional objection as at `integrateLinearTimesCos`,
+                // and the same verdict. `m.decay` is a 1/s tested against a pure
+                // number; the coherent quantity is m.decay * dt, and (1 - e^-x)/x
+                // loses half its digits to the cancellation in `1 - decayFactor`
+                // at x ~ sqrt(eps) = 1.5e-8, so neither this constant nor 1e-12 in
+                // the coherent form is where the crossover actually is.
+                //
+                // Measured before deciding: over 936 modes from 312 converged fits
+                // -- both frequency grids, dt of 0.05 and 0.1, 400 and 1200
+                // samples, orders 4, 6 and 8, every entry of the ferry table --
+                // the *smallest* fitted decay rate is 6.44e-4 1/s. At a 1 ms tick
+                // that is x = 6.4e-7, four decades clear of the crossover and nine
+                // clear of this test. The branch has never been taken and the
+                // expression it guards has never lost a digit.
                 const double gain =
                     (m.decay > 1e-12) ? (1.0 - decayFactor) / m.decay : dt;
                 e.state[at] = decayFactor * e.state[at] + gain * v;

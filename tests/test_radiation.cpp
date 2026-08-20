@@ -666,6 +666,154 @@ void testStateSpaceRecoversKnownPoles() {
     std::printf("     Prony on a planted 4-pole signal: relative rms %.2e\n", fit.relativeRms);
 }
 
+// **A rank-deficient fit must refuse, not return an amplified one.**
+//
+// `fitStateSpace` fits a linear recurrence of `order` terms to K by least
+// squares, and its design matrix is `order` shifted copies of K. When K is a pure
+// exponential -- K[m] = r^m -- every column of that matrix is exactly r times the
+// one beside it, so it has **rank 1 at every order above 1**, and the coefficient
+// vector is not determined by the data at all.
+//
+// That is not a contrived input. A single real pole is the simplest thing a
+// retardation function can be; `testOgilvieTransformsAgainstClosedForms` above
+// uses exactly K(t) = e^{-at} as its closed form; and `RadiationForce` fits every
+// entry of a table at one fixed order without ever asking what order that entry
+// needs. Order 6 against an entry that is one pole is the normal case, not the
+// exotic one.
+//
+// The pivot test in `leastSquares` was supposed to refuse this and could not,
+// because it compared against 1e-300 and a rank-deficient matrix does not produce
+// a pivot near 1e-300 -- it produces one near the rounding error of the entries.
+// Measured here at order 2: the second column arrives with norm 3.606 and its
+// pivot comes out at 3.63e-16, twenty-eight decades above the test. So the fit
+// went through, back substitution divided by that 3.63e-16, and the caller got a
+// residue amplified by 1e16.
+//
+// The negative control at the bottom of this function is why the test is written
+// against the *between-sample* behaviour rather than against the residual: the
+// amplified mode is a Nyquist-frequency sinusoid, and every number the fit reports
+// about itself is sampled where that sinusoid is identically zero.
+//
+// **Driven backwards, as a check on the check.** With `kRankTolerance` in
+// `radiation.cpp` put back to 1e-300, orders 2, 3 and 4 all report `converged`
+// and this function goes red three times -- and *nothing else in the suite
+// moves*: 201 278 checks, 3 failures, all of them here. That is both halves of
+// what a control has to show. The three disjunction assertions see the defect,
+// and the order-1 and two-distinct-poles assertions around them stay green under
+// both thresholds, which is what says they are guarding against over-refusal
+// rather than restating the same thing.
+void testARankDeficientFitIsRefusedRatherThanAmplified() {
+    const double dt = 0.05;
+    const int count = 400;
+    const double decay = 0.8;
+    std::vector<double> k(static_cast<std::size_t>(count));
+    for (int n = 0; n < count; ++n)
+        k[static_cast<std::size_t>(n)] = std::exp(-decay * n * dt);
+
+    // Worst error of a model against the true kernel, on the sample points and at
+    // the midpoints between them. K is known in closed form at every t, so the
+    // midpoints are as much a fact as the samples -- and `RadiationForce::step`
+    // integrates the model between samples, so they are the ones that get used.
+    const auto worstError = [&](const RadiationStateSpace& model, bool between) {
+        double worst = 0;
+        for (int n = 0; n + 1 < count; ++n) {
+            const double t = (n + (between ? 0.5 : 0.0)) * dt;
+            worst = std::max(worst, std::abs(model.impulseResponse(t) - std::exp(-decay * t)));
+        }
+        return worst;
+    };
+
+    // **Guard against a fitter that refuses everything**, which would pass the
+    // assertion below while being useless. At the order the signal actually has,
+    // the fit is exact: whatever happens at order 2, it is not "this data cannot
+    // be fitted". Measured relative rms 9.1e-15 and the pole recovered to 1e-13,
+    // so the bounds below are two orders looser than the measurement to leave the
+    // compiler room.
+    const StateSpaceFit one = fitStateSpace(k, dt, 1);
+    expectTrue("a pure exponential is fitted at the order it has", one.converged);
+    expectEqual("one state for one real pole", one.model.stateCount(), 1);
+    expectTrue("to machine precision", one.relativeRms < 1e-12);
+    expectNear("with the planted decay rate", one.model.modes.empty() ? 0.0 : one.model.modes[0].decay,
+               decay, 1e-9);
+    expectNear("and unit residue", one.model.modes.empty() ? 0.0 : one.model.modes[0].c0, 1.0, 1e-9);
+    expectTrue("and it tracks K between the samples as well as on them",
+               worstError(one.model, true) < 1e-9 * k[0]);
+
+    // The rank-deficient orders. Either refusal or a bounded fit is acceptable --
+    // a fitter that spotted the redundancy and returned a second mode with zero
+    // residue would be just as correct -- but a *confident* fit that is wrong
+    // between the samples is not. The bound is 1e-6 of K(0): a legitimate order-2
+    // fit of this signal lands at 1e-13 (measured on the two-pole control below),
+    // and the amplified one lands at 1.46, so 1e-6 is seven decades clear of both.
+    for (int order : {2, 3, 4}) {
+        const StateSpaceFit fit = fitStateSpace(k, dt, order);
+        const double between = fit.converged ? worstError(fit.model, true) : 0.0;
+        expectTrue("a pure exponential at too high an order is refused, or fitted"
+                   " correctly between the samples and not merely on them",
+                   !fit.converged || between < 1e-6 * k[0]);
+        std::printf("     rank-deficient fit: pure exponential at order %d -> %s\n", order,
+                    fit.converged ? "converged" : "refused");
+    }
+
+    // **Guard against refusing too eagerly**, which is the failure mode that would
+    // silently degrade every RAO in the suite rather than announcing itself. Two
+    // *distinct* real poles make the same matrix genuinely rank 2, and order 2
+    // must still recover them: measured relative rms 9.3e-14 with both decay rates
+    // and both residues exact to 3e-12.
+    const double slow = 0.8, fast = 2.5, slowWeight = 1.0, fastWeight = 0.6;
+    std::vector<double> pair(static_cast<std::size_t>(count));
+    for (int n = 0; n < count; ++n) {
+        const double t = n * dt;
+        pair[static_cast<std::size_t>(n)] =
+            slowWeight * std::exp(-slow * t) + fastWeight * std::exp(-fast * t);
+    }
+    const StateSpaceFit both = fitStateSpace(pair, dt, 2);
+    expectTrue("two distinct poles at order 2 still fit", both.converged);
+    expectEqual("as two real states", both.model.stateCount(), 2);
+    expectTrue("to machine precision", both.relativeRms < 1e-9);
+    for (double wanted : {slow, fast}) {
+        double best = 1e30;
+        for (const RadiationStateSpace::Mode& got : both.model.modes)
+            best = std::min(best, std::abs(got.decay - wanted));
+        expectTrue("and each pole is the planted one", best < 1e-8);
+    }
+    double worstPair = 0;
+    for (int n = 0; n + 1 < count; ++n) {
+        const double t = (n + 0.5) * dt;
+        worstPair = std::max(worstPair,
+                             std::abs(both.model.impulseResponse(t) -
+                                      (slowWeight * std::exp(-slow * t) +
+                                       fastWeight * std::exp(-fast * t))));
+    }
+    expectTrue("and the well-conditioned fit is right between the samples too",
+               worstPair < 1e-9 * pair[0]);
+
+    // **Negative control: the residual a fit reports about itself cannot see this
+    // failure.** These are the modes the unfixed fitter actually returned for the
+    // pure exponential at order 2 -- the true pole, plus a second mode at
+    // frequency pi/dt carrying a residue of 1.83. sin(pi n) is zero at every
+    // integer n, so that mode contributes *nothing* at any sample point and the
+    // fit's rms, peak and relative errors are all clean; between the samples it is
+    // O(1). Any decay rate and any amplitude would do the same, which is exactly
+    // why no on-sample check could have caught it, and why `leastSquares` has to
+    // refuse before the fit is formed rather than after.
+    RadiationStateSpace amplified;
+    amplified.modes.push_back({decay, 0.0, 1.0, 0.0});
+    amplified.modes.push_back({9.019587, kPi / dt, 0.0, -1.829732});
+    const double controlOn = worstError(amplified, false);
+    const double controlBetween = worstError(amplified, true);
+    expectTrue("the control model passes every test the fit makes of itself:"
+               " it is stable",
+               amplified.stable());
+    expectTrue("and reproduces K at every sample to machine precision",
+               controlOn < 1e-12 * k[0]);
+    expectTrue("while being wrong by more than K(0) between them",
+               controlBetween > 1.0 * k[0]);
+    std::printf("     negative control: a fit that is exact at every sample (%.1e of K(0))"
+                " and wrong by %.0f%% of K(0) between them\n",
+                controlOn / k[0], 100.0 * controlBetween / k[0]);
+}
+
 void testStateSpaceApproximatesTheHull() {
     const RadiationTable& table = ferryTable();
     const double dt = 0.1;
@@ -880,6 +1028,7 @@ void runRadiationTests() {
     testRetardationRoundTripsThroughOgilvie();
     testDampingIsPhysical();
     testStateSpaceRecoversKnownPoles();
+    testARankDeficientFitIsRefusedRatherThanAmplified();
     testStateSpaceApproximatesTheHull();
     testRadiationForceReproducesTheConvolution();
     testValidityIsReported();
