@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace sim;
@@ -1068,6 +1069,183 @@ void testTheFerryBuildsItsWholeFlowNetworkFromNamesThatResolve() {
     expectTrue("and the definition it builds validates clean", ferry.validate().empty());
 }
 
+// --- Endpoints the solver may not read ---------------------------------------
+
+namespace {
+
+// The whole compartment state after a fixed run, not a total. The claim under
+// test is bit-identity, and a total hides a compensating pair.
+struct FerryRun {
+    std::vector<double> water, air, temperature;
+    Opening opening;   // the one added below, carrying its last tick's diagnostics
+    std::size_t problems = 0;
+};
+
+// The ferry as shipped, plus `cable_transit` -- the same 0.04 m2 pipe 3.5 m under
+// the design waterline that the lookup tests use -- with its aft end set to
+// whatever is being asked about, stepped for `ticks`.
+FerryRun runFerryWithTransit(int endpointB, bool open, int ticks) {
+    Ship s = game::buildFerry();
+    s.initialise(0.0);
+    int erS = kNoCompartment;
+    expectTrue("the fixture resolves the space the cable transit leaves",
+               s.findCompartment("engine_room_s", erS));
+
+    Opening transit;
+    transit.name = "cable_transit";
+    transit.a = erS;
+    transit.b = endpointB;
+    transit.pos = {-8, -4.0, 2.0};
+    transit.area = 0.04;
+    transit.dischargeCoeff = 0.60;
+    transit.kind = OpeningKind::Pipe;
+    transit.open = open;
+    s.openings.push_back(transit);
+
+    FerryRun r;
+    r.problems = s.validate().size();
+    for (int i = 0; i < ticks; ++i) s.step(0.01, Sea(0.0));
+    for (const Compartment& c : s.compartments) {
+        r.water.push_back(c.waterVolume);
+        r.air.push_back(c.airMass);
+        r.temperature.push_back(c.gasTemperature);
+    }
+    r.opening = s.openings.back();
+    return r;
+}
+
+// Exact equality, deliberately. `==` on a NaN is false, where `expectNear` with a
+// zero tolerance would *pass* one -- `std::abs(NaN - want) > 0.0` is false. A run
+// that read garbage doubles out of bounds is exactly the run that would arrive
+// carrying NaNs, so the comparison has to be the one that catches them.
+bool sameState(const FerryRun& a, const FerryRun& b) {
+    if (a.water.size() != b.water.size()) return false;
+    for (std::size_t i = 0; i < a.water.size(); ++i)
+        if (a.water[i] != b.water[i] || a.air[i] != b.air[i] ||
+            a.temperature[i] != b.temperature[i])
+            return false;
+    return true;
+}
+
+bool passedNothing(const Opening& o) {
+    return o.lastFlow == 0.0 && o.lastGasMassFlow == 0.0 && o.lastGasEnthalpyFlow == 0.0 &&
+           o.lastExchangeDown == 0.0 && o.lastExchangeUp == 0.0 && o.lastExchangeMassDown == 0.0 &&
+           o.lastExchangeMassUp == 0.0;
+}
+
+}  // namespace
+
+// **An endpoint that names no space is refused by the solver, not read.**
+//
+// `Ship::solveFlowNetwork` indexes `compartments[i]` for every endpoint that is
+// not `kSea`, and kSea is the *only* negative it exempts. `kNoCompartment` (-3)
+// and breach.hpp's `kEnclosedVoid` (-2) therefore went straight through as
+// indices: `compartments[-3]` is an out-of-bounds read, and `dWater[-3] -= dv`
+// sixty lines later an out-of-bounds *write* into a heap vector. Against the code
+// before kNoCompartment existed, renaming one ferry compartment reached "double
+// free or corruption (out)" and exit 134.
+//
+// `Ship::validate()` names such an endpoint and that was the entire defence.
+// It is advisory -- nothing on the step path consults it -- and the network is
+// not frozen when it runs: `applyBreaches` pushes openings into a ship that is
+// already stepping, so the endpoints read at tick N are not the set validate()
+// saw. Both halves are asserted here: validate() still names it, *and* the solver
+// refuses it on its own.
+//
+// The assertion is not "it did not crash", which is what undefined behaviour is
+// entitled to look like on a good day. It is that a refused endpoint is exactly a
+// shut opening -- same floodwater, same air mass, same gas temperature in every
+// compartment, bit for bit, after 400 ticks of a ferry that is flooding hard
+// through her breach the whole time.
+void testTheFlowSolverRefusesAnEndpointThatNamesNoSpace() {
+    constexpr int kTicks = 400;
+    const FerryRun shut = runFerryWithTransit(kSea, false, kTicks);
+    expectEqual("the ferry plus a shut transit validates clean",
+                static_cast<long long>(shut.problems), 0);
+
+    // Against vacuity, and it is the load-bearing control: the identity below
+    // would hold trivially if this opening could never move anything. The same
+    // pipe with a *legal* endpoint floods the engine room it opens, and does so by
+    // enough to be visible against a ship already flooding through her breach.
+    const FerryRun sea = runFerryWithTransit(kSea, true, kTicks);
+    expectEqual("the same transit opened to the sea also validates clean",
+                static_cast<long long>(sea.problems), 0);
+    expectTrue("an open cable transit is passing water on the last tick",
+               sea.opening.lastFlow != 0.0);
+    expectTrue("and it has changed the ship, so the comparison below has something to catch",
+               !sameState(sea, shut));
+
+    // Every way an index can fail to name a space. The two sentinels are the ones
+    // this is about; the three out-of-range integers are here because the defect
+    // was a missing *range* check and a check that only tested for -3 and -2 would
+    // be a check written to the two bugs already found.
+    const int n = static_cast<int>(shut.water.size());
+    const struct { const char* what; int endpoint; } refusals[] = {
+        {"kNoCompartment, the answer a name lookup refuses with", kNoCompartment},
+        {"kEnclosedVoid, inside the hull and inside no compartment", -2},
+        {"one past the last compartment", n},
+        {"far past it", n + 97},
+        {"an uninitialised-looking negative", -12345},
+    };
+
+    for (const auto& r : refusals) {
+        const FerryRun run = runFerryWithTransit(r.endpoint, true, kTicks);
+        expectEqual(std::string("validate() names an endpoint at ") + r.what,
+                    static_cast<long long>(run.problems), 1);
+        expectTrue(std::string("... and the solver passes nothing through it: ") + r.what,
+                   passedNothing(run.opening));
+        expectTrue(std::string("... leaving the ship bit-identical to the shut opening: ") + r.what,
+                   sameState(run, shut));
+    }
+}
+
+// **The pump half of the same loop, which indexes on an author-supplied int with
+// no sentinel to exempt at all.**
+//
+// A pump has no sea to be mistaken for a space, so a missed name lookup could
+// never reach it -- but `compartments[p.compartment]` and `dWater[p.compartment]`
+// are the identical unchecked reads, and validate()'s range test on pumps is
+// advisory in exactly the same way. Asserted alongside the openings half so the
+// two cannot drift apart.
+void testARunningPumpOnAnEndpointThatNamesNoSpaceMovesNothing() {
+    constexpr int kTicks = 200;
+
+    auto runWith = [&](int compartment, bool on) {
+        Ship s = game::buildFerry();
+        s.initialise(0.0);
+        s.pumps.push_back({"bilge_nowhere", compartment, 0.060, 25.0, on, 0.0});
+        const std::size_t problems = s.validate().size();
+        for (int i = 0; i < kTicks; ++i) s.step(0.01, Sea(0.0));
+        std::vector<double> water;
+        for (const Compartment& c : s.compartments) water.push_back(c.waterVolume);
+        return std::tuple{water, s.pumps.back().lastFlow, problems};
+    };
+
+    int erS = kNoCompartment;
+    expectTrue("the fixture resolves a space a bilge pump could draw on",
+               game::buildFerry().findCompartment("engine_room_s", erS));
+
+    const auto [offWater, offFlow, offProblems] = runWith(erS, false);
+    expectEqual("a legal pump left off is no problem", static_cast<long long>(offProblems), 0);
+
+    // The control: the same pump, running, on a compartment that exists. It has to
+    // move water or the nulls below say nothing.
+    const auto [onWater, onFlow, onProblems] = runWith(erS, true);
+    expectEqual("nor is one that is running", static_cast<long long>(onProblems), 0);
+    expectTrue("a running bilge pump on a flooding engine room discharges", onFlow > 0.0);
+    expectTrue("and it leaves less water behind than the same pump switched off",
+               onWater != offWater);
+
+    for (const int bad : {kNoCompartment, -2, -12345, static_cast<int>(offWater.size()) + 3}) {
+        const auto [water, flow, problems] = runWith(bad, true);
+        expectEqual("validate() names a pump on a compartment that does not exist",
+                    static_cast<long long>(problems), 1);
+        expectTrue("... and it discharges exactly nothing", flow == 0.0);
+        expectTrue("... leaving the ship where the pump switched off leaves her",
+                   water == offWater);
+    }
+}
+
 void runShipTests() {
     std::printf("\n--- horizontal openings and buoyant exchange ---\n");
     testHorizontalExchangeMatchesTheCounterflowClosedForm();
@@ -1086,4 +1264,8 @@ void runShipTests() {
     testAMissedCompartmentLookupIsRefusedRatherThanAnsweredWithTheSea();
     testAnEndpointFromAMissedLookupIsNamedWhereASeaEndpointCannotBe();
     testTheFerryBuildsItsWholeFlowNetworkFromNamesThatResolve();
+
+    std::printf("\n--- the flow solver refuses an endpoint it may not index ---\n");
+    testTheFlowSolverRefusesAnEndpointThatNamesNoSpace();
+    testARunningPumpOnAnEndpointThatNamesNoSpaceMovesNothing();
 }
