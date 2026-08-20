@@ -565,3 +565,13 @@ whether to measure, not to decide what to do.
   review 11; the defect was an oscillation, so half the sampling points hid it.
   When a fix is about *when* something happens, vary the phase and say in the
   comment which phase the test picked and why.
+- **To change a gated tool's stdout without running the gate**, lift every
+  `sed`/`awk`/`grep` `check-figures.sh` applies to it into a replay script and run
+  those against captured before/after output. The gate is 1676 s and must run
+  alone, so it is not a feedback loop. Record the raw match count for any reader
+  with no `head -1` behind it — those break on a *second* match, not a missing one.
+- **Before/after is not enough when the new line only appears on a bad day.** A
+  diagnostic whose channel is empty in the gated configuration proves nothing by
+  comparison: splice it into the captured output *at maximum density* and replay
+  the readers against that. Otherwise you have shown the code is safe while
+  silent, which is the one case you already knew.
