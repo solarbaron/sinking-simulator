@@ -950,6 +950,171 @@ void testBudgetAccountingAcrossReviews() {
     expectTrue("new promotions after budget freed", rev3.promoted.size() > 0);
 }
 
+// **A compartment the budget cannot afford keeps its dwell.** That is the
+// semantics this tier settled on -- dwell counts qualification, not
+// qualification-and-affordability -- and `WaterCriterion::dwell` carries the
+// evidence for choosing it over the other reading. This is the test that holds the
+// code to it.
+//
+// Three tied 5 m3 compartments and room for exactly one. Compartment 0 promotes;
+// compartments 1 and 2 qualify on every review and are refused on every review, and
+// the question is what being refused does to their hysteresis. It used to destroy
+// it: the promotion loop stopped at the first compartment the budget could not
+// admit, so 1 and 2 were never written back to `qualifying_` and lost their streaks
+// on the spot. They were not deferred, they were restarted, and restarted by a
+// decision taken about compartment 0.
+//
+// What that left was an oscillation rather than a standstill, which matters for how
+// this test is built. Each of them rebuilt to a streak of two on every even review,
+// was refused there and dropped, and stood at one again on every odd review -- so
+// whether a starved compartment ever promoted at all came down to the *parity* of
+// the review the budget happened to free on. That is not a property of the ship, of
+// the water, or of the criterion.
+//
+// The last third is the negative control, and it is the part that separates the two
+// designs rather than merely observing that something eventually promotes. Free the
+// budget and ask *when* compartment 1 arrives. With its dwell retained it promotes
+// on that very review, having become promotable nine reviews earlier. With the
+// streak oscillating it stands at one on the review chosen here and promotes
+// nothing. An assertion that it "promotes eventually" passes under both, and so
+// does one that frees the budget on an even review -- see the note at the control
+// itself.
+void testABudgetStarvedCompartmentKeepsItsDwell() {
+    std::printf("\n   a budget-starved compartment keeps its dwell\n");
+
+    Ship ferry = ferryAfloat();
+    floodCompartment(ferry, 0, 5.0);
+    floodCompartment(ferry, 1, 5.0);
+    floodCompartment(ferry, 2, 5.0);
+    setRollRate(ferry, 0.15);
+
+    WaterCriterion crit;
+    crit.dwell = 2;   // the default, written out because the arithmetic below is in it
+
+    // Room for exactly one, sized off the estimator rather than off a constant, for
+    // the reason `testParticleBudgetEnforcement` gives: a hardcoded number here is a
+    // guess about the estimator's internals and lands on the wrong side of the
+    // boundary in silence when they change.
+    int oneParticles = 0, oneTiles = 0;
+    estimateFlipCost(ferry.compartments[0], crit, oneParticles, oneTiles);
+    expectTrue("one compartment needs particles and tiles",
+               oneParticles > 0 && oneTiles > 0);
+    crit.particleBudget = 2 * oneParticles - 1;   // fits one, one short of two
+    crit.tileBudget = 2 * oneTiles - 1;
+
+    WaterPromoter promoter(crit);
+
+    // Read through a lookup rather than by index: before the fix `starved` is empty
+    // on every review, and a test that indexed into it would crash instead of
+    // reporting, which is the wrong kind of red.
+    const auto refusedFor = [](const WaterReview& r, int compartment) {
+        for (const WaterStarved& st : r.starved)
+            if (st.compartment == compartment) return st.refusedReviews;
+        return 0;
+    };
+    const auto qualifiedFor = [](const WaterReview& r, int compartment) {
+        for (const WaterStarved& st : r.starved)
+            if (st.compartment == compartment) return st.qualifyingReviews;
+        return 0;
+    };
+
+    // Review 1: all three qualify and none has served its dwell, so nothing is
+    // starved. Being short of dwell is the hysteresis working and must not be
+    // reported as a budget refusal -- telling those two apart is the whole point of
+    // the channel.
+    const WaterReview first = promoter.review(ferry);
+    expectEqual("nothing promotes on the first review",
+                static_cast<long long>(first.promoted.size()), 0);
+    expectEqual("and nothing is starved, because nothing is promotable yet",
+                static_cast<long long>(first.starved.size()), 0);
+
+    // Review 2: all three have served their dwell and the budget admits one.
+    const WaterReview second = promoter.review(ferry);
+    expectEqual("one promotes on the second review",
+                static_cast<long long>(second.promoted.size()), 1);
+    expectEqual("and it is compartment 0, the tie-break order",
+                second.promoted.empty() ? -1 : second.promoted[0].compartment, 0);
+    expectEqual("the other two are starved and named",
+                static_cast<long long>(second.starved.size()), 2);
+    expectEqual("compartment 1 has been refused once", refusedFor(second, 1), 1);
+    expectEqual("compartment 2 with it", refusedFor(second, 2), 1);
+
+    // And the candidate list says so on the candidate itself, which is where this
+    // tier puts a refusal -- the answer it already gives for a compartment turned
+    // away on volume or on grid spacing.
+    bool starvedCandidateSaysWhy = false;
+    for (const WaterCandidate& c : second.considered)
+        if (c.compartment == 1 && c.why.find("budget refused it") != std::string::npos)
+            starvedCandidateSaysWhy = true;
+    expectTrue("and the starved candidate carries the reason in its own why",
+               starvedCandidateSaysWhy);
+
+    // Reviews 3 to 10. They qualify every time and are refused every time, and the
+    // refusal count is the measurement: a count stuck at one is exactly what a
+    // destroyed streak looks like from outside, which is why it is asserted to
+    // climb rather than merely to be positive.
+    bool bothNamedEveryReview = true, refusalCountClimbs = true, nothingElsePromoted = true;
+    int previousRefused = refusedFor(second, 1);
+    int qualifyingAtTen = 0;
+    for (int review = 3; review <= 10; ++review) {
+        const WaterReview r = promoter.review(ferry);
+        if (!r.promoted.empty()) nothingElsePromoted = false;
+        if (r.starved.size() != 2 || refusedFor(r, 1) == 0 || refusedFor(r, 2) == 0)
+            bothNamedEveryReview = false;
+        if (refusedFor(r, 1) != previousRefused + 1) refusalCountClimbs = false;
+        previousRefused = refusedFor(r, 1);
+        qualifyingAtTen = qualifiedFor(r, 1);
+    }
+    expectTrue("both are named starved on every review of the eight",
+               bothNamedEveryReview);
+    expectTrue("nothing else promotes while the budget is full", nothingElsePromoted);
+    expectTrue("and the refusal count climbs on every one of them", refusalCountClimbs);
+    expectEqual("so by review 10 compartment 1 has been refused nine reviews running",
+                previousRefused, 9);
+    // The streak underneath it, because the refusal count is derived from it and a
+    // reader handed one is entitled to the other.
+    expectEqual("on a streak of ten qualifying reviews", qualifyingAtTen, 10);
+
+    // The control. Free the budget the only way a caller can from outside: drain
+    // the promoted compartment, which demotes it at once on the volume guard
+    // (`testDrainingACompartmentDemotesItAtOnce`). The criterion is fixed for the
+    // promoter's lifetime so the budget cannot be raised mid-run -- and draining is
+    // the more honest scenario anyway, being what happens on a ship when a
+    // compartment is pumped out.
+    //
+    // **This is review 11, and the odd count is deliberate.** The streak the old
+    // code left behind was not stuck at zero, it *oscillated*: compartment 1 built
+    // to two on every even review, was refused there and dropped, and was back at
+    // one on every odd review. So whether a starved compartment ever promoted
+    // depended on the parity of the review the budget happened to free on, and a
+    // control run at review 12 would have passed against the defect for that reason
+    // alone. Freeing on an odd review is where the two designs disagree: with the
+    // streak kept, compartment 1 has eleven reviews of dwell and promotes; with it
+    // oscillating it stands at one, short of `dwell = 2`, and promotes nothing.
+    floodCompartment(ferry, 0, 0.0);
+    const WaterReview freed = promoter.review(ferry);
+
+    expectEqual("draining the promoted compartment demotes it",
+                static_cast<long long>(freed.demoted.size()), 1);
+    expectEqual("and the starved compartment promotes on that very review, not two later",
+                static_cast<long long>(freed.promoted.size()), 1);
+    expectEqual("which is compartment 1, the next in the tie-break order",
+                freed.promoted.empty() ? -1 : freed.promoted[0].compartment, 1);
+    expectEqual("while compartment 2 is starved still, one place behind it",
+                refusedFor(freed, 2), 10);
+
+    // And it is not silent about it, which is the standard the gas tier set after
+    // the same defect was found there: a budget that refuses a qualifying
+    // compartment says so, in a message carrying the word `water_probe` counts.
+    bool saidSoOutLoud = false;
+    for (const std::string& problem : freed.problems)
+        if (problem.find("budget") != std::string::npos &&
+            problem.find("dwell is retained") != std::string::npos)
+            saidSoOutLoud = true;
+    expectTrue("and the review says out loud that one is still being refused",
+               saidSoOutLoud);
+}
+
 // ===========================================================================
 // Section 4: State Transfer
 // ===========================================================================
@@ -1603,6 +1768,7 @@ void runWaterPromotionTests() {
     testParticleBudgetEnforcement();
     testTileBudgetEnforcement();
     testBudgetAccountingAcrossReviews();
+    testABudgetStarvedCompartmentKeepsItsDwell();
 
     // Section 4: State Transfer
     testRoundTripMassConservation();
