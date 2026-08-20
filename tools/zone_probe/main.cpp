@@ -124,9 +124,20 @@ int main(int argc, char** argv) {
     sim::Ship ferry = game::buildFerry();
     ferry.initialise(0.0);
     const sim::Scantlings scantlings = sim::ferryScantlings();
-    const sim::StructuralMesh structure = sim::makeStructuralMesh(ferry.hull, scantlings);
+    // **The mesher's own account of what it could not build, which this tool used to
+    // throw away.** `makeStructuralMesh` always returns *something* -- a description
+    // whose frames will not lay out yields an empty mesh and the reason goes only
+    // into `problems` -- so passing no pointer meshes a zone out of a structure
+    // nobody checked. Everything below is a function of that structure: the patch is
+    // cut from its panels, the pre-load is read off its section, and the reaction at
+    // the end re-sections it damaged.
+    std::vector<std::string> meshProblems;
+    const sim::StructuralMesh structure =
+        sim::makeStructuralMesh(ferry.hull, scantlings, &meshProblems);
     std::printf("ferry  : %zu plating panels, %zu members, frames at %.2f m\n",
                 structure.panels.size(), structure.members.size(), structure.frameSpacing);
+    for (const std::string& problem : meshProblems)
+        std::printf("       ! %s\n", problem.c_str());
 
     // --- 0. Tier 0, and what it decides ----------------------------------------
     //
@@ -153,6 +164,18 @@ int main(int argc, char** argv) {
     std::printf("tier-0 : on a 3 m crest -- yield %.3f, buckling %.3f, collapse %.3f;"
                 " %.0f ms to know\n", tier.yieldUtilisation, tier.buckleUtilisation,
                 tier.collapseUtilisation, tier.seconds * 1e3);
+    // **The three numbers above are the ones the promotion criterion fires on, and
+    // `tier.problems` is the only place that says whether they mean anything.** Two
+    // things arrive here and both are unsafe to drop. `validateGirder` puts the
+    // shear and moment closure at the perpendiculars in it, and it only speaks above
+    // 5% -- so a few percent of imbalance moves the peak bending moment with nothing
+    // else lit anywhere, and the headline reads exactly as it does on a ship that
+    // balanced. And `tierZero` records how many girder stations produced no strength
+    // curve at all: those stations are absent from `collapseUtilisation` rather than
+    // zero in it, so a station that went missing is one the collapse trigger cannot
+    // fire on, and the error is in the unsafe direction.
+    for (const std::string& problem : tier.problems)
+        std::printf("       ! %s\n", problem.c_str());
 
     const sim::Vec3 impact{options.aim, -9.9, options.height};
     sim::promotion::Criterion criterion;

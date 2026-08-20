@@ -153,7 +153,18 @@ int main(int argc, char** argv) {
     sim::Ship ferry = game::buildFerry();
     ferry.initialise(0.0);
     const sim::Scantlings scantlings = sim::ferryScantlings();
-    const sim::StructuralMesh structure = sim::makeStructuralMesh(ferry.hull, scantlings);
+    // **What the mesher could not build, before either solver is asked anything.**
+    // `makeStructuralMesh` returns its mesh whatever went wrong and reports the
+    // reason only through this pointer, so a caller that passes none cuts its patch
+    // out of a structure nobody checked. It matters here even though the comparison
+    // below is CPU-against-GPU on one patch: both solvers are handed the *same*
+    // patch, so a structural fault cancels out of the relative columns and stays in
+    // every absolute figure the document publishes beside them.
+    std::vector<std::string> meshProblems;
+    const sim::StructuralMesh structure =
+        sim::makeStructuralMesh(ferry.hull, scantlings, &meshProblems);
+    for (const std::string& problem : meshProblems)
+        std::printf("       ! %s\n", problem.c_str());
 
     sim::zone::MeshParams mesh;
     mesh.radius = options.radius;

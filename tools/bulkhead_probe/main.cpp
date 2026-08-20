@@ -285,6 +285,18 @@ struct Outcome {
     int    failedPanels = 0;
     double openingArea = 0;         // m^2 reaching a compartment
     int    openings = 0;
+    // **Every failed panel that produced no opening.** `breach.hpp` keeps this
+    // channel because swallowing it "would leave a hole that floods nothing looking
+    // exactly like no hole at all", and that is precisely the confusion this tool
+    // cannot afford: the whole point of the run is that the failure *relieves* what
+    // caused it -- the hold behind empties into the one on fire and the head falls
+    // -- so a refused panel means the relief never happened and `peakHead`,
+    // `peakSteel`, `peakUtilisation` and `failureTime` are all published from a run
+    // that was never let off, biased in the unsafe direction. `openingArea` reads
+    // 0.00 m2 either way, which is also what a bulkhead that has not torn yet reads.
+    // Deduplicated, because the block that fills it runs on every coupling step
+    // after the first member goes.
+    std::vector<std::string> breachProblems;
 
     double peakSteel = 0;           // K, hottest element on the bulkhead
     // The hottest *member*: its equivalent uniform temperature, which is what the
@@ -355,6 +367,13 @@ struct Chain {
     const Options* o = nullptr;
     Scantlings scantlings;
     StructuralMesh structure;
+    // Whatever `makeStructuralMesh` could not build. It returns its mesh either way
+    // -- a description whose frames will not lay out comes back empty -- and says
+    // why only through the pointer, so this is kept rather than discarded: the
+    // bulkhead's panel columns below are found *in* that mesh, and a column list
+    // built out of a structure nobody checked is what every figure here is a
+    // function of.
+    std::vector<std::string> meshProblems;
     Slab slab;
     std::vector<Column> column;          // ascending in y
     std::vector<thermal::BoundaryFace> fireFace, wetFace;
@@ -402,7 +421,7 @@ Chain buildChain(const Ship& ferry, const Options& o) {
     Chain c;
     c.o = &o;
     c.scantlings = ferryScantlings();
-    c.structure = makeStructuralMesh(ferry.hull, c.scantlings);
+    c.structure = makeStructuralMesh(ferry.hull, c.scantlings, &c.meshProblems);
     c.slab = buildSlab(o.element);
 
     // Panel columns of the bulkhead, from the structural mesh's own panels.
@@ -762,6 +781,10 @@ Outcome run(const Chain& chain, const Options& o, bool fire, bool water, bool ve
             out.failedPanels = static_cast<int>(failedPanel.size());
             out.openings = static_cast<int>(set.breaches.size());
             out.openingArea = set.totalArea();
+            for (const std::string& problem : set.problems)
+                if (std::find(out.breachProblems.begin(), out.breachProblems.end(), problem) ==
+                    out.breachProblems.end())
+                    out.breachProblems.push_back(problem);
         }
 
         const int shipSteps = std::max(1, static_cast<int>(std::lround(o.coupling / o.shipStep)));
@@ -840,6 +863,8 @@ int main(int argc, char** argv) {
                 " plate %.2f MPa\n",
                 chain.section.area, chain.section.secondMoment, chain.section.modulusStiffener,
                 chain.eulerStress / 1e6, chain.plateElastic / 1e6);
+    for (const std::string& problem : chain.meshProblems)
+        std::printf("          ! %s\n", problem.c_str());
     std::printf("conduct : %zu elements, %zu nodes, %d x %d over %.2f x %.2f m\n",
                 chain.slab.mesh.elementCount(), chain.slab.mesh.nodeCount(), chain.slab.nx,
                 chain.slab.ny, 2.0 * kMeshYHalf, kMeshZHi - kMeshZLo);
@@ -900,6 +925,11 @@ int main(int argc, char** argv) {
                 both.heel, both.gm, static_cast<int>(both.afloat));
     std::printf("          %d panel(s) failed -> %d opening(s), %.3f m2 reaching a compartment\n",
                 both.failedPanels, both.openings, both.openingArea);
+    // Beside the two counts, because the gap between them is the whole content of
+    // this channel: panels failed and openings made are only the same number while
+    // nothing was refused, and the line above cannot show a refusal at all.
+    for (const std::string& problem : both.breachProblems)
+        std::printf("          ! %s\n", problem.c_str());
 
     std::printf("\ngas     : the upper layer peaked at %.1f C and the steel it stood against"
                 " at %.1f C, %.1f K behind it\n",
