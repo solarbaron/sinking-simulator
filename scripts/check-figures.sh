@@ -1911,6 +1911,22 @@ if [ -x "$GAS" ]; then
     hint "$h" "$GASDOC"
   done
   gasrun=$("$GAS" --duration=600 2>&1)
+  gasrc=$?
+  # `gas_probe` gained a failure path when `fire::StepResult::incomplete` landed:
+  # it exits 1 rather than publishing figures indexed by a clock that stopped
+  # keeping up with the model. Capturing its output without its status would parse
+  # those figures as though nothing had happened -- the tool would print its
+  # refusal and this gate would read straight past it, which is the same defect
+  # the exit was added to close, one level up.
+  checks=$((checks + 1))
+  if [ "$gasrc" -eq 0 ]; then
+    printf '  %s✓%s gas_probe published its figures off a clock that kept up\n' \
+           "$green" "$off"
+  else
+    printf '  %s✗%s gas_probe exited %s — the figures below are indexed by a clock that fell behind\n' \
+           "$red" "$off" "$gasrc"
+    fails=$((fails + 1))
+  fi
   gasprom=$(printf '%s\n' "$gasrun" | sed -n 's/^ *promotions *\([0-9]*\).*/\1/p')
   gasref=$(printf '%s\n' "$gasrun" | sed -n 's/^ *reviews that refused on budget *\([0-9]*\).*/\1/p')
   gascells=$(printf '%s\n' "$gasrun" | sed -n 's/^ *engine_room_s *\([0-9]*\) *[0-9.]*.*/\1/p' | tail -1)
