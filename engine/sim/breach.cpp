@@ -411,6 +411,16 @@ BreachSet breachesFromFailedPanels(const Ship& ship, const StructuralMesh& mesh,
         for (std::size_t k = 0; k < components.size(); ++k) {
             double area = 0;
             Vec3 moment{};
+            // The region's own two projections -- what it presents to a flow
+            // crossing it downwards, and what it presents to one crossing it
+            // sideways. See the header's §4: their comparison is what decides
+            // which of the two flooding laws this hole gets. Accumulated over the
+            // whole merged region rather than read off any one panel, because the
+            // opening *is* the region: a tear that runs round the turn of the
+            // bilge is part deck and part wall, and classifying it off whichever
+            // panel came first would make the answer depend on the mesher's loop
+            // order.
+            double facingUp = 0, facingSide = 0;
             Breach breach;
             breach.panels.reserve(components[k].size());
             for (std::size_t m : components[k]) {
@@ -422,6 +432,13 @@ BreachSet breachesFromFailedPanels(const Ship& ship, const StructuralMesh& mesh,
                 const double panelArea = panel.area();
                 area += panelArea;
                 moment += panel.centroid() * panelArea;
+                // Sign-free on purpose. Which side of a hole is the upper one is
+                // decided in the world frame every tick by `horizontalSidesOf`,
+                // never by the plate's winding, so a deck panel wound face-down is
+                // the same aperture as one wound face-up.
+                const Vec3 n = panel.normal();
+                facingUp += panelArea * std::abs(n.z);
+                facingSide += panelArea * std::hypot(n.x, n.y);
                 breach.panels.push_back(index);
             }
 
@@ -437,7 +454,18 @@ BreachSet breachesFromFailedPanels(const Ship& ship, const StructuralMesh& mesh,
             opening.area = area;
             opening.dischargeCoeff = params.dischargeCoeff;
             opening.open = true;
-            opening.kind = OpeningKind::Breach;
+            // Which of the two flooding laws this hole floods under, from the
+            // orientation it was just measured to have -- §4. `kind` is the entire
+            // switch on the counter-current branch of `Ship::solveFlowNetwork`, so
+            // a hole torn through a deck and left at `Breach` does not refuse to
+            // flood and does not crash: it reports a plausible small net flow
+            // while a tonne a second should be crossing it in both directions.
+            //
+            // Strict, so a region sitting exactly on the crossover comes out
+            // `Breach`. At 45 degrees neither law is the better one, and the tie
+            // going to the law every torn panel has always had keeps this change
+            // to the panels it is about.
+            opening.kind = facingUp > facingSide ? OpeningKind::Hatch : OpeningKind::Breach;
             out.breaches.push_back(std::move(breach));
         }
     }

@@ -94,6 +94,73 @@
 // it is the tear's aspect ratio and which way the plating folded, and a set of
 // failed panels records neither.
 //
+// --- 4. Which law the hole floods under, from the way the region faces ---------
+//
+// `Opening::kind` is not a label. It is the switch on the flooding model:
+// `Ship::horizontalSidesOf` admits `OpeningKind::Hatch` and nothing else to the
+// counter-current branch, and `ship.hpp` opens by arguing why that branch has to
+// exist -- through a hole in a deck with the sea standing on it, water falls
+// while air rises through the *same* hole, driven by the density difference and
+// by no net pressure difference at all, so "a net-only model sees a still one".
+// Every torn region here used to come out `Breach`, which is also the zero
+// enumerator, so "nobody chose" and "chose `Breach`" were the same bytes and a
+// hole torn through a deck was handed the single-dp vertical orifice law. That
+// failure is not a refusal and not a crash; it is a plausible small net flow
+// where a tonne a second crosses in two directions, which is the shape of thing
+// this whole file exists to get right.
+//
+// **The crossover needs no constant.** A piece of plating whose normal stands at
+// theta from the vertical presents `A cos(theta)` to anything crossing it
+// downwards and `A sin(theta)` to anything crossing it sideways, and those are
+// equal at 45 degrees. So the region's own two projections are summed over its
+// panels and compared:
+//
+//     sum A_i |n_z,i|  >  sum A_i |n_xy,i|   ->  Hatch, else Breach
+//
+// That is a crossover rather than a tuned threshold: it is the one angle at
+// which neither law is the better description, so it is the only place the
+// answer can change without someone having chosen a number.
+//
+// **A region exactly on it comes out `Breach`**, the comparison being strict.
+// The cost of landing on the wrong side there is bounded and it is not
+// symmetric. `Opening` carries no normal -- `horizontalSidesOf` takes a hatch's
+// to be the body's own +z, because a hatch is in a deck -- so a region called
+// `Hatch` at theta exchanges over `A` where only `A cos(theta)` of it faces up,
+// 1.41x too much at the crossover; a region called `Breach` exchanges over
+// nothing at all. Nothing between the two is available: `kind` is the only
+// switch there is, and there is no third law for it to select.
+//
+// **`PanelRole` is not the criterion, because it does not carry orientation.**
+// `PanelRole::Shell` covers the flat of bottom, which is as horizontal as any
+// deck -- and is a deck with the sea standing on it the moment she rolls past
+// ninety degrees, which is exactly the case `ship.hpp` says the exchange has to
+// reverse for -- while the same role covers the side plating, which is a wall.
+// `Deck` and `Bulkhead` are generated at constant z and constant x or |y| today,
+// so for those two the label and the geometry happen to agree; `Shell` is the
+// counterexample and it is most of the ship's watertight envelope. This is §1's
+// argument arriving at the same answer from the other end: a decision that can be
+// got wrong by mis-tagging an element will eventually be got wrong by mis-tagging
+// an element.
+//
+// A hatch produced this way keeps the `breach_` name prefix. The name records
+// where the hole came from; the kind records how it floods, and they are
+// different questions. `fire.cpp`'s `ventShapeFor` reads the same enumerator and
+// gives a `Hatch` no height for its doorway integral, which is the right answer
+// for a hole in a deck for the same reason.
+//
+// **And it puts a price on §2's merge rule that a breach does not have.** The
+// claim there -- that splitting a torn region into N holes costs nothing in total
+// flow -- is a statement about `Cd·A·√(2Δp/ρ)`, which is linear in area. The
+// horizontal law is not: its driving head is `(ρ_up − ρ_lo) g D/2` with
+// `D = √(4A/π)`, so the exchange goes as `A^{5/4}` -- the `D^{5/2}` that
+// `ship.hpp` cites Epstein and Cooper for -- and N equal pieces of one deck hole
+// pass `N^{-1/4}` of what the whole hole passes, 16% less at N = 2. Merging on a
+// shared edge is therefore load-bearing for a hatch where it was only tidy for a
+// breach, and the corner-touching split §2 keeps is now a modelling choice with a
+// cost rather than a free one. It is kept: the pinch between two panels meeting
+// at a corner still has zero width and still passes nothing, and the alternative
+// is to merge regions that are not one hole.
+//
 // SI throughout, body frame per CLAUDE.md.
 #pragma once
 
