@@ -71,14 +71,27 @@ Ship ferryAfloat() {
 // period rather than assumed -- the same construction `test_girder.cpp` uses.
 struct Crest {
     WaveField field;
-    Sea sea;
+    double time = 0.0;
+
+    // Built on demand rather than held as a member. A `Sea` holds a *pointer* to its
+    // wave field, so a struct holding both would point into itself -- and a
+    // self-referential struct is wrong the moment it is copied, because the copy's
+    // pointer still addresses the *original's* field. `crestAmidships` returns one by
+    // value, where NRVO is a permitted optimisation and not a guarantee, so the
+    // member form was correct only for as long as the compiler chose to elide. There
+    // is no stored pointer here to get wrong.
+    Sea sea() const {
+        Sea s;
+        s.waves = &field;
+        s.time = time;
+        return s;
+    }
 };
 
 Crest crestAmidships(const Ship& ship, double amplitude) {
     const double length = ship.hullHi.x - ship.hullLo.x;
     const double omega = std::sqrt(kGravity * 2.0 * kPi / length);
-    Crest out{WaveField::regular(amplitude, omega, 0.0), Sea{}};
-    out.sea.waves = &out.field;
+    Crest out{WaveField::regular(amplitude, omega, 0.0)};
     const double period = 2.0 * kPi / omega;
     double best = -1e30;
     for (int i = 0; i < 720; ++i) {
@@ -86,7 +99,7 @@ Crest crestAmidships(const Ship& ship, double amplitude) {
         const double eta = out.field.elevation(ship.state.position.x, 0.0, t);
         if (eta > best) {
             best = eta;
-            out.sea.time = t;
+            out.time = t;
         }
     }
     return out;
@@ -963,11 +976,11 @@ void testTheDecisionIsCheapAndTheTierZeroAnswerIsNot() {
     const Crest crest = crestAmidships(ferry, 3.0);
 
     const promotion::TierZero tier =
-        promotion::tierZero(ferry, crest.sea, structure, scantlings);
+        promotion::tierZero(ferry, crest.sea(), structure, scantlings);
     promotion::TierZeroParams cheap;
     cheap.collapse = false;
     const promotion::TierZero withoutCollapse =
-        promotion::tierZero(ferry, crest.sea, structure, scantlings, cheap);
+        promotion::tierZero(ferry, crest.sea(), structure, scantlings, cheap);
 
     promotion::Criterion criterion;
     criterion.mesh.radius = 3.0;
@@ -1223,7 +1236,7 @@ void testThePreLoadIsTheGirdersOwnStress() {
     const Ship ferry = ferryAfloat();
     const StructuralMesh& structure = ferryStructure();
     const Crest crest = crestAmidships(ferry, 3.0);
-    const HullGirder girder = hullGirder(ferry, crest.sea, 41);
+    const HullGirder girder = hullGirder(ferry, crest.sea(), 41);
     expectTrue("she is hogging on the crest", girder.hogging());
 
     zone::MeshParams mesh;
@@ -2135,7 +2148,7 @@ void testAnExplicitYieldStrengthReachesEveryUtilisation() {
     const Crest crest = crestAmidships(ferry, 3.0);
 
     const promotion::TierZero plating =
-        promotion::tierZero(ferry, crest.sea, structure, scantlings);
+        promotion::tierZero(ferry, crest.sea(), structure, scantlings);
 
     // Half the plating's yield. A softer steel buckles sooner, so the utilisation
     // must rise -- and the direction is the point: a parameter that is read but
@@ -2143,7 +2156,7 @@ void testAnExplicitYieldStrengthReachesEveryUtilisation() {
     promotion::TierZeroParams soft;
     soft.yieldStrength = 0.5 * ah36Steel().yieldStrength;
     const promotion::TierZero halved =
-        promotion::tierZero(ferry, crest.sea, structure, scantlings, soft);
+        promotion::tierZero(ferry, crest.sea(), structure, scantlings, soft);
 
     std::printf("      yield %.0f MPa -> yield util %.4f, buckle util %.4f\n",
                 plating.yieldStrength / 1e6, plating.yieldUtilisation, plating.buckleUtilisation);
@@ -2162,7 +2175,7 @@ void testAnExplicitYieldStrengthReachesEveryUtilisation() {
     // plating's own, so a caller that asks for nothing gets what it always got.
     promotion::TierZeroParams silent;
     const promotion::TierZero implied =
-        promotion::tierZero(ferry, crest.sea, structure, scantlings, silent);
+        promotion::tierZero(ferry, crest.sea(), structure, scantlings, silent);
     expectNear("an unset yield strength is still the plating's own",
                implied.buckleUtilisation, plating.buckleUtilisation, 0.0);
 }

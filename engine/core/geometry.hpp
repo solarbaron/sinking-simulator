@@ -55,6 +55,17 @@ VolumeIntegral integrateBelowPlane(const TriMesh& mesh, const Vec3& n, double pl
 class PlaneSweep {
 public:
     PlaneSweep(const TriMesh& mesh, const Vec3& n);
+    // **A temporary is a compile error, not a dangling read.** `mesh_` below is a
+    // pointer captured in the constructor, so `PlaneSweep(makeBox(...), n).below(z)`
+    // would bind it to something destroyed at the end of the full expression and
+    // every later call would read freed heap. All eight construction sites bind
+    // something longer-lived today; deleting this overload is what keeps that true,
+    // where a comment would only record it.
+    //
+    // It cannot be covered by a test instead: a test that constructed one would *be*
+    // the undefined behaviour rather than a check on it. Prevention and detection are
+    // not interchangeable here, and only one of them is available.
+    PlaneSweep(TriMesh&& mesh, const Vec3& n) = delete;
 
     // Volume and centroid of the region satisfying dot(n, x) <= offset.
     VolumeIntegral below(double offset) const;

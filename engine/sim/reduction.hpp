@@ -886,8 +886,23 @@ Reduction craigBampton(const Substructure& substructure, const ReduceParams& par
 // --- Using it -------------------------------------------------------------------
 
 // f_r = T^T f, from a load in the substructure's global DOF numbering. Exact for
-// any load: the interior part arrives as Psi^T f_i on the boundary and Phi^T f_i
-// on the modes.
+// any load *the partitions can see*: the interior part arrives as Psi^T f_i on the
+// boundary and Phi^T f_i on the modes.
+//
+// **A load on a DOF that `Attachment::constrained` eliminated is silently dropped,
+// and the caller must fold it onto the masters first.** This function reads
+// `boundaryDof()` and `interiorDof()`; an eliminated DOF is in neither, so its load
+// reaches no partition and simply vanishes -- 0.84 MN of it on the reference ferry,
+// measured and written up in `section.hpp`'s Tier-0/Tier-1 comparison. It belongs to
+// the masters by the transpose of the constraint, exactly as the reaction does in
+// `stiffnessTimes`, and `tools/section_probe` folds before calling.
+//
+// The header said "Exact for any load" unqualified until this correction, which is
+// the worse half of the defect: `recover` below has carried the eliminated-DOF
+// explanation all along, and the measurement sat in a third file, so the one
+// sentence a caller actually reads was the one that did not mention it. A documented
+// exactness that is false is worse than an undocumented gap -- the gap makes a
+// careful caller look, and the claim tells them not to bother.
 std::vector<double> reduceLoad(const Substructure& substructure, const Reduction& reduced,
                                const std::vector<double>& load);
 
